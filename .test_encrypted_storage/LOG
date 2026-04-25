@@ -1,0 +1,245 @@
+2026/04/12-12:10:24.646818 2ddc RocksDB version: 8.1.1
+2026/04/12-12:10:24.646907 2ddc Compile date 2023-04-06 16:38:52
+2026/04/12-12:10:24.646931 2ddc DB SUMMARY
+2026/04/12-12:10:24.646948 2ddc DB Session ID:  234D76ZZXTUBCERF464N
+2026/04/12-12:10:24.647217 2ddc SST files in .test_encrypted_storage dir, Total Num: 0, files: 
+2026/04/12-12:10:24.647240 2ddc Write Ahead Log file in .test_encrypted_storage: 
+2026/04/12-12:10:24.647255 2ddc                         Options.error_if_exists: 0
+2026/04/12-12:10:24.647268 2ddc                       Options.create_if_missing: 1
+2026/04/12-12:10:24.647280 2ddc                         Options.paranoid_checks: 1
+2026/04/12-12:10:24.647293 2ddc             Options.flush_verify_memtable_count: 1
+2026/04/12-12:10:24.647305 2ddc                               Options.track_and_verify_wals_in_manifest: 0
+2026/04/12-12:10:24.647434 2ddc        Options.verify_sst_unique_id_in_manifest: 1
+2026/04/12-12:10:24.647447 2ddc                                     Options.env: 000001FB29D7F7A0
+2026/04/12-12:10:24.647455 2ddc                                      Options.fs: WinFS
+2026/04/12-12:10:24.647462 2ddc                                Options.info_log: 000001FB29D9FC20
+2026/04/12-12:10:24.647468 2ddc                Options.max_file_opening_threads: 16
+2026/04/12-12:10:24.647474 2ddc                              Options.statistics: 0000000000000000
+2026/04/12-12:10:24.647481 2ddc                               Options.use_fsync: 0
+2026/04/12-12:10:24.647487 2ddc                       Options.max_log_file_size: 0
+2026/04/12-12:10:24.647493 2ddc                  Options.max_manifest_file_size: 1073741824
+2026/04/12-12:10:24.647526 2ddc                   Options.log_file_time_to_roll: 0
+2026/04/12-12:10:24.647535 2ddc                       Options.keep_log_file_num: 1000
+2026/04/12-12:10:24.647542 2ddc                    Options.recycle_log_file_num: 0
+2026/04/12-12:10:24.647548 2ddc                         Options.allow_fallocate: 1
+2026/04/12-12:10:24.647554 2ddc                        Options.allow_mmap_reads: 0
+2026/04/12-12:10:24.647560 2ddc                       Options.allow_mmap_writes: 0
+2026/04/12-12:10:24.647566 2ddc                        Options.use_direct_reads: 0
+2026/04/12-12:10:24.647572 2ddc                        Options.use_direct_io_for_flush_and_compaction: 0
+2026/04/12-12:10:24.647578 2ddc          Options.create_missing_column_families: 0
+2026/04/12-12:10:24.647584 2ddc                              Options.db_log_dir: 
+2026/04/12-12:10:24.647590 2ddc                                 Options.wal_dir: 
+2026/04/12-12:10:24.647596 2ddc                Options.table_cache_numshardbits: 6
+2026/04/12-12:10:24.647602 2ddc                         Options.WAL_ttl_seconds: 0
+2026/04/12-12:10:24.647608 2ddc                       Options.WAL_size_limit_MB: 0
+2026/04/12-12:10:24.647648 2ddc                        Options.max_write_batch_group_size_bytes: 1048576
+2026/04/12-12:10:24.647678 2ddc             Options.manifest_preallocation_size: 4194304
+2026/04/12-12:10:24.647685 2ddc                     Options.is_fd_close_on_exec: 1
+2026/04/12-12:10:24.647691 2ddc                   Options.advise_random_on_open: 1
+2026/04/12-12:10:24.647697 2ddc                    Options.db_write_buffer_size: 0
+2026/04/12-12:10:24.647703 2ddc                    Options.write_buffer_manager: 000001FB29D7B2E0
+2026/04/12-12:10:24.647709 2ddc         Options.access_hint_on_compaction_start: 1
+2026/04/12-12:10:24.647715 2ddc           Options.random_access_max_buffer_size: 1048576
+2026/04/12-12:10:24.647721 2ddc                      Options.use_adaptive_mutex: 0
+2026/04/12-12:10:24.647727 2ddc                            Options.rate_limiter: 0000000000000000
+2026/04/12-12:10:24.647734 2ddc     Options.sst_file_manager.rate_bytes_per_sec: 0
+2026/04/12-12:10:24.647740 2ddc                       Options.wal_recovery_mode: 2
+2026/04/12-12:10:24.647746 2ddc                  Options.enable_thread_tracking: 0
+2026/04/12-12:10:24.647752 2ddc                  Options.enable_pipelined_write: 0
+2026/04/12-12:10:24.647758 2ddc                  Options.unordered_write: 0
+2026/04/12-12:10:24.647807 2ddc         Options.allow_concurrent_memtable_write: 1
+2026/04/12-12:10:24.647817 2ddc      Options.enable_write_thread_adaptive_yield: 1
+2026/04/12-12:10:24.647824 2ddc             Options.write_thread_max_yield_usec: 100
+2026/04/12-12:10:24.647830 2ddc            Options.write_thread_slow_yield_usec: 3
+2026/04/12-12:10:24.647836 2ddc                               Options.row_cache: None
+2026/04/12-12:10:24.647842 2ddc                              Options.wal_filter: None
+2026/04/12-12:10:24.647848 2ddc             Options.avoid_flush_during_recovery: 0
+2026/04/12-12:10:24.647854 2ddc             Options.allow_ingest_behind: 0
+2026/04/12-12:10:24.647860 2ddc             Options.two_write_queues: 0
+2026/04/12-12:10:24.647865 2ddc             Options.manual_wal_flush: 0
+2026/04/12-12:10:24.647871 2ddc             Options.wal_compression: 0
+2026/04/12-12:10:24.647877 2ddc             Options.atomic_flush: 0
+2026/04/12-12:10:24.647896 2ddc             Options.avoid_unnecessary_blocking_io: 0
+2026/04/12-12:10:24.647902 2ddc                 Options.persist_stats_to_disk: 0
+2026/04/12-12:10:24.647907 2ddc                 Options.write_dbid_to_manifest: 0
+2026/04/12-12:10:24.647913 2ddc                 Options.log_readahead_size: 0
+2026/04/12-12:10:24.647919 2ddc                 Options.file_checksum_gen_factory: Unknown
+2026/04/12-12:10:24.647925 2ddc                 Options.best_efforts_recovery: 0
+2026/04/12-12:10:24.647930 2ddc                Options.max_bgerror_resume_count: 2147483647
+2026/04/12-12:10:24.647990 2ddc            Options.bgerror_resume_retry_interval: 1000000
+2026/04/12-12:10:24.648005 2ddc             Options.allow_data_in_errors: 0
+2026/04/12-12:10:24.648012 2ddc             Options.db_host_id: __hostname__
+2026/04/12-12:10:24.648018 2ddc             Options.enforce_single_del_contracts: true
+2026/04/12-12:10:24.648024 2ddc             Options.max_background_jobs: 2
+2026/04/12-12:10:24.648030 2ddc             Options.max_background_compactions: -1
+2026/04/12-12:10:24.648036 2ddc             Options.max_subcompactions: 1
+2026/04/12-12:10:24.648042 2ddc             Options.avoid_flush_during_shutdown: 0
+2026/04/12-12:10:24.648076 2ddc           Options.writable_file_max_buffer_size: 1048576
+2026/04/12-12:10:24.648087 2ddc             Options.delayed_write_rate : 16777216
+2026/04/12-12:10:24.648093 2ddc             Options.max_total_wal_size: 0
+2026/04/12-12:10:24.648099 2ddc             Options.delete_obsolete_files_period_micros: 21600000000
+2026/04/12-12:10:24.648105 2ddc                   Options.stats_dump_period_sec: 600
+2026/04/12-12:10:24.648111 2ddc                 Options.stats_persist_period_sec: 600
+2026/04/12-12:10:24.648117 2ddc                 Options.stats_history_buffer_size: 1048576
+2026/04/12-12:10:24.648123 2ddc                          Options.max_open_files: -1
+2026/04/12-12:10:24.648129 2ddc                          Options.bytes_per_sync: 0
+2026/04/12-12:10:24.648135 2ddc                      Options.wal_bytes_per_sync: 0
+2026/04/12-12:10:24.648141 2ddc                   Options.strict_bytes_per_sync: 0
+2026/04/12-12:10:24.648147 2ddc       Options.compaction_readahead_size: 0
+2026/04/12-12:10:24.648153 2ddc                  Options.max_background_flushes: -1
+2026/04/12-12:10:24.648159 2ddc Compression algorithms supported:
+2026/04/12-12:10:24.648167 2ddc 	kZSTD supported: 1
+2026/04/12-12:10:24.648173 2ddc 	kSnappyCompression supported: 1
+2026/04/12-12:10:24.648180 2ddc 	kBZip2Compression supported: 1
+2026/04/12-12:10:24.648186 2ddc 	kZlibCompression supported: 1
+2026/04/12-12:10:24.648192 2ddc 	kLZ4Compression supported: 1
+2026/04/12-12:10:24.648198 2ddc 	kXpressCompression supported: 0
+2026/04/12-12:10:24.648204 2ddc 	kLZ4HCCompression supported: 1
+2026/04/12-12:10:24.648209 2ddc 	kZSTDNotFinalCompression supported: 1
+2026/04/12-12:10:24.648223 2ddc Fast CRC32 supported: Not supported on x86
+2026/04/12-12:10:24.648229 2ddc DMutex implementation: std::mutex
+2026/04/12-12:10:24.652465 2ddc [/:315] Creating manifest 1 
+2026/04/12-12:10:24.661060 2ddc [:5662] Recovering from manifest file: .test_encrypted_storage/MANIFEST-000001
+2026/04/12-12:10:24.661403 2ddc [olumn_family.cc:621] --------------- Options for column family [default]:
+2026/04/12-12:10:24.661416 2ddc               Options.comparator: leveldb.BytewiseComparator
+2026/04/12-12:10:24.661431 2ddc           Options.merge_operator: None
+2026/04/12-12:10:24.661437 2ddc        Options.compaction_filter: None
+2026/04/12-12:10:24.661443 2ddc        Options.compaction_filter_factory: None
+2026/04/12-12:10:24.661449 2ddc  Options.sst_partitioner_factory: None
+2026/04/12-12:10:24.661455 2ddc         Options.memtable_factory: SkipListFactory
+2026/04/12-12:10:24.661461 2ddc            Options.table_factory: BlockBasedTable
+2026/04/12-12:10:24.661502 2ddc            table_factory options:   flush_block_policy_factory: FlushBlockBySizePolicyFactory (000001FB29DA4490)
+  cache_index_and_filter_blocks: 0
+  cache_index_and_filter_blocks_with_high_priority: 1
+  pin_l0_filter_and_index_blocks_in_cache: 0
+  pin_top_level_index_and_filter: 1
+  index_type: 0
+  data_block_index_type: 0
+  index_shortening: 1
+  data_block_hash_table_util_ratio: 0.750000
+  checksum: 4
+  no_block_cache: 0
+  block_cache: 000001FB29D7B020
+  block_cache_name: LRUCache
+  block_cache_options:
+    capacity : 8388608
+    num_shard_bits : 4
+    strict_capacity_limit : 0
+    memory_allocator : None
+    high_pri_pool_ratio: 0.000
+    low_pri_pool_ratio: 0.000
+  persistent_cache: 0000000000000000
+  block_size: 4096
+  block_size_deviation: 10
+  block_restart_interval: 16
+  index_block_restart_interval: 1
+  metadata_block_size: 4096
+  partition_filters: 0
+  use_delta_encoding: 1
+  filter_policy: nullptr
+  whole_key_filtering: 1
+  verify_compression: 0
+  read_amp_bytes_per_bit: 0
+  format_version: 5
+  enable_index_compression: 1
+  block_align: 0
+  max_auto_readahead_size: 262144
+  prepopulate_block_cache: 0
+  initial_auto_readahead_size: 8192
+  num_file_reads_for_auto_readahead: 2
+2026/04/12-12:10:24.661512 2ddc        Options.write_buffer_size: 67108864
+2026/04/12-12:10:24.661519 2ddc  Options.max_write_buffer_number: 2
+2026/04/12-12:10:24.661525 2ddc          Options.compression: Snappy
+2026/04/12-12:10:24.661531 2ddc                  Options.bottommost_compression: Disabled
+2026/04/12-12:10:24.661537 2ddc       Options.prefix_extractor: nullptr
+2026/04/12-12:10:24.661542 2ddc   Options.memtable_insert_with_hint_prefix_extractor: nullptr
+2026/04/12-12:10:24.661548 2ddc             Options.num_levels: 7
+2026/04/12-12:10:24.661554 2ddc        Options.min_write_buffer_number_to_merge: 1
+2026/04/12-12:10:24.661559 2ddc     Options.max_write_buffer_number_to_maintain: 0
+2026/04/12-12:10:24.661565 2ddc     Options.max_write_buffer_size_to_maintain: 0
+2026/04/12-12:10:24.661571 2ddc            Options.bottommost_compression_opts.window_bits: -14
+2026/04/12-12:10:24.661576 2ddc                  Options.bottommost_compression_opts.level: 32767
+2026/04/12-12:10:24.661583 2ddc               Options.bottommost_compression_opts.strategy: 0
+2026/04/12-12:10:24.661589 2ddc         Options.bottommost_compression_opts.max_dict_bytes: 0
+2026/04/12-12:10:24.661594 2ddc         Options.bottommost_compression_opts.zstd_max_train_bytes: 0
+2026/04/12-12:10:24.661600 2ddc         Options.bottommost_compression_opts.parallel_threads: 1
+2026/04/12-12:10:24.661606 2ddc                  Options.bottommost_compression_opts.enabled: false
+2026/04/12-12:10:24.661612 2ddc         Options.bottommost_compression_opts.max_dict_buffer_bytes: 0
+2026/04/12-12:10:24.661617 2ddc         Options.bottommost_compression_opts.use_zstd_dict_trainer: true
+2026/04/12-12:10:24.661623 2ddc            Options.compression_opts.window_bits: -14
+2026/04/12-12:10:24.661629 2ddc                  Options.compression_opts.level: 32767
+2026/04/12-12:10:24.661634 2ddc               Options.compression_opts.strategy: 0
+2026/04/12-12:10:24.661640 2ddc         Options.compression_opts.max_dict_bytes: 0
+2026/04/12-12:10:24.661646 2ddc         Options.compression_opts.zstd_max_train_bytes: 0
+2026/04/12-12:10:24.661655 2ddc         Options.compression_opts.use_zstd_dict_trainer: true
+2026/04/12-12:10:24.661662 2ddc         Options.compression_opts.parallel_threads: 1
+2026/04/12-12:10:24.661668 2ddc                  Options.compression_opts.enabled: false
+2026/04/12-12:10:24.661674 2ddc         Options.compression_opts.max_dict_buffer_bytes: 0
+2026/04/12-12:10:24.661679 2ddc      Options.level0_file_num_compaction_trigger: 4
+2026/04/12-12:10:24.661685 2ddc          Options.level0_slowdown_writes_trigger: 20
+2026/04/12-12:10:24.661691 2ddc              Options.level0_stop_writes_trigger: 36
+2026/04/12-12:10:24.661696 2ddc                   Options.target_file_size_base: 67108864
+2026/04/12-12:10:24.661702 2ddc             Options.target_file_size_multiplier: 1
+2026/04/12-12:10:24.661708 2ddc                Options.max_bytes_for_level_base: 268435456
+2026/04/12-12:10:24.661713 2ddc Options.level_compaction_dynamic_level_bytes: 0
+2026/04/12-12:10:24.661719 2ddc          Options.max_bytes_for_level_multiplier: 10.000000
+2026/04/12-12:10:24.661726 2ddc Options.max_bytes_for_level_multiplier_addtl[0]: 1
+2026/04/12-12:10:24.661731 2ddc Options.max_bytes_for_level_multiplier_addtl[1]: 1
+2026/04/12-12:10:24.661737 2ddc Options.max_bytes_for_level_multiplier_addtl[2]: 1
+2026/04/12-12:10:24.661743 2ddc Options.max_bytes_for_level_multiplier_addtl[3]: 1
+2026/04/12-12:10:24.661748 2ddc Options.max_bytes_for_level_multiplier_addtl[4]: 1
+2026/04/12-12:10:24.661754 2ddc Options.max_bytes_for_level_multiplier_addtl[5]: 1
+2026/04/12-12:10:24.661760 2ddc Options.max_bytes_for_level_multiplier_addtl[6]: 1
+2026/04/12-12:10:24.661765 2ddc       Options.max_sequential_skip_in_iterations: 8
+2026/04/12-12:10:24.661771 2ddc                    Options.max_compaction_bytes: 1677721600
+2026/04/12-12:10:24.661777 2ddc   Options.ignore_max_compaction_bytes_for_input: true
+2026/04/12-12:10:24.661782 2ddc                        Options.arena_block_size: 1048576
+2026/04/12-12:10:24.661788 2ddc   Options.soft_pending_compaction_bytes_limit: 68719476736
+2026/04/12-12:10:24.661794 2ddc   Options.hard_pending_compaction_bytes_limit: 274877906944
+2026/04/12-12:10:24.661799 2ddc                Options.disable_auto_compactions: 0
+2026/04/12-12:10:24.661807 2ddc                        Options.compaction_style: kCompactionStyleLevel
+2026/04/12-12:10:24.661814 2ddc                          Options.compaction_pri: kMinOverlappingRatio
+2026/04/12-12:10:24.661820 2ddc Options.compaction_options_universal.size_ratio: 1
+2026/04/12-12:10:24.661826 2ddc Options.compaction_options_universal.min_merge_width: 2
+2026/04/12-12:10:24.661831 2ddc Options.compaction_options_universal.max_merge_width: 4294967295
+2026/04/12-12:10:24.661837 2ddc Options.compaction_options_universal.max_size_amplification_percent: 200
+2026/04/12-12:10:24.661843 2ddc Options.compaction_options_universal.compression_size_percent: -1
+2026/04/12-12:10:24.661850 2ddc Options.compaction_options_universal.stop_style: kCompactionStopStyleTotalSize
+2026/04/12-12:10:24.661855 2ddc Options.compaction_options_fifo.max_table_files_size: 1073741824
+2026/04/12-12:10:24.661861 2ddc Options.compaction_options_fifo.allow_compaction: 0
+2026/04/12-12:10:24.661870 2ddc                   Options.table_properties_collectors: 
+2026/04/12-12:10:24.661876 2ddc                   Options.inplace_update_support: 0
+2026/04/12-12:10:24.661925 2ddc                 Options.inplace_update_num_locks: 10000
+2026/04/12-12:10:24.661934 2ddc               Options.memtable_prefix_bloom_size_ratio: 0.000000
+2026/04/12-12:10:24.661941 2ddc               Options.memtable_whole_key_filtering: 0
+2026/04/12-12:10:24.661946 2ddc   Options.memtable_huge_page_size: 0
+2026/04/12-12:10:24.661952 2ddc                           Options.bloom_locality: 0
+2026/04/12-12:10:24.661957 2ddc                    Options.max_successive_merges: 0
+2026/04/12-12:10:24.661963 2ddc                Options.optimize_filters_for_hits: 0
+2026/04/12-12:10:24.661969 2ddc                Options.paranoid_file_checks: 0
+2026/04/12-12:10:24.661974 2ddc                Options.force_consistency_checks: 1
+2026/04/12-12:10:24.662034 2ddc                Options.report_bg_io_stats: 0
+2026/04/12-12:10:24.662043 2ddc                               Options.ttl: 2592000
+2026/04/12-12:10:24.662049 2ddc          Options.periodic_compaction_seconds: 0
+2026/04/12-12:10:24.662054 2ddc  Options.preclude_last_level_data_seconds: 0
+2026/04/12-12:10:24.662060 2ddc    Options.preserve_internal_time_seconds: 0
+2026/04/12-12:10:24.662066 2ddc                       Options.enable_blob_files: false
+2026/04/12-12:10:24.662092 2ddc                           Options.min_blob_size: 0
+2026/04/12-12:10:24.662099 2ddc                          Options.blob_file_size: 268435456
+2026/04/12-12:10:24.662106 2ddc                   Options.blob_compression_type: NoCompression
+2026/04/12-12:10:24.662112 2ddc          Options.enable_blob_garbage_collection: false
+2026/04/12-12:10:24.662117 2ddc      Options.blob_garbage_collection_age_cutoff: 0.250000
+2026/04/12-12:10:24.662124 2ddc Options.blob_garbage_collection_force_threshold: 1.000000
+2026/04/12-12:10:24.662130 2ddc          Options.blob_compaction_readahead_size: 0
+2026/04/12-12:10:24.662136 2ddc                Options.blob_file_starting_level: 0
+2026/04/12-12:10:24.662142 2ddc Options.experimental_mempurge_threshold: 0.000000
+2026/04/12-12:10:24.664642 2ddc [%llu, next_file_number is %llu, last_sequence is %llu, log_number is %llu,prev_log_number is %llu,max_column_family is %u,min_log_number_to_keep is %llu
+:5713] Recovered from manifest file:.test_encrypted_storage/MANIFEST-000001 succeeded,manifest_file_number is 1, next_file_number is 3, last_sequence is 0, log_number is 0,prev_log_number is 0,max_column_family is 0,min_log_number_to_keep is 0
+2026/04/12-12:10:24.664678 2ddc [e MANIFEST file in :5722] Column family [default] (ID 0), log number is 0
+2026/04/12-12:10:24.665078 2ddc [ Db, wal_dir contains existing log file: :537] DB ID: b69e0ddc-3681-11f1-8336-f832e4c04912
+2026/04/12-12:10:24.671342 2ddc [NIFEST write %s
+:5180] Creating manifest 5
+2026/04/12-12:10:24.682291 2ddc [ailed --- Unable to persist Options file:1977] SstFileManager instance 000001FB29DF6170
+2026/04/12-12:10:24.682807 2ddc DB pointer 000001FB29DDA280
+2026/04/12-12:10:24.686216 2ddc [b_impl.cc:490] Shutdown: canceling all background work
+2026/04/12-12:10:24.688050 2ddc [oring error %s:692] Shutdown complete

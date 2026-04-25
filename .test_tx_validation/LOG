@@ -1,0 +1,245 @@
+2026/04/12-12:10:27.786829 17dc RocksDB version: 8.1.1
+2026/04/12-12:10:27.786910 17dc Compile date 2023-04-06 16:38:52
+2026/04/12-12:10:27.786947 17dc DB SUMMARY
+2026/04/12-12:10:27.786961 17dc DB Session ID:  T09YR3KQFKW8YBUIOKTX
+2026/04/12-12:10:27.787263 17dc SST files in .test_tx_validation dir, Total Num: 0, files: 
+2026/04/12-12:10:27.787284 17dc Write Ahead Log file in .test_tx_validation: 
+2026/04/12-12:10:27.787299 17dc                         Options.error_if_exists: 0
+2026/04/12-12:10:27.787312 17dc                       Options.create_if_missing: 1
+2026/04/12-12:10:27.787324 17dc                         Options.paranoid_checks: 1
+2026/04/12-12:10:27.787337 17dc             Options.flush_verify_memtable_count: 1
+2026/04/12-12:10:27.787349 17dc                               Options.track_and_verify_wals_in_manifest: 0
+2026/04/12-12:10:27.787484 17dc        Options.verify_sst_unique_id_in_manifest: 1
+2026/04/12-12:10:27.787495 17dc                                     Options.env: 000001FB945CF9B0
+2026/04/12-12:10:27.787503 17dc                                      Options.fs: WinFS
+2026/04/12-12:10:27.787509 17dc                                Options.info_log: 000001FB945CC3C0
+2026/04/12-12:10:27.787515 17dc                Options.max_file_opening_threads: 16
+2026/04/12-12:10:27.787521 17dc                              Options.statistics: 0000000000000000
+2026/04/12-12:10:27.787527 17dc                               Options.use_fsync: 0
+2026/04/12-12:10:27.787533 17dc                       Options.max_log_file_size: 0
+2026/04/12-12:10:27.787539 17dc                  Options.max_manifest_file_size: 1073741824
+2026/04/12-12:10:27.787545 17dc                   Options.log_file_time_to_roll: 0
+2026/04/12-12:10:27.787551 17dc                       Options.keep_log_file_num: 1000
+2026/04/12-12:10:27.787557 17dc                    Options.recycle_log_file_num: 0
+2026/04/12-12:10:27.787563 17dc                         Options.allow_fallocate: 1
+2026/04/12-12:10:27.787569 17dc                        Options.allow_mmap_reads: 0
+2026/04/12-12:10:27.787575 17dc                       Options.allow_mmap_writes: 0
+2026/04/12-12:10:27.787581 17dc                        Options.use_direct_reads: 0
+2026/04/12-12:10:27.787587 17dc                        Options.use_direct_io_for_flush_and_compaction: 0
+2026/04/12-12:10:27.787592 17dc          Options.create_missing_column_families: 0
+2026/04/12-12:10:27.787598 17dc                              Options.db_log_dir: 
+2026/04/12-12:10:27.787604 17dc                                 Options.wal_dir: 
+2026/04/12-12:10:27.787610 17dc                Options.table_cache_numshardbits: 6
+2026/04/12-12:10:27.787616 17dc                         Options.WAL_ttl_seconds: 0
+2026/04/12-12:10:27.787622 17dc                       Options.WAL_size_limit_MB: 0
+2026/04/12-12:10:27.787628 17dc                        Options.max_write_batch_group_size_bytes: 1048576
+2026/04/12-12:10:27.787634 17dc             Options.manifest_preallocation_size: 4194304
+2026/04/12-12:10:27.787639 17dc                     Options.is_fd_close_on_exec: 1
+2026/04/12-12:10:27.787645 17dc                   Options.advise_random_on_open: 1
+2026/04/12-12:10:27.787651 17dc                    Options.db_write_buffer_size: 0
+2026/04/12-12:10:27.787657 17dc                    Options.write_buffer_manager: 000001FB946212E0
+2026/04/12-12:10:27.787663 17dc         Options.access_hint_on_compaction_start: 1
+2026/04/12-12:10:27.787669 17dc           Options.random_access_max_buffer_size: 1048576
+2026/04/12-12:10:27.787675 17dc                      Options.use_adaptive_mutex: 0
+2026/04/12-12:10:27.787680 17dc                            Options.rate_limiter: 0000000000000000
+2026/04/12-12:10:27.787687 17dc     Options.sst_file_manager.rate_bytes_per_sec: 0
+2026/04/12-12:10:27.787693 17dc                       Options.wal_recovery_mode: 2
+2026/04/12-12:10:27.787699 17dc                  Options.enable_thread_tracking: 0
+2026/04/12-12:10:27.787704 17dc                  Options.enable_pipelined_write: 0
+2026/04/12-12:10:27.787710 17dc                  Options.unordered_write: 0
+2026/04/12-12:10:27.787739 17dc         Options.allow_concurrent_memtable_write: 1
+2026/04/12-12:10:27.787748 17dc      Options.enable_write_thread_adaptive_yield: 1
+2026/04/12-12:10:27.787754 17dc             Options.write_thread_max_yield_usec: 100
+2026/04/12-12:10:27.787760 17dc            Options.write_thread_slow_yield_usec: 3
+2026/04/12-12:10:27.787766 17dc                               Options.row_cache: None
+2026/04/12-12:10:27.787771 17dc                              Options.wal_filter: None
+2026/04/12-12:10:27.787777 17dc             Options.avoid_flush_during_recovery: 0
+2026/04/12-12:10:27.787783 17dc             Options.allow_ingest_behind: 0
+2026/04/12-12:10:27.787789 17dc             Options.two_write_queues: 0
+2026/04/12-12:10:27.787795 17dc             Options.manual_wal_flush: 0
+2026/04/12-12:10:27.787800 17dc             Options.wal_compression: 0
+2026/04/12-12:10:27.787806 17dc             Options.atomic_flush: 0
+2026/04/12-12:10:27.787812 17dc             Options.avoid_unnecessary_blocking_io: 0
+2026/04/12-12:10:27.787817 17dc                 Options.persist_stats_to_disk: 0
+2026/04/12-12:10:27.787823 17dc                 Options.write_dbid_to_manifest: 0
+2026/04/12-12:10:27.787829 17dc                 Options.log_readahead_size: 0
+2026/04/12-12:10:27.787835 17dc                 Options.file_checksum_gen_factory: Unknown
+2026/04/12-12:10:27.787841 17dc                 Options.best_efforts_recovery: 0
+2026/04/12-12:10:27.787847 17dc                Options.max_bgerror_resume_count: 2147483647
+2026/04/12-12:10:27.787852 17dc            Options.bgerror_resume_retry_interval: 1000000
+2026/04/12-12:10:27.787858 17dc             Options.allow_data_in_errors: 0
+2026/04/12-12:10:27.787864 17dc             Options.db_host_id: __hostname__
+2026/04/12-12:10:27.787870 17dc             Options.enforce_single_del_contracts: true
+2026/04/12-12:10:27.787876 17dc             Options.max_background_jobs: 2
+2026/04/12-12:10:27.787882 17dc             Options.max_background_compactions: -1
+2026/04/12-12:10:27.787888 17dc             Options.max_subcompactions: 1
+2026/04/12-12:10:27.787893 17dc             Options.avoid_flush_during_shutdown: 0
+2026/04/12-12:10:27.787899 17dc           Options.writable_file_max_buffer_size: 1048576
+2026/04/12-12:10:27.787905 17dc             Options.delayed_write_rate : 16777216
+2026/04/12-12:10:27.787911 17dc             Options.max_total_wal_size: 0
+2026/04/12-12:10:27.787916 17dc             Options.delete_obsolete_files_period_micros: 21600000000
+2026/04/12-12:10:27.787922 17dc                   Options.stats_dump_period_sec: 600
+2026/04/12-12:10:27.787928 17dc                 Options.stats_persist_period_sec: 600
+2026/04/12-12:10:27.787934 17dc                 Options.stats_history_buffer_size: 1048576
+2026/04/12-12:10:27.787940 17dc                          Options.max_open_files: -1
+2026/04/12-12:10:27.787946 17dc                          Options.bytes_per_sync: 0
+2026/04/12-12:10:27.787951 17dc                      Options.wal_bytes_per_sync: 0
+2026/04/12-12:10:27.787957 17dc                   Options.strict_bytes_per_sync: 0
+2026/04/12-12:10:27.787963 17dc       Options.compaction_readahead_size: 0
+2026/04/12-12:10:27.787969 17dc                  Options.max_background_flushes: -1
+2026/04/12-12:10:27.787975 17dc Compression algorithms supported:
+2026/04/12-12:10:27.787981 17dc 	kZSTD supported: 1
+2026/04/12-12:10:27.787988 17dc 	kSnappyCompression supported: 1
+2026/04/12-12:10:27.787994 17dc 	kBZip2Compression supported: 1
+2026/04/12-12:10:27.788000 17dc 	kZlibCompression supported: 1
+2026/04/12-12:10:27.788005 17dc 	kLZ4Compression supported: 1
+2026/04/12-12:10:27.788011 17dc 	kXpressCompression supported: 0
+2026/04/12-12:10:27.788017 17dc 	kLZ4HCCompression supported: 1
+2026/04/12-12:10:27.788023 17dc 	kZSTDNotFinalCompression supported: 1
+2026/04/12-12:10:27.788032 17dc Fast CRC32 supported: Not supported on x86
+2026/04/12-12:10:27.788039 17dc DMutex implementation: std::mutex
+2026/04/12-12:10:27.790880 17dc [/:315] Creating manifest 1 
+2026/04/12-12:10:27.795281 17dc [:5662] Recovering from manifest file: .test_tx_validation/MANIFEST-000001
+2026/04/12-12:10:27.795697 17dc [olumn_family.cc:621] --------------- Options for column family [default]:
+2026/04/12-12:10:27.795713 17dc               Options.comparator: leveldb.BytewiseComparator
+2026/04/12-12:10:27.795721 17dc           Options.merge_operator: None
+2026/04/12-12:10:27.795727 17dc        Options.compaction_filter: None
+2026/04/12-12:10:27.795732 17dc        Options.compaction_filter_factory: None
+2026/04/12-12:10:27.795738 17dc  Options.sst_partitioner_factory: None
+2026/04/12-12:10:27.795744 17dc         Options.memtable_factory: SkipListFactory
+2026/04/12-12:10:27.795749 17dc            Options.table_factory: BlockBasedTable
+2026/04/12-12:10:27.795801 17dc            table_factory options:   flush_block_policy_factory: FlushBlockBySizePolicyFactory (000001FB945FBA80)
+  cache_index_and_filter_blocks: 0
+  cache_index_and_filter_blocks_with_high_priority: 1
+  pin_l0_filter_and_index_blocks_in_cache: 0
+  pin_top_level_index_and_filter: 1
+  index_type: 0
+  data_block_index_type: 0
+  index_shortening: 1
+  data_block_hash_table_util_ratio: 0.750000
+  checksum: 4
+  no_block_cache: 0
+  block_cache: 000001FB945E7F30
+  block_cache_name: LRUCache
+  block_cache_options:
+    capacity : 8388608
+    num_shard_bits : 4
+    strict_capacity_limit : 0
+    memory_allocator : None
+    high_pri_pool_ratio: 0.000
+    low_pri_pool_ratio: 0.000
+  persistent_cache: 0000000000000000
+  block_size: 4096
+  block_size_deviation: 10
+  block_restart_interval: 16
+  index_block_restart_interval: 1
+  metadata_block_size: 4096
+  partition_filters: 0
+  use_delta_encoding: 1
+  filter_policy: nullptr
+  whole_key_filtering: 1
+  verify_compression: 0
+  read_amp_bytes_per_bit: 0
+  format_version: 5
+  enable_index_compression: 1
+  block_align: 0
+  max_auto_readahead_size: 262144
+  prepopulate_block_cache: 0
+  initial_auto_readahead_size: 8192
+  num_file_reads_for_auto_readahead: 2
+2026/04/12-12:10:27.795808 17dc        Options.write_buffer_size: 67108864
+2026/04/12-12:10:27.795814 17dc  Options.max_write_buffer_number: 2
+2026/04/12-12:10:27.795820 17dc          Options.compression: Snappy
+2026/04/12-12:10:27.795826 17dc                  Options.bottommost_compression: Disabled
+2026/04/12-12:10:27.795832 17dc       Options.prefix_extractor: nullptr
+2026/04/12-12:10:27.795837 17dc   Options.memtable_insert_with_hint_prefix_extractor: nullptr
+2026/04/12-12:10:27.795843 17dc             Options.num_levels: 7
+2026/04/12-12:10:27.795848 17dc        Options.min_write_buffer_number_to_merge: 1
+2026/04/12-12:10:27.795854 17dc     Options.max_write_buffer_number_to_maintain: 0
+2026/04/12-12:10:27.795859 17dc     Options.max_write_buffer_size_to_maintain: 0
+2026/04/12-12:10:27.795865 17dc            Options.bottommost_compression_opts.window_bits: -14
+2026/04/12-12:10:27.795871 17dc                  Options.bottommost_compression_opts.level: 32767
+2026/04/12-12:10:27.795876 17dc               Options.bottommost_compression_opts.strategy: 0
+2026/04/12-12:10:27.795882 17dc         Options.bottommost_compression_opts.max_dict_bytes: 0
+2026/04/12-12:10:27.795888 17dc         Options.bottommost_compression_opts.zstd_max_train_bytes: 0
+2026/04/12-12:10:27.795893 17dc         Options.bottommost_compression_opts.parallel_threads: 1
+2026/04/12-12:10:27.795899 17dc                  Options.bottommost_compression_opts.enabled: false
+2026/04/12-12:10:27.795905 17dc         Options.bottommost_compression_opts.max_dict_buffer_bytes: 0
+2026/04/12-12:10:27.795910 17dc         Options.bottommost_compression_opts.use_zstd_dict_trainer: true
+2026/04/12-12:10:27.795916 17dc            Options.compression_opts.window_bits: -14
+2026/04/12-12:10:27.795921 17dc                  Options.compression_opts.level: 32767
+2026/04/12-12:10:27.795927 17dc               Options.compression_opts.strategy: 0
+2026/04/12-12:10:27.795933 17dc         Options.compression_opts.max_dict_bytes: 0
+2026/04/12-12:10:27.795938 17dc         Options.compression_opts.zstd_max_train_bytes: 0
+2026/04/12-12:10:27.795944 17dc         Options.compression_opts.use_zstd_dict_trainer: true
+2026/04/12-12:10:27.795952 17dc         Options.compression_opts.parallel_threads: 1
+2026/04/12-12:10:27.795958 17dc                  Options.compression_opts.enabled: false
+2026/04/12-12:10:27.795964 17dc         Options.compression_opts.max_dict_buffer_bytes: 0
+2026/04/12-12:10:27.795970 17dc      Options.level0_file_num_compaction_trigger: 4
+2026/04/12-12:10:27.795975 17dc          Options.level0_slowdown_writes_trigger: 20
+2026/04/12-12:10:27.795981 17dc              Options.level0_stop_writes_trigger: 36
+2026/04/12-12:10:27.795986 17dc                   Options.target_file_size_base: 67108864
+2026/04/12-12:10:27.795992 17dc             Options.target_file_size_multiplier: 1
+2026/04/12-12:10:27.795998 17dc                Options.max_bytes_for_level_base: 268435456
+2026/04/12-12:10:27.796003 17dc Options.level_compaction_dynamic_level_bytes: 0
+2026/04/12-12:10:27.796009 17dc          Options.max_bytes_for_level_multiplier: 10.000000
+2026/04/12-12:10:27.796016 17dc Options.max_bytes_for_level_multiplier_addtl[0]: 1
+2026/04/12-12:10:27.796021 17dc Options.max_bytes_for_level_multiplier_addtl[1]: 1
+2026/04/12-12:10:27.796028 17dc Options.max_bytes_for_level_multiplier_addtl[2]: 1
+2026/04/12-12:10:27.796033 17dc Options.max_bytes_for_level_multiplier_addtl[3]: 1
+2026/04/12-12:10:27.796039 17dc Options.max_bytes_for_level_multiplier_addtl[4]: 1
+2026/04/12-12:10:27.796044 17dc Options.max_bytes_for_level_multiplier_addtl[5]: 1
+2026/04/12-12:10:27.796050 17dc Options.max_bytes_for_level_multiplier_addtl[6]: 1
+2026/04/12-12:10:27.796056 17dc       Options.max_sequential_skip_in_iterations: 8
+2026/04/12-12:10:27.796062 17dc                    Options.max_compaction_bytes: 1677721600
+2026/04/12-12:10:27.796067 17dc   Options.ignore_max_compaction_bytes_for_input: true
+2026/04/12-12:10:27.796073 17dc                        Options.arena_block_size: 1048576
+2026/04/12-12:10:27.796079 17dc   Options.soft_pending_compaction_bytes_limit: 68719476736
+2026/04/12-12:10:27.796087 17dc   Options.hard_pending_compaction_bytes_limit: 274877906944
+2026/04/12-12:10:27.796093 17dc                Options.disable_auto_compactions: 0
+2026/04/12-12:10:27.796101 17dc                        Options.compaction_style: kCompactionStyleLevel
+2026/04/12-12:10:27.796108 17dc                          Options.compaction_pri: kMinOverlappingRatio
+2026/04/12-12:10:27.796128 17dc Options.compaction_options_universal.size_ratio: 1
+2026/04/12-12:10:27.796134 17dc Options.compaction_options_universal.min_merge_width: 2
+2026/04/12-12:10:27.796139 17dc Options.compaction_options_universal.max_merge_width: 4294967295
+2026/04/12-12:10:27.796145 17dc Options.compaction_options_universal.max_size_amplification_percent: 200
+2026/04/12-12:10:27.796151 17dc Options.compaction_options_universal.compression_size_percent: -1
+2026/04/12-12:10:27.796158 17dc Options.compaction_options_universal.stop_style: kCompactionStopStyleTotalSize
+2026/04/12-12:10:27.796163 17dc Options.compaction_options_fifo.max_table_files_size: 1073741824
+2026/04/12-12:10:27.796169 17dc Options.compaction_options_fifo.allow_compaction: 0
+2026/04/12-12:10:27.796190 17dc                   Options.table_properties_collectors: 
+2026/04/12-12:10:27.796196 17dc                   Options.inplace_update_support: 0
+2026/04/12-12:10:27.796202 17dc                 Options.inplace_update_num_locks: 10000
+2026/04/12-12:10:27.796207 17dc               Options.memtable_prefix_bloom_size_ratio: 0.000000
+2026/04/12-12:10:27.796213 17dc               Options.memtable_whole_key_filtering: 0
+2026/04/12-12:10:27.796219 17dc   Options.memtable_huge_page_size: 0
+2026/04/12-12:10:27.796224 17dc                           Options.bloom_locality: 0
+2026/04/12-12:10:27.796230 17dc                    Options.max_successive_merges: 0
+2026/04/12-12:10:27.796235 17dc                Options.optimize_filters_for_hits: 0
+2026/04/12-12:10:27.796241 17dc                Options.paranoid_file_checks: 0
+2026/04/12-12:10:27.796246 17dc                Options.force_consistency_checks: 1
+2026/04/12-12:10:27.796281 17dc                Options.report_bg_io_stats: 0
+2026/04/12-12:10:27.796289 17dc                               Options.ttl: 2592000
+2026/04/12-12:10:27.796294 17dc          Options.periodic_compaction_seconds: 0
+2026/04/12-12:10:27.796300 17dc  Options.preclude_last_level_data_seconds: 0
+2026/04/12-12:10:27.796306 17dc    Options.preserve_internal_time_seconds: 0
+2026/04/12-12:10:27.796311 17dc                       Options.enable_blob_files: false
+2026/04/12-12:10:27.796317 17dc                           Options.min_blob_size: 0
+2026/04/12-12:10:27.796322 17dc                          Options.blob_file_size: 268435456
+2026/04/12-12:10:27.796328 17dc                   Options.blob_compression_type: NoCompression
+2026/04/12-12:10:27.796334 17dc          Options.enable_blob_garbage_collection: false
+2026/04/12-12:10:27.796340 17dc      Options.blob_garbage_collection_age_cutoff: 0.250000
+2026/04/12-12:10:27.796346 17dc Options.blob_garbage_collection_force_threshold: 1.000000
+2026/04/12-12:10:27.796352 17dc          Options.blob_compaction_readahead_size: 0
+2026/04/12-12:10:27.796358 17dc                Options.blob_file_starting_level: 0
+2026/04/12-12:10:27.796363 17dc Options.experimental_mempurge_threshold: 0.000000
+2026/04/12-12:10:27.797807 17dc [%llu, next_file_number is %llu, last_sequence is %llu, log_number is %llu,prev_log_number is %llu,max_column_family is %u,min_log_number_to_keep is %llu
+:5713] Recovered from manifest file:.test_tx_validation/MANIFEST-000001 succeeded,manifest_file_number is 1, next_file_number is 3, last_sequence is 0, log_number is 0,prev_log_number is 0,max_column_family is 0,min_log_number_to_keep is 0
+2026/04/12-12:10:27.797824 17dc [e MANIFEST file in :5722] Column family [default] (ID 0), log number is 0
+2026/04/12-12:10:27.799201 17dc [ Db, wal_dir contains existing log file: :537] DB ID: bc7a8ff3-3681-11f1-8336-f832e4c04912
+2026/04/12-12:10:27.800970 17dc [NIFEST write %s
+:5180] Creating manifest 5
+2026/04/12-12:10:27.814727 17dc [ailed --- Unable to persist Options file:1977] SstFileManager instance 000001FB945CEDB0
+2026/04/12-12:10:27.815594 17dc DB pointer 000001FB945E3C40
+2026/04/12-12:10:27.818830 17dc [b_impl.cc:490] Shutdown: canceling all background work
+2026/04/12-12:10:27.820764 17dc [oring error %s:692] Shutdown complete
