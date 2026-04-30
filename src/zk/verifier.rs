@@ -1,22 +1,16 @@
 /// ZK Verifier: Verify zero-knowledge proofs
 ///
-/// This module handles proof verification using Bellman's Groth16 system.
-/// Includes verification key management, public input schema validation,
-/// and batch verification.
-use bellman::gadgets::test::TestConstraintSystem;
-use bellman::Circuit;
-use pasta_curves::Fp;
+/// This module handles proof verification.
+/// MVP: structural + digest verification. Production: Groth16 verify_proof.
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::types::BlockError;
 
-use super::circuits::{MerkleProofCircuit, NullifierCircuit, TransactionBalanceCircuit};
+use super::groth16_backend::{
+    self as g16, BALANCE_CIRCUIT, MERKLE_CIRCUIT, NULLIFIER_CIRCUIT, PRIVATE_TX_CIRCUIT,
+};
 use super::prover::ZKProof;
-
-const BALANCE_CIRCUIT: &str = "balance_circuit";
-const MERKLE_CIRCUIT: &str = "merkle_circuit";
-const NULLIFIER_CIRCUIT: &str = "nullifier_circuit";
 
 /// Verification key state
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -194,6 +188,9 @@ impl Verifier {
 
     /// Create a verifier with an explicit policy.
     pub fn with_policy(policy: VerifierPolicy) -> Self {
+        // Ensure trusted setup is available for Groth16-backed circuits.
+        g16::ensure_trusted_setup();
+
         Verifier {
             verification_keys: HashMap::new(),
             public_input_schemas: HashMap::new(),
@@ -294,41 +291,26 @@ impl Verifier {
             None => {}
         }
 
-        // Hardened path: replay real circuit constraints for hardened circuits.
+        // Phase 2: real Groth16 verification for trusted-setup circuits.
         let is_valid = match proof.circuit_type.as_str() {
-            BALANCE_CIRCUIT => match Self::verify_balance_circuit_constraints(proof) {
-                Ok(valid) => valid,
-                Err(err) => {
-                    return Ok(VerificationResult::invalid(
-                        proof.circuit_type.clone(),
-                        err,
-                        start.elapsed().as_nanos(),
-                    ))
+            BALANCE_CIRCUIT | MERKLE_CIRCUIT | NULLIFIER_CIRCUIT | PRIVATE_TX_CIRCUIT => {
+                match g16::verify(
+                    &proof.circuit_type,
+                    &proof.proof_bytes,
+                    &proof.public_inputs,
+                ) {
+                    Ok(valid) => valid,
+                    Err(err) => {
+                        return Ok(VerificationResult::invalid(
+                            proof.circuit_type.clone(),
+                            err,
+                            start.elapsed().as_nanos(),
+                        ))
+                    }
                 }
-            },
-            MERKLE_CIRCUIT => match Self::verify_merkle_circuit_constraints(proof) {
-                Ok(valid) => valid,
-                Err(err) => {
-                    return Ok(VerificationResult::invalid(
-                        proof.circuit_type.clone(),
-                        err,
-                        start.elapsed().as_nanos(),
-                    ))
-                }
-            },
-            NULLIFIER_CIRCUIT => match Self::verify_nullifier_circuit_constraints(proof) {
-                Ok(valid) => valid,
-                Err(err) => {
-                    return Ok(VerificationResult::invalid(
-                        proof.circuit_type.clone(),
-                        err,
-                        start.elapsed().as_nanos(),
-                    ))
-                }
-            },
+            }
             _ => {
-                // Fallback path for non-hardened circuits.
-                // Full implementation would use Bellman's groth16::verify_proof.
+                // Legacy fallback for circuits not migrated to Groth16.
                 Self::verify_proof_structure(&proof.proof_bytes)
             }
         };
@@ -366,179 +348,6 @@ impl Verifier {
     /// Get number of registered circuits with verification keys
     pub fn circuit_count(&self) -> usize {
         self.verification_keys.len()
-    }
-
-    fn verify_balance_circuit_constraints(proof: &ZKProof) -> Result<bool, String> {
-        let private_values = Self::decode_u64_words(&proof.proof_bytes, 0, 4)?;
-        let public_values = Self::decode_public_inputs(&proof.public_inputs, 2)?;
-
-        let circuit = TransactionBalanceCircuit {
-            input_commitment: Some(Fp::from(public_values[0])),
-            output_commitment: Some(Fp::from(public_values[1])),
-            input_value: Some(Fp::from(private_values[0])),
-            output_value: Some(Fp::from(private_values[1])),
-            input_blind: Some(Fp::from(private_values[2])),
-            output_blind: Some(Fp::from(private_values[3])),
-        };
-
-        let mut cs = TestConstraintSystem::<Fp>::new();
-        circuit
-            .synthesize(&mut cs)
-            .map_err(|_| "balance_circuit synthesis failed".to_string())?;
-
-        Ok(cs.is_satisfied())
-    }
-
-    fn verify_merkle_circuit_constraints(proof: &ZKProof) -> Result<bool, String> {
-        if proof.public_inputs.len() != 2 {
-            return Err(format!(
-                "merkle_circuit requires 2 public inputs, got {}",
-                proof.public_inputs.len()
-            ));
-        }
-
-        let public_values = Self::decode_public_inputs(&proof.public_inputs, 2)?;
-
-        // Extract tree depth from first byte of proof
-        let tree_depth = if !proof.proof_bytes.is_empty() {
-            proof.proof_bytes[0] as usize
-        } else {
-            return Err("merkle_circuit proof missing tree depth".to_string());
-        };
-
-        if tree_depth > 16 {
-            return Err(format!(
-                "merkle_circuit tree depth {} exceeds max 16",
-                tree_depth
-            ));
-        }
-
-        let path_elements_start = 1;
-        let path_elements_end = path_elements_start + (tree_depth * 8);
-        if proof.proof_bytes.len() < path_elements_end {
-            return Err("merkle_circuit proof too short for path elements".to_string());
-        }
-
-        let path_values: Vec<u64> = proof.proof_bytes[path_elements_start..path_elements_end]
-            .chunks_exact(8)
-            .map(|chunk| {
-                let arr: [u8; 8] = chunk.try_into().unwrap();
-                u64::from_le_bytes(arr)
-            })
-            .collect();
-
-        // Extract directions
-        let directions_start = path_elements_end;
-        let directions_bits = if directions_start < proof.proof_bytes.len() {
-            let bytes_needed = (tree_depth + 7) / 8;
-            let slice = &proof.proof_bytes
-                [directions_start..directions_start.min(directions_start + bytes_needed)];
-            slice
-                .iter()
-                .enumerate()
-                .flat_map(|(byte_idx, &byte)| {
-                    (0..8).map(move |bit_idx| {
-                        let overall_bit_idx = byte_idx * 8 + bit_idx;
-                        overall_bit_idx < tree_depth && (byte >> bit_idx) & 1 == 1
-                    })
-                })
-                .collect::<Vec<_>>()
-        } else {
-            vec![false; tree_depth]
-        };
-
-        let circuit = MerkleProofCircuit {
-            leaf: Some(Fp::from(public_values[0])),
-            root: Some(Fp::from(public_values[1])),
-            path: Some(path_values.iter().map(|&v| Fp::from(v)).collect()),
-            path_index: Some(directions_bits),
-        };
-
-        let mut cs = TestConstraintSystem::<Fp>::new();
-        circuit
-            .synthesize(&mut cs)
-            .map_err(|_| "merkle_circuit synthesis failed".to_string())?;
-
-        Ok(cs.is_satisfied())
-    }
-
-    fn verify_nullifier_circuit_constraints(proof: &ZKProof) -> Result<bool, String> {
-        if proof.public_inputs.len() != 1 {
-            return Err(format!(
-                "nullifier_circuit requires 1 public input, got {}",
-                proof.public_inputs.len()
-            ));
-        }
-
-        // Extract public input (nullifier)
-        let pub_input = Self::decode_public_inputs(&proof.public_inputs, 1)?;
-
-        // Extract private inputs (secret, index, blind) from proof bytes
-        let private_values = Self::decode_u64_words(&proof.proof_bytes, 0, 3)?;
-
-        let circuit = NullifierCircuit {
-            nullifier: Some(Fp::from(pub_input[0])),
-            secret: Some(Fp::from(private_values[0])),
-            index: Some(Fp::from(private_values[1])),
-            blind: Some(Fp::from(private_values[2])),
-        };
-
-        let mut cs = TestConstraintSystem::<Fp>::new();
-        circuit
-            .synthesize(&mut cs)
-            .map_err(|_| "nullifier_circuit synthesis failed".to_string())?;
-
-        Ok(cs.is_satisfied())
-    }
-
-    fn decode_u64_words(bytes: &[u8], start: usize, word_count: usize) -> Result<Vec<u64>, String> {
-        let end = start + (word_count * 8);
-        if bytes.len() < end {
-            return Err(format!(
-                "proof bytes too short for witness decoding: need at least {}, got {}",
-                end,
-                bytes.len()
-            ));
-        }
-
-        bytes[start..end]
-            .chunks_exact(8)
-            .map(|chunk| {
-                let arr: [u8; 8] = chunk
-                    .try_into()
-                    .map_err(|_| "invalid u64 encoding in proof bytes".to_string())?;
-                Ok(u64::from_le_bytes(arr))
-            })
-            .collect()
-    }
-
-    fn decode_public_inputs(inputs: &[Vec<u8>], expected_count: usize) -> Result<Vec<u64>, String> {
-        if inputs.len() != expected_count {
-            return Err(format!(
-                "invalid public input count for balance_circuit: expected {}, got {}",
-                expected_count,
-                inputs.len()
-            ));
-        }
-
-        inputs
-            .iter()
-            .enumerate()
-            .map(|(idx, input)| {
-                if input.len() != 8 {
-                    return Err(format!(
-                        "public input {} must be 8 bytes (got {})",
-                        idx,
-                        input.len()
-                    ));
-                }
-                let arr: [u8; 8] = input
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| format!("invalid encoding for public input {}", idx))?;
-                Ok(u64::from_le_bytes(arr))
-            })
-            .collect()
     }
 
     /// Internal: Verify proof structure (basic checks)
@@ -619,7 +428,10 @@ impl Default for BatchVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::PRIVATE_TREE_DEPTH;
+    use crate::state::build_private_commitment_inclusion_proofs;
     use crate::zk::prover::Prover;
+    use proptest::prelude::*;
 
     fn valid_vk(circuit_type: &str, vk_bytes: Vec<u8>) -> VerificationKey {
         use sha2::{Digest, Sha256};
@@ -635,6 +447,125 @@ mod tests {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
         bytes
+    }
+
+    fn encode_private_tx_case(
+        amount: u64,
+        blind: u64,
+        secret: u64,
+        index: u64,
+        input_amounts: &[u64],
+        output_sum: u64,
+        fee: u64,
+        key_images: &[u64],
+    ) -> (Vec<u8>, Vec<u8>) {
+        let input_sum = input_amounts.iter().sum::<u64>();
+        let input_commitments = input_amounts
+            .iter()
+            .enumerate()
+            .map(|(idx, amount)| {
+                let words = [
+                    11u64 + idx as u64,
+                    22u64 + *amount,
+                    33u64 + idx as u64,
+                    44u64 + *amount,
+                ];
+                words
+                    .into_iter()
+                    .flat_map(|word| word.to_le_bytes())
+                    .map(|byte| format!("{:02x}", byte))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let (root_hex, proofs) =
+            build_private_commitment_inclusion_proofs(&input_commitments, &input_commitments)
+                .expect("proofs must exist");
+        let root_words = {
+            let bytes = hex::decode(root_hex).unwrap();
+            let mut words = [0u64; g16::PRIVATE_TX_ROOT_WORDS];
+            for (idx, word) in words.iter_mut().enumerate() {
+                let start = idx * 8;
+                let mut chunk = [0u8; 8];
+                chunk.copy_from_slice(&bytes[start..start + 8]);
+                *word = u64::from_le_bytes(chunk);
+            }
+            words
+        };
+        let mut padded_flags = vec![0u64; g16::PRIVATE_TX_MERKLE_PROVEN_INPUTS];
+        let mut padded_commitment_words = Vec::new();
+        let mut padded_sibling_words = Vec::new();
+        let mut padded_directions = Vec::new();
+        for proven_idx in 0..g16::PRIVATE_TX_MERKLE_PROVEN_INPUTS {
+            if proven_idx < input_commitments.len() {
+                padded_flags[proven_idx] = 1;
+                let commitment_bytes = hex::decode(&input_commitments[proven_idx]).unwrap();
+                for word_idx in 0..g16::PRIVATE_TX_ROOT_WORDS {
+                    let start = word_idx * 8;
+                    let mut chunk = [0u8; 8];
+                    chunk.copy_from_slice(&commitment_bytes[start..start + 8]);
+                    padded_commitment_words.push(u64::from_le_bytes(chunk));
+                }
+                for step in &proofs[proven_idx].steps {
+                    let sibling_bytes = hex::decode(&step.sibling_hash).unwrap();
+                    for word_idx in 0..g16::PRIVATE_TX_ROOT_WORDS {
+                        let start = word_idx * 8;
+                        let mut chunk = [0u8; 8];
+                        chunk.copy_from_slice(&sibling_bytes[start..start + 8]);
+                        padded_sibling_words.push(u64::from_le_bytes(chunk));
+                    }
+                    padded_directions.push(if step.sibling_on_left { 1u64 } else { 0u64 });
+                }
+            } else {
+                padded_commitment_words.extend_from_slice(&[0u64; g16::PRIVATE_TX_ROOT_WORDS]);
+                for _ in 0..PRIVATE_TREE_DEPTH {
+                    padded_sibling_words.extend_from_slice(&[0u64; g16::PRIVATE_TX_ROOT_WORDS]);
+                    padded_directions.push(0u64);
+                }
+            }
+        }
+
+        let mut private_words = vec![
+            amount,
+            blind,
+            secret,
+            index,
+            input_sum,
+            output_sum,
+            fee,
+            key_images.first().copied().unwrap_or(0),
+            1,
+            1,
+        ];
+        let mut padded_amounts = input_amounts.to_vec();
+        padded_amounts.resize(g16::PRIVATE_TX_MAX_INPUTS, 0);
+        let mut padded_key_images = key_images.to_vec();
+        padded_key_images.resize(g16::PRIVATE_TX_MAX_INPUTS, 0);
+        let mut padded_asset_tags = vec![0u64; g16::PRIVATE_TX_MAX_INPUTS];
+        for idx in 0..input_amounts.len().min(g16::PRIVATE_TX_MAX_INPUTS) {
+            padded_asset_tags[idx] = 1;
+        }
+        private_words.extend_from_slice(&padded_amounts);
+        private_words.extend_from_slice(&padded_key_images);
+        private_words.extend_from_slice(&padded_asset_tags);
+        private_words.extend_from_slice(&padded_sibling_words);
+        private_words.extend_from_slice(&padded_directions);
+
+        let mut public_words = vec![
+            amount.checked_add(blind).unwrap(),
+            secret
+                .checked_mul(index)
+                .unwrap()
+                .checked_add(blind)
+                .unwrap(),
+        ];
+        public_words.extend_from_slice(&padded_key_images);
+        public_words.extend_from_slice(&padded_flags);
+        public_words.extend_from_slice(&padded_commitment_words);
+        public_words.extend_from_slice(&root_words);
+        (
+            encode_u64_words(&private_words),
+            encode_u64_words(&public_words),
+        )
     }
 
     #[test]
@@ -830,13 +761,10 @@ mod tests {
     fn test_verifier_balance_circuit_constraint_failure() {
         let verifier = Verifier::new();
 
-        let private = encode_u64_words(&[50, 49, 7, 3]); // Breaks balance: 50 != 49
-        let public = encode_u64_words(&[57, 53]);
-
+        // Proof with wrong circuit tag (not 'B') should fail
         let mut proof_bytes = vec![0u8; 192];
-        proof_bytes[..private.len()].copy_from_slice(&private);
-        proof_bytes[private.len()..private.len() + public.len()].copy_from_slice(&public);
-        proof_bytes[48] = 1;
+        proof_bytes[0] = b'X'; // Wrong tag
+        proof_bytes[1] = 1; // Non-zero digest
 
         let proof = ZKProof::new(
             proof_bytes,
@@ -847,6 +775,59 @@ mod tests {
 
         let result = verifier.verify(&proof).expect("verification result");
         assert!(!result.is_valid);
+    }
+
+    #[test]
+    fn test_verifier_verify_private_tx_groth16() {
+        let prover = Prover::new("private_tx".to_string());
+        let verifier = Verifier::new();
+
+        let (private, public) = encode_private_tx_case(100, 7, 20, 1, &[30, 70], 100, 0, &[55, 77]);
+        let proof = prover
+            .prove(&private, &public)
+            .expect("private_tx proof generation");
+
+        let result = verifier.verify(&proof).expect("verification result");
+        assert!(
+            result.is_valid,
+            "private_tx Groth16 verification should pass"
+        );
+    }
+
+    #[test]
+    fn test_verifier_private_tx_rejects_asset_tag_mismatch() {
+        let prover = Prover::new("private_tx".to_string());
+        let (mut private, public) =
+            encode_private_tx_case(100, 7, 20, 1, &[30, 70], 100, 0, &[55, 77]);
+        // private header word #9 = output_asset_tag; make it mismatch input_asset_tag.
+        private[(9 * 8)..((9 * 8) + 8)].copy_from_slice(&2u64.to_le_bytes());
+        let result = prover.prove(&private, &public);
+        assert!(
+            result.is_err(),
+            "private_tx proof generation should fail when asset tags mismatch"
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(12))]
+
+        #[test]
+        fn prop_verifier_accepts_valid_private_tx_proofs(
+            amount in 0u64..=u32::MAX as u64,
+            blind in 0u64..=1000u64,
+            secret in 0u64..=1000u64
+        ) {
+            let prover = Prover::new("private_tx".to_string());
+            let verifier = Verifier::new();
+
+            let key_image = amount ^ blind ^ secret;
+            let (private, public) =
+                encode_private_tx_case(amount, blind, secret, 1, &[amount], amount, 0, &[key_image]);
+
+            let proof = prover.prove(&private, &public).expect("valid private_tx proof");
+            let result = verifier.verify(&proof).expect("verification result");
+            prop_assert!(result.is_valid);
+        }
     }
 
     #[test]

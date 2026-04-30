@@ -11,19 +11,13 @@ use sha2::{Digest, Sha256};
 use crate::types::BlockError;
 
 use super::circuits::{MerkleProofCircuit, NullifierCircuit, TransactionBalanceCircuit};
-
-const BALANCE_CIRCUIT: &str = "balance_circuit";
-const MERKLE_CIRCUIT: &str = "merkle_circuit";
-const NULLIFIER_CIRCUIT: &str = "nullifier_circuit";
-
-const BALANCE_PRIVATE_INPUT_WORDS: usize = 4; // input_value, output_value, input_blind, output_blind
-const BALANCE_PUBLIC_INPUT_WORDS: usize = 2; // input_commitment, output_commitment
+use super::groth16_backend::{
+    self as g16, BALANCE_CIRCUIT, BALANCE_PRIVATE_INPUT_WORDS, BALANCE_PUBLIC_INPUT_WORDS,
+    MERKLE_CIRCUIT, MERKLE_PUBLIC_INPUT_WORDS, NULLIFIER_CIRCUIT, NULLIFIER_PRIVATE_INPUT_WORDS,
+    NULLIFIER_PUBLIC_INPUT_WORDS, PRIVATE_TX_CIRCUIT,
+};
 
 const MERKLE_MAX_DEPTH: usize = 16;
-const MERKLE_PUBLIC_INPUT_WORDS: usize = 2; // leaf, root
-
-const NULLIFIER_PRIVATE_INPUT_WORDS: usize = 3; // secret, index, blind
-const NULLIFIER_PUBLIC_INPUT_WORDS: usize = 1; // nullifier
 
 /// Serializable ZK proof with metadata
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -79,6 +73,9 @@ pub struct Prover {
 impl Prover {
     /// Create new prover instance
     pub fn new(circuit_name: String) -> Self {
+        if g16::is_groth16_circuit(&circuit_name) {
+            g16::ensure_trusted_setup();
+        }
         Prover {
             circuit_name,
             proving_keys_cache: std::collections::HashMap::new(),
@@ -99,6 +96,7 @@ impl Prover {
             BALANCE_CIRCUIT => self.prove_balance_circuit(private_inputs, public_inputs),
             MERKLE_CIRCUIT => self.prove_merkle_circuit(private_inputs, public_inputs),
             NULLIFIER_CIRCUIT => self.prove_nullifier_circuit(private_inputs, public_inputs),
+            PRIVATE_TX_CIRCUIT => self.prove_private_tx_circuit(private_inputs, public_inputs),
             _ => self.prove_placeholder(private_inputs, public_inputs),
         }
     }
@@ -117,12 +115,16 @@ impl Prover {
     /// Load proving key from file (stub for future implementation)
     pub fn load_proving_key(&mut self, _path: &str) -> Result<(), BlockError> {
         // In production: load from trusted setup file
+        if g16::is_groth16_circuit(&self.circuit_name) {
+            self.proving_keys_cache
+                .insert(self.circuit_name.clone(), vec![1u8]);
+        }
         Ok(())
     }
 
     /// Check if proving key is loaded
     pub fn has_proving_key(&self) -> bool {
-        !self.proving_keys_cache.is_empty()
+        g16::is_groth16_circuit(&self.circuit_name) || !self.proving_keys_cache.is_empty()
     }
 
     /// Get circuit name
@@ -190,28 +192,8 @@ impl Prover {
             ));
         }
 
-        // Keep a fixed-size proof container for compatibility with existing structure checks.
-        // Encode witness + statement bytes to allow verifier-side constraint replay in MVP hardening.
-        let mut proof_bytes = vec![0u8; 192];
-        proof_bytes[..private_inputs.len().min(192)]
-            .copy_from_slice(&private_inputs[..private_inputs.len().min(192)]);
-        let statement_start = private_inputs.len().min(192);
-        let statement_end = (statement_start + public_inputs.len()).min(192);
-        if statement_end > statement_start {
-            proof_bytes[statement_start..statement_end]
-                .copy_from_slice(&public_inputs[..statement_end - statement_start]);
-        }
-
-        let mut hasher = Sha256::new();
-        hasher.update(private_inputs);
-        hasher.update(public_inputs);
-        let proof_digest = hasher.finalize();
-        proof_bytes[48..80].copy_from_slice(&proof_digest);
-
-        let public_inputs_serialized = public_inputs
-            .chunks_exact(8)
-            .map(|chunk| chunk.to_vec())
-            .collect();
+        let (proof_bytes, public_inputs_serialized) =
+            g16::prove_balance(private_inputs, public_inputs)?;
 
         Ok(ZKProof::new(
             proof_bytes,
@@ -302,22 +284,8 @@ impl Prover {
             ));
         }
 
-        // Build proof bytes
-        let mut proof_bytes = vec![0u8; 192];
-        proof_bytes[0] = tree_depth as u8;
-        let copy_len = public_inputs.len().min(191);
-        proof_bytes[1..1 + copy_len].copy_from_slice(&public_inputs[..copy_len]);
-
-        let mut hasher = Sha256::new();
-        hasher.update(private_inputs);
-        hasher.update(public_inputs);
-        let proof_digest = hasher.finalize();
-        proof_bytes[48..80].copy_from_slice(&proof_digest);
-
-        let public_inputs_serialized = public_inputs
-            .chunks_exact(8)
-            .map(|chunk| chunk.to_vec())
-            .collect();
+        let (proof_bytes, public_inputs_serialized) =
+            g16::prove_merkle(private_inputs, public_inputs)?;
 
         Ok(ZKProof::new(
             proof_bytes,
@@ -363,27 +331,24 @@ impl Prover {
             ));
         }
 
-        let mut proof_bytes = vec![0u8; 192];
-        proof_bytes[..private_inputs.len().min(192)]
-            .copy_from_slice(&private_inputs[..private_inputs.len().min(192)]);
-        let statement_start = private_inputs.len().min(192);
-        let statement_end = (statement_start + public_inputs.len()).min(192);
-        if statement_end > statement_start {
-            proof_bytes[statement_start..statement_end]
-                .copy_from_slice(&public_inputs[..statement_end - statement_start]);
-        }
+        let (proof_bytes, public_inputs_serialized) =
+            g16::prove_nullifier(private_inputs, public_inputs)?;
 
-        let mut hasher = Sha256::new();
-        hasher.update(private_inputs);
-        hasher.update(public_inputs);
-        let proof_digest = hasher.finalize();
-        proof_bytes[48..80].copy_from_slice(&proof_digest);
+        Ok(ZKProof::new(
+            proof_bytes,
+            self.circuit_name.clone(),
+            public_inputs_serialized,
+            current_unix_timestamp(),
+        ))
+    }
 
-        let public_inputs_serialized = public_inputs
-            .chunks_exact(8)
-            .map(|chunk| chunk.to_vec())
-            .collect();
-
+    fn prove_private_tx_circuit(
+        &self,
+        private_inputs: &[u8],
+        public_inputs: &[u8],
+    ) -> Result<ZKProof, BlockError> {
+        let (proof_bytes, public_inputs_serialized) =
+            g16::prove_private_tx(private_inputs, public_inputs)?;
         Ok(ZKProof::new(
             proof_bytes,
             self.circuit_name.clone(),
@@ -473,6 +438,8 @@ impl Default for BatchProver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::PRIVATE_TREE_DEPTH;
+    use crate::state::build_private_commitment_inclusion_proofs;
 
     fn encode_u64_words(values: &[u64]) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(values.len() * 8);
@@ -480,6 +447,125 @@ mod tests {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
         bytes
+    }
+
+    fn encode_private_tx_case(
+        amount: u64,
+        blind: u64,
+        secret: u64,
+        index: u64,
+        input_amounts: &[u64],
+        output_sum: u64,
+        fee: u64,
+        key_images: &[u64],
+    ) -> (Vec<u8>, Vec<u8>) {
+        let input_sum = input_amounts.iter().sum::<u64>();
+        let input_commitments = input_amounts
+            .iter()
+            .enumerate()
+            .map(|(idx, amount)| {
+                let words = [
+                    11u64 + idx as u64,
+                    22u64 + *amount,
+                    33u64 + idx as u64,
+                    44u64 + *amount,
+                ];
+                words
+                    .into_iter()
+                    .flat_map(|word| word.to_le_bytes())
+                    .map(|byte| format!("{:02x}", byte))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let (root_hex, proofs) =
+            build_private_commitment_inclusion_proofs(&input_commitments, &input_commitments)
+                .expect("proofs must exist");
+        let root_words = {
+            let bytes = hex::decode(root_hex).unwrap();
+            let mut words = [0u64; g16::PRIVATE_TX_ROOT_WORDS];
+            for (idx, word) in words.iter_mut().enumerate() {
+                let start = idx * 8;
+                let mut chunk = [0u8; 8];
+                chunk.copy_from_slice(&bytes[start..start + 8]);
+                *word = u64::from_le_bytes(chunk);
+            }
+            words
+        };
+        let mut padded_flags = vec![0u64; g16::PRIVATE_TX_MERKLE_PROVEN_INPUTS];
+        let mut padded_commitment_words = Vec::new();
+        let mut padded_sibling_words = Vec::new();
+        let mut padded_directions = Vec::new();
+        for proven_idx in 0..g16::PRIVATE_TX_MERKLE_PROVEN_INPUTS {
+            if proven_idx < input_commitments.len() {
+                padded_flags[proven_idx] = 1;
+                let commitment_bytes = hex::decode(&input_commitments[proven_idx]).unwrap();
+                for word_idx in 0..g16::PRIVATE_TX_ROOT_WORDS {
+                    let start = word_idx * 8;
+                    let mut chunk = [0u8; 8];
+                    chunk.copy_from_slice(&commitment_bytes[start..start + 8]);
+                    padded_commitment_words.push(u64::from_le_bytes(chunk));
+                }
+                for step in &proofs[proven_idx].steps {
+                    let sibling_bytes = hex::decode(&step.sibling_hash).unwrap();
+                    for word_idx in 0..g16::PRIVATE_TX_ROOT_WORDS {
+                        let start = word_idx * 8;
+                        let mut chunk = [0u8; 8];
+                        chunk.copy_from_slice(&sibling_bytes[start..start + 8]);
+                        padded_sibling_words.push(u64::from_le_bytes(chunk));
+                    }
+                    padded_directions.push(if step.sibling_on_left { 1u64 } else { 0u64 });
+                }
+            } else {
+                padded_commitment_words.extend_from_slice(&[0u64; g16::PRIVATE_TX_ROOT_WORDS]);
+                for _ in 0..PRIVATE_TREE_DEPTH {
+                    padded_sibling_words.extend_from_slice(&[0u64; g16::PRIVATE_TX_ROOT_WORDS]);
+                    padded_directions.push(0u64);
+                }
+            }
+        }
+
+        let mut private_words = vec![
+            amount,
+            blind,
+            secret,
+            index,
+            input_sum,
+            output_sum,
+            fee,
+            key_images.first().copied().unwrap_or(0),
+            1,
+            1,
+        ];
+        let mut padded_amounts = input_amounts.to_vec();
+        padded_amounts.resize(g16::PRIVATE_TX_MAX_INPUTS, 0);
+        let mut padded_key_images = key_images.to_vec();
+        padded_key_images.resize(g16::PRIVATE_TX_MAX_INPUTS, 0);
+        let mut padded_asset_tags = vec![0u64; g16::PRIVATE_TX_MAX_INPUTS];
+        for idx in 0..input_amounts.len().min(g16::PRIVATE_TX_MAX_INPUTS) {
+            padded_asset_tags[idx] = 1;
+        }
+        private_words.extend_from_slice(&padded_amounts);
+        private_words.extend_from_slice(&padded_key_images);
+        private_words.extend_from_slice(&padded_asset_tags);
+        private_words.extend_from_slice(&padded_sibling_words);
+        private_words.extend_from_slice(&padded_directions);
+
+        let mut public_words = vec![
+            amount.checked_add(blind).unwrap(),
+            secret
+                .checked_mul(index)
+                .unwrap()
+                .checked_add(blind)
+                .unwrap(),
+        ];
+        public_words.extend_from_slice(&padded_key_images);
+        public_words.extend_from_slice(&padded_flags);
+        public_words.extend_from_slice(&padded_commitment_words);
+        public_words.extend_from_slice(&root_words);
+        (
+            encode_u64_words(&private_words),
+            encode_u64_words(&public_words),
+        )
     }
 
     #[test]
@@ -500,7 +586,7 @@ mod tests {
     fn test_prover_creation() {
         let prover = Prover::new("balance_circuit".to_string());
         assert_eq!(prover.circuit_name(), "balance_circuit");
-        assert!(!prover.has_proving_key());
+        assert!(prover.has_proving_key());
     }
 
     #[test]
@@ -688,5 +774,48 @@ mod tests {
         let proof_nullifier =
             batch.prove("nullifier_circuit", &private_nullifier, &public_nullifier);
         assert!(proof_nullifier.is_ok());
+    }
+
+    #[test]
+    fn test_prover_prove_private_tx_circuit_valid() {
+        let prover = Prover::new("private_tx".to_string());
+        let (private, public) = encode_private_tx_case(100, 7, 20, 1, &[40, 60], 100, 0, &[55, 66]);
+
+        let proof = prover.prove(&private, &public).expect("private_tx proof");
+        assert_eq!(proof.circuit_type, "private_tx");
+        assert_eq!(
+            proof.public_inputs.len(),
+            g16::PRIVATE_TX_PUBLIC_INPUT_WORDS
+        );
+        assert!(proof.is_valid_structure());
+    }
+
+    #[test]
+    fn test_prover_prove_private_tx_circuit_out_of_range() {
+        let prover = Prover::new("private_tx".to_string());
+        let (private, public) =
+            encode_private_tx_case((u32::MAX as u64) + 1, 7, 20, 1, &[10], 10, 0, &[55]);
+
+        let result = prover.prove(&private, &public);
+        assert!(
+            result.is_err(),
+            "range proof should reject out-of-range amount"
+        );
+    }
+
+    #[test]
+    fn test_prover_prove_private_tx_rejects_asset_tag_mismatch() {
+        let prover = Prover::new("private_tx".to_string());
+        let (mut private, public) =
+            encode_private_tx_case(100, 7, 20, 1, &[40, 60], 100, 0, &[55, 66]);
+
+        // private header word #9 = output_asset_tag; make it mismatch input_asset_tag.
+        private[(9 * 8)..((9 * 8) + 8)].copy_from_slice(&2u64.to_le_bytes());
+
+        let result = prover.prove(&private, &public);
+        assert!(
+            result.is_err(),
+            "private_tx proof should reject input/output asset tag mismatch"
+        );
     }
 }

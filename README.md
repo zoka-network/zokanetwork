@@ -1,75 +1,101 @@
-﻿# 🔐 ZOKA - Private Blockchain
+# ZOKA — Private Blockchain
 
-Rust-based private blockchain with zero-knowledge proofs, commitments, nullifiers, and PBFT consensus.
+Rust-based privacy chain with zero-knowledge proofs, RandomX PoW, BIP39 wallets,
+and PBFT-ready consensus. Mainnet v1 in pre-launch.
 
-## Quick Start
+## Where to start
 
-```bash
+| Audience | Read this first |
+|---|---|
+| You want the full picture of what's built | [`docs/project-state.md`](docs/project-state.md) |
+| You want to know what's still pending | [`docs/agent-vs-human-roadmap.md`](docs/agent-vs-human-roadmap.md) |
+| You want the canonical mainnet roadmap | [`docs/mainnet_launch_roadmap_v6.md`](docs/mainnet_launch_roadmap_v6.md) |
+| You want to use the CLI | [`docs/user-cli-reference.en.md`](docs/user-cli-reference.en.md) |
+| You want to verify a release binary | [`docs/release-verification.md`](docs/release-verification.md) |
+| You want every doc indexed | [`docs/README.md`](docs/README.md) |
+
+## Build
+
+```sh
+# Dev / testnet (works on any host with Rust)
 cargo build --release
-cargo test --all
-cargo run --example private_scenario
+
+# Mainnet binary (requires MSVC + cmake on Windows, gcc + cmake on Linux)
+powershell -ExecutionPolicy Bypass -File scripts/check_randomx_toolchain.ps1 -Strict
+cargo build --release --features randomx
 ```
 
-## Current Status
+See [`docs/reproducible-builds.md`](docs/reproducible-builds.md) for the exact
+canonical build command and the toolchain pin used for releases.
 
-- **Privacy:** 22% (Monero-equivalent)
-- **Build:** ✅ Passing (0 errors)
-- **Tests:** ✅ 177/177 passing
+## Test
 
-## Implementation Roadmap
+```sh
+cargo test --lib       # ~600 unit tests
+cargo test --tests     # integration tests in tests/
+```
 
-See **[ROADMAP.md](ROADMAP.md)** for the complete plan to reach **95%+ Monero-level privacy** (15-17 hours).
+Test layout is documented in [`tests/README.md`](tests/README.md).
 
-5 Phases:
-1. P2P Integration (4-6h) → 40%
-2. Stealth Addresses (3-4h) → 70%
-3. Range Proofs (2-3h) → 85%
-4. Persistent Wallets (2-3h) → 90%
-5. Balance Privacy (4-5h) → 95%
+## Frozen mainnet decisions
 
-## Project Structure
+- **PoW**: RandomX (`zoka-randomx-v1`). See [`docs/pow-mainnet-decision.md`](docs/pow-mainnet-decision.md).
+- **Token**: ZKA, max supply 23,000,000, halving every 1,051,200 blocks, target
+  block time 120s, coinbase maturity 60 blocks. See `src/economics.rs` and
+  [`docs/economics.mainnet.v1.json`](docs/economics.mainnet.v1.json).
+- **Genesis schema**: `zoka-genesis-v1`. See
+  [`docs/genesis.mainnet.v1.spec.md`](docs/genesis.mainnet.v1.spec.md).
+- **Snapshot schema**: `zoka-snapshot-v1`. See
+  [`docs/pruning-snapshots-strategy.md`](docs/pruning-snapshots-strategy.md).
+
+## Project structure
 
 ```
 src/
-├── crypto/           # Signatures, hashing, KDF
-├── transaction/      # Commitments, nullifiers, validation
-├── zk/              # ZK circuits & proofs
-├── consensus/       # PBFT protocol
-├── network/         # P2P with libp2p
-├── private_wallet/  # Private transaction management
-├── state/           # State + Merkle tree
-├── storage/         # RocksDB persistence
-├── block/           # Block structure
-├── mempool/         # Transaction pool
-└── bin/            # CLI utilities
+├── main.rs                  # zoka CLI
+├── lib.rs
+├── economics.rs             # frozen economic constants
+├── genesis.rs               # zoka-genesis-v1
+├── snapshot.rs              # zoka-snapshot-v1
+├── mining/                  # PoW engine, difficulty, block validator
+├── state/                   # chain DB, fork choice, IBD sync
+├── storage/                 # RocksDB wrapper
+├── network/                 # libp2p (Tor/I2P aware), gossipsub, dandelion
+├── consensus/               # PBFT (separate from PoW chain DB today)
+├── private_wallet/          # PrivateWallet, claims, decryption
+├── wallet/                  # encrypted wallet storage
+├── transaction/             # CLSAG, nullifiers
+├── crypto/                  # Pedersen, Bulletproofs, MPC ceremony
+├── identity/                # HDWallet, BIP39
+├── api/                     # HTTP RPC (axum)
+└── bin/                     # auxiliary binaries (zokahd, ceremony, ...)
 
-
-tests/             # Integration tests
+docs/                        # canonical docs (see docs/README.md)
+scripts/                     # release tooling and ceremony scripts
+tests/                       # integration tests (see tests/README.md)
+fuzz/                        # cargo-fuzz targets
 ```
 
-## Build & Test
+## Status snapshot
 
-```bash
-# Build
-cargo build
+Updated periodically from [`docs/project-state.md`](docs/project-state.md):
 
-# Test everything
-cargo test --all
+- All 8 mainnet roadmap phases have a code-side answer:
+  - Phases 1-4: code closed.
+  - Phase 5 (audit) and Phase 6 (testnet) require external actors.
+  - Phase 7 (release): tooling closed; remaining steps need MSVC toolchain
+    + GPG keyholders.
+  - Phase 8 (operations): runbooks closed; execution needs operators.
+- ~600 unit tests + integration tests pass.
+- Canonical mainnet artifacts ([`docs/genesis.mainnet.v1.json`](docs/genesis.mainnet.v1.json),
+  [`docs/mainnet-network.v1.json`](docs/mainnet-network.v1.json)) have
+  regression gates in the test suite that fail loudly on drift.
 
-# Run example
-cargo run --example private_scenario
+For the precise list of what an agent can still build vs what requires
+humans, see [`docs/agent-vs-human-roadmap.md`](docs/agent-vs-human-roadmap.md).
 
-# Interactive CLI
-cargo run --bin user-cli-private
-```
+## Legacy
 
-## Requirements
-
-- Rust 1.70+
-- libp2p 0.53+
-- Bellman cryptography
-- RocksDB
-
----
-
-**See [ROADMAP.md](ROADMAP.md) to implement Monero-level privacy.**
+The original `ROADMAP.md` (5-phase Monero privacy plan) is superseded by
+`docs/mainnet_launch_roadmap_v6.md`. Likewise the older
+`docs/mainnet_operational_roadmap_v5.md` is kept for reference only.

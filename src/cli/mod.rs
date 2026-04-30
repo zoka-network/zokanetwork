@@ -2033,7 +2033,8 @@ mod tests {
 
     #[test]
     fn test_cli_config_save_and_load_json() {
-        let test_file = ".test_cli_config.json";
+        let test_file = ".zoka/test-suite/.test_cli_config.json";
+        fs::create_dir_all(".zoka/test-suite").unwrap();
         let _ = fs::remove_file(test_file);
 
         let mut config = CliConfig::default();
@@ -2052,7 +2053,8 @@ mod tests {
 
     #[test]
     fn test_cli_config_save_and_load_toml() {
-        let test_file = ".test_cli_config.toml";
+        let test_file = ".zoka/test-suite/.test_cli_config.toml";
+        fs::create_dir_all(".zoka/test-suite").unwrap();
         let _ = fs::remove_file(test_file);
 
         let mut config = CliConfig::default();
@@ -2087,7 +2089,8 @@ mod tests {
 
     #[test]
     fn test_cli_config_load_json_format() {
-        let test_file = ".test_cli_json.json";
+        let test_file = ".zoka/test-suite/.test_cli_json.json";
+        fs::create_dir_all(".zoka/test-suite").unwrap();
         let json_content = r#"{
   "name": "json-config",
   "default_wallet": "main",
@@ -2166,7 +2169,8 @@ mod tests {
 
     #[test]
     fn test_multi_profile_file_persistence() {
-        let test_file = ".test_profiles.toml";
+        let test_file = ".zoka/test-suite/.test_profiles.toml";
+        fs::create_dir_all(".zoka/test-suite").unwrap();
         let _ = fs::remove_file(test_file);
 
         let mut config = MultiProfileConfig::new();

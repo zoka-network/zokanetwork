@@ -1,0 +1,92 @@
+{
+  "schema": "zoka-mainnet-launch-material-v1",
+  "genesis": {
+    "validators": [
+      {
+        "label": "validator-na-1",
+        "consensus_pubkey_hex": "<32-byte-ed25519-public-key-hex>",
+        "operator_pubkey_hex": "<32-byte-ed25519-public-key-hex>",
+        "voting_power": 100,
+        "role": "active"
+      },
+      {
+        "label": "validator-eu-1",
+        "consensus_pubkey_hex": "<32-byte-ed25519-public-key-hex>",
+        "operator_pubkey_hex": "<32-byte-ed25519-public-key-hex>",
+        "voting_power": 100,
+        "role": "active"
+      },
+      {
+        "label": "validator-sa-1",
+        "consensus_pubkey_hex": "<32-byte-ed25519-public-key-hex>",
+        "operator_pubkey_hex": "<32-byte-ed25519-public-key-hex>",
+        "voting_power": 100,
+        "role": "active"
+      }
+    ],
+    "pre_mine": [],
+    "initial_accounts": [
+      {
+        "address": "zka1burn000000000000000000000000000000000000000000000000000000",
+        "balance_zka": 0
+      },
+      {
+        "address": "zka1treasury000000000000000000000000000000000000000000000000000",
+        "balance_zka": 0
+      }
+    ]
+  },
+  "network": {
+    "status": "launch-ready",
+    "seed_nodes": [
+      {
+        "label": "seed-na-1",
+        "operator": "<operator-name>",
+        "region": "north-america",
+        "multiaddr": "/dns4/<host>/tcp/28080/p2p/<peer-id>",
+        "onion": "/onion3/<service-id>:28080/p2p/<peer-id>",
+        "i2p": "/dnsaddr/<service>.b32.i2p/p2p/<peer-id>",
+        "role": "seed",
+        "status": "active"
+      },
+      {
+        "label": "seed-eu-1",
+        "operator": "<operator-name>",
+        "region": "europe",
+        "multiaddr": "/dns4/<host>/tcp/28080/p2p/<peer-id>",
+        "onion": "/onion3/<service-id>:28080/p2p/<peer-id>",
+        "i2p": "/dnsaddr/<service>.b32.i2p/p2p/<peer-id>",
+        "role": "seed",
+        "status": "active"
+      },
+      {
+        "label": "seed-sa-1",
+        "operator": "<operator-name>",
+        "region": "south-america",
+        "multiaddr": "/dns4/<host>/tcp/28080/p2p/<peer-id>",
+        "onion": "/onion3/<service-id>:28080/p2p/<peer-id>",
+        "i2p": "/dnsaddr/<service>.b32.i2p/p2p/<peer-id>",
+        "role": "seed",
+        "status": "active"
+      }
+    ],
+    "public_rpc": [
+      {
+        "label": "rpc-eu-1",
+        "operator": "<operator-name>",
+        "region": "europe",
+        "url": "https://<rpc-host>",
+        "onion": "http://<service-id>.onion",
+        "i2p": "http://<service>.b32.i2p",
+        "status": "active",
+        "logging_policy": "docs/infrastructure-logs-policy.md"
+      }
+    ],
+    "snapshot_signers": [
+      "<32-byte-ed25519-public-key-hex>"
+    ]
+  },
+  "release": {
+    "gpg_fingerprint": "<40-hex-char-gpg-fingerprint>"
+  }
+}

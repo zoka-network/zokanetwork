@@ -16,6 +16,8 @@ pub use handler::MessageHandler;
 #[allow(unused_imports)]
 pub use message::ZokaMessage;
 #[allow(unused_imports)]
+pub use p2p::NetworkPrivacyConfig;
+#[allow(unused_imports)]
 pub use p2p::Node;
 
 /// ConfiguraciÃ³n del nodo P2P

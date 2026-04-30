@@ -138,6 +138,14 @@ impl Identity {
 
 pub type Address = String;
 
+/// Public transaction on the ledger. Private transactions live in
+/// `crate::private_wallet::PrivateTransaction` and never cross this type —
+/// there used to be a `zk_proof: Option<Vec<u8>>` field here together with
+/// API-layer redaction logic for "private-looking" rows, but no code path
+/// ever actually set it to `Some(...)`, so the redaction was a placebo.
+/// Removing the field enforces the rule at the type level: anything on a
+/// `Transaction` is, by construction, public. If you want privacy, you must
+/// build a `PrivateTransaction`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Transaction {
     pub hash: String,
@@ -147,7 +155,6 @@ pub struct Transaction {
     pub nonce: u64,
     pub timestamp: u64,
     pub signature: Signature,
-    pub zk_proof: Option<Vec<u8>>,
 }
 
 impl Transaction {
@@ -167,7 +174,6 @@ impl Transaction {
             nonce,
             timestamp,
             signature,
-            zk_proof: None,
         };
         tx.hash = tx.compute_hash();
         tx
@@ -182,11 +188,6 @@ impl Transaction {
         );
         hasher.update(data.as_bytes());
         format!("{:x}", hasher.finalize())
-    }
-
-    pub fn with_zk_proof(mut self, proof: Vec<u8>) -> Self {
-        self.zk_proof = Some(proof);
-        self
     }
 }
 
@@ -205,11 +206,66 @@ pub struct BlockHeader {
     pub seal: Signature,
 }
 
+/// Encrypted opening that lets the block producer claim a private tx fee
+/// without revealing the fee amount to observers. The referenced private
+/// transaction hash must be committed in the same block.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrivateFeeClaim {
+    pub tx_hash: String,
+    pub ephemeral_pubkey: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+}
+
+/// Privacy-native block reward output committed inside the block body.
+///
+/// Mainnet v1 keeps the subsidy amount public in the canonical coinbase
+/// transaction so emission remains independently auditable. This output is
+/// the spendable private note metadata the winning miner later imports after
+/// coinbase maturity.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrivateCoinbaseOutput {
+    pub block_height: u64,
+    pub recipient_address: Address,
+    pub unlock_height: u64,
+    pub output_id: String,
+    pub asset_tag: String,
+    pub asset_tag_commitment: String,
+    pub recipient_commitment: String,
+    pub stealth_address: String,
+    pub ephemeral_pubkey: Vec<u8>,
+    pub commitment: String,
+    pub amount_commitment: String,
+    pub range_proof: Vec<u8>,
+    pub one_time_public_key: String,
+    pub encrypted_amount: Vec<u8>,
+    pub commitment_blind: Vec<u8>,
+}
+
+/// Block body on the ledger.
+///
+/// Public transactions live in `transactions`. Private transactions are
+/// referenced here by **hash only** (`private_tx_hashes`); the actual
+/// `PrivateTransaction` payloads live in `PrivateTransactionPool` on each
+/// node and are fetched on demand by peers that don't have them yet.
+/// That keeps `types::Block` free of a cyclic dependency on the private
+/// wallet crate while still anchoring each private tx to its position in
+/// the chain via the Merkle root.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Block {
     pub header: BlockHeader,
     pub transactions: Vec<Transaction>,
-    pub zk_proof: Option<Vec<u8>>,
+    /// Hashes of private transactions committed at this height. Defaults
+    /// to empty for backwards compatibility with pre-split blocks.
+    #[serde(default)]
+    pub private_tx_hashes: Vec<String>,
+    /// Encrypted fee-opening envelopes for private txs included in this
+    /// block. These are committed by Merkle root but hide the fee amount.
+    #[serde(default)]
+    pub private_fee_claims: Vec<PrivateFeeClaim>,
+    /// Spendable private output for the block subsidy. Present whenever
+    /// the block subsidy is non-zero.
+    #[serde(default)]
+    pub private_coinbase: Option<PrivateCoinbaseOutput>,
 }
 
 impl Block {
@@ -235,7 +291,9 @@ impl Block {
                 seal,
             },
             transactions,
-            zk_proof: None,
+            private_tx_hashes: Vec::new(),
+            private_fee_claims: Vec::new(),
+            private_coinbase: None,
         };
 
         block.header.merkle_root = block.compute_merkle_root();
@@ -243,10 +301,41 @@ impl Block {
         block
     }
 
+    /// Attach a set of private-transaction hashes. Recomputes the Merkle
+    /// root and block hash, so call this *before* signing the block.
+    pub fn with_private_tx_hashes(mut self, private_tx_hashes: Vec<String>) -> Self {
+        self.private_tx_hashes = private_tx_hashes;
+        self.header.merkle_root = self.compute_merkle_root();
+        self.header.hash = self.compute_hash();
+        self
+    }
+
+    /// Attach encrypted private-fee claims. Recomputes the Merkle root and
+    /// block hash, so call this before finalizing PoW/signature.
+    pub fn with_private_fee_claims(mut self, private_fee_claims: Vec<PrivateFeeClaim>) -> Self {
+        self.private_fee_claims = private_fee_claims;
+        self.header.merkle_root = self.compute_merkle_root();
+        self.header.hash = self.compute_hash();
+        self
+    }
+
+    /// Attach the private spendable reward output. Recomputes the Merkle
+    /// root and block hash, so call this before finalizing PoW/signature.
+    pub fn with_private_coinbase(mut self, private_coinbase: PrivateCoinbaseOutput) -> Self {
+        self.private_coinbase = Some(private_coinbase);
+        self.header.merkle_root = self.compute_merkle_root();
+        self.header.hash = self.compute_hash();
+        self
+    }
+
     pub fn compute_merkle_root(&self) -> String {
         use sha2::{Digest, Sha256};
 
-        if self.transactions.is_empty() {
+        if self.transactions.is_empty()
+            && self.private_tx_hashes.is_empty()
+            && self.private_fee_claims.is_empty()
+            && self.private_coinbase.is_none()
+        {
             return String::from("0");
         }
 
@@ -258,7 +347,59 @@ impl Block {
                 hasher.update(tx.hash.as_bytes());
                 hasher.finalize().to_vec()
             })
+            .chain(self.private_tx_hashes.iter().map(|hash| {
+                // Prefix private tx hashes so they can't collide with a
+                // public-tx hash whose string value happens to match.
+                let mut hasher = Sha256::new();
+                hasher.update(b"private:");
+                hasher.update(hash.as_bytes());
+                hasher.finalize().to_vec()
+            }))
+            .chain(self.private_fee_claims.iter().map(|claim| {
+                let mut hasher = Sha256::new();
+                hasher.update(b"private-fee-claim:");
+                hasher.update(claim.tx_hash.as_bytes());
+                hasher.update([0x1f]);
+                hasher.update(&claim.ephemeral_pubkey);
+                hasher.update([0x1f]);
+                hasher.update(&claim.ciphertext);
+                hasher.finalize().to_vec()
+            }))
             .collect();
+        if let Some(coinbase) = &self.private_coinbase {
+            let mut hasher = Sha256::new();
+            hasher.update(b"private-coinbase-v1:");
+            hasher.update(coinbase.block_height.to_le_bytes());
+            hasher.update([0x1f]);
+            hasher.update(coinbase.recipient_address.as_bytes());
+            hasher.update([0x1f]);
+            hasher.update(coinbase.unlock_height.to_le_bytes());
+            hasher.update([0x1f]);
+            hasher.update(coinbase.output_id.as_bytes());
+            hasher.update([0x1f]);
+            hasher.update(coinbase.asset_tag.as_bytes());
+            hasher.update([0x1f]);
+            hasher.update(coinbase.asset_tag_commitment.as_bytes());
+            hasher.update([0x1f]);
+            hasher.update(coinbase.recipient_commitment.as_bytes());
+            hasher.update([0x1f]);
+            hasher.update(coinbase.stealth_address.as_bytes());
+            hasher.update([0x1f]);
+            hasher.update(&coinbase.ephemeral_pubkey);
+            hasher.update([0x1f]);
+            hasher.update(coinbase.commitment.as_bytes());
+            hasher.update([0x1f]);
+            hasher.update(coinbase.amount_commitment.as_bytes());
+            hasher.update([0x1f]);
+            hasher.update(&coinbase.range_proof);
+            hasher.update([0x1f]);
+            hasher.update(coinbase.one_time_public_key.as_bytes());
+            hasher.update([0x1f]);
+            hasher.update(&coinbase.encrypted_amount);
+            hasher.update([0x1f]);
+            hasher.update(&coinbase.commitment_blind);
+            hashes.push(hasher.finalize().to_vec());
+        }
 
         while hashes.len() > 1 {
             let mut next_level = Vec::new();
@@ -297,11 +438,6 @@ impl Block {
     pub fn with_state_root(mut self, state_root: String) -> Self {
         self.header.state_root = state_root;
         self.header.hash = self.compute_hash();
-        self
-    }
-
-    pub fn with_zk_proof(mut self, proof: Vec<u8>) -> Self {
-        self.zk_proof = Some(proof);
         self
     }
 }
@@ -356,6 +492,8 @@ impl Validator {
 #[derive(Clone, Debug)]
 pub struct State {
     pub accounts: HashMap<Address, AccountState>,
+    pub private_commitments: Vec<String>,
+    pub private_commitment_root: String,
     pub current_height: u64,
     pub current_hash: String,
     pub current_state_root: String,
@@ -365,6 +503,8 @@ impl State {
     pub fn new() -> Self {
         State {
             accounts: HashMap::new(),
+            private_commitments: Vec::new(),
+            private_commitment_root: String::from("0"),
             current_height: 0,
             current_hash: String::from("0"),
             current_state_root: String::from("0"),
@@ -474,4 +614,94 @@ pub struct AccountResponse {
     pub address: Address,
     pub balance: u64,
     pub nonce: u64,
+}
+
+#[cfg(test)]
+mod block_body_split_tests {
+    use super::*;
+
+    fn dummy_validator() -> PublicKey {
+        PublicKey(vec![1u8; 32])
+    }
+
+    fn dummy_seal() -> Signature {
+        Signature(vec![2u8; 64])
+    }
+
+    #[test]
+    fn private_tx_hashes_default_to_empty() {
+        let block = Block::new(
+            "prev".to_string(),
+            0,
+            0,
+            0,
+            vec![],
+            dummy_validator(),
+            dummy_seal(),
+        );
+        assert!(block.private_tx_hashes.is_empty());
+    }
+
+    #[test]
+    fn private_tx_hashes_change_merkle_root() {
+        let empty = Block::new(
+            "prev".to_string(),
+            0,
+            0,
+            0,
+            vec![],
+            dummy_validator(),
+            dummy_seal(),
+        );
+        let with_private = empty
+            .clone()
+            .with_private_tx_hashes(vec!["private-tx-1".to_string()]);
+        assert_ne!(
+            empty.header.merkle_root, with_private.header.merkle_root,
+            "adding a private tx hash must change the Merkle root"
+        );
+        assert_ne!(
+            empty.header.hash, with_private.header.hash,
+            "adding a private tx hash must change the block hash"
+        );
+    }
+
+    #[test]
+    fn public_and_private_hash_namespaces_do_not_collide() {
+        // A public tx whose hash string happens to match a private tx hash
+        // string must still produce different Merkle roots — otherwise a
+        // malicious peer could substitute one for the other unnoticed.
+        let shared = "collision-candidate";
+        let public_tx =
+            Transaction::new("a".to_string(), "b".to_string(), 1, 1, 0, Signature(vec![]));
+        let mut block_public = Block::new(
+            "prev".to_string(),
+            0,
+            0,
+            0,
+            vec![public_tx],
+            dummy_validator(),
+            dummy_seal(),
+        );
+        // Force the public tx hash to `shared` so it would equal the
+        // private tx hash string below.
+        block_public.transactions[0].hash = shared.to_string();
+        block_public.header.merkle_root = block_public.compute_merkle_root();
+
+        let block_private = Block::new(
+            "prev".to_string(),
+            0,
+            0,
+            0,
+            vec![],
+            dummy_validator(),
+            dummy_seal(),
+        )
+        .with_private_tx_hashes(vec![shared.to_string()]);
+
+        assert_ne!(
+            block_public.header.merkle_root, block_private.header.merkle_root,
+            "namespace prefix must prevent same-hex string collision"
+        );
+    }
 }

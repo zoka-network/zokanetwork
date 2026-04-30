@@ -2,6 +2,7 @@
 use crate::cli::{CliConfig, MultiProfileConfig};
 use crate::consensus::pbft::PbftConsensus;
 use crate::mempool::Mempool;
+use crate::private_wallet::PrivateWalletManager;
 use crate::state::{AccountInclusionProof, StateManager};
 use crate::types::{AccountResponse, StateError, TransactionRequest, TransactionResponse};
 use axum::{
@@ -23,6 +24,11 @@ use tokio::sync::RwLock;
 
 type SharedState = Arc<StateManager>;
 type SharedMempool = Arc<Mempool>;
+/// Handle to the node's private transaction pool. Private txs are held
+/// inside `PrivateWalletManager::private_pool`; wrapping the manager in
+/// `RwLock` mirrors the pattern used by `StateManager` and `Mempool`
+/// (shared ownership + interior mutability for the async HTTP handlers).
+type SharedPrivateWalletManager = Arc<RwLock<PrivateWalletManager>>;
 
 #[derive(Clone, Debug)]
 pub struct ApiSecurityConfig {
@@ -441,6 +447,10 @@ pub struct AppState {
     pub security_stats: Arc<ApiSecurityStats>,
     pub ws_manager: WebSocketConnectionManager,
     pub pbft_consensus: Arc<tokio::sync::Mutex<Option<PbftConsensus>>>,
+    /// Optional: when present, the `/private/tx/:hash` endpoint serves
+    /// private-tx bodies from the node's pool. Left as `None` in tests
+    /// that don't spin up a wallet manager.
+    pub private_wallet_manager: Option<SharedPrivateWalletManager>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1763,6 +1773,70 @@ async fn get_latest_block(
     }
 }
 
+/// Fetch a private transaction body by its hash from the local node's
+/// `PrivateTransactionPool`. What comes back is the canonical private tx
+/// shape — commitments, nullifiers, ring metadata, stealth outputs,
+/// zk proof — **never** plaintext sender/receiver/amount. If this node
+/// has no `private_wallet_manager` wired (typical for tests), the
+/// endpoint 404s rather than lying.
+async fn get_private_tx_by_hash(
+    State(app_state): State<Arc<AppState>>,
+    Path(hash): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let manager = match &app_state.private_wallet_manager {
+        Some(m) => m,
+        None => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "this node does not expose a private transaction pool".to_string(),
+            ));
+        }
+    };
+    let manager = manager.read().await;
+    match manager.get_private_transaction(&hash) {
+        Some(tx) => {
+            // Serialize with serde_json; the type is serde-derive-friendly
+            // and its wire shape already omits sender/receiver/amount
+            // clear fields (they don't exist on `PrivateTransaction`).
+            Ok(Json(serde_json::to_value(tx).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to serialize private tx: {}", e),
+                )
+            })?))
+        }
+        None => Err((
+            StatusCode::NOT_FOUND,
+            format!("private transaction {} not found in this node's pool", hash),
+        )),
+    }
+}
+
+/// Get the private-transaction hashes committed at a specific block.
+/// Returns only hashes — by design the full `PrivateTransaction` body is
+/// never exposed through this API; clients that want the body look it up
+/// via `/private/tx/:hash` on a node that holds the body.
+async fn get_block_private_tx_hashes(
+    State(app_state): State<Arc<AppState>>,
+    Path(height): Path<u64>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    match app_state
+        .state_manager
+        .get_block_private_tx_hashes(height)
+        .await
+    {
+        Ok(hashes) => Ok(Json(serde_json::json!({
+            "block_height": height,
+            "private_tx_count": hashes.len(),
+            "private_tx_hashes": hashes,
+        }))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to get block private tx hashes: {}", e),
+        )),
+    }
+}
+
 /// Get transactions in a specific block
 async fn get_block_transactions(
     State(app_state): State<Arc<AppState>>,
@@ -1772,15 +1846,22 @@ async fn get_block_transactions(
         Ok(txs) => Ok(Json(serde_json::json!({
             "block_height": height,
             "transactions_count": txs.len(),
+            // `Transaction` is the public-ledger type; by construction every
+            // row here carries plaintext sender/receiver/amount. Private txs
+            // are in `PrivateTransaction` and never serialize through this
+            // endpoint — the old placebo redaction that keyed off a dead
+            // `zk_proof` flag is gone.
             "transactions": txs
                 .iter()
-                .map(|tx| serde_json::json!({
-                    "hash": tx.hash,
-                    "sender": tx.sender,
-                    "receiver": tx.receiver,
-                    "amount": tx.amount,
-                    "nonce": tx.nonce,
-                }))
+                .map(|tx| {
+                    serde_json::json!({
+                        "hash": tx.hash,
+                        "sender": tx.sender,
+                        "receiver": tx.receiver,
+                        "amount": tx.amount,
+                        "nonce": tx.nonce,
+                    })
+                })
                 .collect::<Vec<_>>(),
         }))),
         Err(e) => Err((
@@ -1834,7 +1915,8 @@ async fn get_transaction_by_hash(
     State(app_state): State<Arc<AppState>>,
     Path(hash): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Check mempool first
+    // Check mempool first. Public mempool only holds `Transaction` rows,
+    // which are by construction public (no zk_proof field anymore).
     if let Some(tx) = app_state.mempool.get_transaction(&hash).await {
         return Ok(Json(serde_json::json!({
             "hash": tx.hash,
@@ -2111,6 +2193,64 @@ pub struct AdvancedEventFilter {
     pub include_pending: bool,
 }
 
+/// Bridge from PBFT `Committed` event to state + private-pool
+/// application. Returns a JSON report with what happened so the HTTP
+/// response can surface it. Any failure is reported, not panicked:
+/// consensus finality must not be blocked by a missing block or a
+/// transient DB error.
+async fn auto_apply_committed_block(
+    app_state: &Arc<AppState>,
+    block_hash: &str,
+) -> serde_json::Value {
+    let block = match app_state.state_manager.get_block_by_hash(block_hash).await {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            return serde_json::json!({
+                "status": "block_not_in_storage",
+                "block_hash": block_hash,
+            });
+        }
+        Err(e) => {
+            return serde_json::json!({
+                "status": "storage_error",
+                "block_hash": block_hash,
+                "error": e.to_string(),
+            });
+        }
+    };
+
+    if let Err(e) = app_state.state_manager.apply_block(&block).await {
+        return serde_json::json!({
+            "status": "apply_block_failed",
+            "block_hash": block_hash,
+            "error": e.to_string(),
+        });
+    }
+
+    // Notify the private pool if this node holds one. The block's
+    // `private_tx_hashes` are the canonical list of private txs that
+    // were committed at this height.
+    let mut private_confirmed = 0usize;
+    let mut private_missing: Vec<String> = Vec::new();
+    if let Some(manager) = &app_state.private_wallet_manager {
+        let mut manager = manager.write().await;
+        for hash in &block.private_tx_hashes {
+            match manager.confirm_private_transaction(hash) {
+                Ok(()) => private_confirmed += 1,
+                Err(_) => private_missing.push(hash.clone()),
+            }
+        }
+    }
+
+    serde_json::json!({
+        "status": "applied",
+        "block_hash": block_hash,
+        "public_tx_applied": block.transactions.len(),
+        "private_tx_confirmed": private_confirmed,
+        "private_tx_missing": private_missing,
+    })
+}
+
 /// Start PBFT consensus
 async fn pbft_start(
     State(app_state): State<Arc<AppState>>,
@@ -2226,14 +2366,41 @@ async fn pbft_message(
             );
 
             match consensus.process_message(msg) {
-                Ok(event) => Ok(Json(serde_json::json!({
-                    "status": "received",
-                    "msg_type": req.msg_type,
-                    "view": req.view,
-                    "sequence": req.sequence,
-                    "processed": true,
-                    "event": event.map(|e| format!("{e:?}")),
-                }))),
+                Ok(event) => {
+                    // Auto-wire PBFT finality → state-apply pipeline.
+                    // When a block is committed by consensus, and this
+                    // node holds both a state manager and a private
+                    // wallet manager, we immediately apply the block and
+                    // notify the private pool. Nodes without a wallet
+                    // manager (tests, stateless observers) just log the
+                    // event and move on.
+                    let mut commit_report: Option<serde_json::Value> = None;
+                    if let Some(crate::consensus::pbft::PbftEvent::Committed {
+                        block_hash, ..
+                    }) = &event
+                    {
+                        drop(pbft); // release the consensus lock before taking other locks
+                        commit_report =
+                            Some(auto_apply_committed_block(&app_state, block_hash).await);
+                        // Re-take for subsequent calls — cheap since no
+                        // work happens here afterwards, but keep the
+                        // structure consistent.
+                        let _ = app_state.pbft_consensus.lock().await;
+                    }
+
+                    let mut json = serde_json::json!({
+                        "status": "received",
+                        "msg_type": req.msg_type,
+                        "view": req.view,
+                        "sequence": req.sequence,
+                        "processed": true,
+                        "event": event.map(|e| format!("{e:?}")),
+                    });
+                    if let Some(report) = commit_report {
+                        json["commit_report"] = report;
+                    }
+                    Ok(Json(json))
+                }
                 Err(err) => Ok(Json(serde_json::json!({
                     "status": "rejected",
                     "msg_type": req.msg_type,
@@ -2513,6 +2680,11 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         .route("/blocks/hash/:hash", get(get_block_by_hash))
         .route("/blocks/latest", get(get_latest_block))
         .route("/blocks/:height/transactions", get(get_block_transactions))
+        .route(
+            "/blocks/:height/private_tx_hashes",
+            get(get_block_private_tx_hashes),
+        )
+        .route("/private/tx/:hash", get(get_private_tx_by_hash))
         .route("/blocks/range/:from/:to", get(get_blocks_range))
         .route("/transactions/:hash", get(get_transaction_by_hash))
         .route("/admin/rollback", post(admin_rollback))
@@ -2875,6 +3047,7 @@ pub async fn start_api_with_config(
         security_stats: Arc::new(ApiSecurityStats::default()),
         ws_manager: WebSocketConnectionManager::new(),
         pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+        private_wallet_manager: None,
     });
 
     let router = create_router(app_state);
@@ -2899,7 +3072,7 @@ mod tests {
     async fn test_create_router() {
         let mempool = Arc::new(Mempool::new(1000));
 
-        let test_dir = ".test_api";
+        let test_dir = ".zoka/test-suite/.test_api";
         let storage = Arc::new(crate::storage::RocksDbStorage::new(test_dir).unwrap());
         let state_manager = Arc::new(StateManager::new(storage.clone()));
 
@@ -2911,6 +3084,7 @@ mod tests {
             security_stats: Arc::new(ApiSecurityStats::default()),
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
         });
 
         let _router = create_router(state);
@@ -2923,7 +3097,7 @@ mod tests {
     async fn test_state_root_and_account_proof_handlers() {
         let mempool = Arc::new(Mempool::new(1000));
 
-        let test_dir = ".test_api_state_root";
+        let test_dir = ".zoka/test-suite/.test_api_state_root";
         let _ = std::fs::remove_dir_all(test_dir);
         let storage = Arc::new(crate::storage::RocksDbStorage::new(test_dir).unwrap());
         let state_manager = Arc::new(StateManager::new(storage));
@@ -2940,6 +3114,7 @@ mod tests {
             security_stats: Arc::new(ApiSecurityStats::default()),
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
         });
 
         let root_resp = get_state_root(State(app_state.clone())).await;
@@ -2987,7 +3162,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_block_by_height() {
         let mempool = Arc::new(Mempool::new(1000));
-        let test_dir = ".test_api_block_height";
+        let test_dir = ".zoka/test-suite/.test_api_block_height";
         let _ = std::fs::remove_dir_all(test_dir);
         let storage = Arc::new(crate::storage::RocksDbStorage::new(test_dir).unwrap());
         let state_manager = Arc::new(StateManager::new(storage));
@@ -3012,6 +3187,7 @@ mod tests {
             security_stats: Arc::new(ApiSecurityStats::default()),
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
         });
 
         let resp = get_block_by_height(State(app_state), Path(0)).await;
@@ -3025,7 +3201,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_block_by_hash() {
         let mempool = Arc::new(Mempool::new(1000));
-        let test_dir = ".test_api_block_hash";
+        let test_dir = ".zoka/test-suite/.test_api_block_hash";
         let _ = std::fs::remove_dir_all(test_dir);
         let storage = Arc::new(crate::storage::RocksDbStorage::new(test_dir).unwrap());
         let state_manager = Arc::new(StateManager::new(storage));
@@ -3050,6 +3226,7 @@ mod tests {
             security_stats: Arc::new(ApiSecurityStats::default()),
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
         });
 
         let resp = get_block_by_hash(State(app_state), Path(block_hash.clone())).await;
@@ -3063,7 +3240,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_blocks_range() {
         let mempool = Arc::new(Mempool::new(1000));
-        let test_dir = ".test_api_blocks_range";
+        let test_dir = ".zoka/test-suite/.test_api_blocks_range";
         let _ = std::fs::remove_dir_all(test_dir);
         let storage = Arc::new(crate::storage::RocksDbStorage::new(test_dir).unwrap());
         let state_manager = Arc::new(StateManager::new(storage));
@@ -3094,6 +3271,7 @@ mod tests {
             security_stats: Arc::new(ApiSecurityStats::default()),
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
         });
 
         let resp = get_blocks_range(State(app_state), Path((1u64, 3u64))).await;
@@ -3108,7 +3286,7 @@ mod tests {
     #[tokio::test]
     async fn test_admin_rollback() {
         let mempool = Arc::new(Mempool::new(1000));
-        let test_dir = ".test_api_rollback";
+        let test_dir = ".zoka/test-suite/.test_api_rollback";
         let _ = std::fs::remove_dir_all(test_dir);
         let storage = Arc::new(crate::storage::RocksDbStorage::new(test_dir).unwrap());
         let state_manager = Arc::new(StateManager::new(storage));
@@ -3139,6 +3317,7 @@ mod tests {
             security_stats: Arc::new(ApiSecurityStats::default()),
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
         });
 
         // Check initial height
@@ -3990,7 +4169,7 @@ mod tests {
     #[tokio::test]
     async fn test_ws_subscribe() {
         let mempool = Arc::new(Mempool::new(1000));
-        let test_dir = ".test_ws_subscribe";
+        let test_dir = ".zoka/test-suite/.test_ws_subscribe";
         let _ = std::fs::remove_dir_all(test_dir);
         let storage = Arc::new(crate::storage::RocksDbStorage::new(test_dir).unwrap());
         let state_manager = Arc::new(StateManager::new(storage));
@@ -4003,6 +4182,7 @@ mod tests {
             security_stats: Arc::new(ApiSecurityStats::default()),
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
         });
 
         let req = SubscribeRequest {
@@ -4024,7 +4204,7 @@ mod tests {
     #[tokio::test]
     async fn test_ws_unsubscribe() {
         let mempool = Arc::new(Mempool::new(1000));
-        let test_dir = ".test_ws_unsubscribe";
+        let test_dir = ".zoka/test-suite/.test_ws_unsubscribe";
         let _ = std::fs::remove_dir_all(test_dir);
         let storage = Arc::new(crate::storage::RocksDbStorage::new(test_dir).unwrap());
         let state_manager = Arc::new(StateManager::new(storage));
@@ -4037,6 +4217,7 @@ mod tests {
             security_stats: Arc::new(ApiSecurityStats::default()),
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
         });
 
         // First subscribe
@@ -4068,7 +4249,7 @@ mod tests {
     #[tokio::test]
     async fn test_ws_status() {
         let mempool = Arc::new(Mempool::new(1000));
-        let test_dir = ".test_ws_status";
+        let test_dir = ".zoka/test-suite/.test_ws_status";
         let _ = std::fs::remove_dir_all(test_dir);
         let storage = Arc::new(crate::storage::RocksDbStorage::new(test_dir).unwrap());
         let state_manager = Arc::new(StateManager::new(storage));
@@ -4081,6 +4262,7 @@ mod tests {
             security_stats: Arc::new(ApiSecurityStats::default()),
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
         });
 
         // Add some connections
@@ -4105,7 +4287,7 @@ mod tests {
     #[tokio::test]
     async fn test_ws_subscribe_multiple_types() {
         let mempool = Arc::new(Mempool::new(1000));
-        let test_dir = ".test_ws_multi";
+        let test_dir = ".zoka/test-suite/.test_ws_multi";
         let _ = std::fs::remove_dir_all(test_dir);
         let storage = Arc::new(crate::storage::RocksDbStorage::new(test_dir).unwrap());
         let state_manager = Arc::new(StateManager::new(storage));
@@ -4118,6 +4300,7 @@ mod tests {
             security_stats: Arc::new(ApiSecurityStats::default()),
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
         });
 
         let req = SubscribeRequest {
@@ -4143,7 +4326,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_router_with_ws_endpoints() {
         let mempool = Arc::new(Mempool::new(1000));
-        let test_dir = ".test_ws_router";
+        let test_dir = ".zoka/test-suite/.test_ws_router";
         let _ = std::fs::remove_dir_all(test_dir);
         let storage = Arc::new(crate::storage::RocksDbStorage::new(test_dir).unwrap());
         let state_manager = Arc::new(StateManager::new(storage.clone()));
@@ -4156,6 +4339,7 @@ mod tests {
             security_stats: Arc::new(ApiSecurityStats::default()),
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
         });
 
         let _router = create_router(app_state);
@@ -4168,7 +4352,7 @@ mod tests {
     #[tokio::test]
     async fn test_pbft_start() {
         let mempool = Arc::new(Mempool::new(1000));
-        let test_dir = ".test_pbft_start";
+        let test_dir = ".zoka/test-suite/.test_pbft_start";
         let _ = std::fs::remove_dir_all(test_dir);
         let storage = Arc::new(crate::storage::RocksDbStorage::new(test_dir).unwrap());
         let state_manager = Arc::new(StateManager::new(storage));
@@ -4181,6 +4365,7 @@ mod tests {
             security_stats: Arc::new(ApiSecurityStats::default()),
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
         });
 
         let req = PbftStartRequest {
@@ -4208,7 +4393,7 @@ mod tests {
     #[tokio::test]
     async fn test_pbft_status() {
         let mempool = Arc::new(Mempool::new(1000));
-        let test_dir = ".test_pbft_status";
+        let test_dir = ".zoka/test-suite/.test_pbft_status";
         let _ = std::fs::remove_dir_all(test_dir);
         let storage = Arc::new(crate::storage::RocksDbStorage::new(test_dir).unwrap());
         let state_manager = Arc::new(StateManager::new(storage));
@@ -4221,6 +4406,7 @@ mod tests {
             security_stats: Arc::new(ApiSecurityStats::default()),
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
         });
 
         // First start consensus
@@ -4250,7 +4436,7 @@ mod tests {
     #[tokio::test]
     async fn test_pbft_message_prepare() {
         let mempool = Arc::new(Mempool::new(1000));
-        let test_dir = ".test_pbft_msg_prepare";
+        let test_dir = ".zoka/test-suite/.test_pbft_msg_prepare";
         let _ = std::fs::remove_dir_all(test_dir);
         let storage = Arc::new(crate::storage::RocksDbStorage::new(test_dir).unwrap());
         let state_manager = Arc::new(StateManager::new(storage));
@@ -4263,6 +4449,7 @@ mod tests {
             security_stats: Arc::new(ApiSecurityStats::default()),
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
         });
 
         // First start consensus
@@ -4316,7 +4503,7 @@ mod tests {
     #[tokio::test]
     async fn test_pbft_message_commit() {
         let mempool = Arc::new(Mempool::new(1000));
-        let test_dir = ".test_pbft_msg_commit";
+        let test_dir = ".zoka/test-suite/.test_pbft_msg_commit";
         let _ = std::fs::remove_dir_all(test_dir);
         let storage = Arc::new(crate::storage::RocksDbStorage::new(test_dir).unwrap());
         let state_manager = Arc::new(StateManager::new(storage));
@@ -4329,6 +4516,7 @@ mod tests {
             security_stats: Arc::new(ApiSecurityStats::default()),
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
         });
 
         // First start consensus
@@ -4405,7 +4593,7 @@ mod tests {
     #[tokio::test]
     async fn test_pbft_message_pre_prepare() {
         let mempool = Arc::new(Mempool::new(1000));
-        let test_dir = ".test_pbft_msg_preprepare";
+        let test_dir = ".zoka/test-suite/.test_pbft_msg_preprepare";
         let _ = std::fs::remove_dir_all(test_dir);
         let storage = Arc::new(crate::storage::RocksDbStorage::new(test_dir).unwrap());
         let state_manager = Arc::new(StateManager::new(storage));
@@ -4418,6 +4606,7 @@ mod tests {
             security_stats: Arc::new(ApiSecurityStats::default()),
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
         });
 
         let req = PbftMessageRequest {
@@ -4441,7 +4630,7 @@ mod tests {
     #[tokio::test]
     async fn test_pbft_message_invalid_type() {
         let mempool = Arc::new(Mempool::new(1000));
-        let test_dir = ".test_pbft_msg_invalid";
+        let test_dir = ".zoka/test-suite/.test_pbft_msg_invalid";
         let _ = std::fs::remove_dir_all(test_dir);
         let storage = Arc::new(crate::storage::RocksDbStorage::new(test_dir).unwrap());
         let state_manager = Arc::new(StateManager::new(storage));
@@ -4454,6 +4643,7 @@ mod tests {
             security_stats: Arc::new(ApiSecurityStats::default()),
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
         });
 
         let req = PbftMessageRequest {
@@ -4475,7 +4665,7 @@ mod tests {
     #[tokio::test]
     async fn test_pbft_start_insufficient_validators() {
         let mempool = Arc::new(Mempool::new(1000));
-        let test_dir = ".test_pbft_start_insufficient";
+        let test_dir = ".zoka/test-suite/.test_pbft_start_insufficient";
         let _ = std::fs::remove_dir_all(test_dir);
         let storage = Arc::new(crate::storage::RocksDbStorage::new(test_dir).unwrap());
         let state_manager = Arc::new(StateManager::new(storage));
@@ -4488,6 +4678,7 @@ mod tests {
             security_stats: Arc::new(ApiSecurityStats::default()),
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
         });
 
         let req = PbftStartRequest {
@@ -4506,7 +4697,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_snapshot() {
         let mempool = Arc::new(Mempool::new(1000));
-        let test_dir = ".test_create_snapshot";
+        let test_dir = ".zoka/test-suite/.test_create_snapshot";
         let _ = std::fs::remove_dir_all(test_dir);
         let storage = Arc::new(crate::storage::RocksDbStorage::new(test_dir).unwrap());
         let state_manager = Arc::new(StateManager::new(storage));
@@ -4519,6 +4710,7 @@ mod tests {
             security_stats: Arc::new(ApiSecurityStats::default()),
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
         });
 
         let resp =
@@ -4534,7 +4726,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_snapshots() {
         let mempool = Arc::new(Mempool::new(1000));
-        let test_dir = ".test_list_snapshots";
+        let test_dir = ".zoka/test-suite/.test_list_snapshots";
         let _ = std::fs::remove_dir_all(test_dir);
         let storage = Arc::new(crate::storage::RocksDbStorage::new(test_dir).unwrap());
         let state_manager = Arc::new(StateManager::new(storage));
@@ -4547,6 +4739,7 @@ mod tests {
             security_stats: Arc::new(ApiSecurityStats::default()),
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
         });
 
         // Create snapshot first
@@ -4569,7 +4762,7 @@ mod tests {
     #[tokio::test]
     async fn test_filter_events_with_criteria() {
         let mempool = Arc::new(Mempool::new(1000));
-        let test_dir = ".test_filter_events";
+        let test_dir = ".zoka/test-suite/.test_filter_events";
         let _ = std::fs::remove_dir_all(test_dir);
         let storage = Arc::new(crate::storage::RocksDbStorage::new(test_dir).unwrap());
         let state_manager = Arc::new(StateManager::new(storage));
@@ -4582,6 +4775,7 @@ mod tests {
             security_stats: Arc::new(ApiSecurityStats::default()),
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
         });
 
         let filter = AdvancedEventFilter {
@@ -4606,7 +4800,7 @@ mod tests {
     async fn test_list_profiles() {
         let _guard = PROFILE_ENV_LOCK.lock().unwrap();
         let mempool = Arc::new(Mempool::new(1000));
-        let test_dir = ".test_list_profiles";
+        let test_dir = ".zoka/test-suite/.test_list_profiles";
         let profile_file = format!("{}/profiles.toml", test_dir);
         let _ = std::fs::remove_dir_all(test_dir);
         let _ = std::fs::create_dir_all(test_dir);
@@ -4622,6 +4816,7 @@ mod tests {
             security_stats: Arc::new(ApiSecurityStats::default()),
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
         });
 
         let resp = list_profiles(State(app_state)).await;
@@ -4636,10 +4831,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_private_tx_endpoint_without_manager_returns_404() {
+        // Node without a `private_wallet_manager` must refuse cleanly, not
+        // crash or lie. Confirms the Option wiring works.
+        let test_dir = "/tmp/test_private_tx_endpoint_without_manager";
+        let _ = std::fs::remove_dir_all(test_dir);
+        let _ = std::fs::create_dir_all(test_dir);
+        let storage = Arc::new(crate::storage::RocksDbStorage::new(test_dir).unwrap());
+        let state_manager = Arc::new(StateManager::new(storage));
+        let mempool = Arc::new(Mempool::new(1000));
+
+        let app_state = Arc::new(AppState {
+            state_manager,
+            mempool,
+            security: ApiSecurityConfig::default(),
+            rate_limiter: ApiRateLimiter::default(),
+            security_stats: Arc::new(ApiSecurityStats::default()),
+            ws_manager: WebSocketConnectionManager::new(),
+            pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
+        });
+
+        let res = get_private_tx_by_hash(State(app_state), Path("deadbeef".to_string())).await;
+        match res {
+            Err((code, _)) => assert_eq!(code, StatusCode::NOT_FOUND),
+            Ok(_) => panic!("expected 404 when manager is None"),
+        }
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[tokio::test]
     async fn test_switch_profile() {
         let _guard = PROFILE_ENV_LOCK.lock().unwrap();
         let mempool = Arc::new(Mempool::new(1000));
-        let test_dir = ".test_switch_profile";
+        let test_dir = ".zoka/test-suite/.test_switch_profile";
         let profile_file = format!("{}/profiles.toml", test_dir);
         let _ = std::fs::remove_dir_all(test_dir);
         let _ = std::fs::create_dir_all(test_dir);
@@ -4655,6 +4880,7 @@ mod tests {
             security_stats: Arc::new(ApiSecurityStats::default()),
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
         });
 
         let req = ProfileManagementRequest {
@@ -4677,6 +4903,7 @@ mod tests {
             security_stats: Arc::new(ApiSecurityStats::default()),
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
         })))
         .await
         .unwrap();

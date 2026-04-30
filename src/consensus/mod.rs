@@ -77,15 +77,57 @@ impl PoAConsensus {
             }
         }
 
+        // Rule 6: Every private tx hash the block references must be
+        // non-empty and unique. Deeper validation (the hash actually maps
+        // to a valid, range-proven, ring-signed `PrivateTransaction`)
+        // happens when the body is applied from the local pool — that
+        // pipeline runs outside this pure structural check.
+        let mut seen_private: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for h in &block.private_tx_hashes {
+            if h.is_empty() {
+                return Err(BlockError::TransactionValidationFailed(
+                    "Empty private_tx_hash in block body".to_string(),
+                ));
+            }
+            if !seen_private.insert(h.as_str()) {
+                return Err(BlockError::TransactionValidationFailed(format!(
+                    "Duplicate private_tx_hash {} in block body",
+                    h
+                )));
+            }
+        }
+
         Ok(())
     }
 
-    /// Create a new block (for validators)
+    /// Create a new block (for validators). Keeps the legacy signature —
+    /// prefer `create_block_with_private` when private tx hashes are
+    /// available so they end up in the Merkle root.
     pub fn create_block(
         &self,
         prev_hash: String,
         block_height: u64,
         transactions: Vec<crate::types::Transaction>,
+        validator_key: PublicKey,
+    ) -> Result<Block, BlockError> {
+        self.create_block_with_private(
+            prev_hash,
+            block_height,
+            transactions,
+            Vec::new(),
+            validator_key,
+        )
+    }
+
+    /// Create a new block that commits both the public transactions and
+    /// the provided private transaction hashes. The Merkle root covers
+    /// both, so tampering with either invalidates the block hash.
+    pub fn create_block_with_private(
+        &self,
+        prev_hash: String,
+        block_height: u64,
+        transactions: Vec<crate::types::Transaction>,
+        private_tx_hashes: Vec<String>,
         validator_key: PublicKey,
     ) -> Result<Block, BlockError> {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -103,7 +145,8 @@ impl PoAConsensus {
             transactions,
             validator_key,
             crate::types::Signature(vec![]),
-        );
+        )
+        .with_private_tx_hashes(private_tx_hashes);
 
         // Validate the block we just created
         self.validate_block(&block)?;
@@ -364,6 +407,65 @@ mod tests {
 
         assert_eq!(block.header.state_root, "abc123");
         assert!(consensus.validate_block(&block).is_ok());
+    }
+
+    #[test]
+    fn test_create_block_with_private_tx_hashes_changes_merkle() {
+        let consensus = PoAConsensus::new();
+        let plain = consensus
+            .create_block("prev".to_string(), 1, vec![], PublicKey(vec![1]))
+            .expect("plain block");
+        let with_private = consensus
+            .create_block_with_private(
+                "prev".to_string(),
+                1,
+                vec![],
+                vec!["priv-tx-1".to_string(), "priv-tx-2".to_string()],
+                PublicKey(vec![1]),
+            )
+            .expect("block with private hashes");
+
+        assert_eq!(with_private.private_tx_hashes.len(), 2);
+        assert_ne!(
+            plain.header.merkle_root, with_private.header.merkle_root,
+            "private_tx_hashes must flow into the Merkle root"
+        );
+        assert!(
+            consensus.validate_block(&with_private).is_ok(),
+            "block carrying private hashes must still validate"
+        );
+    }
+
+    #[test]
+    fn test_validate_block_rejects_duplicate_private_tx_hash() {
+        let consensus = PoAConsensus::new();
+        let block = consensus.create_block_with_private(
+            "prev".to_string(),
+            1,
+            vec![],
+            vec!["dup-hash".to_string(), "dup-hash".to_string()],
+            PublicKey(vec![1]),
+        );
+        assert!(
+            matches!(block, Err(BlockError::TransactionValidationFailed(_))),
+            "duplicate private_tx_hash must be rejected by validation"
+        );
+    }
+
+    #[test]
+    fn test_validate_block_rejects_empty_private_tx_hash() {
+        let consensus = PoAConsensus::new();
+        let block = consensus.create_block_with_private(
+            "prev".to_string(),
+            1,
+            vec![],
+            vec![String::new()],
+            PublicKey(vec![1]),
+        );
+        assert!(
+            matches!(block, Err(BlockError::TransactionValidationFailed(_))),
+            "empty private_tx_hash must be rejected"
+        );
     }
 
     #[tokio::test]

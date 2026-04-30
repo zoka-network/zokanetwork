@@ -26,7 +26,10 @@
 //! ```
 
 pub mod circuits;
+pub mod groth16_backend;
 pub mod prover;
+pub mod range_proofs;
+pub mod setup_io;
 pub mod verifier;
 
 pub use prover::{Prover, ZKProof};

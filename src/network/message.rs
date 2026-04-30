@@ -3,7 +3,21 @@
 //! Define los tipos de mensajes que viajan por la red P2P
 
 use crate::consensus::{PbftMessage, PbftNewView, PbftViewChange};
+use crate::state::PrivateCommitmentInclusionProof;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+fn default_user_query_found() -> bool {
+    true
+}
+
+fn default_ring_version() -> u8 {
+    1
+}
+
+fn default_asset_tag() -> String {
+    "ZOKA".to_string()
+}
 
 /// Tipos de mensajes en ZOKA
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -12,8 +26,12 @@ pub enum ZokaMessage {
     Transaction(crate::types::Transaction),
     /// Transacción privada
     PrivateTransaction(PrivateTransactionMessage),
+    StemPrivateTransaction(StemPrivateTransactionMessage),
+    PrivateMixerBatch(MixerBatchMessage),
     /// Solicitud de bloque
-    BlockRequest { block_height: u64 },
+    BlockRequest {
+        block_height: u64,
+    },
     /// Respuesta con bloque
     BlockResponse(BlockResponseMessage),
     /// Estado sincronizado
@@ -22,40 +40,170 @@ pub enum ZokaMessage {
     Ping(PingMessage),
     /// Mensajes de consenso PBFT
     Pbft(PbftNetworkMessage),
-    /// Registro de usuario (para descubrimiento)
+    /// Registro de usuario (anuncio minimizado para descubrimiento)
     UserRegistry {
         username: String,
-        public_address: String,
-        commitment_key: String,
-        peer_id: String,
         #[serde(default)]
-        listen_addr: Option<String>,
+        record_digest: String,
+        #[serde(default)]
+        updated_at: u64,
     },
     /// Consulta para encontrar usuario
-    UserQuery { username: String },
-    /// Respuesta de consulta de usuario
+    UserQuery {
+        username: String,
+    },
+    /// Respuesta de consulta (sin exponer metadata sensible)
     UserQueryResponse {
         username: String,
-        public_address: String,
-        commitment_key: String,
-        peer_id: String,
+        #[serde(default = "default_user_query_found")]
+        found: bool,
         #[serde(default)]
-        listen_addr: Option<String>,
+        record_digest: String,
+        #[serde(default)]
+        updated_at: u64,
     },
 }
 
 /// Mensaje de transacción privada
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PrivateOutputMessage {
+    #[serde(default)]
+    pub output_id: String,
+    #[serde(default = "default_asset_tag")]
+    pub asset_tag: String,
+    #[serde(default)]
+    pub asset_tag_commitment: String,
+    #[serde(default)]
+    pub recipient_commitment: String,
+    #[serde(default)]
+    pub stealth_address: String,
+    #[serde(default)]
+    pub ephemeral_pubkey: Vec<u8>,
+    #[serde(default)]
+    pub commitment: String,
+    #[serde(default)]
+    pub amount_commitment: String,
+    #[serde(default)]
+    pub range_proof: Vec<u8>,
+    #[serde(default)]
+    pub one_time_public_key: String,
+    #[serde(default)]
+    pub encrypted_amount: Vec<u8>,
+    #[serde(default)]
+    pub commitment_blind: Vec<u8>,
+    #[serde(default)]
+    pub is_change: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AssetBalanceCommitmentMessage {
+    #[serde(default = "default_asset_tag")]
+    pub asset_tag: String,
+    #[serde(default)]
+    pub balance_commitment: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PrivateTransactionMessage {
     /// Hash único de la transacción
     pub tx_hash: String,
     /// Commitment (cantidad oculta)
     pub commitment: String,
+    #[serde(default)]
+    pub stealth_address: String,
+    #[serde(default)]
+    pub ephemeral_pubkey: Vec<u8>,
     /// Nullifier (previene double-spend)
     pub nullifier: String,
     /// Prueba ZK-SNARK
     pub zk_proof: Option<Vec<u8>>,
     /// Timestamp del envío
+    pub timestamp: u64,
+    /// Recipient commitment identifier (who can decrypt)
+    #[serde(default)]
+    pub recipient_commitment: String,
+    /// Encrypted amount payload for receiver
+    #[serde(default)]
+    pub encrypted_amount: Vec<u8>,
+    /// Groth16 public input #1
+    #[serde(default)]
+    pub proof_commitment: u64,
+    /// Groth16 public input #2
+    #[serde(default)]
+    pub proof_nullifier: u64,
+    #[serde(default)]
+    pub proof_input_sum: u64,
+    #[serde(default)]
+    pub proof_output_sum: u64,
+    #[serde(default)]
+    pub proof_fee: u64,
+    #[serde(default)]
+    pub proof_key_image: u64,
+    #[serde(default)]
+    pub proof_private_root_words: Vec<u64>,
+    #[serde(default)]
+    pub fee: u64,
+    #[serde(default)]
+    pub ring_id: String,
+    #[serde(default = "default_ring_version")]
+    pub ring_version: u8,
+    #[serde(default)]
+    pub ring_members: Vec<String>,
+    #[serde(default)]
+    pub ring_signature: Vec<u8>,
+    #[serde(default)]
+    pub input_nullifiers: Vec<String>,
+    #[serde(default)]
+    pub input_commitments: Vec<String>,
+    #[serde(default)]
+    pub input_asset_tags: Vec<String>,
+    #[serde(default)]
+    pub input_public_keys: Vec<String>,
+    #[serde(default)]
+    pub input_key_images: Vec<String>,
+    #[serde(default)]
+    pub input_amount_commitments: Vec<String>,
+    #[serde(default)]
+    pub amount_balance_commitment: String,
+    #[serde(default = "default_asset_tag")]
+    pub fee_asset_tag: String,
+    #[serde(default)]
+    pub asset_balance_commitments: Vec<AssetBalanceCommitmentMessage>,
+    #[serde(default)]
+    pub fee_commitment: String,
+    #[serde(default)]
+    pub fee_range_proof: Vec<u8>,
+    #[serde(default)]
+    pub private_commitment_root: String,
+    #[serde(default)]
+    pub input_inclusion_proofs: Vec<PrivateCommitmentInclusionProof>,
+    #[serde(default)]
+    pub outputs: Vec<PrivateOutputMessage>,
+    /// Commitment blindness factor (needed by receiver to verify)
+    #[serde(default)]
+    pub commitment_blind: Vec<u8>,
+    /// Nullifier nonce (needed for reconstruction)
+    #[serde(default)]
+    pub nullifier_nonce: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StemPrivateTransactionMessage {
+    pub route_id: String,
+    #[serde(default)]
+    pub relay_hint: String,
+    pub stem_hops: u8,
+    #[serde(default)]
+    pub padding: Vec<u8>,
+    pub private_tx: PrivateTransactionMessage,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MixerBatchMessage {
+    pub batch_id: String,
+    pub txs: Vec<PrivateTransactionMessage>,
+    #[serde(default)]
+    pub padding: Vec<u8>,
     pub timestamp: u64,
 }
 
@@ -129,6 +277,27 @@ pub struct UserDiscoveryRecord {
     pub updated_at: u64,
 }
 
+impl UserDiscoveryRecord {
+    /// Deterministic digest for lightweight discovery announcements.
+    pub fn digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.username.as_bytes());
+        hasher.update([0x1f]);
+        hasher.update(self.public_address.as_bytes());
+        hasher.update([0x1f]);
+        hasher.update(self.commitment_key.as_bytes());
+        hasher.update([0x1f]);
+        hasher.update(self.peer_id.as_bytes());
+        hasher.update([0x1f]);
+        if let Some(addr) = &self.listen_addr {
+            hasher.update(addr.as_bytes());
+        }
+        hasher.update([0x1f]);
+        hasher.update(self.updated_at.to_le_bytes());
+        hex::encode(hasher.finalize())
+    }
+}
+
 /// Mensajes de consenso PBFT sobre la red
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum PbftNetworkMessage {
@@ -146,6 +315,8 @@ impl ZokaMessage {
         match self {
             ZokaMessage::Transaction(_msg) => 0, // Would get from tx
             ZokaMessage::PrivateTransaction(msg) => msg.timestamp,
+            ZokaMessage::StemPrivateTransaction(msg) => msg.private_tx.timestamp,
+            ZokaMessage::PrivateMixerBatch(msg) => msg.timestamp,
             ZokaMessage::BlockRequest { .. } => 0,
             ZokaMessage::BlockResponse(msg) => msg.timestamp,
             ZokaMessage::SyncState(msg) => msg.timestamp,
@@ -176,6 +347,7 @@ impl ZokaMessage {
 mod tests {
     use super::*;
     use crate::types::{Signature, Transaction};
+    use serde_json::json;
 
     #[test]
     fn test_transaction_message() {
@@ -187,7 +359,6 @@ mod tests {
             nonce: 0,
             timestamp: 1234567890,
             signature: Signature(vec![10, 11, 12]),
-            zk_proof: Some(vec![5, 6, 7]),
         };
 
         let tx_msg = ZokaMessage::Transaction(tx);
@@ -195,6 +366,292 @@ mod tests {
         let restored = ZokaMessage::from_bytes(&bytes).unwrap();
 
         assert!(matches!(restored, ZokaMessage::Transaction(_)));
+    }
+
+    #[test]
+    fn test_private_transaction_message_roundtrip_with_ring_metadata() {
+        let private_tx = PrivateTransactionMessage {
+            tx_hash: "0xpriv".to_string(),
+            commitment: "commitment".to_string(),
+            stealth_address: "stlth_abc".to_string(),
+            ephemeral_pubkey: vec![1, 2, 3],
+            nullifier: "nullifier".to_string(),
+            zk_proof: Some(vec![9, 9, 9]),
+            timestamp: 123,
+            recipient_commitment: "recipient".to_string(),
+            encrypted_amount: vec![7, 7, 7, 7, 7, 7, 7, 7],
+            proof_commitment: 11,
+            proof_nullifier: 22,
+            proof_input_sum: 33,
+            proof_output_sum: 33,
+            proof_fee: 0,
+            proof_key_image: 44,
+            proof_private_root_words: vec![1, 2, 3, 4],
+            fee: 0,
+            ring_id: "ring-id".to_string(),
+            ring_version: 1,
+            ring_members: vec!["member-a".to_string(), "member-b".to_string()],
+            ring_signature: vec![4u8; 128],
+            input_nullifiers: vec!["nullifier".to_string()],
+            input_commitments: vec!["commitment".to_string()],
+            input_asset_tags: vec!["ZOKA".to_string()],
+            outputs: vec![PrivateOutputMessage {
+                output_id: "out-1".to_string(),
+                asset_tag: "ZOKA".to_string(),
+                asset_tag_commitment: "asset-tag-commitment".to_string(),
+                recipient_commitment: "recipient".to_string(),
+                stealth_address: "stlth_abc".to_string(),
+                ephemeral_pubkey: vec![1, 2, 3],
+                commitment: "commitment".to_string(),
+                amount_commitment: "amount-commitment".to_string(),
+                range_proof: vec![8u8; 32],
+                one_time_public_key: "one-time-key".to_string(),
+                encrypted_amount: vec![7, 7, 7, 7, 7, 7, 7, 7],
+                commitment_blind: vec![5u8; 32],
+                is_change: false,
+            }],
+            input_public_keys: vec!["input-pub-1".to_string()],
+            input_key_images: vec!["key-image-1".to_string()],
+            input_amount_commitments: vec!["amount-commitment-in".to_string()],
+            amount_balance_commitment: "balance-commitment".to_string(),
+            fee_asset_tag: "ZOKA".to_string(),
+            asset_balance_commitments: vec![AssetBalanceCommitmentMessage {
+                asset_tag: "ZOKA".to_string(),
+                balance_commitment: "balance-commitment".to_string(),
+            }],
+            fee_commitment: String::new(),
+            fee_range_proof: Vec::new(),
+            private_commitment_root: String::new(),
+            input_inclusion_proofs: vec![],
+            commitment_blind: vec![5u8; 32],
+            nullifier_nonce: vec![6u8; 16],
+        };
+
+        let msg = ZokaMessage::PrivateTransaction(private_tx);
+        let bytes = msg.to_bytes().unwrap();
+        let restored = ZokaMessage::from_bytes(&bytes).unwrap();
+
+        match restored {
+            ZokaMessage::PrivateTransaction(restored) => {
+                assert_eq!(restored.ring_id, "ring-id");
+                assert_eq!(restored.ring_members.len(), 2);
+                assert_eq!(restored.ring_signature.len(), 128);
+                assert_eq!(restored.proof_commitment, 11);
+                assert_eq!(restored.proof_input_sum, 33);
+                assert_eq!(restored.proof_private_root_words.len(), 4);
+                assert_eq!(restored.outputs.len(), 1);
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_stem_private_transaction_message_roundtrip() {
+        let stem = StemPrivateTransactionMessage {
+            route_id: "route-1".to_string(),
+            relay_hint: "peer-a".to_string(),
+            stem_hops: 2,
+            padding: vec![0u8; 32],
+            private_tx: PrivateTransactionMessage {
+                tx_hash: "0xpriv".to_string(),
+                commitment: "commitment".to_string(),
+                stealth_address: "stlth_abc".to_string(),
+                ephemeral_pubkey: vec![1, 2, 3],
+                nullifier: "nullifier".to_string(),
+                zk_proof: Some(vec![9, 9, 9]),
+                timestamp: 123,
+                recipient_commitment: "recipient".to_string(),
+                encrypted_amount: vec![7, 7, 7, 7, 7, 7, 7, 7],
+                proof_commitment: 11,
+                proof_nullifier: 22,
+                proof_input_sum: 33,
+                proof_output_sum: 33,
+                proof_fee: 0,
+                proof_key_image: 44,
+                proof_private_root_words: vec![1, 2, 3, 4],
+                fee: 0,
+                ring_id: "ring-id".to_string(),
+                ring_version: 1,
+                ring_members: vec!["member-a".to_string(), "member-b".to_string()],
+                ring_signature: vec![4u8; 128],
+                input_nullifiers: vec!["nullifier".to_string()],
+                input_commitments: vec!["commitment".to_string()],
+                input_asset_tags: vec!["ZOKA".to_string()],
+                outputs: vec![PrivateOutputMessage {
+                    output_id: "out-1".to_string(),
+                    asset_tag: "ZOKA".to_string(),
+                    asset_tag_commitment: "asset-tag-commitment".to_string(),
+                    recipient_commitment: "recipient".to_string(),
+                    stealth_address: "stlth_abc".to_string(),
+                    ephemeral_pubkey: vec![1, 2, 3],
+                    commitment: "commitment".to_string(),
+                    amount_commitment: "amount-commitment".to_string(),
+                    range_proof: vec![8u8; 32],
+                    one_time_public_key: "one-time-key".to_string(),
+                    encrypted_amount: vec![7, 7, 7, 7, 7, 7, 7, 7],
+                    commitment_blind: vec![5u8; 32],
+                    is_change: false,
+                }],
+                input_public_keys: vec!["input-pub-1".to_string()],
+                input_key_images: vec!["key-image-1".to_string()],
+                input_amount_commitments: vec!["amount-commitment-in".to_string()],
+                amount_balance_commitment: "balance-commitment".to_string(),
+                fee_asset_tag: "ZOKA".to_string(),
+                asset_balance_commitments: vec![AssetBalanceCommitmentMessage {
+                    asset_tag: "ZOKA".to_string(),
+                    balance_commitment: "balance-commitment".to_string(),
+                }],
+                fee_commitment: String::new(),
+                fee_range_proof: Vec::new(),
+                private_commitment_root: String::new(),
+                input_inclusion_proofs: vec![],
+                commitment_blind: vec![5u8; 32],
+                nullifier_nonce: vec![6u8; 16],
+            },
+        };
+
+        let msg = ZokaMessage::StemPrivateTransaction(stem);
+        let bytes = msg.to_bytes().unwrap();
+        let restored = ZokaMessage::from_bytes(&bytes).unwrap();
+
+        match restored {
+            ZokaMessage::StemPrivateTransaction(restored) => {
+                assert_eq!(restored.route_id, "route-1");
+                assert_eq!(restored.relay_hint, "peer-a");
+                assert_eq!(restored.padding.len(), 32);
+                assert_eq!(restored.private_tx.tx_hash, "0xpriv");
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_private_mixer_batch_message_roundtrip() {
+        let batch = MixerBatchMessage {
+            batch_id: "batch-1".to_string(),
+            txs: vec![PrivateTransactionMessage {
+                tx_hash: "0xpriv".to_string(),
+                commitment: "commitment".to_string(),
+                stealth_address: "stlth_abc".to_string(),
+                ephemeral_pubkey: vec![1, 2, 3],
+                nullifier: "nullifier".to_string(),
+                zk_proof: Some(vec![9, 9, 9]),
+                timestamp: 123,
+                recipient_commitment: "recipient".to_string(),
+                encrypted_amount: vec![7, 7, 7, 7, 7, 7, 7, 7],
+                proof_commitment: 11,
+                proof_nullifier: 22,
+                proof_input_sum: 33,
+                proof_output_sum: 33,
+                proof_fee: 0,
+                proof_key_image: 44,
+                proof_private_root_words: vec![1, 2, 3, 4],
+                fee: 0,
+                ring_id: "ring-id".to_string(),
+                ring_version: 1,
+                ring_members: vec!["member-a".to_string(), "member-b".to_string()],
+                ring_signature: vec![4u8; 128],
+                input_nullifiers: vec!["nullifier".to_string()],
+                input_commitments: vec!["commitment".to_string()],
+                input_asset_tags: vec!["ZOKA".to_string()],
+                outputs: vec![PrivateOutputMessage {
+                    output_id: "out-1".to_string(),
+                    asset_tag: "ZOKA".to_string(),
+                    asset_tag_commitment: "asset-tag-commitment".to_string(),
+                    recipient_commitment: "recipient".to_string(),
+                    stealth_address: "stlth_abc".to_string(),
+                    ephemeral_pubkey: vec![1, 2, 3],
+                    commitment: "commitment".to_string(),
+                    amount_commitment: "amount-commitment".to_string(),
+                    range_proof: vec![8u8; 32],
+                    one_time_public_key: "one-time-key".to_string(),
+                    encrypted_amount: vec![7, 7, 7, 7, 7, 7, 7, 7],
+                    commitment_blind: vec![5u8; 32],
+                    is_change: false,
+                }],
+                input_public_keys: vec!["input-pub-1".to_string()],
+                input_key_images: vec!["key-image-1".to_string()],
+                input_amount_commitments: vec!["amount-commitment-in".to_string()],
+                amount_balance_commitment: "balance-commitment".to_string(),
+                fee_asset_tag: "ZOKA".to_string(),
+                asset_balance_commitments: vec![AssetBalanceCommitmentMessage {
+                    asset_tag: "ZOKA".to_string(),
+                    balance_commitment: "balance-commitment".to_string(),
+                }],
+                fee_commitment: String::new(),
+                fee_range_proof: Vec::new(),
+                private_commitment_root: String::new(),
+                input_inclusion_proofs: vec![],
+                commitment_blind: vec![5u8; 32],
+                nullifier_nonce: vec![6u8; 16],
+            }],
+            padding: vec![0u8; 64],
+            timestamp: 555,
+        };
+
+        let msg = ZokaMessage::PrivateMixerBatch(batch);
+        let bytes = msg.to_bytes().unwrap();
+        let restored = ZokaMessage::from_bytes(&bytes).unwrap();
+
+        match restored {
+            ZokaMessage::PrivateMixerBatch(restored) => {
+                assert_eq!(restored.batch_id, "batch-1");
+                assert_eq!(restored.txs.len(), 1);
+                assert_eq!(restored.padding.len(), 64);
+                assert_eq!(restored.timestamp, 555);
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_private_transaction_message_missing_ring_version_defaults_to_clsag() {
+        let legacy_like = serde_json::json!({
+            "PrivateTransaction": {
+                "tx_hash": "tx-legacy",
+                "commitment": "commitment",
+                "nullifier": "nullifier",
+                "zk_proof": null,
+                "timestamp": 1
+            }
+        });
+        let restored: ZokaMessage =
+            serde_json::from_value(legacy_like).expect("deserialize legacy private tx");
+        match restored {
+            ZokaMessage::PrivateTransaction(tx) => {
+                assert_eq!(tx.ring_version, 1);
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_private_transaction_message_missing_output_asset_tag_defaults() {
+        let legacy_like = serde_json::json!({
+            "PrivateTransaction": {
+                "tx_hash": "tx-legacy",
+                "commitment": "commitment",
+                "nullifier": "nullifier",
+                "timestamp": 1,
+                "ring_version": 1,
+                "ring_members": ["a", "b", "c"],
+                "outputs": [{
+                    "output_id": "out-1",
+                    "recipient_commitment": "recipient",
+                    "commitment": "commitment",
+                    "amount_commitment": "amount-commitment"
+                }]
+            }
+        });
+        let restored: ZokaMessage =
+            serde_json::from_value(legacy_like).expect("deserialize legacy private tx");
+        match restored {
+            ZokaMessage::PrivateTransaction(tx) => {
+                assert_eq!(tx.outputs.len(), 1);
+                assert_eq!(tx.outputs[0].asset_tag, "ZOKA");
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
     }
 
     #[test]
@@ -246,5 +703,84 @@ mod tests {
 
         assert_eq!(restored.timestamp(), 777);
         assert!(matches!(restored, ZokaMessage::Pbft(_)));
+    }
+
+    #[test]
+    fn test_user_registry_payload_is_minimized() {
+        let msg = ZokaMessage::UserRegistry {
+            username: "alice".to_string(),
+            record_digest: "digest123".to_string(),
+            updated_at: 42,
+        };
+
+        let value = serde_json::to_value(&msg).expect("serialize user registry");
+        let payload = value
+            .get("UserRegistry")
+            .and_then(|v| v.as_object())
+            .expect("UserRegistry payload object");
+
+        assert_eq!(
+            payload.get("username").and_then(|v| v.as_str()),
+            Some("alice")
+        );
+        assert_eq!(
+            payload.get("record_digest").and_then(|v| v.as_str()),
+            Some("digest123")
+        );
+        assert_eq!(payload.get("updated_at").and_then(|v| v.as_u64()), Some(42));
+
+        assert!(!payload.contains_key("public_address"));
+        assert!(!payload.contains_key("commitment_key"));
+        assert!(!payload.contains_key("peer_id"));
+        assert!(!payload.contains_key("listen_addr"));
+    }
+
+    #[test]
+    fn test_user_query_response_defaults_found_for_compatibility() {
+        let legacy_like = json!({
+            "UserQueryResponse": {
+                "username": "alice",
+                "record_digest": "digest123",
+                "updated_at": 7
+            }
+        });
+
+        let restored: ZokaMessage =
+            serde_json::from_value(legacy_like).expect("deserialize user query response");
+
+        match restored {
+            ZokaMessage::UserQueryResponse {
+                username,
+                found,
+                record_digest,
+                updated_at,
+            } => {
+                assert_eq!(username, "alice");
+                assert!(found);
+                assert_eq!(record_digest, "digest123");
+                assert_eq!(updated_at, 7);
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_user_discovery_digest_is_deterministic() {
+        let record = UserDiscoveryRecord {
+            username: "alice".to_string(),
+            public_address: "0x1111".to_string(),
+            commitment_key: "cmt".to_string(),
+            peer_id: "peer-a".to_string(),
+            listen_addr: Some("/ip4/127.0.0.1/tcp/7777".to_string()),
+            updated_at: 100,
+        };
+
+        let digest_a = record.digest();
+        let digest_b = record.digest();
+        assert_eq!(digest_a, digest_b);
+
+        let mut changed = record.clone();
+        changed.updated_at = 101;
+        assert_ne!(digest_a, changed.digest());
     }
 }

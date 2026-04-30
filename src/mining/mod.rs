@@ -2,6 +2,10 @@
 use crate::types::{Block, BlockError, PublicKey, Signature, Transaction};
 use std::sync::{Arc, Mutex};
 
+pub mod block_validator;
+pub mod difficulty;
+pub mod pow;
+
 /// Mining configuration and rewards
 #[allow(dead_code)]
 pub struct MiningConfig {
@@ -98,7 +102,9 @@ impl UserMiner {
                 seal: Signature(vec![]),
             },
             transactions: txs.clone(),
-            zk_proof: None,
+            private_tx_hashes: Vec::new(),
+            private_fee_claims: Vec::new(),
+            private_coinbase: None,
         };
 
         loop {

@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "zoka"
 version = "0.1.0"
 edition = "2021"
@@ -9,27 +9,49 @@ description = "100% private blockchain with Zero-Knowledge proofs (zk) in Rust."
 name = "zoka"
 path = "src/main.rs"
 
+[[bin]]
+name = "zokahd"
+path = "src/bin/zokahd.rs"
+
 [lib]
 name = "zoka"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Enables the RandomX PoW backend (the canonical mainnet algorithm).
+# Pulls in the `randomx-rs` crate which links to the official RandomX
+# C++ library; mainnet binaries MUST be built with this feature.
+# Build prerequisites:
+#   - Linux x86_64: gcc/clang, cmake >= 3.5, make, pkg-config
+#   - Windows x86_64: Visual Studio Build Tools (MSVC v143+) and cmake on PATH
+# See docs/pow-mainnet-decision.md for the rationale.
+randomx = ["dep:randomx-rs"]
+
 [dependencies]
+randomx-rs = { version = "1.3", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
+tokio-socks = "0.5"
 libp2p = { version = "0.53", features = ["tokio", "noise", "yamux", "tcp", "kad", "identify", "gossipsub", "macros"] }
 sha2 = "0.10"
 sha3 = "0.10"
 hmac = "0.12"
 rand = "0.8"
+rand_chacha = "0.3"
 thiserror = "1.0"
 bellman = "0.14"
 pasta_curves = "0.5"
+bls12_381 = "0.8"
 rocksdb = "0.21"
 axum = "0.7"
 tower = "0.4"
 tower-http = "0.5"
 ed25519-dalek = "2.0"
+curve25519-dalek = "4.1"
+bulletproofs = "5.0"
+merlin = "3"
 blake3 = "1.5"
 argon2 = "0.5"
 base64 = "0.21"
@@ -44,7 +66,71 @@ async-trait = "0.1"
 home = "0.5"
 clap = { version = "4.4", features = ["derive"] }
 toml = "0.8"
+bip39 = "2"
+bs58 = "0.5"
 
 [dev-dependencies]
 proptest = "1.0"
+tempfile = "3"
+
+# ----------------------------------------------------------------------------
+# Test/dev profile speedups for crypto-heavy crates.
+#
+# `cargo test` runs in debug mode by default. Curve25519 / Bulletproofs /
+# bellman / argon2 are ~50-100x slower in debug than release. Tests that
+# stress them (clsag ring sizes 2..=16, range proofs, MPC ceremony,
+# wallet KDF) end up taking minutes per run for no consensus reason.
+#
+# We compile only those crates at -O3 even in dev/test, so the rest of
+# the repo stays in fast-compile debug. First test run pays a one-time
+# recompile of these deps; every subsequent run is dramatically faster.
+# Output bytes from these crates are independent of opt-level, so this
+# never changes test verdicts — only their speed.
+# ----------------------------------------------------------------------------
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+
+[profile.dev.package.bulletproofs]
+opt-level = 3
+
+[profile.dev.package.bls12_381]
+opt-level = 3
+
+[profile.dev.package.bellman]
+opt-level = 3
+
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.subtle]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.sha3]
+opt-level = 3
+
+[profile.dev.package.blake3]
+opt-level = 3
+
+[profile.dev.package.aes-gcm]
+opt-level = 3
+
+[profile.dev.package.merlin]
+opt-level = 3
+
+[profile.dev.package.pasta_curves]
+opt-level = 3
+
+[[bin]]
+name = "zoka-trusted-setup"
+path = "src/bin/generate_trusted_setup.rs"
+
+[[bin]]
+name = "zoka-ceremony-contribute"
+path = "src/bin/zoka_ceremony_contribute.rs"
 

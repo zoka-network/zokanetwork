@@ -33,6 +33,9 @@ struct EncryptedPrivateWallet {
     pub wallet: PrivateWallet,
     /// Encrypted spending key
     pub encrypted_spending_key: Vec<u8>,
+    /// Encrypted scan key
+    #[serde(default)]
+    pub encrypted_scan_key: Vec<u8>,
 }
 
 impl WalletStorage {
@@ -60,6 +63,18 @@ impl WalletStorage {
             wallets_path,
             private_wallets_path,
         })
+    }
+
+    /// Returns true if a public wallet file with this name exists on disk.
+    pub fn public_wallet_file_exists(&self, wallet_name: &str) -> bool {
+        let filename = format!("{}.wallet.json", wallet_name);
+        self.wallets_path.join(filename).is_file()
+    }
+
+    /// Returns true if a private wallet file with this name exists on disk.
+    pub fn private_wallet_file_exists(&self, wallet_name: &str) -> bool {
+        let filename = format!("{}.private.json", wallet_name);
+        self.private_wallets_path.join(filename).is_file()
     }
 
     /// Save public wallet to disk
@@ -109,40 +124,71 @@ impl WalletStorage {
         let filepath = self.wallets_path.join(&filename);
 
         if !filepath.exists() {
-            return Err(BlockError::TransactionValidationFailed(
-                "Wallet file not found".to_string(),
-            ));
+            return Err(BlockError::TransactionValidationFailed(format!(
+                "wallet '{}' not found: run 'wallet-list' to see available wallets, or 'wallet-create --name {}' to create it",
+                wallet_name, wallet_name
+            )));
         }
 
         let mut file = fs::File::open(&filepath).map_err(|e| {
-            BlockError::TransactionValidationFailed(format!("Failed to open wallet file: {}", e))
+            BlockError::TransactionValidationFailed(format!(
+                "failed to open wallet file '{}': {}",
+                filepath.display(),
+                e
+            ))
         })?;
 
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).map_err(|e| {
-            BlockError::TransactionValidationFailed(format!("Failed to read wallet file: {}", e))
+            BlockError::TransactionValidationFailed(format!(
+                "failed to read wallet file '{}': {}",
+                filepath.display(),
+                e
+            ))
         })?;
+
+        let looks_encrypted =
+            bytes.len() >= ENCRYPTION_MAGIC.len() && bytes.starts_with(ENCRYPTION_MAGIC);
 
         // If password provided, decrypt
         let json_str = if let Some(pwd) = password {
             let decrypted = decrypt_data(&bytes, pwd)?;
             String::from_utf8(decrypted).map_err(|e| {
-                BlockError::TransactionValidationFailed(format!("UTF-8 error: {}", e))
+                BlockError::TransactionValidationFailed(format!(
+                    "wallet file '{}' is corrupted (invalid UTF-8 after decryption): {}",
+                    filepath.display(),
+                    e
+                ))
             })?
         } else {
+            if looks_encrypted {
+                return Err(BlockError::TransactionValidationFailed(
+                    "wallet is encrypted: provide --password <pwd> to unlock it".to_string(),
+                ));
+            }
             String::from_utf8(bytes).map_err(|e| {
-                BlockError::TransactionValidationFailed(format!("UTF-8 error: {}", e))
+                BlockError::TransactionValidationFailed(format!(
+                    "wallet file '{}' is corrupted (invalid UTF-8): {}",
+                    filepath.display(),
+                    e
+                ))
             })?
         };
 
         let encrypted: EncryptedWallet = serde_json::from_str(&json_str).map_err(|e| {
-            BlockError::TransactionValidationFailed(format!("JSON parse failed: {}", e))
+            BlockError::TransactionValidationFailed(format!(
+                "wallet file '{}' is corrupted (invalid JSON): {}",
+                filepath.display(),
+                e
+            ))
         })?;
 
         Ok((encrypted.wallet, encrypted.mnemonic))
     }
 
     /// Save private wallet to disk
+    /// SECURITY: The private keys are NEVER written to disk in cleartext.
+    /// Only encrypted key blobs are persisted. The wallet field has key material zeroed.
     pub fn save_private_wallet(
         &self,
         wallet: &PrivateWallet,
@@ -154,10 +200,27 @@ impl WalletStorage {
         } else {
             wallet.spending_key.clone()
         };
+        let encrypted_scan_key = if let Some(pwd) = password {
+            encrypt_data(&wallet.scan_key, pwd)?
+        } else {
+            wallet.scan_key.clone()
+        };
+
+        // Create a sanitized copy with key material cleared
+        let mut sanitized_wallet = wallet.clone();
+        sanitized_wallet.spending_key = vec![];
+        sanitized_wallet.scan_key = vec![];
+        for key in &mut sanitized_wallet.historical_spending_keys {
+            *key = vec![];
+        }
+        for key in &mut sanitized_wallet.historical_scan_keys {
+            *key = vec![];
+        }
 
         let encrypted = EncryptedPrivateWallet {
-            wallet: wallet.clone(),
+            wallet: sanitized_wallet,
             encrypted_spending_key: encrypted_key,
+            encrypted_scan_key,
         };
 
         let json = serde_json::to_string(&encrypted).map_err(|e| {
@@ -194,32 +257,73 @@ impl WalletStorage {
         let filepath = self.private_wallets_path.join(&filename);
 
         if !filepath.exists() {
-            return Err(BlockError::TransactionValidationFailed(
-                "Private wallet file not found".to_string(),
-            ));
+            return Err(BlockError::TransactionValidationFailed(format!(
+                "private wallet '{}' not found: run 'wallet-list' to see available wallets, or 'wallet-create --name {}' to create it",
+                wallet_name, wallet_name
+            )));
         }
 
         let mut file = fs::File::open(&filepath).map_err(|e| {
-            BlockError::TransactionValidationFailed(format!("Failed to open wallet file: {}", e))
+            BlockError::TransactionValidationFailed(format!(
+                "failed to open private wallet file '{}': {}",
+                filepath.display(),
+                e
+            ))
         })?;
 
         let mut json_bytes = Vec::new();
         file.read_to_end(&mut json_bytes).map_err(|e| {
-            BlockError::TransactionValidationFailed(format!("Failed to read wallet file: {}", e))
+            BlockError::TransactionValidationFailed(format!(
+                "failed to read private wallet file '{}': {}",
+                filepath.display(),
+                e
+            ))
         })?;
 
-        let json_str = String::from_utf8(json_bytes)
-            .map_err(|e| BlockError::TransactionValidationFailed(format!("UTF-8 error: {}", e)))?;
+        let json_str = String::from_utf8(json_bytes).map_err(|e| {
+            BlockError::TransactionValidationFailed(format!(
+                "private wallet file '{}' is corrupted (invalid UTF-8): {}",
+                filepath.display(),
+                e
+            ))
+        })?;
 
         let mut encrypted: EncryptedPrivateWallet =
             serde_json::from_str(&json_str).map_err(|e| {
-                BlockError::TransactionValidationFailed(format!("JSON parse failed: {}", e))
+                BlockError::TransactionValidationFailed(format!(
+                    "private wallet file '{}' is corrupted (invalid JSON): {}",
+                    filepath.display(),
+                    e
+                ))
             })?;
 
-        // Decrypt spending key if password-protected
+        // Restore private keys from encrypted fields, never from wallet body.
         if let Some(pwd) = password {
             let decrypted = decrypt_data(&encrypted.encrypted_spending_key, pwd)?;
             encrypted.wallet.spending_key = decrypted;
+            if encrypted.encrypted_scan_key.is_empty() {
+                encrypted.wallet.scan_key = encrypted.wallet.spending_key.clone();
+            } else {
+                encrypted.wallet.scan_key = decrypt_data(&encrypted.encrypted_scan_key, pwd)?;
+            }
+        } else {
+            if encrypted
+                .encrypted_spending_key
+                .starts_with(ENCRYPTION_MAGIC)
+                || encrypted.encrypted_scan_key.starts_with(ENCRYPTION_MAGIC)
+            {
+                return Err(BlockError::TransactionValidationFailed(
+                    "private wallet is encrypted: provide --password <pwd> to unlock it"
+                        .to_string(),
+                ));
+            }
+            // Without password, the encrypted_spending_key is the raw key
+            encrypted.wallet.spending_key = encrypted.encrypted_spending_key.clone();
+            encrypted.wallet.scan_key = if encrypted.encrypted_scan_key.is_empty() {
+                encrypted.wallet.spending_key.clone()
+            } else {
+                encrypted.encrypted_scan_key.clone()
+            };
         }
 
         Ok(encrypted.wallet)
@@ -312,6 +416,45 @@ impl WalletStorage {
 
         Ok(())
     }
+
+    /// Backup a public wallet file to an arbitrary path.
+    pub fn backup_public_wallet(
+        &self,
+        wallet_name: &str,
+        destination: &std::path::Path,
+    ) -> Result<(), BlockError> {
+        let source = self
+            .wallets_path
+            .join(format!("{}.wallet.json", wallet_name));
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                BlockError::TransactionValidationFailed(format!(
+                    "Failed to create backup dir: {}",
+                    e
+                ))
+            })?;
+        }
+        fs::copy(&source, destination).map_err(|e| {
+            BlockError::TransactionValidationFailed(format!(
+                "Failed to copy backup file from '{}' to '{}': {}",
+                source.display(),
+                destination.display(),
+                e
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Re-encrypt a public wallet with a new passphrase.
+    pub fn change_public_wallet_passphrase(
+        &self,
+        wallet_name: &str,
+        old_password: Option<&str>,
+        new_password: Option<&str>,
+    ) -> Result<(), BlockError> {
+        let (wallet, mnemonic) = self.load_public_wallet(wallet_name, old_password)?;
+        self.save_public_wallet(&wallet, mnemonic, new_password)
+    }
 }
 
 impl Default for WalletStorage {
@@ -369,7 +512,8 @@ fn encrypt_data(data: &[u8], password: &str) -> Result<Vec<u8>, BlockError> {
 
     if password.is_empty() {
         return Err(BlockError::TransactionValidationFailed(
-            "Password cannot be empty".to_string(),
+            "password cannot be empty: choose a non-empty passphrase to protect this wallet"
+                .to_string(),
         ));
     }
 
@@ -408,7 +552,7 @@ fn decrypt_data(encrypted: &[u8], password: &str) -> Result<Vec<u8>, BlockError>
 
     if password.is_empty() {
         return Err(BlockError::TransactionValidationFailed(
-            "Password cannot be empty".to_string(),
+            "password cannot be empty: provide --password <pwd> to unlock the wallet".to_string(),
         ));
     }
 
@@ -429,8 +573,11 @@ fn decrypt_data(encrypted: &[u8], password: &str) -> Result<Vec<u8>, BlockError>
         })?;
         let plaintext = cipher
             .decrypt(Nonce::from_slice(nonce), ciphertext)
-            .map_err(|e| {
-                BlockError::TransactionValidationFailed(format!("Decryption failed: {}", e))
+            .map_err(|_| {
+                BlockError::TransactionValidationFailed(
+                    "incorrect password (or wallet file corrupted): authenticated decryption failed"
+                        .to_string(),
+                )
             })?;
         key.zeroize();
         return Ok(plaintext);
@@ -443,6 +590,8 @@ fn decrypt_data(encrypted: &[u8], password: &str) -> Result<Vec<u8>, BlockError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::private_wallet::PrivateWalletManager;
+    use rand::RngCore;
 
     #[test]
     fn test_wallet_storage_creation() {
@@ -468,5 +617,198 @@ mod tests {
         let legacy = xor_legacy(data, password).expect("legacy");
         let decrypted = decrypt_data(&legacy, password).expect("decrypt fallback");
         assert_eq!(decrypted, data);
+    }
+
+    #[test]
+    fn test_private_wallet_roundtrip_persists_scan_key() {
+        let storage = WalletStorage::new().expect("storage");
+        let mut manager = PrivateWalletManager::new();
+        let mut random_suffix = [0u8; 4];
+        rand::rngs::OsRng.fill_bytes(&mut random_suffix);
+        let wallet_name = format!("storage-test-{}", hex::encode(random_suffix));
+        let password = "private-storage-password";
+
+        manager
+            .create_private_wallet(&wallet_name)
+            .expect("create private wallet");
+        let wallet = manager
+            .get_private_wallet(&wallet_name)
+            .expect("wallet exists")
+            .clone();
+
+        storage
+            .save_private_wallet(&wallet, Some(password))
+            .expect("save private wallet");
+        let restored = storage
+            .load_private_wallet(&wallet_name, Some(password))
+            .expect("load private wallet");
+
+        assert_eq!(restored.spending_key, wallet.spending_key);
+        assert_eq!(restored.scan_key, wallet.scan_key);
+        assert_eq!(restored.commitment_key, wallet.commitment_key);
+        assert!(restored.commitment_key.starts_with("zpriv:"));
+
+        storage
+            .delete_wallet(&wallet_name, true)
+            .expect("cleanup private wallet file");
+    }
+
+    #[test]
+    fn test_encrypted_private_wallet_requires_password() {
+        let storage = WalletStorage::new().expect("storage");
+        let mut manager = PrivateWalletManager::new();
+        let mut random_suffix = [0u8; 4];
+        rand::rngs::OsRng.fill_bytes(&mut random_suffix);
+        let wallet_name = format!("storage-encrypted-test-{}", hex::encode(random_suffix));
+        let password = "required-password";
+
+        manager
+            .create_private_wallet(&wallet_name)
+            .expect("create private wallet");
+        let wallet = manager
+            .get_private_wallet(&wallet_name)
+            .expect("wallet exists")
+            .clone();
+
+        storage
+            .save_private_wallet(&wallet, Some(password))
+            .expect("save encrypted private wallet");
+
+        let without_password = storage.load_private_wallet(&wallet_name, None);
+        assert!(without_password.is_err());
+
+        let restored = storage
+            .load_private_wallet(&wallet_name, Some(password))
+            .expect("load with password");
+        assert_eq!(restored.commitment_key, wallet.commitment_key);
+
+        storage
+            .delete_wallet(&wallet_name, true)
+            .expect("cleanup private wallet file");
+    }
+
+    #[test]
+    fn test_decrypt_with_wrong_password_returns_actionable_message() {
+        let data = b"wallet-sensitive-payload";
+        let encrypted = encrypt_data(data, "right-password").expect("encrypt");
+
+        let err = decrypt_data(&encrypted, "wrong-password").unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("incorrect password"),
+            "wrong-password decryption error must say 'incorrect password'; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_decrypt_empty_password_returns_actionable_message() {
+        let encrypted = encrypt_data(b"x", "p").expect("encrypt");
+        let err = decrypt_data(&encrypted, "").unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("--password"),
+            "empty password error must mention --password flag; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_missing_public_wallet_returns_actionable_message() {
+        let storage = WalletStorage::new().expect("storage");
+        let mut suffix = [0u8; 4];
+        rand::rngs::OsRng.fill_bytes(&mut suffix);
+        let bogus = format!("does-not-exist-{}", hex::encode(suffix));
+
+        let err = storage.load_public_wallet(&bogus, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&bogus),
+            "error must include the wallet name the user typed; got: {msg}"
+        );
+        assert!(
+            msg.contains("wallet-list") || msg.contains("wallet-create"),
+            "error must hint at wallet-list or wallet-create; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_missing_private_wallet_returns_actionable_message() {
+        let storage = WalletStorage::new().expect("storage");
+        let mut suffix = [0u8; 4];
+        rand::rngs::OsRng.fill_bytes(&mut suffix);
+        let bogus = format!("private-does-not-exist-{}", hex::encode(suffix));
+
+        let err = storage.load_private_wallet(&bogus, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&bogus),
+            "error must include the wallet name the user typed; got: {msg}"
+        );
+        assert!(
+            msg.contains("wallet-list") || msg.contains("wallet-create"),
+            "error must hint at wallet-list or wallet-create; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_encrypted_private_wallet_without_password_says_provide_password() {
+        let storage = WalletStorage::new().expect("storage");
+        let mut manager = PrivateWalletManager::new();
+        let mut suffix = [0u8; 4];
+        rand::rngs::OsRng.fill_bytes(&mut suffix);
+        let wallet_name = format!("encrypted-no-pwd-{}", hex::encode(suffix));
+
+        manager
+            .create_private_wallet(&wallet_name)
+            .expect("create private wallet");
+        let wallet = manager
+            .get_private_wallet(&wallet_name)
+            .expect("wallet exists")
+            .clone();
+
+        storage
+            .save_private_wallet(&wallet, Some("locked-password"))
+            .expect("save encrypted");
+
+        let err = storage.load_private_wallet(&wallet_name, None).unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("--password"),
+            "missing-password error must point the user at --password; got: {msg}"
+        );
+
+        storage
+            .delete_wallet(&wallet_name, true)
+            .expect("cleanup private wallet file");
+    }
+
+    #[test]
+    fn test_wallet_file_existence_helpers() {
+        let storage = WalletStorage::new().expect("storage");
+        let mut suffix = [0u8; 4];
+        rand::rngs::OsRng.fill_bytes(&mut suffix);
+        let wallet_name = format!("file-existence-{}", hex::encode(suffix));
+
+        assert!(!storage.public_wallet_file_exists(&wallet_name));
+        assert!(!storage.private_wallet_file_exists(&wallet_name));
+
+        let mut manager = PrivateWalletManager::new();
+        manager
+            .create_private_wallet(&wallet_name)
+            .expect("create private wallet");
+        let wallet = manager
+            .get_private_wallet(&wallet_name)
+            .expect("wallet exists")
+            .clone();
+        storage
+            .save_private_wallet(&wallet, Some("file-test"))
+            .expect("save private wallet");
+
+        assert!(storage.private_wallet_file_exists(&wallet_name));
+
+        storage
+            .delete_wallet(&wallet_name, true)
+            .expect("cleanup private wallet file");
+
+        assert!(!storage.private_wallet_file_exists(&wallet_name));
     }
 }

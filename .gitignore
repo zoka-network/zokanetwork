@@ -1,0 +1,14 @@
+target/
+target-*/
+target_*/
+.rustup-zoka/
+.test_*/
+.zoka/test/
+.zoka/test-suite/
+*.pdb
+*.exe
+*.d
+*.log
+*.lock
+release/
+releases/

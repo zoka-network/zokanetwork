@@ -12,7 +12,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_full_blockchain_lifecycle() {
-        let test_dir = ".test_blockchain_full";
+        let test_dir = ".zoka/test-suite/.test_blockchain_full";
         let _ = fs::remove_dir_all(test_dir);
 
         // 1. Initialize storage
@@ -99,7 +99,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_transaction_validation() {
-        let test_dir = ".test_tx_validation";
+        let test_dir = ".zoka/test-suite/.test_tx_validation";
         let _ = fs::remove_dir_all(test_dir);
 
         let storage = Arc::new(RocksDbStorage::new(test_dir).unwrap());
@@ -121,7 +121,6 @@ mod tests {
             nonce: 1,
             timestamp: 0,
             signature: Signature(vec![]),
-            zk_proof: None,
         };
 
         assert!(mempool.add_transaction(valid_tx, &state).await.is_ok());
@@ -136,7 +135,6 @@ mod tests {
             nonce: 0, // Should be > 0
             timestamp: 0,
             signature: Signature(vec![]),
-            zk_proof: None,
         };
 
         let result = mempool.add_transaction(invalid_nonce_tx, &state).await;
@@ -202,7 +200,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_storage_persistence() {
-        let test_dir = ".test_storage_persist";
+        let test_dir = ".zoka/test-suite/.test_storage_persist";
         let _ = fs::remove_dir_all(test_dir);
 
         // Write data
@@ -249,7 +247,6 @@ mod tests {
             nonce: 1,
             timestamp: 0,
             signature: Signature(vec![1, 2, 3]),
-            zk_proof: None,
         };
 
         // Serialize

@@ -57,6 +57,23 @@ impl MessageHandler for DefaultMessageHandler {
                 let mut stats = self.stats.write().await;
                 stats.transactions += 1;
             }
+            ZokaMessage::StemPrivateTransaction(private_tx) => {
+                info!(
+                    "Processing stem private transaction: route={}, tx={}",
+                    private_tx.route_id, private_tx.private_tx.tx_hash
+                );
+                let mut stats = self.stats.write().await;
+                stats.transactions += 1;
+            }
+            ZokaMessage::PrivateMixerBatch(batch) => {
+                info!(
+                    "Processing private mixer batch: id={}, size={}",
+                    batch.batch_id,
+                    batch.txs.len()
+                );
+                let mut stats = self.stats.write().await;
+                stats.transactions += batch.txs.len() as u64;
+            }
             ZokaMessage::BlockRequest { block_height } => {
                 info!("Block request received: height={}", block_height);
                 let mut stats = self.stats.write().await;

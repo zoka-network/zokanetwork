@@ -1,0 +1,69 @@
+{
+    "schema":  "zoka-mainnet-network-v1",
+    "status":  "launch-ready",
+    "chain_id":  "zoka-mainnet-v1",
+    "protocol_freeze_id":  "/zoka/1.0.0",
+    "transport_policy":  {
+                             "anonymous_transport_preferred":  true,
+                             "clearnet_requires_explicit_operator_choice":  true,
+                             "supported":  [
+                                               "tor",
+                                               "i2p",
+                                               "tcp"
+                                           ]
+                         },
+    "seed_nodes":  [
+                       {
+                           "label":  "seed-na-1",
+                           "operator":  "local-rc-operator-na",
+                           "region":  "north-america",
+                           "multiaddr":  "/ip4/127.0.0.1/tcp/28080",
+                           "onion":  "/onion3/zokalocalrcseednaabcdefghijklmnopqrstuvwxabcdefghijklmnop:28080",
+                           "i2p":  "/dnsaddr/zoka-local-rc-seed-na.b32.i2p",
+                           "role":  "seed",
+                           "status":  "active"
+                       },
+                       {
+                           "label":  "seed-eu-1",
+                           "operator":  "local-rc-operator-eu",
+                           "region":  "europe",
+                           "multiaddr":  "/ip4/127.0.0.1/tcp/28081",
+                           "onion":  "/onion3/zokalocalrcseedeuabcdefghijklmnopqrstuvwxabcdefghijklmnop:28081",
+                           "i2p":  "/dnsaddr/zoka-local-rc-seed-eu.b32.i2p",
+                           "role":  "seed",
+                           "status":  "active"
+                       },
+                       {
+                           "label":  "seed-sa-1",
+                           "operator":  "local-rc-operator-sa",
+                           "region":  "south-america",
+                           "multiaddr":  "/ip4/127.0.0.1/tcp/28082",
+                           "onion":  "/onion3/zokalocalrcseedsaabcdefghijklmnopqrstuvwxabcdefghijklmnop:28082",
+                           "i2p":  "/dnsaddr/zoka-local-rc-seed-sa.b32.i2p",
+                           "role":  "seed",
+                           "status":  "active"
+                       }
+                   ],
+    "public_rpc":  [
+                       {
+                           "label":  "rpc-eu-1",
+                           "operator":  "local-rc-operator-eu",
+                           "region":  "europe",
+                           "url":  "http://127.0.0.1:28880",
+                           "onion":  "http://zokalocalrceuabcdefghijklmnopqrstuvwxabcdefghijklmnop.onion",
+                           "i2p":  "http://zoka-local-rc-rpc-eu.b32.i2p",
+                           "status":  "active",
+                           "logging_policy":  "docs/infrastructure-logs-policy.md"
+                       }
+                   ],
+    "snapshot_signers":  [
+                             "9afdb2914b6a28bba7261f743cf1d6aab033f16e787831672936f5d37bd53c70"
+                         ],
+    "notes":  [
+                  "Set status=active only after operator sign-off and endpoint reachability validation.",
+                  "Replace placeholder peer IDs, onion service IDs and snapshot signer key before launch.",
+                  "Seed operators must be independent by region, provider and legal owner.",
+                  "Do not publish public_rpc entries unless docs/infrastructure-logs-policy.md is enforced.",
+                  "Tor/I2P endpoints should be published alongside any clearnet multiaddr."
+              ]
+}

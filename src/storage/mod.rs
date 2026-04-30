@@ -43,13 +43,52 @@ impl RocksDbStorage {
 
     /// Save a block to storage
     pub fn save_block(&self, block: &Block) -> Result<(), StorageError> {
+        self.save_block_body(block)?;
+        self.set_block_hash_at_height(block.header.block_height, &block.header.hash)?;
+        Ok(())
+    }
+
+    /// Save only the block body by hash. This is used for side branches:
+    /// a block can be known without becoming canonical at its height.
+    pub fn save_block_body(&self, block: &Block) -> Result<(), StorageError> {
         let key = format!("block:{}", block.header.hash);
         let value = serde_json::to_vec(block)
             .map_err(|e| StorageError::SerializationError(e.to_string()))?;
-        self.put_raw(&key, value)?;
-        let height_key = format!("chain:block_height:{}", block.header.block_height);
-        self.put_raw(&height_key, block.header.hash.as_bytes().to_vec())?;
-        Ok(())
+        self.put_raw(&key, value)
+    }
+
+    /// Set the canonical block hash for a height.
+    pub fn set_block_hash_at_height(&self, height: u64, hash: &str) -> Result<(), StorageError> {
+        let height_key = format!("chain:block_height:{}", height);
+        self.put_raw(&height_key, hash.as_bytes().to_vec())
+    }
+
+    /// Remove the canonical height index entry. Used when a reorg selects
+    /// a shorter but heavier chain.
+    pub fn delete_block_hash_at_height(&self, height: u64) -> Result<(), StorageError> {
+        let height_key = format!("chain:block_height:{}", height);
+        self.db
+            .delete(height_key.as_bytes())
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))
+    }
+
+    /// Delete a block body by hash. Used by the pruner when a block is
+    /// older than the retention window. Caller is responsible for
+    /// removing height-index and per-block metadata too — see
+    /// `state::chain::prune_below_head`.
+    pub fn delete_block_body(&self, hash: &str) -> Result<(), StorageError> {
+        let key = format!("block:{}", hash);
+        self.db
+            .delete(key.as_bytes())
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))
+    }
+
+    /// Delete an arbitrary key from storage. Used by the pruner to
+    /// remove `chain:block_meta:<hash>` entries.
+    pub fn delete_raw(&self, key: &str) -> Result<(), StorageError> {
+        self.db
+            .delete(key.as_bytes())
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))
     }
 
     /// Persist block, chain metadata, and all account states atomically.
@@ -77,6 +116,13 @@ impl RocksDbStorage {
             "chain:state_root".as_bytes(),
             state.current_state_root.as_bytes(),
         );
+        batch.put(
+            "chain:private_commitment_root".as_bytes(),
+            state.private_commitment_root.as_bytes(),
+        );
+        let private_commitments = serde_json::to_vec(&state.private_commitments)
+            .map_err(|e| StorageError::SerializationError(e.to_string()))?;
+        batch.put("chain:private_commitments".as_bytes(), private_commitments);
 
         for (address, account) in &state.accounts {
             let key = format!("state:{}", address);
@@ -127,6 +173,70 @@ impl RocksDbStorage {
         let value =
             serde_json::to_vec(tx).map_err(|e| StorageError::SerializationError(e.to_string()))?;
         self.put_raw(&key, value)
+    }
+
+    // ===== Private transaction bodies =====
+    //
+    // Private transactions are held in-memory by `PrivateTransactionPool`.
+    // Persisting their bodies here lets a node survive restarts without
+    // losing the pool, and lets the `/private/tx/:hash` endpoint succeed
+    // after a cold boot. The storage layer stays generic: we take and
+    // return raw bytes, and the caller (private_wallet) handles
+    // serialization. This avoids a cyclic `storage -> private_wallet`
+    // dependency.
+    //
+    // Keys live under the `priv_tx:` prefix so they share the RocksDB
+    // instance with public data but cannot be confused with it during
+    // key scans.
+
+    /// Persist the serialized body of a private transaction.
+    pub fn save_private_transaction_bytes(
+        &self,
+        hash: &str,
+        body: &[u8],
+    ) -> Result<(), StorageError> {
+        let key = format!("priv_tx:{}", hash);
+        self.put_raw(&key, body.to_vec())
+    }
+
+    /// Retrieve a private transaction body, if any.
+    pub fn get_private_transaction_bytes(
+        &self,
+        hash: &str,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let key = format!("priv_tx:{}", hash);
+        self.get_raw(&key)
+    }
+
+    /// Remove a private transaction body from storage (used by retention
+    /// sweeps and rollback).
+    pub fn delete_private_transaction(&self, hash: &str) -> Result<(), StorageError> {
+        let key = format!("priv_tx:{}", hash);
+        self.db
+            .delete(key.as_bytes())
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))
+    }
+
+    /// Iterate over every persisted private transaction body, yielding
+    /// `(hash, body_bytes)` pairs. Useful for warm-loading the pool at
+    /// node startup.
+    pub fn iterate_private_transactions(&self) -> Result<Vec<(String, Vec<u8>)>, StorageError> {
+        let prefix = b"priv_tx:";
+        let mut out = Vec::new();
+        for item in self
+            .db
+            .iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward))
+        {
+            let (key, value) = item.map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let hash = String::from_utf8(key[prefix.len()..].to_vec()).map_err(|_| {
+                StorageError::SerializationError("Invalid UTF-8 in priv_tx key".to_string())
+            })?;
+            out.push((hash, value.to_vec()));
+        }
+        Ok(out)
     }
 
     /// Retrieve a transaction by hash
@@ -203,6 +313,39 @@ impl RocksDbStorage {
         self.put_raw("chain:state_root", root.as_bytes().to_vec())
     }
 
+    /// Get the latest persisted private commitment root
+    pub fn get_private_commitment_root(&self) -> Result<String, StorageError> {
+        match self.get_raw("chain:private_commitment_root")? {
+            Some(data) => {
+                let root = String::from_utf8(data)
+                    .map_err(|_| StorageError::SerializationError("Invalid UTF-8".to_string()))?;
+                Ok(root)
+            }
+            None => Ok("0".to_string()),
+        }
+    }
+
+    /// Set the latest private commitment root
+    pub fn set_private_commitment_root(&self, root: &str) -> Result<(), StorageError> {
+        self.put_raw("chain:private_commitment_root", root.as_bytes().to_vec())
+    }
+
+    /// Get persisted private commitments list
+    pub fn get_private_commitments(&self) -> Result<Vec<String>, StorageError> {
+        match self.get_raw("chain:private_commitments")? {
+            Some(data) => serde_json::from_slice(&data)
+                .map_err(|e| StorageError::SerializationError(e.to_string())),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Persist private commitments list
+    pub fn set_private_commitments(&self, commitments: &[String]) -> Result<(), StorageError> {
+        let serialized = serde_json::to_vec(commitments)
+            .map_err(|e| StorageError::SerializationError(e.to_string()))?;
+        self.put_raw("chain:private_commitments", serialized)
+    }
+
     /// Get the last block hash
     pub fn get_last_block_hash(&self) -> Result<String, StorageError> {
         match self.get_raw("chain:last_hash")? {
@@ -218,6 +361,60 @@ impl RocksDbStorage {
     /// Set the last block hash
     pub fn set_last_block_hash(&self, hash: &str) -> Result<(), StorageError> {
         self.put_raw("chain:last_hash", hash.as_bytes().to_vec())
+    }
+
+    /// Cumulative ZKA emission across the canonical chain (sum of all
+    /// coinbase amounts up to and including the chain tip). Defaults to 0
+    /// when the key is absent so a fresh DB looks like genesis.
+    pub fn get_total_supply_emitted(&self) -> Result<u64, StorageError> {
+        match self.get_raw("chain:total_supply_emitted")? {
+            Some(data) => Ok(String::from_utf8(data)
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0)),
+            None => Ok(0),
+        }
+    }
+
+    pub fn set_total_supply_emitted(&self, total: u64) -> Result<(), StorageError> {
+        self.put_raw("chain:total_supply_emitted", total.to_string().into_bytes())
+    }
+
+    /// Cumulative PoW work across the canonical chain, measured as the sum
+    /// of leading-zero-bits per block hash. Used by fork-choice to pick
+    /// the heaviest chain. Defaults to 0 on a fresh DB.
+    pub fn get_cumulative_work(&self) -> Result<u128, StorageError> {
+        match self.get_raw("chain:cumulative_work")? {
+            Some(data) => Ok(String::from_utf8(data)
+                .ok()
+                .and_then(|s| s.parse::<u128>().ok())
+                .unwrap_or(0)),
+            None => Ok(0),
+        }
+    }
+
+    pub fn set_cumulative_work(&self, work: u128) -> Result<(), StorageError> {
+        self.put_raw("chain:cumulative_work", work.to_string().into_bytes())
+    }
+
+    /// Difficulty bits used for the most recent block on the canonical
+    /// chain. Defaults to 0 (= "no chain yet"); callers must treat 0 as
+    /// "use the canonical genesis difficulty from `economics`".
+    pub fn get_current_difficulty_bits(&self) -> Result<u32, StorageError> {
+        match self.get_raw("chain:current_difficulty_bits")? {
+            Some(data) => Ok(String::from_utf8(data)
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0)),
+            None => Ok(0),
+        }
+    }
+
+    pub fn set_current_difficulty_bits(&self, bits: u32) -> Result<(), StorageError> {
+        self.put_raw(
+            "chain:current_difficulty_bits",
+            bits.to_string().into_bytes(),
+        )
     }
 
     /// Check if a block exists
@@ -498,7 +695,7 @@ mod tests {
 
     #[test]
     fn test_storage_basic_operations() {
-        let test_dir = ".test_storage";
+        let test_dir = ".zoka/test-suite/.test_storage";
         let _ = fs::remove_dir_all(test_dir);
 
         let storage = RocksDbStorage::new(test_dir).expect("Failed to create storage");
@@ -524,8 +721,88 @@ mod tests {
     }
 
     #[test]
+    fn test_storage_private_commitment_metadata() {
+        let test_dir = ".zoka/test-suite/.test_storage_private_commitment";
+        let _ = fs::remove_dir_all(test_dir);
+
+        let storage = RocksDbStorage::new(test_dir).expect("Failed to create storage");
+        let commitments = vec!["c1".to_string(), "c2".to_string()];
+
+        storage.set_private_commitments(&commitments).unwrap();
+        storage
+            .set_private_commitment_root("private-root-1")
+            .unwrap();
+
+        assert_eq!(storage.get_private_commitments().unwrap(), commitments);
+        assert_eq!(
+            storage.get_private_commitment_root().unwrap(),
+            "private-root-1".to_string()
+        );
+
+        let _ = fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn test_storage_private_tx_bodies_roundtrip() {
+        let test_dir = ".zoka/test-suite/.test_storage_priv_tx";
+        let _ = fs::remove_dir_all(test_dir);
+
+        let storage = RocksDbStorage::new(test_dir).expect("storage");
+        // Two opaque bodies — storage treats them as byte blobs.
+        storage
+            .save_private_transaction_bytes("hash_alpha", b"serialized-tx-alpha")
+            .unwrap();
+        storage
+            .save_private_transaction_bytes("hash_beta", b"serialized-tx-beta")
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .get_private_transaction_bytes("hash_alpha")
+                .unwrap()
+                .as_deref(),
+            Some(b"serialized-tx-alpha".as_slice())
+        );
+        assert_eq!(
+            storage
+                .get_private_transaction_bytes("hash_beta")
+                .unwrap()
+                .as_deref(),
+            Some(b"serialized-tx-beta".as_slice())
+        );
+        assert!(storage
+            .get_private_transaction_bytes("missing")
+            .unwrap()
+            .is_none());
+
+        let mut all = storage.iterate_private_transactions().unwrap();
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].0, "hash_alpha");
+        assert_eq!(all[1].0, "hash_beta");
+
+        // Deletion leaves the other body intact and does not leak into
+        // the public `tx:` namespace.
+        storage.delete_private_transaction("hash_alpha").unwrap();
+        assert!(storage
+            .get_private_transaction_bytes("hash_alpha")
+            .unwrap()
+            .is_none());
+        assert!(storage
+            .get_private_transaction_bytes("hash_beta")
+            .unwrap()
+            .is_some());
+        assert!(
+            storage.get_transaction("hash_beta").unwrap().is_none(),
+            "private body must NOT be reachable via the public tx: namespace"
+        );
+
+        let _ = fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
     fn test_storage_account_state() {
-        let test_dir = ".test_storage_account";
+        let test_dir = ".zoka/test-suite/.test_storage_account";
         let _ = fs::remove_dir_all(test_dir);
 
         let storage = RocksDbStorage::new(test_dir).expect("Failed to create storage");
@@ -550,7 +827,7 @@ mod tests {
 
     #[test]
     fn test_storage_get_block_by_height() {
-        let test_dir = ".test_storage_block_index";
+        let test_dir = ".zoka/test-suite/.test_storage_block_index";
         let _ = fs::remove_dir_all(test_dir);
 
         let storage = RocksDbStorage::new(test_dir).expect("Failed to create storage");
@@ -577,7 +854,7 @@ mod tests {
 
     #[test]
     fn test_storage_get_block_by_height_fallback_scan() {
-        let test_dir = ".test_storage_block_fallback";
+        let test_dir = ".zoka/test-suite/.test_storage_block_fallback";
         let _ = fs::remove_dir_all(test_dir);
 
         let storage = RocksDbStorage::new(test_dir).expect("Failed to create storage");
@@ -659,7 +936,7 @@ mod tests {
 
     #[test]
     fn test_encrypted_storage_basic() {
-        let test_dir = ".test_encrypted_storage";
+        let test_dir = ".zoka/test-suite/.test_encrypted_storage";
         let _ = fs::remove_dir_all(test_dir);
 
         let config = EncryptionAtRestConfig::new(vec![42, 84, 126, 210]);
@@ -682,7 +959,7 @@ mod tests {
 
     #[test]
     fn test_encrypted_storage_multiple_keys() {
-        let test_dir = ".test_encrypted_storage_multi";
+        let test_dir = ".zoka/test-suite/.test_encrypted_storage_multi";
         let _ = fs::remove_dir_all(test_dir);
 
         let config = EncryptionAtRestConfig::new(vec![1, 2, 3, 4, 5]);
@@ -701,7 +978,7 @@ mod tests {
 
     #[test]
     fn test_encrypted_storage_delete() {
-        let test_dir = ".test_encrypted_storage_delete";
+        let test_dir = ".zoka/test-suite/.test_encrypted_storage_delete";
         let _ = fs::remove_dir_all(test_dir);
 
         let config = EncryptionAtRestConfig::disabled();
@@ -734,7 +1011,7 @@ mod tests {
 
     #[test]
     fn test_encrypted_storage_account_state() {
-        let test_dir = ".test_encrypted_account";
+        let test_dir = ".zoka/test-suite/.test_encrypted_account";
         let _ = fs::remove_dir_all(test_dir);
 
         let config = EncryptionAtRestConfig::new(vec![111, 222, 33, 44]);

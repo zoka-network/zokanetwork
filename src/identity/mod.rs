@@ -1,5 +1,6 @@
 // Identity module: Handles keys and permissions
 use crate::types::{BlockError, Identity, Permission, PrivateKey, PublicKey, Signature};
+use bip39::{Language, Mnemonic};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
@@ -159,56 +160,35 @@ impl HDWallet {
         Ok(seed)
     }
 
-    /// Convert seed to BIP-39 mnemonic words (simplified: 12 or 24 words)
+    /// Convert seed entropy to BIP-39 mnemonic words.
     pub fn seed_to_mnemonic(&self) -> Result<Vec<String>, BlockError> {
         if self.seed.is_empty() {
             return Err(BlockError::TransactionValidationFailed(
                 "Empty seed".to_string(),
             ));
         }
-
-        // Simplified: Map seed bytes to word indices
-        let word_count = if self.seed.len() >= 32 { 24 } else { 12 };
-        let mut words = Vec::new();
-
-        // BIP-39 simplified word list (first 256 words of actual list)
-        let bip39_words = vec![
-            "abandon", "ability", "able", "about", "above", "absent", "absorb", "abstract",
-            "abuse", "access", "accident", "account", "accuse", "achieve", "acid", "acoustic",
-            "acquire", "across", "act", "action", "actor", "acts", "actual", "ada",
-        ];
-
-        for (_i, byte) in self.seed.iter().take(word_count).enumerate() {
-            let word_idx = (*byte as usize) % bip39_words.len();
-            words.push(bip39_words[word_idx].to_string());
-        }
-
-        // Pad to exact count
-        while words.len() < word_count {
-            words.push("abandon".to_string());
-        }
-
-        Ok(words.into_iter().take(word_count).collect())
+        let mnemonic = Mnemonic::from_entropy_in(Language::English, &self.seed).map_err(|e| {
+            BlockError::TransactionValidationFailed(format!("BIP39 mnemonic error: {}", e))
+        })?;
+        Ok(mnemonic
+            .to_string()
+            .split_whitespace()
+            .map(|w| w.to_string())
+            .collect())
     }
 
-    /// Recover seed from mnemonic words (validate and reconstruct)
+    /// Recover seed entropy from BIP-39 mnemonic words.
     pub fn mnemonic_to_seed(mnemonic: &[String]) -> Result<Vec<u8>, BlockError> {
         if mnemonic.is_empty() || (mnemonic.len() != 12 && mnemonic.len() != 24) {
             return Err(BlockError::TransactionValidationFailed(
                 "Invalid mnemonic length".to_string(),
             ));
         }
-
-        let mut seed = Vec::new();
-        for word in mnemonic {
-            // Simplified: hash each word and append to seed
-            let mut hasher = Sha256::new();
-            hasher.update(word.as_bytes());
-            let hash = hasher.finalize();
-            seed.push((hash[0] ^ hash[1]) as u8);
-        }
-
-        Ok(seed)
+        let phrase = mnemonic.join(" ");
+        let parsed = Mnemonic::parse_in_normalized(Language::English, &phrase).map_err(|e| {
+            BlockError::TransactionValidationFailed(format!("Invalid mnemonic: {}", e))
+        })?;
+        Ok(parsed.to_entropy())
     }
 
     /// Derive account keys from master using BIP-32 path
@@ -446,20 +426,8 @@ mod tests {
 
     #[test]
     fn test_mnemonic_to_seed_recovery_12() {
-        let mnemonic = vec![
-            "abandon".to_string(),
-            "ability".to_string(),
-            "abandon".to_string(),
-            "abandon".to_string(),
-            "abandon".to_string(),
-            "abandon".to_string(),
-            "abandon".to_string(),
-            "abandon".to_string(),
-            "abandon".to_string(),
-            "abandon".to_string(),
-            "abandon".to_string(),
-            "abandon".to_string(),
-        ];
+        let wallet = HDWallet::new(vec![7u8; 16]).unwrap();
+        let mnemonic = wallet.seed_to_mnemonic().unwrap();
         let seed = HDWallet::mnemonic_to_seed(&mnemonic);
         assert!(seed.is_ok());
         assert!(!seed.unwrap().is_empty());
@@ -467,10 +435,8 @@ mod tests {
 
     #[test]
     fn test_mnemonic_to_seed_recovery_24() {
-        let mut mnemonic = vec![];
-        for _ in 0..24 {
-            mnemonic.push("abandon".to_string());
-        }
+        let wallet = HDWallet::new(vec![9u8; 32]).unwrap();
+        let mnemonic = wallet.seed_to_mnemonic().unwrap();
         let seed = HDWallet::mnemonic_to_seed(&mnemonic);
         assert!(seed.is_ok());
     }

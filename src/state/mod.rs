@@ -1,3 +1,10 @@
+pub mod chain;
+pub mod sync;
+
+use crate::crypto::{
+    private_tree_hash_commitment, private_tree_hash_pair, private_tree_scalar_from_hex,
+    private_tree_scalar_to_hex, PRIVATE_TREE_DEPTH,
+};
 use crate::storage::RocksDbStorage;
 use crate::types::{AccountState, Block, State, StateError, Transaction};
 use serde::{Deserialize, Serialize};
@@ -20,6 +27,14 @@ pub struct AccountInclusionProof {
     pub steps: Vec<MerkleProofStep>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PrivateCommitmentInclusionProof {
+    pub commitment: String,
+    pub leaf_hash: String,
+    pub root_hash: String,
+    pub steps: Vec<MerkleProofStep>,
+}
+
 fn hash_account_leaf(address: &str, account: &AccountState) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(address.as_bytes());
@@ -36,18 +51,12 @@ fn hash_pair(left: &[u8], right: &[u8]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-fn compute_state_root_for_state(state: &State) -> String {
-    if state.accounts.is_empty() {
+fn compute_merkle_root_from_sorted_leaves(mut leaves: Vec<(String, Vec<u8>)>) -> String {
+    if leaves.is_empty() {
         return "0".to_string();
     }
 
-    let mut leaves: Vec<(String, Vec<u8>)> = state
-        .accounts
-        .iter()
-        .map(|(address, account)| (address.clone(), hash_account_leaf(address, account)))
-        .collect();
     leaves.sort_by(|a, b| a.0.cmp(&b.0));
-
     let mut level: Vec<Vec<u8>> = leaves.into_iter().map(|(_, leaf)| leaf).collect();
     while level.len() > 1 {
         let mut next_level = Vec::with_capacity(level.len().div_ceil(2));
@@ -64,6 +73,143 @@ fn compute_state_root_for_state(state: &State) -> String {
     }
 
     hex::encode(&level[0])
+}
+
+fn compute_account_root_for_state(state: &State) -> String {
+    if state.accounts.is_empty() {
+        return "0".to_string();
+    }
+
+    let leaves: Vec<(String, Vec<u8>)> = state
+        .accounts
+        .iter()
+        .map(|(address, account)| (address.clone(), hash_account_leaf(address, account)))
+        .collect();
+    compute_merkle_root_from_sorted_leaves(leaves)
+}
+
+pub fn hash_private_commitment_leaf_bytes(commitment: &str) -> Vec<u8> {
+    private_tree_hash_commitment(commitment).to_bytes().to_vec()
+}
+
+pub fn hash_private_commitment_leaf_hex(commitment: &str) -> String {
+    private_tree_scalar_to_hex(&private_tree_hash_commitment(commitment))
+}
+
+fn build_private_commitment_layers(commitments: &[String]) -> Vec<Vec<bls12_381::Scalar>> {
+    if commitments.is_empty() {
+        return Vec::new();
+    }
+
+    let mut leaves: Vec<(String, bls12_381::Scalar)> = commitments
+        .iter()
+        .cloned()
+        .map(|commitment| {
+            (
+                commitment.clone(),
+                private_tree_hash_commitment(&commitment),
+            )
+        })
+        .collect();
+    leaves.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut layers = Vec::with_capacity(PRIVATE_TREE_DEPTH + 1);
+    let mut current: Vec<bls12_381::Scalar> = leaves.into_iter().map(|(_, leaf)| leaf).collect();
+    layers.push(current.clone());
+
+    for _ in 0..PRIVATE_TREE_DEPTH {
+        let mut next = Vec::with_capacity(current.len().div_ceil(2).max(1));
+        for chunk in current.chunks(2) {
+            let left = chunk[0];
+            let right = if chunk.len() == 2 { chunk[1] } else { chunk[0] };
+            next.push(private_tree_hash_pair(left, right));
+        }
+        current = next;
+        layers.push(current.clone());
+    }
+
+    layers
+}
+
+fn compute_private_commitment_root(commitments: &[String]) -> String {
+    if commitments.is_empty() {
+        return "0".to_string();
+    }
+
+    let layers = build_private_commitment_layers(commitments);
+    private_tree_scalar_to_hex(layers.last().and_then(|level| level.first()).unwrap())
+}
+
+pub fn build_private_commitment_inclusion_proofs(
+    commitments: &[String],
+    targets: &[String],
+) -> Option<(String, Vec<PrivateCommitmentInclusionProof>)> {
+    if commitments.is_empty() {
+        return None;
+    }
+
+    let mut leaves: Vec<(String, bls12_381::Scalar)> = commitments
+        .iter()
+        .cloned()
+        .map(|commitment| {
+            (
+                commitment.clone(),
+                private_tree_hash_commitment(&commitment),
+            )
+        })
+        .collect();
+    leaves.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let root_hash = compute_private_commitment_root(commitments);
+    let mut proofs = Vec::with_capacity(targets.len());
+
+    for target in targets {
+        let mut index = leaves.iter().position(|(c, _)| c == target)?;
+        let (proof_commitment, proof_leaf) = leaves[index].clone();
+        let mut level: Vec<bls12_381::Scalar> = leaves.iter().map(|(_, leaf)| *leaf).collect();
+        let mut steps = Vec::new();
+
+        for _ in 0..PRIVATE_TREE_DEPTH {
+            let sibling_index = if index % 2 == 0 {
+                if index + 1 < level.len() {
+                    index + 1
+                } else {
+                    index
+                }
+            } else {
+                index - 1
+            };
+            let sibling = level[sibling_index];
+            steps.push(MerkleProofStep {
+                sibling_hash: private_tree_scalar_to_hex(&sibling),
+                sibling_on_left: sibling_index < index,
+            });
+
+            let mut next_level = Vec::with_capacity(level.len().div_ceil(2).max(1));
+            for chunk in level.chunks(2) {
+                let left = chunk[0];
+                let right = if chunk.len() == 2 { chunk[1] } else { chunk[0] };
+                next_level.push(private_tree_hash_pair(left, right));
+            }
+            index /= 2;
+            level = next_level;
+        }
+
+        proofs.push(PrivateCommitmentInclusionProof {
+            commitment: proof_commitment,
+            leaf_hash: private_tree_scalar_to_hex(&proof_leaf),
+            root_hash: root_hash.clone(),
+            steps,
+        });
+    }
+
+    Some((root_hash, proofs))
+}
+
+fn compute_state_root_for_state(state: &State) -> String {
+    // Canonical state root remains account-based for backward compatibility.
+    // Private commitments are tracked via `private_commitment_root`.
+    compute_account_root_for_state(state)
 }
 
 /// Blockchain state machine managing all account states
@@ -115,12 +261,26 @@ impl StateManager {
             state.accounts.insert(account.address.clone(), account);
         }
 
-        // Recompute state root from loaded account set if needed.
-        if !state.accounts.is_empty() {
-            let recomputed_root = compute_state_root_for_state(&state);
-            if state.current_state_root == "0" || state.current_state_root != recomputed_root {
-                state.current_state_root = recomputed_root;
-            }
+        state.private_commitments = self
+            .storage
+            .get_private_commitments()
+            .map_err(|e| StateError::StorageError(e.to_string()))?;
+        state.private_commitment_root = self
+            .storage
+            .get_private_commitment_root()
+            .map_err(|e| StateError::StorageError(e.to_string()))?;
+
+        let recomputed_private_root = compute_private_commitment_root(&state.private_commitments);
+        if state.private_commitment_root == "0"
+            || state.private_commitment_root != recomputed_private_root
+        {
+            state.private_commitment_root = recomputed_private_root;
+        }
+
+        // Recompute combined state root from loaded account + private commitment sets.
+        let recomputed_root = compute_state_root_for_state(&state);
+        if state.current_state_root == "0" || state.current_state_root != recomputed_root {
+            state.current_state_root = recomputed_root;
         }
 
         Ok(())
@@ -167,6 +327,11 @@ impl StateManager {
         state: &mut State,
         tx: &Transaction,
     ) -> Result<(), StateError> {
+        // Private transactions live in `private_wallet::PrivateTransaction`
+        // and never enter this path — the public `Transaction` type no longer
+        // has a `zk_proof` field, so the type system already enforces that
+        // anything arriving here is a plaintext public transfer.
+
         // Get or create sender account
         let sender = state
             .accounts
@@ -287,6 +452,20 @@ impl StateManager {
         }
     }
 
+    /// Return the private-transaction hashes committed at this block
+    /// height. The actual `PrivateTransaction` bodies live in
+    /// `PrivateTransactionPool`; callers that want the full private tx
+    /// must look each hash up there.
+    pub async fn get_block_private_tx_hashes(
+        &self,
+        height: u64,
+    ) -> Result<Vec<String>, StateError> {
+        match self.get_block_by_height(height).await? {
+            Some(block) => Ok(block.private_tx_hashes),
+            None => Err(StateError::StorageError("Block not found".to_string())),
+        }
+    }
+
     /// Create an account with initial balance (for testing/genesis)
     pub async fn create_account(
         &self,
@@ -351,6 +530,12 @@ impl StateManager {
 
         self.storage
             .set_state_root(&state.current_state_root)
+            .map_err(|e| StateError::StorageError(e.to_string()))?;
+        self.storage
+            .set_private_commitment_root(&state.private_commitment_root)
+            .map_err(|e| StateError::StorageError(e.to_string()))?;
+        self.storage
+            .set_private_commitments(&state.private_commitments)
             .map_err(|e| StateError::StorageError(e.to_string()))?;
 
         Ok(())
@@ -507,6 +692,78 @@ impl StateManager {
         let recomputed_root = hex::encode(current);
         recomputed_root == expected_root && recomputed_root == proof.root_hash
     }
+
+    /// Append a private commitment to the state commitment tree.
+    pub async fn append_private_commitment(
+        &self,
+        commitment: String,
+    ) -> Result<String, StateError> {
+        if commitment.is_empty() {
+            return Err(StateError::InvalidStateTransition);
+        }
+
+        let mut state = self.state.write().await;
+        state.private_commitments.push(commitment);
+        state.private_commitment_root = compute_private_commitment_root(&state.private_commitments);
+        state.current_state_root = compute_state_root_for_state(&state);
+
+        self.storage
+            .set_private_commitments(&state.private_commitments)
+            .map_err(|e| StateError::StorageError(e.to_string()))?;
+        self.storage
+            .set_private_commitment_root(&state.private_commitment_root)
+            .map_err(|e| StateError::StorageError(e.to_string()))?;
+        self.storage
+            .set_state_root(&state.current_state_root)
+            .map_err(|e| StateError::StorageError(e.to_string()))?;
+
+        Ok(state.private_commitment_root.clone())
+    }
+
+    /// Return the current private commitment Merkle root.
+    pub async fn get_private_commitment_root(&self) -> String {
+        let state = self.state.read().await;
+        state.private_commitment_root.clone()
+    }
+
+    /// Build inclusion proof for a private commitment currently in state.
+    pub async fn get_private_commitment_inclusion_proof(
+        &self,
+        commitment: &str,
+    ) -> Option<PrivateCommitmentInclusionProof> {
+        let state = self.state.read().await;
+        let (_, mut proofs) = build_private_commitment_inclusion_proofs(
+            &state.private_commitments,
+            &[commitment.to_string()],
+        )?;
+        proofs.pop()
+    }
+
+    /// Verify a private commitment inclusion proof against expected root.
+    pub fn verify_private_commitment_inclusion_proof(
+        expected_root: &str,
+        proof: &PrivateCommitmentInclusionProof,
+    ) -> bool {
+        let mut current = private_tree_hash_commitment(&proof.commitment);
+        if private_tree_scalar_to_hex(&current) != proof.leaf_hash {
+            return false;
+        }
+
+        for step in &proof.steps {
+            let sibling = match private_tree_scalar_from_hex(&step.sibling_hash) {
+                Some(scalar) => scalar,
+                None => return false,
+            };
+            current = if step.sibling_on_left {
+                private_tree_hash_pair(sibling, current)
+            } else {
+                private_tree_hash_pair(current, sibling)
+            };
+        }
+
+        let recomputed_root = private_tree_scalar_to_hex(&current);
+        recomputed_root == expected_root && recomputed_root == proof.root_hash
+    }
 }
 
 /// State pruning and garbage collection
@@ -627,7 +884,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_apply_transaction() {
-        let test_dir = ".test_state_tx";
+        let test_dir = ".zoka/test-suite/.test_state_tx";
         let _ = fs::remove_dir_all(test_dir);
 
         let storage = Arc::new(RocksDbStorage::new(test_dir).unwrap());
@@ -681,7 +938,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_insufficient_balance() {
-        let test_dir = ".test_state_balance";
+        let test_dir = ".zoka/test-suite/.test_state_balance";
         let _ = fs::remove_dir_all(test_dir);
 
         let storage = Arc::new(RocksDbStorage::new(test_dir).unwrap());
@@ -723,7 +980,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_root_validated_during_block_apply() {
-        let test_dir = ".test_state_root_validation";
+        let test_dir = ".zoka/test-suite/.test_state_root_validation";
         let _ = fs::remove_dir_all(test_dir);
 
         let storage = Arc::new(RocksDbStorage::new(test_dir).unwrap());
@@ -782,7 +1039,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_account_inclusion_proof_roundtrip() {
-        let test_dir = ".test_state_merkle_proof";
+        let test_dir = ".zoka/test-suite/.test_state_merkle_proof";
         let _ = fs::remove_dir_all(test_dir);
 
         let storage = Arc::new(RocksDbStorage::new(test_dir).unwrap());
@@ -821,7 +1078,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_from_storage_restores_accounts() {
-        let test_dir = ".test_state_load_storage";
+        let test_dir = ".zoka/test-suite/.test_state_load_storage";
         let _ = fs::remove_dir_all(test_dir);
 
         let storage = Arc::new(RocksDbStorage::new(test_dir).unwrap());
@@ -858,6 +1115,71 @@ mod tests {
         assert!(alice.is_some());
         assert!(bob.is_some());
         assert_ne!(manager.get_state_root().await, "0");
+
+        let _ = fs::remove_dir_all(test_dir);
+    }
+
+    #[tokio::test]
+    async fn test_private_commitment_tree_roundtrip() {
+        let test_dir = ".zoka/test-suite/.test_private_commitment_tree";
+        let _ = fs::remove_dir_all(test_dir);
+
+        let storage = Arc::new(RocksDbStorage::new(test_dir).unwrap());
+        let manager = StateManager::new(storage.clone());
+
+        let root_1 = manager
+            .append_private_commitment("cmt-a".to_string())
+            .await
+            .unwrap();
+        assert_ne!(root_1, "0");
+
+        let root_2 = manager
+            .append_private_commitment("cmt-b".to_string())
+            .await
+            .unwrap();
+        assert_ne!(root_1, root_2);
+        assert_eq!(manager.get_private_commitment_root().await, root_2);
+
+        manager.load_from_storage().await.unwrap();
+        assert_eq!(manager.get_private_commitment_root().await, root_2);
+
+        let _ = fs::remove_dir_all(test_dir);
+    }
+
+    #[tokio::test]
+    async fn test_private_commitment_inclusion_proof_roundtrip() {
+        let test_dir = ".zoka/test-suite/.test_private_commitment_proof";
+        let _ = fs::remove_dir_all(test_dir);
+
+        let storage = Arc::new(RocksDbStorage::new(test_dir).unwrap());
+        let manager = StateManager::new(storage);
+        manager
+            .append_private_commitment("cmt-a".to_string())
+            .await
+            .unwrap();
+        manager
+            .append_private_commitment("cmt-b".to_string())
+            .await
+            .unwrap();
+        manager
+            .append_private_commitment("cmt-c".to_string())
+            .await
+            .unwrap();
+
+        let root = manager.get_private_commitment_root().await;
+        let proof = manager
+            .get_private_commitment_inclusion_proof("cmt-b")
+            .await
+            .expect("proof must exist");
+        assert!(StateManager::verify_private_commitment_inclusion_proof(
+            &root, &proof
+        ));
+
+        let mut tampered = proof.clone();
+        tampered.commitment = "cmt-x".to_string();
+        assert!(!StateManager::verify_private_commitment_inclusion_proof(
+            &root, &tampered
+        ));
 
         let _ = fs::remove_dir_all(test_dir);
     }
