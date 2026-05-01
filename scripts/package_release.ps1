@@ -27,11 +27,11 @@ param(
 $ErrorActionPreference = "Stop"
 
 function Invoke-Checked {
-    param([string]$Command, [string[]]$Args)
-    Write-Host "==> $Command $($Args -join ' ')"
-    & $Command @Args
+    param([string]$Command, [string[]]$CommandArgs)
+    Write-Host "==> $Command $($CommandArgs -join ' ')"
+    & $Command @CommandArgs
     if ($LASTEXITCODE -ne 0) {
-        throw "command failed: $Command $($Args -join ' ')"
+        throw "command failed: $Command $($CommandArgs -join ' ')"
     }
 }
 
@@ -86,7 +86,7 @@ foreach ($target in $Targets) {
     }
 
     if (-not $SkipBuild) {
-        Invoke-Checked -Command "cargo" -Args $cargoArgs
+        Invoke-Checked -Command "cargo" -CommandArgs $cargoArgs
     }
 
     $artifactName = "zoka-$Version-$target"
