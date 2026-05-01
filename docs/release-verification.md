@@ -65,14 +65,14 @@ gpg --import zoka-release-signing.asc   # primera vez solamente
 gpg --verify SHA256SUMS.txt.asc SHA256SUMS.txt
 ```
 
-Salida esperada: `Good signature from "ZOKA Release <release@zoka...>"` con
+Salida esperada: `Good signature from "ZOKA Release <release@zoka.local>"` con
 fingerprint igual al publicado mas abajo.
 
 ### Fingerprint de la clave de release
 
 
 ```
-4AB9 49CA 7255 79DF FF5D BE2F 7007 39CE F978 DD3C
+B9B8 0871 6252 5D33 771F 0562 2834 2DF9 834A E872
 ```
 
 Si tu `gpg --verify` imprime un fingerprint distinto, **no confiar**: ni en
