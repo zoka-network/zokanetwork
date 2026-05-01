@@ -2,6 +2,10 @@ target/
 target-*/
 target_*/
 .rustup-zoka/
+.claude/
+.install_vctools.cmd
+.vs_install_cmd.exitcode
+.vswhere.json
 .test_*/
 .zoka/test/
 .zoka/test-suite/
