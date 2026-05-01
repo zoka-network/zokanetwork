@@ -7,6 +7,7 @@ target_*/
 .vs_install_cmd.exitcode
 .vswhere.json
 .test_*/
+.zoka/
 .zoka/test/
 .zoka/test-suite/
 *.pdb
