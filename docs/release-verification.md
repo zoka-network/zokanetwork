@@ -78,6 +78,19 @@ B9B8 0871 6252 5D33 771F 0562 2834 2DF9 834A E872
 Si tu `gpg --verify` imprime un fingerprint distinto, **no confiar**: ni en
 el binario, ni en `SHA256SUMS.txt`. Reportar a `security@zoka...`.
 
+### Custodia de la clave de release
+
+La clave publica oficial esta versionada en `docs/zoka-release-signing.asc`.
+La clave privada y su passphrase no se versionan: en esta maquina quedaron
+en `.zoka/gnupg-official-release` y
+`.zoka/gnupg-official-release-passphrase.txt`, ambos ignorados por Git.
+Antes de reinstalar Windows, limpiar `.zoka/`, mover el repo o publicar un
+release final, respaldar esos secretos en almacenamiento seguro offline.
+
+La regla de oro: el fingerprint documentado debe coincidir exactamente con
+la clave que firma `SHA256SUMS.txt`. Si no coincide, no confiar en el
+release.
+
 ## 4. Reproducir el build (opcional)
 
 Para anclar la confianza al source code (no a la firma de quien construyo el
