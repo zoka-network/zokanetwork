@@ -25,3 +25,33 @@
 - [ ] `zoka wallet-balance --help`
 - [ ] `zoka tx-send --help`
 - [ ] `zoka mine --help`
+
+## Local multi-node rehearsal
+
+- [ ] 2-4 local nodes boot with separate DBs, ports and wallets.
+- [ ] Nodes discover/connect to each other.
+- [ ] A mined block propagates from one node to the others.
+- [ ] A fresh node syncs from height 0 to current head.
+- [ ] Restarted nodes preserve chain head and reconnect.
+- [ ] Wallet flow over local network passes: create, backup, restore, balance,
+  mine/receive coinbase, maturity, private transfer.
+- [ ] Evidence archived: commands, node IDs, heights, head hashes and logs.
+
+## CLI/UX gate
+
+- [ ] Exhaustive command matrix for `zoka` and `zokahd` passes.
+- [ ] Error cases are actionable: wrong password, missing wallet, invalid
+  address, invalid path, no peers, empty DB.
+- [ ] `--json` outputs remain stable and machine-readable.
+- [ ] Human console output is readable: help, tables, errors, node/mining
+  dashboard and wallet status.
+
+## AI assistant gate
+
+- [ ] AI assistant is optional and disabled unless explicitly invoked.
+- [ ] Offline/local mode is the default.
+- [ ] Assistant maps natural language to audited internal CLI/core actions.
+- [ ] Assistant never reads, prints, sends or stores seeds, spend keys,
+  passphrases or private material.
+- [ ] Sensitive actions require explicit confirmation.
+- [ ] Prompt-injection and secret-exfiltration tests pass.

@@ -12,6 +12,10 @@ Mainnet publica solo se considera lista cuando:
 
 - un usuario puede crear, respaldar, restaurar y usar una wallet sin ayuda tecnica;
 - un nodo puede arrancar, sincronizar, minar y mantenerse conectado sin intervencion manual;
+- una red local con multiples nodos puede conectarse, propagar bloques,
+  resincronizar nodos atrasados y sobrevivir reinicios;
+- todos los comandos `zoka` y `zokahd` fueron ejercitados en una matriz
+  reproducible de exito/error;
 - el genesis, chain ID, economia y validator set estan congelados y publicados;
 - los binarios son reproducibles, firmados y verificables;
 - la red fue probada en testnet publica continua;
@@ -172,6 +176,20 @@ Salida de fase:
 
 Bloqueante de mainnet.
 
+- [ ] Ejecutar rehearsal local multi-nodo antes de abrir testnet publica.
+- [ ] Levantar 2-4 nodos locales con DBs, puertos y wallets separados.
+- [ ] Confirmar conexion P2P entre nodos locales.
+- [ ] Confirmar mineria en un nodo y propagacion/aplicacion del bloque en los
+  demas.
+- [ ] Confirmar IBD/sync de un nodo que arranca desde DB vacia contra peers ya
+  avanzados.
+- [ ] Confirmar restart limpio: nodos conservan chain head, reconectan y siguen
+  minando/sincronizando.
+- [ ] Probar wallet de usuario sobre esa red local: create, backup, restore,
+  balance, history, coinbase maturity y transferencia privada cuando haya fondos
+  spendables.
+- [ ] Guardar evidencia de rehearsal: comandos, logs minimos, heights, head
+  hashes y resultado por nodo.
 - [ ] Lanzar testnet publica con genesis propio.
 - [ ] Mantenerla 8 a 12 semanas sin reset no planificado.
 - [ ] Probar wallets nuevas/restauradas.
@@ -186,7 +204,40 @@ Bloqueante de mainnet.
 
 Salida de fase:
 
-- evidencia publica de estabilidad, no solo pruebas locales.
+- evidencia local reproducible antes de testnet y evidencia publica de
+  estabilidad despues, no solo tests unitarios.
+
+---
+
+## Fase 6.5 - CLI/UX y agente AI privado
+
+Bloqueante de calidad antes de invitar usuarios no tecnicos.
+
+- [ ] Ejecutar auditoria intensiva de todos los comandos `zoka` y `zokahd`.
+- [ ] Cubrir casos OK, errores esperados, `--json`, wallets inexistentes,
+  passwords incorrectos, DB vacia, rutas invalidas, red sin peers y comandos de
+  ayuda.
+- [ ] Convertir la matriz en script reproducible para CI/local smoke.
+- [ ] Mejorar presentacion visual de consola: help, tablas, errores, dashboard
+  de nodo, mineria y estados de wallet.
+- [ ] Mantener estable toda salida `--json` para integraciones externas.
+- [ ] Disenar `zoka ai` o `zoka assistant` como feature opcional para operar por
+  lenguaje natural.
+- [ ] El agente AI solo puede invocar acciones existentes del CLI/core; no puede
+  saltarse validaciones de wallet, transaccion, mineria o nodo.
+- [ ] El agente nunca debe leer, imprimir, enviar ni guardar seed phrases,
+  spend keys, passphrases o material privado.
+- [ ] Modo offline/local por defecto; cualquier proveedor externo debe ser
+  opcional, explicito y apagado por defecto.
+- [ ] Acciones sensibles como crear wallet, exportar secretos, enviar fondos,
+  borrar wallet o iniciar mineria requieren confirmacion explicita.
+- [ ] Tests contra prompt injection, exfiltracion de secretos y ejecucion de
+  acciones sin confirmacion.
+
+Salida de fase:
+
+- un usuario puede operar ZOKA desde consola con comandos claros o con un agente
+  asistido, sin degradar privacidad ni seguridad de claves.
 
 ---
 
@@ -257,7 +308,11 @@ Orden recomendado de trabajo desde el estado actual:
 9. ~~Seed/RPC config cargable por nodo.~~ Cerrado: `fullnode`/`zokahd` auto-cargan `docs/mainnet-network.v1.json`, conectan seeds activos y `zoka mainnet-network-lint` valida readiness minima.
 10. ~~Release tooling + user-facing docs (Fases 7-8 codeable).~~ Cerrado: `scripts/package_release.ps1`, `scripts/release_checksums.{ps1,sh}`, `scripts/check_randomx_toolchain.ps1`, `scripts/mainnet_readiness_check.ps1`, runbooks (`docs/runbook-*.md`), reference de usuario (`docs/user-cli-reference.en.md`), build reproducible (`docs/reproducible-builds.md`), verification (`docs/release-verification.md`), regression gate del genesis publicado.
 11. ~~Operability helpers finales.~~ Cerrado: test de integracion mainnet boot, `zoka chain-stats`, `zoka chain-prune`, `zoka snapshot-info` y smoke CLI reproducible.
-12. Pendiente externo (no codeable por el agente): commit-freeze del release, firma GPG de `SHA256SUMS.txt`, auditoria externa (Fase 5), testnet publica 8-12 semanas (Fase 6), bug bounty + ventana de launch + dry-run T-24/48h (Fase 8).
+12. Pendiente inmediato codeable: rehearsal local multi-nodo, auditoria total de
+    CLI, mejora visual de consola y agente AI privado opcional.
+13. Pendiente externo/operativo: commit-freeze del release, auditoria externa
+    (Fase 5), testnet publica 8-12 semanas (Fase 6), bug bounty + ventana de
+    launch + dry-run T-24/48h (Fase 8).
 
 ---
 

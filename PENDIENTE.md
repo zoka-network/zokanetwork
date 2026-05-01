@@ -2,7 +2,7 @@
 
 Roadmap canonico: [docs/mainnet_launch_roadmap_v6.md](docs/mainnet_launch_roadmap_v6.md)
 
-Estado al 2026-04-28: la base tecnica principal de v6 esta cerrada y
+Estado al 2026-05-01: la base tecnica principal de v6 esta cerrada y
 verificada localmente, pero ZOKA todavia no esta lista para mainnet publica.
 Lo que falta ya no es "terminar wallet/PoW/genesis basico", sino cerrar
 operacion real, auditoria, testnet publica y release firmado.
@@ -72,6 +72,60 @@ principal ya es externo/operativo.
   checksum y firma GPG local. Ver
   `docs/local-rc-complete-status.md`.
 
+## Nuevo bloqueante pre-mainnet: rehearsal local intensivo
+
+Antes de decir "mainnet para todos los usuarios", ZOKA debe pasar un ensayo
+local controlado que simule operadores y usuarios reales sin depender todavia de
+infraestructura publica.
+
+- [ ] Levantar 2-4 nodos locales independientes con directorios `.zoka`
+  separados, puertos distintos y genesis/config mainnet RC.
+- [ ] Verificar discovery/conexion peer-to-peer entre nodos locales.
+- [ ] Minar bloques desde un nodo y confirmar propagacion/aplicacion en los
+  demas.
+- [ ] Arrancar un nodo atrasado desde DB vacia y verificar sync/IBD hasta la
+  altura actual.
+- [ ] Probar restart de nodos: apagar/arrancar, conservar DB, reconectar y
+  continuar desde chain head correcto.
+- [ ] Probar wallet real sobre la red local: crear, respaldar, restaurar,
+  consultar balance, minar/recibir coinbase y respetar maturity.
+- [ ] Probar transferencia privada entre wallets locales cuando haya fondos
+  spendables.
+- [ ] Documentar evidencia: comandos, logs minimos, alturas, hashes de head y
+  resultado por nodo.
+
+## Nuevo bloqueante pre-mainnet: auditoria total de CLI
+
+- [ ] Ejecutar una matriz exhaustiva de todos los comandos `zoka` y `zokahd`,
+  incluyendo casos OK, errores esperados, `--json`, passwords incorrectos,
+  wallet inexistente, DB vacia, rutas invalidas y red sin peers.
+- [ ] Convertir esa matriz en script reproducible para no depender de pruebas
+  manuales.
+- [ ] Revisar textos user-facing: mensajes claros, consistentes, sin ruido
+  tecnico innecesario y con acciones sugeridas.
+- [ ] Mejorar la presentacion visual de la consola: help, tablas, estados,
+  errores y dashboard de nodo/mineria, manteniendo salida `--json` estable.
+
+## Nuevo objetivo mayor: agente AI privado para consola
+
+Objetivo: integrar un agente AI opcional para que el usuario pueda chatear por
+consola y pedir acciones en lenguaje natural, por ejemplo crear wallet,
+consultar balance, minar, explicar estado del nodo o preparar una transaccion.
+
+Condiciones obligatorias:
+
+- [ ] El agente nunca debe leer, imprimir, enviar ni almacenar seed phrases,
+  spend keys, passphrases o material privado sensible.
+- [ ] Toda accion destructiva o irreversible requiere confirmacion explicita del
+  usuario.
+- [ ] El agente debe mapear lenguaje natural a comandos internos auditables, no
+  saltarse las validaciones del CLI.
+- [ ] Modo offline/local primero; cualquier proveedor externo de AI debe ser
+  opcional y estar bloqueado por defecto para proteger privacidad.
+- [ ] El agente debe explicar que accion va a ejecutar antes de ejecutarla.
+- [ ] Las rutas de wallet, transaccion, mineria y nodo deben tener tests de
+  seguridad contra prompt injection y filtracion de secretos.
+
 ## Pendiente humano / operativo
 
 - [x] Copiar `docs/mainnet-launch-material.template.json` fuera del repo,
@@ -112,9 +166,9 @@ principal ya es externo/operativo.
 
 ## Siguiente orden recomendado
 
-1. Limpiar el working tree: separar codigo/doc fuente de artefactos locales
-   (`target`, `.zoka`, DBs de prueba) y preparar commits auditables.
-2. Limpiar/commitear el working tree y congelar tag si este RC local queda
-   como base.
-3. Para mainnet publica, reemplazar endpoints locales por operadores reales.
-4. Pasar a auditoria externa + testnet publica.
+1. Ejecutar rehearsal local multi-nodo con evidencia.
+2. Ejecutar auditoria intensiva de todos los comandos `zoka`/`zokahd`.
+3. Mejorar UX visual de consola sin romper `--json`.
+4. Disenar e implementar agente AI privado como feature opcional.
+5. Para mainnet publica, reemplazar endpoints locales por operadores reales.
+6. Pasar a auditoria externa + testnet publica.
