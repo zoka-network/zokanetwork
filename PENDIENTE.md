@@ -78,9 +78,9 @@ Antes de decir "mainnet para todos los usuarios", ZOKA debe pasar un ensayo
 local controlado que simule operadores y usuarios reales sin depender todavia de
 infraestructura publica.
 
-- [ ] Levantar 2-4 nodos locales independientes con directorios `.zoka`
+- [x] Levantar 2-4 nodos locales independientes con directorios `.zoka`
   separados, puertos distintos y genesis/config mainnet RC.
-- [ ] Verificar discovery/conexion peer-to-peer entre nodos locales.
+- [x] Verificar discovery/conexion peer-to-peer entre nodos locales.
 - [ ] Minar bloques desde un nodo y confirmar propagacion/aplicacion en los
   demas.
 - [ ] Arrancar un nodo atrasado desde DB vacia y verificar sync/IBD hasta la
