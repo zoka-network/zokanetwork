@@ -21,7 +21,7 @@
 //! side branch with more cumulative work can replace the canonical
 //! height index once its known branch connects to a common ancestor.
 //! Full state rollback/replay remains a higher-risk migration tracked in
-//! `docs/mainnet_launch_roadmap_v6.md`.
+//! `docs/protocol-overview.md`.
 
 use std::sync::Arc;
 

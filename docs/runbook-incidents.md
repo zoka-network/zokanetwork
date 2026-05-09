@@ -1,39 +1,23 @@
-# ZOKA Mainnet Runbook - Incident Response
+# Incident Runbook
 
-## Purpose
+Use this runbook for public testnet or future mainnet incidents.
 
-Standard incident handling for mainnet launch and early production operation.
+## First Actions
 
-## Roles
+1. Preserve logs without exposing wallet secrets.
+2. Record binary version, git commit, chain ID, node role, and height.
+3. Check whether the issue is local, peer-related, or consensus-related.
+4. Avoid deleting chain data until the failure is understood.
 
-- Incident Commander (IC)
-- Communications Lead
-- Core Dev Lead
-- Ops Lead
+## Useful Commands
 
-## Severity matrix
+```sh
+zoka status --network testnet
+zoka mine-status --network testnet
+zoka genesis-verify docs/genesis.testnet.v1.json
+```
 
-- SEV-1: chain halt, consensus safety risk, critical exploit.
-- SEV-2: degraded sync/finality, partial outage.
-- SEV-3: non-critical bug with workaround.
+## Escalation
 
-## Response process
-
-1. Detect and classify severity.
-2. Assign IC and open incident channel.
-3. Freeze risky changes and branch cuts.
-4. Mitigate user impact.
-5. Confirm technical recovery.
-6. Publish external/internal postmortem.
-
-## Mandatory artifacts
-
-- Timeline with UTC timestamps.
-- Impact assessment and affected components.
-- Root cause statement.
-- Corrective actions with owners/dates.
-
-## Launch-day additions
-
-- Keep SEV-1 bridge active for the full launch window.
-- Require explicit go/no-go sign-off before resuming planned operations.
+Escalate immediately if nodes disagree on finalized chain state, accept invalid
+blocks, reject valid blocks, lose wallet funds, or expose private wallet data.

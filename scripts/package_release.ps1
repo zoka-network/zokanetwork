@@ -108,11 +108,15 @@ foreach ($target in $Targets) {
         foreach ($doc in @(
             "docs/release-verification.md",
             "docs/reproducible-builds.md",
-            "docs/user-cli-reference.en.md",
+            "docs/user-cli-reference.md",
+            "docs/testnet.md",
+            "docs/node-operator-guide.md",
+            "docs/protocol-overview.md",
             "docs/genesis.mainnet.v1.spec.md",
+            "docs/genesis.testnet.v1.json",
             "docs/genesis.mainnet.v1.json",
+            "docs/testnet-network.v1.json",
             "docs/mainnet-network.v1.json",
-            "docs/mainnet-network-ops.md",
             "docs/infrastructure-logs-policy.md"
         )) {
             if (Test-Path $doc -PathType Leaf) {
@@ -144,7 +148,7 @@ foreach ($target in $Targets) {
     } else {
         $archive = "$archiveBase.tar.gz"
         if (Test-Path $archive) { Remove-Item -Force $archive }
-        Invoke-Checked -Command "tar" -Args @("-czf", $archive, "-C", $releaseRoot, $artifactName)
+        Invoke-Checked -Command "tar" -CommandArgs @("-czf", $archive, "-C", $releaseRoot, $artifactName)
     }
     Remove-Item -Recurse -Force $stage
     Write-Host "Packaged $archive"

@@ -1,44 +1,19 @@
-# ZOKA Mainnet Runbook - PBFT Halt Recovery
+# PBFT Halt Recovery Runbook
 
-Scope: recover from PBFT finality halt while preserving canonical chain integrity.
+The PBFT module is present in the codebase, but public testnet v0.1.0 primarily
+validates the PoW chain path. Keep this runbook for future validator-set
+testing.
 
-## Halt criteria
+## Symptoms
 
-Treat as PBFT halt when both conditions hold for >= 3 block intervals:
+- Validator votes stop progressing.
+- Nodes disagree about quorum state.
+- Chain data continues but finality state does not advance.
 
-- no finalized progress at expected cadence; and
-- active validator votes observed below quorum threshold.
+## Recovery Outline
 
-## Severity levels
-
-- SEV-1: total halt with no quorum.
-- SEV-2: intermittent quorum loss with delayed finality.
-
-## Recovery workflow
-
-1. Declare incident and freeze deployments.
-2. Collect active validator liveness and vote participation.
-3. Identify failing validators (network partition, key issue, process crash).
-4. Restore quorum:
-   - restart unhealthy validators;
-   - switch to backup links (Tor/I2P or approved clearnet override);
-   - if key compromise suspected, apply [runbook-key-rotation.md](runbook-key-rotation.md).
-5. Validate resumed PBFT finalization over at least 10 consecutive heights.
-6. Publish incident summary and action items.
-
-## Data integrity checks
-
-- Chain head and cumulative work are monotonic after recovery.
-- No invalid reorg outside consensus rules.
-- Supply and coinbase maturity accounting remain consistent.
-
-## Escalation
-
-- If quorum is not restored in 30 minutes, escalate to core release lead.
-- If conflicting finalized views appear, stop launch and trigger governance emergency review.
-
-## Exit criteria
-
-- Finality restored and stable for 60 minutes.
-- All validators acknowledged on-call.
-- Incident report published with root cause and prevention actions.
+1. Stop adding new validator changes.
+2. Capture logs and node heights from every validator.
+3. Identify whether the halt is connectivity, key, clock, or software related.
+4. Restart only after preserving evidence.
+5. Resume with the smallest validator set change possible.

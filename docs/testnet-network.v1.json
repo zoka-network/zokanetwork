@@ -1,6 +1,6 @@
 {
   "schema": "zoka-testnet-network-v1",
-  "status": "local-draft",
+  "status": "public-testnet-v0.1",
   "chain_id": "zoka-testnet-v1",
   "protocol_freeze_id": "/zoka/1.0.0",
   "transport_policy": {
@@ -16,7 +16,8 @@
   "public_rpc": [],
   "snapshot_signers": [],
   "notes": [
-    "Local draft until public seed operators are assigned.",
+    "Public testnet configuration for the testnet-v0.1.0 release line.",
+    "Seed nodes are added as VPS operators come online.",
     "Testnet mirrors mainnet blockchain logic and RandomX PoW.",
     "Bugs found on testnet must be fixed in shared code, not testnet-only blockchain paths."
   ]

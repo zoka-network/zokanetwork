@@ -1,41 +1,24 @@
-# ZOKA Mainnet Runbook - Upgrade and Hard Fork
+# Upgrade And Hard Fork Runbook
 
-## Scope
+Use this runbook for coordinated protocol upgrades.
 
-Safe rollout of protocol upgrades and emergency hard forks.
+## Planning
 
-## Preconditions
+- Define the release tag.
+- Define the activation height or timestamp.
+- Publish binaries and checksums.
+- Publish the exact migration or fork rule.
+- Give operators enough time to upgrade.
 
-- Release artifacts reproducible and signed.
-- Upgrade notes published with rollback instructions.
-- Validator/operator acknowledgment >= 80% before cutover.
+## Execution
 
-## Planned upgrade process
-
-1. Publish release candidate, hashes, and signature verification instructions.
-2. Run testnet replay with target build.
-3. Confirm validator readiness and maintenance window.
-4. Deploy staged rollout:
-   - non-validator nodes first;
-   - validators second;
-   - edge/public RPC last.
-5. Monitor chain health for at least 2 halving windows worth of blocks or agreed launch SLO.
-
-## Emergency hard fork process
-
-1. Trigger SEV-1 governance response.
-2. Freeze all non-essential changes.
-3. Publish minimum-change patch and fork activation condition.
-4. Collect validator/operator signatures for activation approval.
-5. Execute synchronized rollout and verify post-fork chain state.
+1. Freeze the release commit.
+2. Build and verify release artifacts.
+3. Publish upgrade instructions.
+4. Monitor upgrade adoption.
+5. Activate only when the operator threshold is reached.
 
 ## Rollback
 
-- If consensus divergence occurs before activation point, roll back to previous signed release.
-- If divergence occurs after activation, follow PBFT halt recovery and governance emergency process.
-
-## Exit criteria
-
-- No consensus divergence.
-- Stable block production/finality.
-- Public post-upgrade report with observed metrics and known issues.
+Rollback must be explicit. Do not ask operators to downgrade unless the release
+notes define a safe rollback path.

@@ -340,17 +340,19 @@ struct SeedCandidate {
 }
 
 impl MainnetNetworkConfig {
-    fn validate_for_mainnet(&self) -> Result<(), String> {
-        if self.schema != "zoka-mainnet-network-v1" {
+    fn validate_for_network(&self, network: NetworkProfile) -> Result<(), String> {
+        if self.schema != network.network_config_schema() {
             return Err(format!(
-                "network config schema '{}' is not supported",
-                self.schema
+                "network config schema '{}' is not supported for {}",
+                self.schema,
+                network.label()
             ));
         }
-        if self.chain_id != MAINNET_CHAIN_ID {
+        if self.chain_id != network.chain_id() {
             return Err(format!(
                 "network config chain_id '{}' does not match binary chain_id '{}'",
-                self.chain_id, MAINNET_CHAIN_ID
+                self.chain_id,
+                network.chain_id()
             ));
         }
         if self.protocol_freeze_id != PROTOCOL_FREEZE_ID {
@@ -617,17 +619,32 @@ fn default_mainnet_network_config_path() -> PathBuf {
     PathBuf::from("docs").join("mainnet-network.v1.json")
 }
 
+#[cfg(test)]
 fn parse_mainnet_network_config(raw: &str) -> Result<MainnetNetworkConfig, String> {
+    parse_network_config_for(raw, NetworkProfile::Mainnet)
+}
+
+fn parse_network_config_for(
+    raw: &str,
+    network: NetworkProfile,
+) -> Result<MainnetNetworkConfig, String> {
     let config: MainnetNetworkConfig =
         serde_json::from_str(raw).map_err(|e| format!("invalid network config json: {e}"))?;
-    config.validate_for_mainnet()?;
+    config.validate_for_network(network)?;
     Ok(config)
 }
 
 fn load_mainnet_network_config(path: &Path) -> Result<MainnetNetworkConfig, String> {
+    load_network_config_for(path, NetworkProfile::Mainnet)
+}
+
+fn load_network_config_for(
+    path: &Path,
+    network: NetworkProfile,
+) -> Result<MainnetNetworkConfig, String> {
     let raw = fs::read_to_string(path)
         .map_err(|e| format!("failed to read network config '{}': {e}", path.display()))?;
-    parse_mainnet_network_config(&raw)
+    parse_network_config_for(&raw, network)
 }
 
 fn write_secrets_export(path: &str, payload: &WalletSecretsExport) -> Result<(), String> {
@@ -1890,6 +1907,20 @@ impl NetworkProfile {
         }
     }
 
+    fn default_network_config_path(self) -> &'static str {
+        match self {
+            Self::Mainnet => "docs/mainnet-network.v1.json",
+            Self::Testnet => "docs/testnet-network.v1.json",
+        }
+    }
+
+    fn network_config_schema(self) -> &'static str {
+        match self {
+            Self::Mainnet => "zoka-mainnet-network-v1",
+            Self::Testnet => "zoka-testnet-network-v1",
+        }
+    }
+
     fn mining_mode(self) -> &'static str {
         match self {
             Self::Mainnet => MAINNET_MINING_MODE,
@@ -1908,7 +1939,7 @@ impl NetworkProfile {
 /// Algorithm id chosen for the chain ZOKA currently runs against. With
 /// `MAINNET_CHAIN_ID = zoka-mainnet-v1` this resolves to RandomX in
 /// release builds compiled with `--features randomx`, and to the CPU
-/// fallback otherwise â€” the `engine_for` call is the only place where
+/// fallback otherwise; the `engine_for` call is the only place where
 /// that choice is enforced at runtime.
 fn active_pow_algorithm() -> &'static str {
     economics::pow_algorithm_for_chain(MAINNET_CHAIN_ID)
@@ -3626,7 +3657,7 @@ fn run_mining_batch_with_progress(
 
         let _epoch = height / pow_epoch_blocks;
         // Source-of-truth for the next block's difficulty is the chain
-        // DB, not the local state file. Every node â€” miner or verifier â€”
+        // DB, not the local state file. Every node, miner or verifier,
         // calls the same helper, so the miner cannot pick a number out
         // of thin air. Falls back to the local-state value when no
         // chain DB is configured (legacy CLI-only mining).
@@ -3673,7 +3704,7 @@ fn run_mining_batch_with_progress(
         // Construct the canonical Block this miner just produced and run
         // it through `validate_pow_block`. Any node receiving this block
         // would call the same validator; failing here means the miner
-        // produced something the network would reject â€” which must never
+        // produced something the network would reject, which must never
         // happen, so we treat it as a hard error.
         let coinbase_tx = zoka::mining::block_validator::build_coinbase_tx(
             wallet_address.clone(),
@@ -3763,7 +3794,7 @@ fn run_mining_batch_with_progress(
         // The canonical `apply_block` re-derives the expected difficulty
         // from `mining::difficulty::expected_for_next_block` so the miner
         // and any peer apply the same rule. Failing here means the miner
-        // produced something the network would reject â€” escalate as a
+        // produced something the network would reject; escalate as a
         // hard error.
         if let Some(path) = config.chain_db_path.as_deref() {
             let chain_storage = open_storage(path)?;
@@ -4270,8 +4301,7 @@ fn is_transient_storage_lock_error(err: &str) -> bool {
         || err.contains("being used by another process")
         || err.contains("utilizado por otro proceso")
         || err.contains("no tiene acceso al archivo")
-        || err.contains("estÃ¡ siendo utilizado por otro proceso")
-        || err.contains("estÃ¯Â¿Â½ siendo utilizado por otro proceso")
+        || err.contains("siendo utilizado por otro proceso")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5084,16 +5114,17 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         } else {
             connected_seeds.join(", ")
         });
-    } else if use_network_config && network == NetworkProfile::Mainnet {
+    } else if use_network_config {
         let config_path = network_config_arg
             .as_deref()
             .map(PathBuf::from)
-            .unwrap_or_else(default_mainnet_network_config_path);
+            .unwrap_or_else(|| PathBuf::from(network.default_network_config_path()));
         if config_path.exists() {
-            let network_config = load_mainnet_network_config(&config_path)?;
+            let network_config = load_network_config_for(&config_path, network)?;
             let seed_candidates = network_config.active_seed_candidates(allow_clearnet_seeds);
             startup_notes.push(format!(
-                "Network config loaded from {}: status={}, active_seeds={}, active_rpc={}, snapshot_signers={}, notes={}.",
+                "{} network config loaded from {}: status={}, active_seeds={}, active_rpc={}, snapshot_signers={}, notes={}.",
+                network.label(),
                 config_path.display(),
                 if network_config.status.is_empty() {
                     "unknown"
@@ -5147,30 +5178,17 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             }
         } else if network_config_arg.is_some() {
             return Err(format!(
-                "network config file not found: {}",
+                "{} network config file not found: {}",
+                network.label(),
                 config_path.display()
             ));
         } else {
             startup_notes.push(format!(
-                "Default network config not found at {}; running standalone until peers connect.",
+                "Default {} network config not found at {}; running standalone until peers connect.",
+                network.label(),
                 config_path.display()
             ));
         }
-    } else if use_network_config && network == NetworkProfile::Testnet {
-        let config_path = network_config_arg
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("docs/testnet-network.v1.json"));
-        if network_config_arg.is_some() && !config_path.exists() {
-            return Err(format!(
-                "testnet network config file not found: {}",
-                config_path.display()
-            ));
-        }
-        startup_notes.push(format!(
-            "Testnet network config {} is a local draft; running standalone until manual testnet seeds are configured.",
-            config_path.display()
-        ));
     } else {
         startup_notes
             .push("No seed peer configured; running standalone until peers connect.".to_string());
@@ -5511,7 +5529,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 mining_power_label_for_threads(mining_threads)
             );
             next_mine_at = tokio::time::Instant::now() + Duration::from_secs(1);
-            // here are non-fatal â€” the block is already persisted
+            // here are non-fatal; the block is already persisted
         }
 
         let now = tokio::time::Instant::now();
@@ -8787,7 +8805,7 @@ fn cmd_genesis_verify(args: &[String]) -> Result<(), String> {
         println!("Initial accounts:    {}", report.initial_account_count);
         println!();
         println!(
-            "OK â€” genesis is structurally valid. Compare the digest against the published value before applying it."
+            "OK - genesis is structurally valid. Compare the digest against the published value before applying it."
         );
     }
     Ok(())

@@ -1,102 +1,113 @@
-# ZOKA — Private Blockchain
+# ZOKA Network
 
-Rust-based privacy chain with zero-knowledge proofs, RandomX PoW, BIP39 wallets,
-and PBFT-ready consensus. Mainnet v1 in pre-launch.
+ZOKA is a Rust privacy blockchain built around private wallet flows,
+zero-knowledge proof infrastructure, RandomX proof of work, per-network wallet
+storage, and a full-node daemon for public testnet operation.
 
-## Where to start
+This repository is the public source tree for the ZOKA network software. The
+current release line is **ZOKA Testnet v0.1.0**.
 
-| Audience | Read this first |
+## Quick Start
+
+Download release binaries from GitHub Releases when available:
+
+```text
+https://github.com/zokachain/zoka-network/releases
+```
+
+Build from source:
+
+```sh
+cargo build --release --features randomx --bin zoka --bin zokahd
+```
+
+Run a testnet node:
+
+```sh
+zokahd --network testnet --password "<wallet-password>"
+```
+
+Create a testnet wallet:
+
+```sh
+zoka create my-wallet --network testnet --password "<wallet-password>"
+```
+
+List local wallets:
+
+```sh
+zoka wallets --network testnet
+```
+
+## Documentation
+
+| Topic | Document |
 |---|---|
-| You want the full picture of what's built | [`docs/project-state.md`](docs/project-state.md) |
-| You want to know what's still pending | [`docs/agent-vs-human-roadmap.md`](docs/agent-vs-human-roadmap.md) |
-| You want the canonical mainnet roadmap | [`docs/mainnet_launch_roadmap_v6.md`](docs/mainnet_launch_roadmap_v6.md) |
-| You want to use the CLI | [`docs/user-cli-reference.en.md`](docs/user-cli-reference.en.md) |
-| You want to verify a release binary | [`docs/release-verification.md`](docs/release-verification.md) |
-| You want every doc indexed | [`docs/README.md`](docs/README.md) |
+| Public testnet | [docs/testnet.md](docs/testnet.md) |
+| Node and VPS operation | [docs/node-operator-guide.md](docs/node-operator-guide.md) |
+| CLI reference | [docs/user-cli-reference.md](docs/user-cli-reference.md) |
+| Release verification | [docs/release-verification.md](docs/release-verification.md) |
+| Protocol overview | [docs/protocol-overview.md](docs/protocol-overview.md) |
+| Troubleshooting | [docs/troubleshooting.md](docs/troubleshooting.md) |
+| Documentation index | [docs/README.md](docs/README.md) |
 
-## Build
+## Network Artifacts
+
+The published configuration artifacts live in `docs/`:
+
+| Artifact | Purpose |
+|---|---|
+| `docs/genesis.testnet.v1.json` | Testnet genesis file |
+| `docs/testnet-network.v1.json` | Testnet seed/RPC/snapshot configuration |
+| `docs/economics.testnet.v1.json` | Testnet economic constants |
+| `docs/genesis.mainnet.v1.json` | Mainnet genesis candidate |
+| `docs/mainnet-network.v1.json` | Mainnet network configuration candidate |
+| `docs/economics.mainnet.v2-atoms.json` | Mainnet economic constants |
+
+## Core Properties
+
+- Private wallet flows are the user default.
+- User transfers are private; no transparent user-transfer UX is exposed.
+- Wallet files are stored per network under `.zoka/<network>/private_wallets/`.
+- Testnet and mainnet use separate chain databases and wallet directories.
+- RandomX (`zoka-randomx-v1`) is the canonical PoW backend for public network
+  binaries.
+- ZKA uses 6 decimal places: `1 ZKA = 1,000,000 atoms`.
+- Coinbase maturity is 60 blocks.
+
+## Build And Test
 
 ```sh
-# Dev / testnet (works on any host with Rust)
-cargo build --release
-
-# Mainnet binary (requires MSVC + cmake on Windows, gcc + cmake on Linux)
-powershell -ExecutionPolicy Bypass -File scripts/check_randomx_toolchain.ps1 -Strict
-powershell -ExecutionPolicy Bypass -File scripts/build_mainnet_release.ps1
+cargo check --bins
+cargo test --bin zoka
+cargo test --lib wallet::storage::tests
+cargo test --tests
+cargo build --release --features randomx --bin zoka --bin zokahd
 ```
 
-See [`docs/reproducible-builds.md`](docs/reproducible-builds.md) for the exact
-canonical build command and the toolchain pin used for releases.
+The full test suite includes networking and integration tests. Some long-running
+soak scenarios are ignored by default.
 
-## Test
+## Repository Layout
 
-```sh
-cargo test --lib       # ~600 unit tests
-cargo test --tests     # integration tests in tests/
+```text
+src/main.rs          zoka CLI
+src/bin/zokahd.rs    full-node daemon wrapper
+src/mining/          PoW engine, difficulty, block validation
+src/state/           chain database, fork choice, sync
+src/network/         libp2p transport and peer handling
+src/private_wallet/  private wallet, claims, note handling
+src/wallet/          encrypted wallet storage
+src/zk/              proof circuits, prover, verifier, setup IO
+docs/                public network docs and release artifacts
+scripts/             build, release, ceremony, and operator tooling
+tests/               integration tests
+fuzz/                fuzz targets
 ```
 
-Test layout is documented in [`tests/README.md`](tests/README.md).
+## Security Notice
 
-## Frozen mainnet decisions
-
-- **PoW**: RandomX (`zoka-randomx-v1`). See [`docs/pow-mainnet-decision.md`](docs/pow-mainnet-decision.md).
-- **Token**: ZKA, 6 decimals (`1 ZKA = 1,000,000 atoms`), max supply
-  23,000,000, halving every 1,051,200 blocks, target block time 120s,
-  coinbase maturity 60 blocks. See `src/economics.rs` and
-  [`docs/economics.mainnet.v2-atoms.json`](docs/economics.mainnet.v2-atoms.json).
-- **Genesis schema**: `zoka-genesis-v1`. See
-  [`docs/genesis.mainnet.v1.spec.md`](docs/genesis.mainnet.v1.spec.md).
-- **Snapshot schema**: `zoka-snapshot-v1`. See
-  [`docs/pruning-snapshots-strategy.md`](docs/pruning-snapshots-strategy.md).
-
-## Project structure
-
-```
-src/
-├── main.rs                  # zoka CLI
-├── lib.rs
-├── economics.rs             # frozen economic constants
-├── genesis.rs               # zoka-genesis-v1
-├── snapshot.rs              # zoka-snapshot-v1
-├── mining/                  # PoW engine, difficulty, block validator
-├── state/                   # chain DB, fork choice, IBD sync
-├── storage/                 # RocksDB wrapper
-├── network/                 # libp2p (Tor/I2P aware), gossipsub, dandelion
-├── consensus/               # PBFT (separate from PoW chain DB today)
-├── private_wallet/          # PrivateWallet, claims, decryption
-├── wallet/                  # encrypted wallet storage
-├── transaction/             # CLSAG, nullifiers
-├── crypto/                  # Pedersen, Bulletproofs, MPC ceremony
-├── identity/                # HDWallet, BIP39
-├── api/                     # HTTP RPC (axum)
-└── bin/                     # auxiliary binaries (zokahd, ceremony, ...)
-
-docs/                        # canonical docs (see docs/README.md)
-scripts/                     # release tooling and ceremony scripts
-tests/                       # integration tests (see tests/README.md)
-fuzz/                        # cargo-fuzz targets
-```
-
-## Status snapshot
-
-Updated periodically from [`docs/project-state.md`](docs/project-state.md):
-
-- All 8 mainnet roadmap phases have a code-side answer:
-  - Phases 1-4: code closed.
-  - Phase 5 (audit) and Phase 6 (testnet) require external actors.
-  - Phase 7 (release): tooling closed; remaining steps need MSVC toolchain
-    + GPG keyholders.
-  - Phase 8 (operations): runbooks closed; execution needs operators.
-- ~600 unit tests + integration tests pass.
-- Canonical mainnet artifacts ([`docs/genesis.mainnet.v1.json`](docs/genesis.mainnet.v1.json),
-  [`docs/mainnet-network.v1.json`](docs/mainnet-network.v1.json)) have
-  regression gates in the test suite that fail loudly on drift.
-
-For the precise list of what an agent can still build vs what requires
-humans, see [`docs/agent-vs-human-roadmap.md`](docs/agent-vs-human-roadmap.md).
-
-## Legacy
-
-The original `ROADMAP.md` (5-phase Monero privacy plan) is superseded by
-`docs/mainnet_launch_roadmap_v6.md`. Likewise the older
-`docs/mainnet_operational_roadmap_v5.md` is kept for reference only.
+ZOKA testnet is for public testing, miner/operator rehearsal, and protocol
+validation. Testnet coins have no economic value. Do not store production
+secrets in the repository, do not publish wallet recovery phrases, and always
+verify release checksums before running binaries on a VPS.
