@@ -1,0 +1,49 @@
+{
+    "schema":  "zoka-genesis-v1",
+    "chain_id":  "zoka-mainnet-v1",
+    "pow_algorithm":  "zoka-randomx-v1",
+    "genesis_timestamp":  1779609600,
+    "economics":  {
+                      "max_supply_zka":  23000000,
+                      "initial_block_reward_zka":  12,
+                      "halving_interval_blocks":  1051200,
+                      "target_block_time_secs":  120,
+                      "coinbase_maturity_blocks":  60
+                  },
+    "validators":  [
+                       {
+                           "label":  "validator-na-1",
+                           "consensus_pubkey_hex":  "1232b570295cff151e3ada6ad0dd58f30980dfd20560f7dfb829ca465ec6e56c",
+                           "operator_pubkey_hex":  "2dabc76ff9a2d41e4bb0ccbb761be6e98599ee55080f7f496fd675d3fbb1c2cc",
+                           "voting_power":  100,
+                           "role":  "active"
+                       },
+                       {
+                           "label":  "validator-eu-1",
+                           "consensus_pubkey_hex":  "ef1c9809edcd2d04d3c9deb203e6f0e4ac491669e09260c5ce46c9abf1c1120c",
+                           "operator_pubkey_hex":  "58c9da60de44a2c871857abd07981de7fcc9e9134d151594a3b0d581b055f2a0",
+                           "voting_power":  100,
+                           "role":  "active"
+                       },
+                       {
+                           "label":  "validator-sa-1",
+                           "consensus_pubkey_hex":  "7cf2b6a420a618618ff1747e8705601c5e9af8507d0f6704a138f87f7e536030",
+                           "operator_pubkey_hex":  "da8f85b08861aa8e6726318027502879cf3b794a4aa76b6dc5df4ad25d1e8e37",
+                           "voting_power":  100,
+                           "role":  "active"
+                       }
+                   ],
+    "pre_mine":  [
+
+                 ],
+    "initial_accounts":  [
+                             {
+                                 "address":  "zka1burn000000000000000000000000000000000000000000000000000000",
+                                 "balance_zka":  0
+                             },
+                             {
+                                 "address":  "zka1treasury000000000000000000000000000000000000000000000000000",
+                                 "balance_zka":  0
+                             }
+                         ]
+}

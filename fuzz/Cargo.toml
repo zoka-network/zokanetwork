@@ -1,0 +1,45 @@
+[package]
+name = "zoka-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1.0"
+tempfile = "3"
+hex = "0.4"
+
+[dependencies.zoka]
+path = ".."
+
+[[bin]]
+name = "fuzz_private_tx_deserialize"
+path = "fuzz_targets/fuzz_private_tx_deserialize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_range_proof_verify"
+path = "fuzz_targets/fuzz_range_proof_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_directory_digest_verify"
+path = "fuzz_targets/fuzz_directory_digest_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_groth16_verify_proof"
+path = "fuzz_targets/fuzz_groth16_verify_proof.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,23 @@
+// ZOKA Library: 100% private blockchain with Zero-Knowledge proofs
+pub mod admin;
+pub mod api;
+pub mod block;
+pub mod cli;
+pub mod consensus;
+pub mod crypto;
+pub mod economics;
+pub mod genesis;
+pub mod health;
+pub mod identity;
+pub mod mempool;
+pub mod metrics;
+pub mod mining;
+pub mod network;
+pub mod private_wallet;
+pub mod snapshot;
+pub mod state;
+pub mod storage;
+pub mod transaction;
+pub mod types;
+pub mod wallet;
+pub mod zk;
