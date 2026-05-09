@@ -18,7 +18,7 @@
   "notes": [
     "Public testnet configuration for the testnet-v0.1.0 release line.",
     "Seed nodes are added as VPS operators come online.",
-    "Testnet mirrors mainnet blockchain logic and RandomX PoW.",
+    "Testnet uses the public ZOKA blockchain logic and RandomX PoW.",
     "Bugs found on testnet must be fixed in shared code, not testnet-only blockchain paths."
   ]
 }

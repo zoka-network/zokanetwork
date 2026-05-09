@@ -23,7 +23,7 @@ pub const POW_INITIAL_DIFFICULTY_BITS: u32 = 16;
 pub const POW_MAX_DIFFICULTY_BITS: u32 = 30;
 pub const POW_KEY_EPOCH_BLOCKS: u64 = 2_048;
 
-/// Canonical mainnet PoW algorithm. See `docs/pow-mainnet-decision.md`.
+/// Canonical public-network PoW algorithm. See `docs/protocol-overview.md`.
 /// Mainnet binaries MUST be built with `--features randomx`; nodes that
 /// claim to be mainnet but produce blocks tagged with another algorithm id
 /// are invalid and must be rejected by other nodes.
@@ -192,15 +192,15 @@ mod tests {
     }
 
     #[test]
-    fn economics_v2_atoms_artifact_matches_code_constants() {
+    fn testnet_economics_artifact_matches_code_constants() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("docs")
-            .join("economics.mainnet.v2-atoms.json");
+            .join("economics.testnet.v1.json");
         let raw = std::fs::read_to_string(path).unwrap();
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
 
         assert_eq!(json["version"], ECONOMICS_VERSION);
-        assert_eq!(json["chain_id"], MAINNET_CHAIN_ID);
+        assert_eq!(json["chain_id"], TESTNET_CHAIN_ID);
         assert_eq!(json["token"]["symbol"], TOKEN_SYMBOL);
         assert_eq!(json["token"]["decimals"], ZKA_DECIMALS);
         assert_eq!(json["token"]["atoms_per_zka"], ATOMS_PER_ZKA);

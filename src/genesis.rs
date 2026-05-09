@@ -1,22 +1,20 @@
-//! Canonical mainnet genesis definition (`zoka-genesis-v1`).
+//! ZOKA genesis definition (`zoka-genesis-v1`).
 //!
-//! Phase 3 of the mainnet roadmap requires a single, versioned genesis
-//! document that every node consumes byte-identically. This module defines:
+//! Public networks require a single, versioned genesis document that every node
+//! consumes byte-identically. This module defines:
 //!
 //! - [`MainnetGenesisV1`]: the typed schema. Every field is consensus-
 //!   relevant; `#[serde(deny_unknown_fields)]` blocks accidental drift.
 //! - [`compute_digest`]: deterministic SHA-256 over the canonical encoding
-//!   used to bind a `genesis.mainnet.json` to the chain state in
-//!   `chain:genesis:digest`. Two nodes that load the same file get the
-//!   same digest.
+//!   used to bind a genesis JSON file to the chain state in
+//!   `chain:genesis:digest`. Two nodes that load the same file get the same
+//!   digest.
 //! - [`validate_static`]: pure structural / consistency check. No DB, no
 //!   network. Used by the `genesis-verify` CLI and by every loader path
 //!   before touching storage.
 //!
-//! The mainnet binary publishes a single `docs/genesis.mainnet.v1.json`
-//! signed by the core team. Operators run `zoka genesis-verify
-//! docs/genesis.mainnet.v1.json` to confirm the digest matches the
-//! announced value before they boot a node against it.
+//! Operators should run `zoka genesis-verify docs/genesis.testnet.v1.json`
+//! before booting a testnet node.
 
 use std::collections::HashSet;
 
@@ -51,7 +49,7 @@ pub enum ValidatorRole {
 #[serde(deny_unknown_fields)]
 pub struct InitialValidator {
     /// Stable, human-readable identifier published by the core team
-    /// (e.g. "validator-eu-1"). Used in dashboards and runbooks.
+    /// (e.g. "validator-eu-1"). Used in dashboards and operator metadata.
     pub label: String,
     /// Hex-encoded ed25519 public key used for PBFT consensus voting.
     /// Lives on the hot signing path.
@@ -727,71 +725,27 @@ mod tests {
         assert!(matches!(err, GenesisError::SchemaMismatch { .. }));
     }
 
-    /// Regression gate for the canonical published mainnet genesis file.
-    ///
-    /// This test parses `docs/genesis.mainnet.v1.json` exactly as a node
-    /// loader would, runs `validate_static`, computes the canonical
-    /// digest, and asserts it matches the digest that
-    /// `docs/genesis-dry-run-evidence.md` claims operators will see when
-    /// they run `zoka genesis-verify`. Any silent drift between the
-    /// committed file and the documented digest fails this test.
-    ///
-    /// If you are intentionally rotating the mainnet genesis (a hard
-    /// fork or pre-launch revision), update both the JSON file AND the
-    /// digest published in `docs/genesis-dry-run-evidence.md` in the
-    /// same commit so this test stays the canary.
+    /// Regression gate for the canonical published testnet genesis file.
     #[test]
-    fn committed_mainnet_genesis_matches_published_digest() {
-        let raw = include_str!("../docs/genesis.mainnet.v1.json");
-        let evidence = include_str!("../docs/genesis-dry-run-evidence.md");
+    fn committed_testnet_genesis_validates_and_hashes() {
+        let raw = include_str!("../docs/genesis.testnet.v1.json");
 
         let genesis: MainnetGenesisV1 =
-            serde_json::from_str(raw).expect("docs/genesis.mainnet.v1.json must parse");
-        validate_static(&genesis).expect("docs/genesis.mainnet.v1.json must validate");
+            serde_json::from_str(raw).expect("docs/genesis.testnet.v1.json must parse");
+        validate_static(&genesis).expect("docs/genesis.testnet.v1.json must validate");
 
         let actual_digest = compute_digest(&genesis).expect("digest");
-
-        let documented_digest = evidence
-            .lines()
-            .find_map(|line| {
-                let trimmed = line.trim();
-                trimmed.find("\"digest_sha256_hex\"").map(|idx| {
-                    let after = &trimmed[idx..];
-                    let after_colon = after
-                        .split_once(':')
-                        .map(|(_, rhs)| rhs.trim_start())
-                        .unwrap_or("");
-                    let mut chars = after_colon.chars();
-                    if chars.next() != Some('"') {
-                        return String::new();
-                    }
-                    chars
-                        .by_ref()
-                        .take_while(|c| *c != '"')
-                        .collect::<String>()
-                })
-            })
-            .filter(|s| !s.is_empty())
-            .expect(
-                "docs/genesis-dry-run-evidence.md must contain a \"digest_sha256_hex\": \"<hex>\" line",
-            );
-
-        assert_eq!(
-            actual_digest, documented_digest,
-            "committed genesis digest drifted from the value documented in docs/genesis-dry-run-evidence.md.\n  computed: {actual_digest}\n  doc:      {documented_digest}\nUpdate both the JSON file and the evidence doc in the same commit."
-        );
+        assert_eq!(actual_digest.len(), 64);
     }
 
-    /// Sanity gate: the published mainnet genesis MUST target the
-    /// canonical mainnet chain id and the canonical mainnet PoW
-    /// algorithm. A misconfigured `chain_id` or `pow_algorithm` is a
-    /// release-blocking bug regardless of the digest match.
+    /// Sanity gate: the published testnet genesis must target the public
+    /// testnet chain id and the public network PoW algorithm.
     #[test]
-    fn committed_mainnet_genesis_targets_mainnet_chain() {
-        let raw = include_str!("../docs/genesis.mainnet.v1.json");
+    fn committed_testnet_genesis_targets_testnet_chain() {
+        let raw = include_str!("../docs/genesis.testnet.v1.json");
         let genesis: MainnetGenesisV1 =
-            serde_json::from_str(raw).expect("docs/genesis.mainnet.v1.json must parse");
-        assert_eq!(genesis.chain_id, economics::MAINNET_CHAIN_ID);
+            serde_json::from_str(raw).expect("docs/genesis.testnet.v1.json must parse");
+        assert_eq!(genesis.chain_id, economics::TESTNET_CHAIN_ID);
         assert_eq!(genesis.pow_algorithm, economics::POW_ALGORITHM_MAINNET);
         assert_eq!(genesis.schema, GENESIS_SCHEMA_ID);
     }

@@ -20,15 +20,13 @@ path = "src/lib.rs"
 
 [features]
 default = []
-ops-tools = []
-test-p2p-worker-bin = []
-# Enables the RandomX PoW backend (the canonical mainnet algorithm).
+# Enables the RandomX PoW backend used by public ZOKA network binaries.
 # Pulls in the `randomx-rs` crate which links to the official RandomX
-# C++ library; mainnet binaries MUST be built with this feature.
+# C++ library; public testnet binaries should be built with this feature.
 # Build prerequisites:
 #   - Linux x86_64: gcc/clang, cmake >= 3.5, make, pkg-config
 #   - Windows x86_64: Visual Studio Build Tools (MSVC v143+) and cmake on PATH
-# See docs/pow-mainnet-decision.md for the rationale.
+# See docs/protocol-overview.md for the network summary.
 randomx = ["dep:randomx-rs"]
 
 [dependencies]
@@ -88,7 +86,7 @@ tempfile = "3"
 # the repo stays in fast-compile debug. First test run pays a one-time
 # recompile of these deps; every subsequent run is dramatically faster.
 # Output bytes from these crates are independent of opt-level, so this
-# never changes test verdicts â€” only their speed.
+# never changes test verdicts; only their speed.
 # ----------------------------------------------------------------------------
 [profile.dev.package.curve25519-dalek]
 opt-level = 3
@@ -128,18 +126,3 @@ opt-level = 3
 
 [profile.dev.package.pasta_curves]
 opt-level = 3
-
-[[bin]]
-name = "zoka-trusted-setup"
-path = "src/bin/generate_trusted_setup.rs"
-required-features = ["ops-tools"]
-
-[[bin]]
-name = "zoka-ceremony-contribute"
-path = "src/bin/zoka_ceremony_contribute.rs"
-required-features = ["ops-tools"]
-
-[[bin]]
-name = "p2p_worker"
-path = "src/bin/p2p_worker.rs"
-required-features = ["test-p2p-worker-bin"]

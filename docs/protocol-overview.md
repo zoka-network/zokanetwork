@@ -4,15 +4,14 @@ ZOKA is a privacy-oriented blockchain implementation written in Rust. The
 software combines private wallet flows, zero-knowledge proof infrastructure,
 RandomX PoW, encrypted wallet storage, local chain state, and libp2p networking.
 
-## Networks
+## Network
 
 | Network | Chain ID | Purpose |
 |---|---|---|
 | Testnet | `zoka-testnet-v1` | Public testing and operator rehearsal |
-| Mainnet candidate | `zoka-mainnet-v1` | Frozen candidate artifacts before launch |
 
-Wallets and databases are separated per network. A testnet wallet is never
-stored in the mainnet wallet directory.
+Wallets and databases are separated by network. Testnet data is stored under
+`.zoka/testnet/`.
 
 ## Token Accounting
 
@@ -68,7 +67,7 @@ Important modules:
 
 ## Trusted Setup
 
-The Groth16 setup path is explicit. Release operators must treat setup files and
-their expected digest as release-critical material. Development-only seeded
-setup is guarded by `ZOKA_ALLOW_INSECURE_SEEDED_SETUP` and must not be used for
-production release artifacts.
+The Groth16 setup path is explicit. Release operators must treat setup files as
+release-critical material. Development-only seeded setup is guarded by
+`ZOKA_ALLOW_INSECURE_SEEDED_SETUP` and must not be used for production-value
+networks.

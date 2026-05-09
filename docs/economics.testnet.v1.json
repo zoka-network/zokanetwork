@@ -1,6 +1,5 @@
 {
   "version": "zoka-economics-v2-atoms",
-  "mirrors": "docs/economics.mainnet.v2-atoms.json",
   "chain_id": "zoka-testnet-v1",
   "token": {
     "symbol": "ZKA",

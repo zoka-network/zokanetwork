@@ -5,15 +5,13 @@ default and wallets are stored separately for each network.
 
 ## Networks
 
-Use `--network testnet` for public testnet and `--network mainnet` for mainnet
-candidate operations.
+Use `--network testnet` for the public testnet.
 
 Default local paths:
 
 | Network | Wallets | Chain DB |
 |---|---|---|
 | testnet | `.zoka/testnet/private_wallets/` | `.zoka/testnet/blockchain.db` |
-| mainnet | `.zoka/mainnet/private_wallets/` | `.zoka/mainnet/blockchain.db` |
 
 ## Short Commands
 
@@ -30,7 +28,7 @@ zoka status --network testnet
 ```
 
 Long command names such as `wallet-create`, `wallet-list`, `tx-send`, and
-`fullnode` remain available for scripts.
+`fullnode` remain available for automation.
 
 ## Wallets
 

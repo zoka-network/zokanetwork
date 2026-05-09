@@ -4,7 +4,7 @@
 //! trait. The mainnet algorithm is RandomX (`zoka-randomx-v1`); the
 //! development/testnet algorithm is a SHA3-based CPU fallback
 //! (`zoka-cpu-fallback-v1`). The choice is anchored to the chain id, never
-//! configurable per-node — see `docs/pow-mainnet-decision.md` for the
+//! configurable per-node; see `docs/protocol-overview.md` for the
 //! rationale and the binding implications.
 //!
 //! All consensus-relevant constants (algorithm IDs, epoch length, difficulty

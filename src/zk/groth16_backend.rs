@@ -18,9 +18,9 @@ use crate::crypto::{
 use crate::types::BlockError;
 use crate::zk::setup_io;
 
-/// Env var pointing at a directory that holds a trusted-setup bundle produced
-/// by `zoka-trusted-setup` or a ceremony. When present, the node boots from
-/// that bundle (after verifying `DIGEST`) instead of regenerating the CRS.
+/// Env var pointing at a directory that holds a release trusted-setup bundle.
+/// When present, the node boots from that bundle after verifying its digest
+/// instead of regenerating the CRS.
 pub const TRUSTED_SETUP_ENV: &str = "ZOKA_TRUSTED_SETUP_DIR";
 
 /// Opt-in acknowledgement that the seeded/deterministic fallback CRS is *not*
@@ -35,7 +35,7 @@ pub const EXPECTED_SETUP_DIGEST_ENV: &str = "ZOKA_EXPECTED_SETUP_DIGEST";
 
 /// Compile-time binding of the canonical CRS digest. Set at build time with
 /// `ZOKA_EXPECTED_SETUP_DIGEST_COMPILED=<hex>` to hard-pin the binary to a
-/// specific ceremony output — any operator that tries to point
+/// specific ceremony output; any operator that tries to point
 /// `ZOKA_TRUSTED_SETUP_DIR` at a different bundle gets rejected at boot.
 pub const EXPECTED_SETUP_DIGEST_COMPILED: Option<&str> =
     option_env!("ZOKA_EXPECTED_SETUP_DIGEST_COMPILED");
@@ -119,13 +119,12 @@ fn build_bundle_from_params(
 
 /// Generate every CRS from OsRng. Suitable for:
 ///   * tests that want a fresh CRS (not the deterministic one),
-///   * the `zoka-trusted-setup` binary that writes artifacts to disk.
+///   * release tooling that writes artifacts to disk.
 ///
-/// The resulting τ lives ephemerally inside `OsRng`'s state during this call
+/// The resulting secret randomness lives ephemerally inside `OsRng`'s state during this call
 /// and is dropped afterwards. That is strictly better than the seeded
 /// fallback, but still weaker than a multi-party ceremony: one operator
-/// could in principle instrument the RNG to exfiltrate τ. The only cure for
-/// that is MPC.
+/// could in principle instrument the RNG. The only cure for that is MPC.
 pub fn generate_setup_bundle_with_osrng() -> (
     Parameters<Bls12>,
     Parameters<Bls12>,
@@ -244,11 +243,10 @@ fn build_setup_bundle() -> SetupBundle {
             }
             Err(err) => {
                 panic!(
-                    "failed to load trusted setup from {}: {}. Regenerate with \
-                     `cargo run --bin zoka-trusted-setup -- --out {}` or unset {}.",
+                    "failed to load trusted setup from {}: {}. Replace it with \
+                     a valid release trusted-setup bundle or unset {}.",
                     path.display(),
                     err,
-                    path.display(),
                     TRUSTED_SETUP_ENV
                 );
             }
@@ -257,15 +255,14 @@ fn build_setup_bundle() -> SetupBundle {
 
     // Debug builds (local dev, `cargo test`) fall back to the seeded CRS with
     // a loud warning. Release builds refuse to boot without either a setup
-    // directory or an explicit opt-in env var — otherwise an operator could
-    // ship a production node silently verifying against a CRS whose τ is
-    // printed above in source.
+    // directory or an explicit opt-in env var; otherwise an operator could
+    // ship a production node silently verifying against a source-visible CRS.
     let allow_seeded =
         cfg!(debug_assertions) || std::env::var(ALLOW_INSECURE_SEEDED_SETUP_ENV).is_ok();
     if allow_seeded {
         tracing::warn!(
             target: "zk::trusted_setup",
-            "using seeded (insecure) trusted setup — proofs verified against this CRS can be forged. \
+            "using seeded (insecure) trusted setup; proofs verified against this CRS can be forged. \
              Set {} to a directory of ceremony artifacts before running in production.",
             TRUSTED_SETUP_ENV
         );
@@ -274,8 +271,7 @@ fn build_setup_bundle() -> SetupBundle {
 
     panic!(
         "ZOKA refuses to boot with the seeded in-memory trusted setup in release mode. Either:\n\
-         (a) Generate a CRS bundle and point {} at it:\n    \
-             cargo run --bin zoka-trusted-setup -- --out ./trusted-setup\n    \
+         (a) Point {} at a valid release trusted-setup bundle:\n    \
              export {}=./trusted-setup\n\
          (b) Opt into the insecure seeded setup explicitly for dev by setting {}=1.",
         TRUSTED_SETUP_ENV, TRUSTED_SETUP_ENV, ALLOW_INSECURE_SEEDED_SETUP_ENV

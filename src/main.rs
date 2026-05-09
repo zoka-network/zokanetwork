@@ -1975,7 +1975,7 @@ fn pow_engine_for_height_for_chain(
 ) -> Result<Box<dyn zoka::mining::pow::PowEngine>, String> {
     zoka::mining::pow::engine_for(chain_id, height).map_err(|e| match e {
         zoka::mining::pow::PowError::BackendNotAvailable(id) => format!(
-            "PoW backend '{id}' is required by chain '{}' but is not compiled into this binary; rebuild with: cargo build --release --features randomx (see docs/pow-mainnet-decision.md)",
+            "PoW backend '{id}' is required by chain '{}' but is not compiled into this binary; rebuild with: cargo build --release --features randomx (see docs/protocol-overview.md)",
             chain_id
         ),
         other => format!("pow engine init failed: {other}"),
@@ -1990,7 +1990,7 @@ fn pow_engine_pool_for_height_for_chain(
     zoka::mining::pow::engine_pool_for(chain_id, height, threads.max(1)).map_err(|e| {
         match e {
             zoka::mining::pow::PowError::BackendNotAvailable(id) => format!(
-                "PoW backend '{id}' is required by chain '{}' but is not compiled into this binary; rebuild with: cargo build --release --features randomx (see docs/pow-mainnet-decision.md)",
+                "PoW backend '{id}' is required by chain '{}' but is not compiled into this binary; rebuild with: cargo build --release --features randomx (see docs/protocol-overview.md)",
                 chain_id
             ),
             other => format!("pow engine pool init failed: {other}"),
@@ -9128,25 +9128,6 @@ mod tests {
         let config = parse_mainnet_network_config(raw).expect("valid config");
         assert_eq!(config.chain_id, MAINNET_CHAIN_ID);
         assert!(config.active_seed_candidates(false).is_empty());
-    }
-
-    #[test]
-    fn committed_mainnet_network_config_matches_loader_schema() {
-        let raw = include_str!("../docs/mainnet-network.v1.json");
-        let config = parse_mainnet_network_config(raw).expect("committed network config");
-        assert_eq!(config.chain_id, MAINNET_CHAIN_ID);
-    }
-
-    #[test]
-    fn mainnet_network_lint_accepts_committed_launch_ready_config() {
-        let tmp = tempfile::NamedTempFile::new().expect("temp config");
-        fs::write(tmp.path(), include_str!("../docs/mainnet-network.v1.json"))
-            .expect("write temp config");
-
-        let report = lint_mainnet_network_config(tmp.path(), false).expect("lint report");
-        assert!(report.ok, "unexpected errors: {:?}", report.errors);
-        assert_eq!(report.active_seed_count, 3);
-        assert_eq!(report.snapshot_signer_count, 1);
     }
 
     #[test]
