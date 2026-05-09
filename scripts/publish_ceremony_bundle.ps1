@@ -13,6 +13,7 @@ $ErrorActionPreference = "Stop"
 
 $args = @(
     "run",
+    "--features", "ops-tools",
     "--bin", "zoka-ceremony-contribute",
     "--",
     "publish-bundle",

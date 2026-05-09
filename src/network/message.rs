@@ -31,6 +31,8 @@ pub enum ZokaMessage {
     /// Solicitud de bloque
     BlockRequest {
         block_height: u64,
+        #[serde(default)]
+        block_hash: Option<String>,
     },
     /// Respuesta con bloque
     BlockResponse(BlockResponseMessage),
@@ -667,7 +669,10 @@ mod tests {
 
     #[test]
     fn test_block_request() {
-        let block_msg = ZokaMessage::BlockRequest { block_height: 100 };
+        let block_msg = ZokaMessage::BlockRequest {
+            block_height: 100,
+            block_hash: None,
+        };
         let bytes = block_msg.to_bytes().unwrap();
 
         assert!(!bytes.is_empty());

@@ -1,4 +1,4 @@
-#[cfg(test)]
+#[cfg(all(test, feature = "test-p2p-worker-bin"))]
 mod multiprocess_transport_tests {
     use std::path::{Path, PathBuf};
     use std::process::Stdio;
@@ -412,6 +412,16 @@ mod multiprocess_transport_tests {
             listener_failures.is_empty(),
             "listener failures: {}",
             listener_failures.join("\n---\n")
+        );
+    }
+}
+
+#[cfg(all(test, not(feature = "test-p2p-worker-bin")))]
+mod multiprocess_transport_tests {
+    #[test]
+    fn p2p_worker_binary_is_opt_in() {
+        eprintln!(
+            "multiprocess PBFT worker tests are opt-in: run with --features test-p2p-worker-bin"
         );
     }
 }

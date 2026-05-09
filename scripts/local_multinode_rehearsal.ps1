@@ -2,9 +2,15 @@ param(
     [string]$RepoRoot = (Resolve-Path ".").Path,
     [string]$ZokaExe = "",
     [string]$OutDir = "",
-    [int]$NodeCount = 2,
+    [int]$NodeCount = 3,
     [int]$BasePort = 29100,
-    [int]$RunSeconds = 24,
+    [int]$RunSeconds = 180,
+    [int]$StopGraceSeconds = 45,
+    [int]$SyncWarmupSeconds = 8,
+    [int]$MineIntervalSeconds = 5,
+    [int]$SyncRebroadcastRecentBlocks = 8,
+    [int]$UnsafeRehearsalDifficultyBits = 4,
+    [int]$TargetHeight = 8,
     [switch]$NoMine
 )
 
@@ -25,11 +31,6 @@ if ([string]::IsNullOrWhiteSpace($OutDir)) {
 }
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-
-function ConvertTo-CmdPath {
-    param([string]$Path)
-    return ($Path -replace '\\', '/')
-}
 
 function Wait-ForPattern {
     param(
@@ -54,7 +55,7 @@ function Wait-ForPattern {
 function Start-ZokaNode {
     param(
         [int]$Index,
-        [string]$Seed = ""
+        [string[]]$Seeds = @()
     )
 
     $nodeDir = Join-Path $OutDir "node-$Index"
@@ -75,29 +76,46 @@ function Start-ZokaNode {
         "--db", $db,
         "--genesis", (Join-Path $RepoRoot "docs\genesis.mainnet.v1.json"),
         "--seconds", "$RunSeconds",
-        "--sync-warmup-secs", "1"
+        "--sync-warmup-secs", "$SyncWarmupSeconds",
+        "--sync-rebroadcast-recent-blocks", "$SyncRebroadcastRecentBlocks",
+        "--unsafe-rehearsal-difficulty-bits", "$UnsafeRehearsalDifficultyBits"
     )
     if ($NoMine) {
         $args += "--no-mine"
     } else {
-        $args += @("--mine-blocks", "1", "--mine-interval-secs", "5")
+        # Every node competes to mine — all are miners, none is privileged.
+        $args += @(
+            "--mine-blocks", "1",
+            "--mine-interval-secs", "$MineIntervalSeconds",
+            "--min-mine-peers", "0"
+        )
     }
-    if (![string]::IsNullOrWhiteSpace($Seed)) {
-        $args += @("--seed", $Seed)
+    foreach ($seed in $Seeds) {
+        if (![string]::IsNullOrWhiteSpace($seed)) {
+            $args += @("--seed", $seed)
+        }
     }
 
-    $quotedArgs = ($args | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join " "
-    $cmd = 'set USERPROFILE=' + (ConvertTo-CmdPath $profile) +
-        '&& set HOME=' + (ConvertTo-CmdPath $profile) +
-        '&& "' + $ZokaExe + '" ' + $quotedArgs
-
-    $process = Start-Process -FilePath "cmd.exe" `
-        -ArgumentList @("/c", $cmd) `
-        -WorkingDirectory $RepoRoot `
-        -RedirectStandardOutput $log `
-        -RedirectStandardError $err `
-        -PassThru `
-        -WindowStyle Hidden
+    $oldUserProfile = $env:USERPROFILE
+    $oldHome = $env:HOME
+    $oldAllowUnsafe = $env:ZOKA_ALLOW_UNSAFE_REHEARSAL
+    try {
+        $env:USERPROFILE = $profile
+        $env:HOME = $profile
+        $env:ZOKA_ALLOW_UNSAFE_REHEARSAL = "1"
+        $process = Start-Process -FilePath $ZokaExe `
+            -ArgumentList $args `
+            -WorkingDirectory $RepoRoot `
+            -RedirectStandardOutput $log `
+            -RedirectStandardError $err `
+            -PassThru `
+            -WindowStyle Hidden
+    }
+    finally {
+        $env:USERPROFILE = $oldUserProfile
+        $env:HOME = $oldHome
+        $env:ZOKA_ALLOW_UNSAFE_REHEARSAL = $oldAllowUnsafe
+    }
 
     [pscustomobject]@{
         Index = $Index
@@ -118,6 +136,37 @@ function Stop-Node {
     }
 }
 
+function Get-NodeHeight {
+    param([string]$Db)
+    $heightJson = & $ZokaExe height --db $Db --json 2>&1 | Out-String
+    try { return [int](($heightJson | ConvertFrom-Json).height) } catch { return $null }
+}
+
+function Get-BlockWinners {
+    param([string]$Db, [int]$MaxHeight)
+    $winners = @()
+    for ($h = 1; $h -le $MaxHeight; $h++) {
+        $infoJson = & $ZokaExe block-info --height $h --db $Db --json 2>&1 | Out-String
+        try {
+            $info = $infoJson | ConvertFrom-Json
+            $winners += [pscustomobject]@{
+                height     = $info.height
+                miner      = $info.miner
+                reward_zka = $info.reward_zka
+                hash       = $info.hash.Substring(0, [Math]::Min(16, $info.hash.Length)) + "..."
+            }
+        } catch {
+            $winners += [pscustomobject]@{
+                height     = $h
+                miner      = "(unreadable)"
+                reward_zka = 0
+                hash       = ""
+            }
+        }
+    }
+    return $winners
+}
+
 $nodes = @()
 $summary = [ordered]@{
     schema = "zoka-local-multinode-rehearsal-v1"
@@ -125,27 +174,38 @@ $summary = [ordered]@{
     node_count = $NodeCount
     base_port = $BasePort
     run_seconds = $RunSeconds
+    stop_grace_seconds = $StopGraceSeconds
+    sync_warmup_seconds = $SyncWarmupSeconds
+    mine_interval_seconds = $MineIntervalSeconds
+    sync_rebroadcast_recent_blocks = $SyncRebroadcastRecentBlocks
+    unsafe_rehearsal_difficulty_bits = $UnsafeRehearsalDifficultyBits
+    target_height = $TargetHeight
     no_mine = [bool]$NoMine
     out_dir = $OutDir
     seed_addr = $null
+    block_winners = @()
     results = @()
 }
 
 try {
-    Write-Host "Starting seed node..."
+    Write-Host "Starting seed node (node-1)..."
     $seedNode = Start-ZokaNode -Index 1
     $nodes += $seedNode
-    $seedAddr = Wait-ForPattern -Path $seedNode.Log -Pattern 'Listen address.*?((/ip4|/ip6)/[^\s\u001b]+)' -TimeoutSeconds 30
+    $seedAddr = Wait-ForPattern -Path $seedNode.Log -Pattern 'Listen address.*?((/ip4|/ip6)/[^\s]+)' -TimeoutSeconds 30
     $summary.seed_addr = $seedAddr
     Write-Host "Seed node address: $seedAddr"
 
+    $knownSeedAddrs = @($seedAddr)
     for ($i = 2; $i -le $NodeCount; $i++) {
-        Write-Host "Starting node $i -> seed..."
-        $nodes += Start-ZokaNode -Index $i -Seed $seedAddr
+        Write-Host "Starting node $i -> seeding from known peers..."
+        $node = Start-ZokaNode -Index $i -Seeds $knownSeedAddrs
+        $nodes += $node
+        $knownSeedAddrs += $node.Listen
         Start-Sleep -Seconds 1
     }
 
-    $deadline = (Get-Date).AddSeconds($RunSeconds + 8)
+    Write-Host "All $NodeCount nodes running and competing to mine. Waiting up to $($RunSeconds + $StopGraceSeconds)s..."
+    $deadline = (Get-Date).AddSeconds($RunSeconds + $StopGraceSeconds)
     foreach ($node in $nodes) {
         while (!$node.Process.HasExited -and (Get-Date) -lt $deadline) {
             Start-Sleep -Milliseconds 500
@@ -159,13 +219,7 @@ try {
         $node.Process.Refresh()
         $stdout = if (Test-Path -LiteralPath $node.Log) { Get-Content -LiteralPath $node.Log -Raw } else { "" }
         $stderr = if (Test-Path -LiteralPath $node.ErrorLog) { Get-Content -LiteralPath $node.ErrorLog -Raw } else { "" }
-        $heightJson = & $ZokaExe height --db $node.Db --json 2>&1 | Out-String
-        $height = $null
-        try {
-            $height = ($heightJson | ConvertFrom-Json).height
-        } catch {
-            $height = $null
-        }
+        $height = Get-NodeHeight -Db $node.Db
 
         $connected = $stdout -match "Connected to seed peer" -or [regex]::IsMatch($stdout, "Connected peers.*?[1-9]")
         $listening = $stdout -match "Listen address"
@@ -191,6 +245,21 @@ try {
         if ($exitCode -ne 0 -or !$listening -or !$startupOk -or !$timedOutCleanly) {
             Write-Warning "Node $($node.Index) did not pass all startup checks. See $($node.Log)"
         }
+        if (!$NoMine -and $height -lt 1) {
+            Write-Warning "Node $($node.Index) did not reach height >= 1. See $($node.Log)"
+        }
+    }
+
+    # --- Block winner table ---
+    # Pick the node with the highest chain to query the canonical history.
+    $bestNode = $nodes | Sort-Object { (Get-NodeHeight -Db $_.Db) } -Descending | Select-Object -First 1
+    $bestHeight = Get-NodeHeight -Db $bestNode.Db
+    if ($null -ne $bestHeight -and $bestHeight -gt 0) {
+        Write-Host ""
+        Write-Host "Block winner table (from node-$($bestNode.Index) at height $bestHeight):"
+        $winners = Get-BlockWinners -Db $bestNode.Db -MaxHeight $bestHeight
+        $summary.block_winners = $winners
+        $winners | Format-Table height, miner, reward_zka, hash -AutoSize
     }
 }
 finally {
@@ -207,12 +276,17 @@ foreach ($result in $summary.results) {
     if ($result.exit_code -ne 0 -or !$result.listening -or !$result.startup_ok -or !$result.clean_time_limit) {
         $allOk = $false
     }
+    if (!$NoMine -and $result.height -lt $TargetHeight) {
+        Write-Warning "Node $($result.node) reached height $($result.height), target was $TargetHeight"
+        $allOk = $false
+    }
 }
 $connectedNodes = @($summary.results | Where-Object { $_.node -gt 1 -and $_.connected }).Count
 if ($connectedNodes -lt ($NodeCount - 1)) {
     $allOk = $false
 }
 
+Write-Host ""
 Write-Host "Summary: $summaryPath"
 $summary.results | Format-Table node, exit_code, listening, connected, startup_ok, clean_time_limit, height -AutoSize
 

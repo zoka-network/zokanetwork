@@ -22,7 +22,7 @@ cargo build --release
 
 # Mainnet binary (requires MSVC + cmake on Windows, gcc + cmake on Linux)
 powershell -ExecutionPolicy Bypass -File scripts/check_randomx_toolchain.ps1 -Strict
-cargo build --release --features randomx
+powershell -ExecutionPolicy Bypass -File scripts/build_mainnet_release.ps1
 ```
 
 See [`docs/reproducible-builds.md`](docs/reproducible-builds.md) for the exact
@@ -40,9 +40,10 @@ Test layout is documented in [`tests/README.md`](tests/README.md).
 ## Frozen mainnet decisions
 
 - **PoW**: RandomX (`zoka-randomx-v1`). See [`docs/pow-mainnet-decision.md`](docs/pow-mainnet-decision.md).
-- **Token**: ZKA, max supply 23,000,000, halving every 1,051,200 blocks, target
-  block time 120s, coinbase maturity 60 blocks. See `src/economics.rs` and
-  [`docs/economics.mainnet.v1.json`](docs/economics.mainnet.v1.json).
+- **Token**: ZKA, 6 decimals (`1 ZKA = 1,000,000 atoms`), max supply
+  23,000,000, halving every 1,051,200 blocks, target block time 120s,
+  coinbase maturity 60 blocks. See `src/economics.rs` and
+  [`docs/economics.mainnet.v2-atoms.json`](docs/economics.mainnet.v2-atoms.json).
 - **Genesis schema**: `zoka-genesis-v1`. See
   [`docs/genesis.mainnet.v1.spec.md`](docs/genesis.mainnet.v1.spec.md).
 - **Snapshot schema**: `zoka-snapshot-v1`. See

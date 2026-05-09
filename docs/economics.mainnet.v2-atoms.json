@@ -1,0 +1,42 @@
+{
+  "version": "zoka-economics-v2-atoms",
+  "supersedes": "zoka-economics-v1",
+  "chain_id": "zoka-mainnet-v1",
+  "token": {
+    "symbol": "ZKA",
+    "display_unit": "ZKA",
+    "accounting_unit": "atom",
+    "decimals": 6,
+    "atoms_per_zka": 1000000
+  },
+  "supply": {
+    "max_supply_zka": 23000000,
+    "max_supply_atoms": 23000000000000,
+    "genesis_supply_zka": 0,
+    "genesis_supply_atoms": 0
+  },
+  "emission": {
+    "initial_block_reward_zka": 12,
+    "initial_block_reward_atoms": 12000000,
+    "halving_interval_blocks": 1051200,
+    "target_block_time_seconds": 120,
+    "coinbase_maturity_blocks": 60,
+    "rule": "reward_atoms(height, emitted_atoms) = min((initial_reward_zka >> floor(height / halving_interval_blocks)) * atoms_per_zka, max_supply_atoms - emitted_atoms)"
+  },
+  "pow": {
+    "mode": "pow-mainnet",
+    "algorithm_v1": "zoka-randomx-v1",
+    "initial_difficulty_bits": 16,
+    "min_difficulty_bits": 12,
+    "max_difficulty_bits": 30,
+    "key_epoch_blocks": 2048
+  },
+  "fees": {
+    "minimum_private_fee_atoms": 0,
+    "minimum_private_fee_zka": "0",
+    "fee_market_step_atoms": 100,
+    "fee_market_step_zka": "0.0001",
+    "zero_fee_allowed_when_quiet": true,
+    "destination_v2": "block_producer_private_fee_claim"
+  }
+}

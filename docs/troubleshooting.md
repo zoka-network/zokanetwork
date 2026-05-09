@@ -72,7 +72,7 @@ Causa: estas usando un binario sin feature `randomx`, normalmente
 Accion:
 
 ```powershell
-cargo build --release --features randomx --bin zoka --bin zokahd
+powershell -ExecutionPolicy Bypass -File scripts\build_mainnet_release.ps1
 ```
 
 Usar despues:
@@ -91,7 +91,13 @@ PowerShell -ExecutionPolicy Bypass -File scripts\check_randomx_toolchain.ps1 -St
 ```
 
 En Windows debe detectar CMake y Visual Studio Build Tools con C++ workload.
-Si falla, instalar esas dependencias y repetir el build release.
+Tambien debe encontrar `libclang.dll`. Si falla en `zstd-sys` con
+`Unable to find libclang`, no es un error de ZOKA: abriste PowerShell sin el
+entorno C++/libclang. Usar:
+
+```powershell
+PowerShell -ExecutionPolicy Bypass -File scripts\build_mainnet_release.ps1
+```
 
 ## GPG no esta instalado o la firma falta
 

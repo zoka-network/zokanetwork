@@ -32,7 +32,9 @@ pub enum PowError {
     #[error("pow input cannot be empty")]
     EmptyInput,
 
-    #[error("pow backend '{0}' is not compiled into this binary; rebuild with the matching feature flag")]
+    #[error(
+        "pow backend '{0}' is not compiled into this binary; rebuild with the matching feature flag"
+    )]
     BackendNotAvailable(AlgorithmId),
 
     #[error(
@@ -126,12 +128,22 @@ pub fn engine_for(chain_id: &str, height: u64) -> Result<Box<dyn PowEngine>, Pow
     build_engine(algorithm, &seed)
 }
 
+pub fn engine_pool_for(
+    chain_id: &str,
+    height: u64,
+    lanes: usize,
+) -> Result<Vec<Box<dyn PowEngine>>, PowError> {
+    let algorithm = canonical_algorithm_for(chain_id);
+    let seed = epoch_seed(chain_id, height);
+    build_engine_pool(algorithm, &seed, lanes)
+}
+
 /// Returns the canonical algorithm for the given chain id. Today only
 /// mainnet and testnet are recognized; anything else falls back to testnet
 /// rules, which is intentional — unknown networks are dev/test, never
 /// allowed to claim the mainnet algorithm.
 pub fn canonical_algorithm_for(chain_id: &str) -> AlgorithmId {
-    if chain_id == economics::MAINNET_CHAIN_ID {
+    if chain_id == economics::MAINNET_CHAIN_ID || chain_id == economics::TESTNET_CHAIN_ID {
         economics::POW_ALGORITHM_MAINNET
     } else {
         economics::POW_ALGORITHM_TESTNET
@@ -151,6 +163,39 @@ pub fn build_engine(algorithm: AlgorithmId, seed: &[u8]) -> Result<Box<dyn PowEn
                 Ok(Box::new(self::randomx_backend::RandomXPow::new(
                     seed.to_vec(),
                 )?))
+            }
+            #[cfg(not(feature = "randomx"))]
+            {
+                Err(PowError::BackendNotAvailable(
+                    economics::POW_ALGORITHM_MAINNET,
+                ))
+            }
+        }
+        other => Err(PowError::Runtime(format!(
+            "unknown PoW algorithm id: {}",
+            other
+        ))),
+    }
+}
+
+pub fn build_engine_pool(
+    algorithm: AlgorithmId,
+    seed: &[u8],
+    lanes: usize,
+) -> Result<Vec<Box<dyn PowEngine>>, PowError> {
+    let lanes = lanes.max(1);
+    match algorithm {
+        id if id == economics::POW_ALGORITHM_TESTNET => Ok((0..lanes)
+            .map(|_| Box::new(CpuFallbackPow::new(seed.to_vec())) as Box<dyn PowEngine>)
+            .collect()),
+        id if id == economics::POW_ALGORITHM_MAINNET => {
+            #[cfg(feature = "randomx")]
+            {
+                self::randomx_backend::RandomXPow::new_pool(seed.to_vec(), lanes).map(|pool| {
+                    pool.into_iter()
+                        .map(|engine| Box::new(engine) as Box<dyn PowEngine>)
+                        .collect()
+                })
             }
             #[cfg(not(feature = "randomx"))]
             {
@@ -204,8 +249,22 @@ impl PowEngine for CpuFallbackPow {
 #[cfg(feature = "randomx")]
 mod randomx_backend {
     use super::*;
-    use randomx_rs::{RandomXCache, RandomXFlag, RandomXVM};
-    use std::sync::Mutex;
+    use randomx_rs::{RandomXCache, RandomXDataset, RandomXFlag, RandomXVM};
+    use std::sync::{Mutex, OnceLock};
+
+    static DATASET_CACHE: OnceLock<Mutex<Option<CachedDataset>>> = OnceLock::new();
+
+    #[derive(Clone)]
+    struct CachedDataset {
+        seed: Vec<u8>,
+        dataset: RandomXDataset,
+    }
+
+    // `RandomXDataset` is internally reference-counted by `randomx-rs`, but the
+    // crate does not mark its raw C handle as Send/Sync. We only store it behind
+    // a process-wide mutex and clone it into VMs after lookup.
+    unsafe impl Send for CachedDataset {}
+    unsafe impl Sync for CachedDataset {}
 
     pub struct RandomXPow {
         vm: Mutex<RandomXVM>,
@@ -220,13 +279,45 @@ mod randomx_backend {
 
     impl RandomXPow {
         pub fn new(seed: Vec<u8>) -> Result<Self, PowError> {
-            let flags = RandomXFlag::default();
-            let cache = RandomXCache::new(flags, &seed)
-                .map_err(|e| PowError::Runtime(format!("randomx cache init failed: {e:?}")))?;
-            let vm = RandomXVM::new(flags, Some(cache), None)
-                .map_err(|e| PowError::Runtime(format!("randomx vm init failed: {e:?}")))?;
-            Ok(Self { vm: Mutex::new(vm) })
+            let mut pool = Self::new_pool(seed, 1)?;
+            pool.pop()
+                .ok_or_else(|| PowError::Runtime("randomx pool init returned no VMs".to_string()))
         }
+
+        pub fn new_pool(seed: Vec<u8>, lanes: usize) -> Result<Vec<Self>, PowError> {
+            let flags = RandomXFlag::get_recommended_flags() | RandomXFlag::FLAG_FULL_MEM;
+            let dataset = dataset_for_seed(flags, &seed)?;
+            let mut pool = Vec::with_capacity(lanes.max(1));
+            for _ in 0..lanes.max(1) {
+                let vm = RandomXVM::new(flags, None, Some(dataset.clone()))
+                    .map_err(|e| PowError::Runtime(format!("randomx vm init failed: {e:?}")))?;
+                pool.push(Self { vm: Mutex::new(vm) });
+            }
+            Ok(pool)
+        }
+    }
+
+    fn dataset_for_seed(flags: RandomXFlag, seed: &[u8]) -> Result<RandomXDataset, PowError> {
+        let cache = DATASET_CACHE.get_or_init(|| Mutex::new(None));
+        let mut guard = cache
+            .lock()
+            .map_err(|e| PowError::Runtime(format!("randomx dataset cache lock poisoned: {e}")))?;
+
+        if let Some(cached) = guard.as_ref() {
+            if cached.seed == seed {
+                return Ok(cached.dataset.clone());
+            }
+        }
+
+        let rx_cache = RandomXCache::new(flags, seed)
+            .map_err(|e| PowError::Runtime(format!("randomx cache init failed: {e:?}")))?;
+        let dataset = RandomXDataset::new(flags, rx_cache, 0)
+            .map_err(|e| PowError::Runtime(format!("randomx dataset init failed: {e:?}")))?;
+        *guard = Some(CachedDataset {
+            seed: seed.to_vec(),
+            dataset: dataset.clone(),
+        });
+        Ok(dataset)
     }
 
     impl PowEngine for RandomXPow {
@@ -390,6 +481,10 @@ mod tests {
     fn canonical_algorithm_per_chain_is_locked_in() {
         assert_eq!(
             canonical_algorithm_for(economics::MAINNET_CHAIN_ID),
+            economics::POW_ALGORITHM_MAINNET
+        );
+        assert_eq!(
+            canonical_algorithm_for(economics::TESTNET_CHAIN_ID),
             economics::POW_ALGORITHM_MAINNET
         );
         assert_eq!(

@@ -40,13 +40,13 @@ IDs de contribuidores (ejemplo):
 1. Generar setup base:
 
 ```powershell
-cargo run --bin zoka-trusted-setup -- --out $CURRENT --force
+cargo run --features ops-tools --bin zoka-trusted-setup -- --out $CURRENT --force
 ```
 
 2. Inicializar transcript:
 
 ```powershell
-cargo run --bin zoka-ceremony-contribute -- init `
+cargo run --features ops-tools --bin zoka-ceremony-contribute -- init `
   --setup-dir $CURRENT `
   --transcript $TRANSCRIPT `
   --label "zoka-mainnet-v1"
@@ -55,7 +55,7 @@ cargo run --bin zoka-ceremony-contribute -- init `
 3. Verificar estado inicial:
 
 ```powershell
-cargo run --bin zoka-ceremony-contribute -- verify --transcript $TRANSCRIPT --final-dir $CURRENT
+cargo run --features ops-tools --bin zoka-ceremony-contribute -- verify --transcript $TRANSCRIPT --final-dir $CURRENT
 ```
 
 ## 3) Ciclo por ronda (R1..R5)
@@ -88,7 +88,7 @@ $ROUND = "$CER\round-R1"
 $IN = "$ROUND\input"
 $OUT = "$ROUND\output_from_contributor"
 
-cargo run --bin zoka-ceremony-contribute -- prepare-adapter `
+cargo run --features ops-tools --bin zoka-ceremony-contribute -- prepare-adapter `
   --setup-dir $CURRENT `
   --adapter-dir $ROUND `
   --label "zoka-mainnet-v1-R1" `
@@ -105,7 +105,7 @@ cargo run --bin zoka-ceremony-contribute -- prepare-adapter `
 ```powershell
 $NEXT = "$CER\current-R1"
 
-cargo run --bin zoka-ceremony-contribute -- finalize-adapter `
+cargo run --features ops-tools --bin zoka-ceremony-contribute -- finalize-adapter `
   --adapter-dir $ROUND `
   --phase2-out-dir $OUT `
   --out-setup-dir $NEXT `
@@ -123,7 +123,7 @@ $CURRENT = $NEXT
 5. Verificar cadena tras cada ronda:
 
 ```powershell
-cargo run --bin zoka-ceremony-contribute -- verify --transcript $TRANSCRIPT --final-dir $CURRENT
+cargo run --features ops-tools --bin zoka-ceremony-contribute -- verify --transcript $TRANSCRIPT --final-dir $CURRENT
 ```
 
 Repetir exactamente para R2, R3, R4 y R5 con IDs distintos.
@@ -131,7 +131,7 @@ Repetir exactamente para R2, R3, R4 y R5 con IDs distintos.
 ## 4) Gate de readiness (umbral 5)
 
 ```powershell
-cargo run --bin zoka-ceremony-contribute -- readiness `
+cargo run --features ops-tools --bin zoka-ceremony-contribute -- readiness `
   --transcript $TRANSCRIPT `
   --final-dir $CURRENT `
   --min-unique-contributors 5 `
@@ -173,7 +173,7 @@ powershell -ExecutionPolicy Bypass -File scripts/verify_ceremony_bundle.ps1 `
 Con el setup final:
 
 ```powershell
-cargo run --bin zoka-ceremony-contribute -- release-pin `
+cargo run --features ops-tools --bin zoka-ceremony-contribute -- release-pin `
   --setup-dir $CURRENT `
   --transcript $TRANSCRIPT `
   --out-env "$CER\release.env"

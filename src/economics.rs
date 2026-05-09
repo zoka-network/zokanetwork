@@ -1,15 +1,19 @@
 //! Canonical ZOKA mainnet v1 economic parameters.
 //!
-//! The current wallet/accounting layer uses whole ZKA units. Do not duplicate
-//! these constants in binaries; import this module so emission rules stay
-//! consistent across CLI, mining, genesis tooling and future consensus checks.
+//! The wallet/accounting layer uses atomic units internally. User-facing CLI
+//! and genesis fields keep speaking in ZKA and convert at the boundary.
 
-pub const ECONOMICS_VERSION: &str = "zoka-economics-v1";
+pub const ECONOMICS_VERSION: &str = "zoka-economics-v2-atoms";
 pub const TOKEN_SYMBOL: &str = "ZKA";
 pub const MAINNET_CHAIN_ID: &str = "zoka-mainnet-v1";
+pub const TESTNET_CHAIN_ID: &str = "zoka-testnet-v1";
 
+pub const ZKA_DECIMALS: u32 = 6;
+pub const ATOMS_PER_ZKA: u64 = 1_000_000;
 pub const MAX_SUPPLY_ZKA: u64 = 23_000_000;
 pub const INITIAL_BLOCK_REWARD_ZKA: u64 = 12;
+pub const MAX_SUPPLY_ATOMS: u64 = MAX_SUPPLY_ZKA * ATOMS_PER_ZKA;
+pub const INITIAL_BLOCK_REWARD_ATOMS: u64 = INITIAL_BLOCK_REWARD_ZKA * ATOMS_PER_ZKA;
 pub const HALVING_INTERVAL_BLOCKS: u64 = 1_051_200;
 pub const TARGET_BLOCK_TIME_SECS: u64 = 120;
 pub const COINBASE_MATURITY_BLOCKS: u64 = 60;
@@ -31,26 +35,89 @@ pub const POW_ALGORITHM_TESTNET: &str = "zoka-cpu-fallback-v1";
 /// Returns the canonical PoW algorithm id for a given chain id. Used by
 /// `mining::pow::engine_for` and by block validation.
 pub fn pow_algorithm_for_chain(chain_id: &str) -> &'static str {
-    if chain_id == MAINNET_CHAIN_ID {
+    if chain_id == MAINNET_CHAIN_ID || chain_id == TESTNET_CHAIN_ID {
         POW_ALGORITHM_MAINNET
     } else {
         POW_ALGORITHM_TESTNET
     }
 }
 
-/// Whole-ZKA block subsidy before cap clipping.
+pub fn zka_to_atoms(zka: u64) -> Option<u64> {
+    zka.checked_mul(ATOMS_PER_ZKA)
+}
+
+pub fn parse_zka_amount(raw: &str) -> Result<u64, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("amount cannot be empty".to_string());
+    }
+    if raw.starts_with('-') {
+        return Err("amount cannot be negative".to_string());
+    }
+    let parts = raw.split('.').collect::<Vec<_>>();
+    if parts.len() > 2 {
+        return Err("amount must contain at most one decimal point".to_string());
+    }
+    let whole = if parts[0].is_empty() {
+        0
+    } else {
+        parts[0]
+            .parse::<u64>()
+            .map_err(|_| format!("invalid whole-ZKA amount: {}", parts[0]))?
+    };
+    let whole_atoms = zka_to_atoms(whole).ok_or_else(|| "amount overflows u64".to_string())?;
+    let fractional_atoms = if parts.len() == 2 {
+        let frac = parts[1];
+        if frac.len() > ZKA_DECIMALS as usize {
+            return Err(format!(
+                "amount has more than {ZKA_DECIMALS} decimal places"
+            ));
+        }
+        let mut padded = frac.to_string();
+        while padded.len() < ZKA_DECIMALS as usize {
+            padded.push('0');
+        }
+        if padded.is_empty() {
+            0
+        } else {
+            padded
+                .parse::<u64>()
+                .map_err(|_| format!("invalid fractional-ZKA amount: {frac}"))?
+        }
+    } else {
+        0
+    };
+    whole_atoms
+        .checked_add(fractional_atoms)
+        .ok_or_else(|| "amount overflows u64".to_string())
+}
+
+pub fn format_zka_amount(atoms: u64) -> String {
+    let whole = atoms / ATOMS_PER_ZKA;
+    let frac = atoms % ATOMS_PER_ZKA;
+    if frac == 0 {
+        return whole.to_string();
+    }
+    let mut frac_text = format!("{frac:0width$}", width = ZKA_DECIMALS as usize);
+    while frac_text.ends_with('0') {
+        frac_text.pop();
+    }
+    format!("{whole}.{frac_text}")
+}
+
+/// Atomic-unit block subsidy before cap clipping.
 pub fn halving_reward_for_height(height: u64) -> u64 {
     let era = height / HALVING_INTERVAL_BLOCKS;
     if era >= u64::BITS as u64 {
         0
     } else {
-        INITIAL_BLOCK_REWARD_ZKA >> era
+        (INITIAL_BLOCK_REWARD_ZKA >> era).saturating_mul(ATOMS_PER_ZKA)
     }
 }
 
 /// Final block subsidy after applying the hard cap.
 pub fn block_reward_for_height(height: u64, total_supply_emitted: u64) -> u64 {
-    let remaining = MAX_SUPPLY_ZKA.saturating_sub(total_supply_emitted);
+    let remaining = MAX_SUPPLY_ATOMS.saturating_sub(total_supply_emitted);
     if remaining == 0 {
         return 0;
     }
@@ -72,29 +139,104 @@ mod tests {
 
     #[test]
     fn emission_v1_halving_schedule_is_stable() {
-        assert_eq!(halving_reward_for_height(0), 12);
-        assert_eq!(halving_reward_for_height(HALVING_INTERVAL_BLOCKS - 1), 12);
-        assert_eq!(halving_reward_for_height(HALVING_INTERVAL_BLOCKS), 6);
-        assert_eq!(halving_reward_for_height(HALVING_INTERVAL_BLOCKS * 2), 3);
-        assert_eq!(halving_reward_for_height(HALVING_INTERVAL_BLOCKS * 3), 1);
+        assert_eq!(halving_reward_for_height(0), 12 * ATOMS_PER_ZKA);
+        assert_eq!(
+            halving_reward_for_height(HALVING_INTERVAL_BLOCKS - 1),
+            12 * ATOMS_PER_ZKA
+        );
+        assert_eq!(
+            halving_reward_for_height(HALVING_INTERVAL_BLOCKS),
+            6 * ATOMS_PER_ZKA
+        );
+        assert_eq!(
+            halving_reward_for_height(HALVING_INTERVAL_BLOCKS * 2),
+            3 * ATOMS_PER_ZKA
+        );
+        assert_eq!(
+            halving_reward_for_height(HALVING_INTERVAL_BLOCKS * 3),
+            ATOMS_PER_ZKA
+        );
         assert_eq!(halving_reward_for_height(HALVING_INTERVAL_BLOCKS * 4), 0);
     }
 
     #[test]
     fn emission_v1_never_exceeds_hard_cap() {
-        assert_eq!(block_reward_for_height(0, 0), 12);
-        assert_eq!(block_reward_for_height(0, MAX_SUPPLY_ZKA - 5), 5);
-        assert_eq!(block_reward_for_height(0, MAX_SUPPLY_ZKA), 0);
-        assert_eq!(block_reward_for_height(0, MAX_SUPPLY_ZKA + 1), 0);
+        assert_eq!(block_reward_for_height(0, 0), 12 * ATOMS_PER_ZKA);
+        assert_eq!(block_reward_for_height(0, MAX_SUPPLY_ATOMS - 5), 5);
+        assert_eq!(block_reward_for_height(0, MAX_SUPPLY_ATOMS), 0);
+        assert_eq!(block_reward_for_height(0, MAX_SUPPLY_ATOMS + 1), 0);
     }
 
     #[test]
     fn emission_v1_maturity_and_timing_are_frozen() {
         assert_eq!(TOKEN_SYMBOL, "ZKA");
+        assert_eq!(ATOMS_PER_ZKA, 1_000_000);
         assert_eq!(MAX_SUPPLY_ZKA, 23_000_000);
+        assert_eq!(MAX_SUPPLY_ATOMS, 23_000_000_000_000);
         assert_eq!(INITIAL_BLOCK_REWARD_ZKA, 12);
+        assert_eq!(INITIAL_BLOCK_REWARD_ATOMS, 12_000_000);
         assert_eq!(HALVING_INTERVAL_BLOCKS, 1_051_200);
         assert_eq!(TARGET_BLOCK_TIME_SECS, 120);
+        assert_eq!(COINBASE_MATURITY_BLOCKS, 60);
+    }
+
+    #[test]
+    fn zka_amount_parser_accepts_fractional_atoms() {
+        assert_eq!(parse_zka_amount("0").unwrap(), 0);
+        assert_eq!(parse_zka_amount("1").unwrap(), ATOMS_PER_ZKA);
+        assert_eq!(parse_zka_amount("1.25").unwrap(), 1_250_000);
+        assert_eq!(parse_zka_amount("0.000001").unwrap(), 1);
+        assert!(parse_zka_amount("0.0000001").is_err());
+        assert_eq!(format_zka_amount(1_250_000), "1.25");
+        assert_eq!(format_zka_amount(1), "0.000001");
+    }
+
+    #[test]
+    fn economics_v2_atoms_artifact_matches_code_constants() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs")
+            .join("economics.mainnet.v2-atoms.json");
+        let raw = std::fs::read_to_string(path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(json["version"], ECONOMICS_VERSION);
+        assert_eq!(json["chain_id"], MAINNET_CHAIN_ID);
+        assert_eq!(json["token"]["symbol"], TOKEN_SYMBOL);
+        assert_eq!(json["token"]["decimals"], ZKA_DECIMALS);
+        assert_eq!(json["token"]["atoms_per_zka"], ATOMS_PER_ZKA);
+        assert_eq!(json["supply"]["max_supply_zka"], MAX_SUPPLY_ZKA);
+        assert_eq!(json["supply"]["max_supply_atoms"], MAX_SUPPLY_ATOMS);
+        assert_eq!(
+            json["emission"]["initial_block_reward_zka"],
+            INITIAL_BLOCK_REWARD_ZKA
+        );
+        assert_eq!(
+            json["emission"]["initial_block_reward_atoms"],
+            INITIAL_BLOCK_REWARD_ATOMS
+        );
+        assert_eq!(
+            json["emission"]["halving_interval_blocks"],
+            HALVING_INTERVAL_BLOCKS
+        );
+        assert_eq!(
+            json["emission"]["target_block_time_seconds"],
+            TARGET_BLOCK_TIME_SECS
+        );
+        assert_eq!(
+            json["emission"]["coinbase_maturity_blocks"],
+            COINBASE_MATURITY_BLOCKS
+        );
+        assert_eq!(json["pow"]["algorithm_v1"], POW_ALGORITHM_MAINNET);
+    }
+
+    #[test]
+    fn testnet_v1_mirrors_mainnet_pow_and_economics() {
+        assert_eq!(
+            pow_algorithm_for_chain(TESTNET_CHAIN_ID),
+            POW_ALGORITHM_MAINNET
+        );
+        assert_eq!(MAX_SUPPLY_ZKA, 23_000_000);
+        assert_eq!(INITIAL_BLOCK_REWARD_ATOMS, 12_000_000);
         assert_eq!(COINBASE_MATURITY_BLOCKS, 60);
     }
 }

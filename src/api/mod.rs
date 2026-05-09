@@ -4834,7 +4834,7 @@ mod tests {
     async fn test_private_tx_endpoint_without_manager_returns_404() {
         // Node without a `private_wallet_manager` must refuse cleanly, not
         // crash or lie. Confirms the Option wiring works.
-        let test_dir = "/tmp/test_private_tx_endpoint_without_manager";
+        let test_dir = ".zoka/test-suite/.test_private_tx_endpoint_without_manager";
         let _ = std::fs::remove_dir_all(test_dir);
         let _ = std::fs::create_dir_all(test_dir);
         let storage = Arc::new(crate::storage::RocksDbStorage::new(test_dir).unwrap());

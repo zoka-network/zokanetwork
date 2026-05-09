@@ -1,4 +1,4 @@
-# ZOKA - Pendientes reales para mainnet publica
+﻿# ZOKA - Pendientes reales para mainnet publica
 
 Roadmap canonico: [docs/mainnet_launch_roadmap_v6.md](docs/mainnet_launch_roadmap_v6.md)
 
@@ -81,50 +81,81 @@ infraestructura publica.
 - [x] Levantar 2-4 nodos locales independientes con directorios `.zoka`
   separados, puertos distintos y genesis/config mainnet RC.
 - [x] Verificar discovery/conexion peer-to-peer entre nodos locales.
-- [ ] Minar bloques desde un nodo y confirmar propagacion/aplicacion en los
-  demas.
-- [ ] Arrancar un nodo atrasado desde DB vacia y verificar sync/IBD hasta la
-  altura actual.
-- [ ] Probar restart de nodos: apagar/arrancar, conservar DB, reconectar y
-  continuar desde chain head correcto.
-- [ ] Probar wallet real sobre la red local: crear, respaldar, restaurar,
-  consultar balance, minar/recibir coinbase y respetar maturity.
-- [ ] Probar transferencia privada entre wallets locales cuando haya fondos
-  spendables.
-- [ ] Documentar evidencia: comandos, logs minimos, alturas, hashes de head y
-  resultado por nodo.
+- [x] Minar un bloque desde un nodo y confirmar propagacion/aplicacion en peers
+  locales. Evidencia 2 nodos:
+  `.zoka\rehearsal\local-multinode-20260501-115813`.
+- [x] Endurecer propagacion 3+ nodos. Se agrego reconnect automatico al seed y
+  `--min-mine-peers` para que el minero espere peers suficientes antes de
+  minar. Evidencia 3 nodos:
+  `.zoka\rehearsal\local-multinode-20260501-123604`; evidencia 4 nodos:
+  `.zoka\rehearsal\local-multinode-20260501-123747`.
+- [x] Arrancar un nodo atrasado desde DB vacia y verificar sync/IBD hasta la
+  altura observada del peer. Evidencia:
+  `.zoka\rehearsal\late-sync-20260501-120928`.
+- [x] Probar restart de nodos: apagar/arrancar, conservar DB, reconectar y
+  continuar desde chain head correcto. Evidencia:
+  `.zoka\rehearsal\restart-20260501-121200`.
+- [x] Probar sincronizacion natural escalonada y competencia posterior: nodo 1
+  mina solo hasta altura 5, nodo 2 entra y sincroniza hasta altura 3, luego
+  entra nodo 3, todos alcanzan altura 5, compiten hasta al menos altura 8 y
+  finalmente convergen al mismo head canonico por trabajo acumulado. Se aplico
+  el patron a `fullnode`/`zokahd` con `--seed` repetible, fallback multi-seed,
+  rebroadcast de bloques recientes, cadencia IBD no bloqueante, requests por
+  hash esperado y promocion de ramas laterales conocidas. Evidencia:
+  `.zoka\rehearsal\staged-sync-20260501-223605`.
+- [x] Cerrar churn cotidiano de nodos antes de avanzar de fase: nodos que
+  entran tarde, salen, vuelven con DB vieja, un nodo fresco entra desde cero,
+  cae el seed original y luego vuelve. Evidencia:
+  `.zoka\rehearsal\churn-20260502-184407\summary.json`. Resultado: node-1,
+  node-2, node-3 y node-4 cerraron en height 5 con el mismo head
+  `88c9ddf7eabec43883514009ca0737d90cdc5df36c2709011e8eb3601c6867ab`.
+- [x] Probar wallet real sobre la red local: crear wallets aisladas, minar con
+  wallet real del nodo, respetar coinbase maturity y sincronizar un verificador
+  contra la cadena minada. Evidencia:
+  `.zoka\rehearsal\wallet-network-20260502-211129`.
+- [x] Probar transferencia privada entre wallets locales cuando hay fondos
+  spendables y comprometer el hash en un bloque propagado. Evidencia:
+  `.zoka\rehearsal\wallet-network-20260502-211129\manual-summary.json`;
+  tx `a3f2c833aa851b8c730cb3c78e7d4e3f` quedo en block 65, ambos nodos
+  terminaron en height 65/head
+  `f2072ed2982854c22b49afb251177642afe68d66b1f215eb046debb2e1f24070`.
+- [x] Documentar evidencia: comandos, logs minimos, alturas, hashes de head y
+  resultado por nodo. El script reproducible base es
+  `scripts/local_wallet_network_rehearsal.ps1`; usa dificultad local insegura y
+  seeded setup dev-only explicitamente para no contaminar parametros mainnet.
 
 ## Nuevo bloqueante pre-mainnet: auditoria total de CLI
 
 - [ ] Ejecutar una matriz exhaustiva de todos los comandos `zoka` y `zokahd`,
   incluyendo casos OK, errores esperados, `--json`, passwords incorrectos,
   wallet inexistente, DB vacia, rutas invalidas y red sin peers.
-- [ ] Convertir esa matriz en script reproducible para no depender de pruebas
-  manuales.
-- [ ] Revisar textos user-facing: mensajes claros, consistentes, sin ruido
-  tecnico innecesario y con acciones sugeridas.
-- [ ] Mejorar la presentacion visual de la consola: help, tablas, estados,
-  errores y dashboard de nodo/mineria, manteniendo salida `--json` estable.
+- [x] Convertir esa matriz en script reproducible para no depender de pruebas
+  manuales: `scripts/cli_smoke_test.ps1` ahora cubre comandos largos y alias UX
+  cortos.
+- [x] Primera simplificacion UX: alias cortos (`create`, `wallets`,
+  `balance`, `send`, `node`, `status`) y help principal orientado a usuarios.
+- [x] Build operativo por defecto limitado a `zoka`/`zokahd`; herramientas de
+  ceremonia y worker multiproceso quedan opt-in para operadores/tests.
+- [ ] Completar revision de textos user-facing: mensajes claros, consistentes,
+  sin ruido tecnico innecesario y con acciones sugeridas.
+- [ ] Completar presentacion visual de tablas/errores; dashboards de
+  nodo/mineria ya existen y deben mantener salida `--json` estable.
 
-## Nuevo objetivo mayor: agente AI privado para consola
+## Decision de alcance: sin asistente conversacional en release actual
 
-Objetivo: integrar un agente AI opcional para que el usuario pueda chatear por
-consola y pedir acciones en lenguaje natural, por ejemplo crear wallet,
-consultar balance, minar, explicar estado del nodo o preparar una transaccion.
+Objetivo actualizado: simplificar la superficie publica y dejar solo el CLI
+`zoka` y el daemon/wrapper `zokahd`. La capa conversacional queda fuera del
+binario, fuera del smoke y fuera de la referencia de usuario.
 
-Condiciones obligatorias:
-
-- [ ] El agente nunca debe leer, imprimir, enviar ni almacenar seed phrases,
-  spend keys, passphrases o material privado sensible.
-- [ ] Toda accion destructiva o irreversible requiere confirmacion explicita del
-  usuario.
-- [ ] El agente debe mapear lenguaje natural a comandos internos auditables, no
-  saltarse las validaciones del CLI.
-- [ ] Modo offline/local primero; cualquier proveedor externo de AI debe ser
-  opcional y estar bloqueado por defecto para proteger privacidad.
-- [ ] El agente debe explicar que accion va a ejecutar antes de ejecutarla.
-- [ ] Las rutas de wallet, transaccion, mineria y nodo deben tener tests de
-  seguridad contra prompt injection y filtracion de secretos.
+- [x] Remover los comandos conversacionales del dispatcher.
+- [x] Remover el menu interactivo del agente; `zoka` sin argumentos queda como
+  consola guiada de Wallets, Transfers, Mining, Node, Status y Help.
+- [x] Remover tests y pasos del asistente en el smoke CLI.
+- [x] Mantener comandos reales de red/wallet/RPC: `rpc-list`, `rpc-status`,
+  `rpc-height`, `rpc-mempool`, `create`, `restore`, `wallets`, `balance`,
+  `send`, `mine`, `node`, `status`, `sync`, `backup`, `wipe` y `zokahd`.
+- [ ] Reforzar ayuda y docs del CLI puro para que las tareas frecuentes no
+  dependan de lenguaje natural.
 
 ## Pendiente humano / operativo
 
@@ -169,6 +200,5 @@ Condiciones obligatorias:
 1. Ejecutar rehearsal local multi-nodo con evidencia.
 2. Ejecutar auditoria intensiva de todos los comandos `zoka`/`zokahd`.
 3. Mejorar UX visual de consola sin romper `--json`.
-4. Disenar e implementar agente AI privado como feature opcional.
-5. Para mainnet publica, reemplazar endpoints locales por operadores reales.
-6. Pasar a auditoria externa + testnet publica.
+4. Para mainnet publica, reemplazar endpoints locales por operadores reales.
+5. Pasar a auditoria externa + testnet publica.

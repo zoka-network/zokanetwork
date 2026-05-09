@@ -1223,6 +1223,30 @@ impl Node {
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                             info!("Peer connected while pumping: {}", peer_id);
                         }
+                        SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+                            if let Some(cause) = cause {
+                                warn!("Peer connection closed while pumping: {} ({})", peer_id, cause);
+                            } else {
+                                info!("Peer connection closed while pumping: {}", peer_id);
+                            }
+                        }
+                        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                            warn!(
+                                "Outgoing peer connection error while pumping: {:?} ({})",
+                                peer_id, error
+                            );
+                        }
+                        SwarmEvent::IncomingConnectionError {
+                            local_addr,
+                            send_back_addr,
+                            error,
+                            ..
+                        } => {
+                            warn!(
+                                "Incoming peer connection error while pumping: {} from {} ({})",
+                                local_addr, send_back_addr, error
+                            );
+                        }
                         SwarmEvent::NewListenAddr { address, .. } => {
                             info!("Listening address announced while pumping: {}", address);
                         }
@@ -1337,9 +1361,12 @@ impl Node {
     pub fn publish_block_request(
         &mut self,
         block_height: u64,
-        _block_hash: Option<String>,
+        block_hash: Option<String>,
     ) -> Result<(), Box<dyn Error>> {
-        self.publish_message(&ZokaMessage::BlockRequest { block_height })
+        self.publish_message(&ZokaMessage::BlockRequest {
+            block_height,
+            block_hash,
+        })
     }
 
     /// Publish BlockResponse message on general topic.
@@ -1361,6 +1388,12 @@ impl Node {
         }))
     }
 
+    fn restore_deferred_messages(&mut self, deferred: &mut Vec<ZokaMessage>) {
+        while let Some(message) = deferred.pop() {
+            self.inbound_queue.push_front(message);
+        }
+    }
+
     /// Request a block and wait for a matching response from the network.
     pub async fn request_block_with_retry(
         &mut self,
@@ -1369,13 +1402,17 @@ impl Node {
         publish_attempts: u32,
         max_wait: Duration,
     ) -> Result<BlockResponseMessage, Box<dyn Error>> {
-        let request = ZokaMessage::BlockRequest { block_height };
+        let request = ZokaMessage::BlockRequest {
+            block_height,
+            block_hash: expected_hash.clone(),
+        };
 
         self.publish_message_with_retry(&request, publish_attempts, Duration::from_millis(120))
             .await?;
 
         let deadline = tokio::time::Instant::now() + max_wait;
         let mut last_error = String::new();
+        let mut deferred = Vec::new();
         loop {
             if tokio::time::Instant::now() >= deadline {
                 let detail = if last_error.is_empty() {
@@ -1383,6 +1420,7 @@ impl Node {
                 } else {
                     last_error
                 };
+                self.restore_deferred_messages(&mut deferred);
                 return Err(Box::new(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("timed out waiting for block response: {detail}"),
@@ -1393,18 +1431,23 @@ impl Node {
                 .saturating_duration_since(tokio::time::Instant::now())
                 .min(Duration::from_millis(800));
             match tokio::time::timeout(wait_budget, self.next_message()).await {
-                Ok(Ok(ZokaMessage::BlockResponse(resp))) => {
-                    if resp.block_height != block_height {
-                        continue;
-                    }
-                    if let Some(hash) = expected_hash.as_ref() {
-                        if &resp.block_hash != hash {
+                Ok(Ok(message)) => match message {
+                    ZokaMessage::BlockResponse(resp) => {
+                        if resp.block_height != block_height {
+                            deferred.push(ZokaMessage::BlockResponse(resp));
                             continue;
                         }
+                        if let Some(hash) = expected_hash.as_ref() {
+                            if &resp.block_hash != hash {
+                                deferred.push(ZokaMessage::BlockResponse(resp));
+                                continue;
+                            }
+                        }
+                        self.restore_deferred_messages(&mut deferred);
+                        return Ok(resp);
                     }
-                    return Ok(resp);
-                }
-                Ok(Ok(_)) => {}
+                    other => deferred.push(other),
+                },
                 Ok(Err(err)) => {
                     last_error = err.to_string();
                 }

@@ -53,6 +53,39 @@ function Find-MsvcInstall {
     return $null
 }
 
+function Find-LibclangPath {
+    if (![string]::IsNullOrWhiteSpace($env:LIBCLANG_PATH)) {
+        $dll = Join-Path $env:LIBCLANG_PATH "libclang.dll"
+        $alt = Join-Path $env:LIBCLANG_PATH "clang.dll"
+        if ((Test-Path -LiteralPath $dll -PathType Leaf) -or (Test-Path -LiteralPath $alt -PathType Leaf)) {
+            return $env:LIBCLANG_PATH
+        }
+    }
+
+    $roots = @(
+        (Join-Path $env:APPDATA "Python"),
+        (Join-Path $env:LOCALAPPDATA "Programs\Python")
+    )
+    foreach ($root in $roots) {
+        if (!(Test-Path -LiteralPath $root)) {
+            continue
+        }
+        $hit = Get-ChildItem -LiteralPath $root -Recurse -Filter "libclang.dll" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -like "*\clang\native\libclang.dll" } |
+            Select-Object -First 1
+        if ($null -ne $hit) {
+            return $hit.DirectoryName
+        }
+    }
+
+    $llvm = "C:\Program Files\LLVM\bin"
+    if (Test-Path -LiteralPath (Join-Path $llvm "libclang.dll") -PathType Leaf) {
+        return $llvm
+    }
+
+    return $null
+}
+
 Write-Host "ZOKA RandomX toolchain preflight"
 Write-Host "--------------------------------"
 
@@ -69,6 +102,16 @@ if ($env:OS -eq "Windows_NT") {
         if ($null -ne $msbuild) { Write-Host "msbuild: $($msbuild.Source)" }
         if (![string]::IsNullOrWhiteSpace($msvcInstall)) { Write-Host "MSVC Build Tools: $msvcInstall" }
     }
+
+    $libclangPath = Find-LibclangPath
+    if ([string]::IsNullOrWhiteSpace($libclangPath)) {
+        $missing.Add("libclang.dll - Install Python package 'clang' or set LIBCLANG_PATH to a valid x64 libclang directory.")
+    } else {
+        Write-Host "LIBCLANG_PATH candidate: $libclangPath"
+        if ($libclangPath -like "C:\Program Files\LLVM\bin*") {
+            Write-Host "Note: if this LLVM libclang is ARM64, set LIBCLANG_PATH to the Python clang native x64 directory instead."
+        }
+    }
 } else {
     Test-Command -Name "cc" -InstallHint "Install gcc or clang."
     Test-Command -Name "c++" -InstallHint "Install g++ or clang++."
@@ -83,7 +126,7 @@ if ($missing.Count -gt 0) {
     }
     Write-Host ""
     Write-Host "Mainnet release binaries must compile with:"
-    Write-Host "  cargo build --release --features randomx --bin zoka --bin zokahd"
+    Write-Host "  powershell -ExecutionPolicy Bypass -File scripts/build_mainnet_release.ps1"
     if ($Strict) {
         exit 1
     }

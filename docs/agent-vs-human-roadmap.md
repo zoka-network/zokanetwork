@@ -107,10 +107,12 @@ Items que solo dependen de codigo / docs y no requieren actores externos.
   `chain.rs`). Para que reorgs sean seguros sobre balances, falta integrar
   con `StateManager`. Decision: hacerlo si/cuando se vuelva a usar el
   ledger publico vs solo el privado.
-- ðŸ¤– **Migracion a unidades atomicas**: hoy contabilidad usa `u64` enteros
-  de ZKA. Para tener subdivision (mZKA, uZKA) necesita migrar wallet,
-  circuitos Bulletproofs, state, mempool. Es hard fork. Documentado en
-  `economics.rs` como roadmap futuro.
+- ðŸ¤– **Migracion explicita de DBs legacy whole-ZKA**: la contabilidad atomica
+  ya esta en codigo como `zoka-economics-v2-atoms` y los DBs nuevos quedan
+  marcados. Los DBs locales antiguos sin marker se bloquean para no mezclar
+  whole-ZKA con atoms. Si se quiere conservar historial viejo, falta una
+  herramienta de migracion explicita; para launch local limpio, usar genesis
+  nuevo.
 
 ---
 

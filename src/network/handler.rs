@@ -74,7 +74,7 @@ impl MessageHandler for DefaultMessageHandler {
                 let mut stats = self.stats.write().await;
                 stats.transactions += batch.txs.len() as u64;
             }
-            ZokaMessage::BlockRequest { block_height } => {
+            ZokaMessage::BlockRequest { block_height, .. } => {
                 info!("Block request received: height={}", block_height);
                 let mut stats = self.stats.write().await;
                 stats.block_requests += 1;

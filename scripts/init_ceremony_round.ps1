@@ -35,7 +35,7 @@ $invitationPath = Join-Path $roundDir ("INVITATION_contrib-{0}.md" -f $Contribut
 $outputDir = Join-Path $roundDir "output_from_contributor"
 
 $prepareArgs = @(
-    "run", "--bin", "zoka-ceremony-contribute", "--",
+    "run", "--features", "ops-tools", "--bin", "zoka-ceremony-contribute", "--",
     "prepare-adapter",
     "--setup-dir", $CurrentDir,
     "--adapter-dir", $roundDir,

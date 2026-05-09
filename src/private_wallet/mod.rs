@@ -832,6 +832,8 @@ fn private_tx_hash(
         hasher.update(&output.ephemeral_pubkey);
         hasher.update([0x1f]);
         hasher.update(output.one_time_public_key.as_bytes());
+        hasher.update([0x1f]);
+        hasher.update(&output.encrypted_amount);
         hasher.update([u8::from(output.is_change)]);
     }
     hex::encode(&hasher.finalize()[..16])
@@ -939,7 +941,6 @@ struct PlannedPrivateOutput {
     asset_tag: String,
     recipient_commitment: String,
     amount: u64,
-    is_change: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1034,6 +1035,17 @@ fn tx_input_nullifiers(tx: &PrivateTransaction) -> Vec<String> {
     } else {
         tx.input_nullifiers.clone()
     }
+}
+
+fn tx_ring_domain(tx: &PrivateTransaction) -> String {
+    if !tx.recipient_commitment.is_empty() {
+        return tx.recipient_commitment.clone();
+    }
+    tx.outputs
+        .first()
+        .map(|output| output.one_time_public_key.clone())
+        .filter(|key| !key.is_empty())
+        .unwrap_or_else(|| tx.stealth_address.clone())
 }
 
 fn default_ring_version() -> u8 {
@@ -1178,10 +1190,11 @@ pub struct PrivateTransactionBuilder {
     nullifier_set: Arc<Mutex<NullifierSet>>,
 }
 
-/// Encrypt amount using commitment_blind as shared secret.
-/// SECURITY: The stream is derived from blake3(commitment_blind || recipient_commitment || nullifier).
-/// Only the sender (who knows commitment_blind) and the receiver (who can verify the commitment)
-/// can derive this stream, preventing passive observers from decrypting.
+const PRIVATE_NOTE_PAYLOAD_V2_LEN: usize = 40;
+
+/// Legacy amount obfuscation retained only so already-created local txs can
+/// still be imported. New transactions use `encrypt_private_note_payload_v2`
+/// below because this legacy stream was keyed by public tx metadata.
 fn xor_amount_with_stream(
     amount: u64,
     commitment_blind: &[u8],
@@ -1234,6 +1247,59 @@ fn decode_amount_from_payload(
     }
 
     Ok(u64::from_le_bytes(bytes))
+}
+
+fn private_note_payload_key(
+    amount_blind: Scalar,
+    commitment: &str,
+    nullifier_domain: &str,
+) -> Vec<u8> {
+    let mut key = amount_blind.to_bytes().to_vec();
+    key.extend_from_slice(commitment.as_bytes());
+    key.extend_from_slice(nullifier_domain.as_bytes());
+    key
+}
+
+fn encrypt_private_note_payload_v2(
+    amount: u64,
+    commitment_blind: &[u8],
+    amount_blind: Scalar,
+    commitment: &str,
+    nullifier_domain: &str,
+) -> Result<Vec<u8>, BlockError> {
+    if commitment_blind.len() != 32 {
+        return Err(BlockError::TransactionValidationFailed(
+            "private note commitment blind must be 32 bytes".to_string(),
+        ));
+    }
+    let mut payload = Vec::with_capacity(PRIVATE_NOTE_PAYLOAD_V2_LEN);
+    payload.extend_from_slice(&amount.to_le_bytes());
+    payload.extend_from_slice(commitment_blind);
+    let key = private_note_payload_key(amount_blind, commitment, nullifier_domain);
+    Ok(xor_with_blake3_stream(
+        &payload,
+        &key,
+        b"zoka-private-note-payload-v2",
+    ))
+}
+
+fn decrypt_private_note_payload_v2(
+    payload: &[u8],
+    amount_blind: Scalar,
+    commitment: &str,
+    nullifier_domain: &str,
+) -> Result<(u64, Vec<u8>), BlockError> {
+    if payload.len() != PRIVATE_NOTE_PAYLOAD_V2_LEN {
+        return Err(BlockError::TransactionValidationFailed(
+            "Invalid private note payload length".to_string(),
+        ));
+    }
+    let key = private_note_payload_key(amount_blind, commitment, nullifier_domain);
+    let plaintext = xor_with_blake3_stream(payload, &key, b"zoka-private-note-payload-v2");
+    let mut amount_bytes = [0u8; 8];
+    amount_bytes.copy_from_slice(&plaintext[..8]);
+    let commitment_blind = plaintext[8..].to_vec();
+    Ok((u64::from_le_bytes(amount_bytes), commitment_blind))
 }
 
 fn coinbase_amount_domain(block_height: u64, recipient_address: &str) -> String {
@@ -1363,7 +1429,6 @@ impl PrivateTransactionBuilder {
             asset_tag: default_asset_tag(),
             recipient_commitment,
             amount,
-            is_change: true,
         });
         self
     }
@@ -1840,7 +1905,6 @@ impl PrivateTransactionBuilder {
             asset_tag: tx_asset_tag.clone(),
             recipient_commitment: recipient_commitment.clone(),
             amount: self.amount,
-            is_change: false,
         }];
         if let Some(change_output) = self.change_output {
             if change_output.amount > 0 {
@@ -1860,21 +1924,22 @@ impl PrivateTransactionBuilder {
                     Commitment::new_random(&planned_output.amount.to_le_bytes());
                 (bytes_to_hex(commitment.as_bytes()), commitment_blind)
             };
-            let encrypted_amount = xor_amount_with_stream(
-                planned_output.amount,
-                &commitment_blind,
-                &planned_output.recipient_commitment,
-                &primary_nullifier,
-            );
             let stealth_material =
                 derive_stealth_payload(&planned_output.recipient_commitment, &commitment_hex)?;
             let amount_blind = stealth_material.amount_blind;
+            let encrypted_amount = encrypt_private_note_payload_v2(
+                planned_output.amount,
+                &commitment_blind,
+                amount_blind,
+                &commitment_hex,
+                &primary_nullifier,
+            )?;
             output_blind_sum += amount_blind;
             outputs.push(PrivateOutput {
                 output_id: String::new(),
                 asset_tag: planned_output.asset_tag.clone(),
                 asset_tag_commitment: asset_tag_commitment_hex(&planned_output.asset_tag),
-                recipient_commitment: planned_output.recipient_commitment,
+                recipient_commitment: String::new(),
                 stealth_address: stealth_material.stealth_address,
                 ephemeral_pubkey: stealth_material.ephemeral_pubkey,
                 commitment: commitment_hex,
@@ -1882,8 +1947,8 @@ impl PrivateTransactionBuilder {
                 range_proof: prove_output_range(planned_output.amount, amount_blind)?,
                 one_time_public_key: stealth_material.one_time_public_key,
                 encrypted_amount,
-                commitment_blind,
-                is_change: planned_output.is_change,
+                commitment_blind: Vec::new(),
+                is_change: false,
             });
         }
         // Generate a private fee commitment when fee > 0. The commitment is a
@@ -1935,7 +2000,7 @@ impl PrivateTransactionBuilder {
                 &tx_hash,
                 ordinal,
                 &output.commitment,
-                &output.recipient_commitment,
+                &output.one_time_public_key,
             );
         }
 
@@ -1949,7 +2014,7 @@ impl PrivateTransactionBuilder {
                 )
             })?;
         let commitment_hex = primary_output.commitment.clone();
-        let commitment_blind = primary_output.commitment_blind.clone();
+        let commitment_blind = Vec::new();
         let encrypted_amount = primary_output.encrypted_amount.clone();
         let stealth_address = primary_output.stealth_address.clone();
         let ephemeral_pubkey = primary_output.ephemeral_pubkey.clone();
@@ -1975,7 +2040,7 @@ impl PrivateTransactionBuilder {
             .iter()
             .enumerate()
             .map(|(idx, member)| {
-                derive_decoy_ring_member(member, &tx_hash, &recipient_commitment, idx)
+                derive_decoy_ring_member(member, &tx_hash, &primary_output.one_time_public_key, idx)
             })
             .collect::<Vec<_>>();
         ring_points.push(signer_public);
@@ -1995,7 +2060,7 @@ impl PrivateTransactionBuilder {
             &tx_hash,
             &commitment_hex,
             &primary_nullifier,
-            &recipient_commitment,
+            &primary_output.one_time_public_key,
             &ring_members,
             &input_public_keys,
             &input_key_images,
@@ -2020,14 +2085,14 @@ impl PrivateTransactionBuilder {
             &input_public_keys,
             &input_key_images,
             &tx_hash,
-            &recipient_commitment,
+            &primary_output.one_time_public_key,
             &ring_message,
         );
 
         Ok(PrivateTransaction {
             tx_hash,
             commitment: commitment_hex,
-            recipient_commitment,
+            recipient_commitment: String::new(),
             stealth_address,
             ephemeral_pubkey,
             encrypted_amount,
@@ -2038,7 +2103,11 @@ impl PrivateTransactionBuilder {
             proof_fee: 0,
             proof_key_image: 0,
             proof_private_root_words,
-            fee: self.fee,
+            fee: if fee_commitment.is_empty() {
+                self.fee
+            } else {
+                0
+            },
             ring_id,
             ring_version: ring_version_for_backend(signing_backend),
             ring_members,
@@ -2234,6 +2303,8 @@ pub struct PrivateWallet {
     pub private_notes: Vec<PrivateNote>,
     pub private_balance: u64,
     pub private_transactions: Vec<PrivateTransaction>,
+    #[serde(default)]
+    pub private_fee_openings: HashMap<String, PrivateFeeOpening>,
     pub created_at: u64,
 }
 
@@ -2259,6 +2330,7 @@ impl PrivateWallet {
             private_notes: vec![],
             private_balance: 0,
             private_transactions: vec![],
+            private_fee_openings: HashMap::new(),
             created_at: current_timestamp(),
         }
     }
@@ -2634,22 +2706,16 @@ impl PrivateWallet {
                 note.spent_at = Some(spend_timestamp);
             }
         }
-        let self_commitment = self.commitment_key.clone();
-        let change_outputs = tx_outputs(&tx)
-            .into_iter()
-            .filter(|output| {
-                output.is_change
-                    && constant_time_eq_str(&output.recipient_commitment, &self_commitment)
-            })
-            .collect::<Vec<_>>();
-        for output in change_outputs {
-            let change_amount = decode_amount_from_payload(
-                &output.encrypted_amount,
-                &output.commitment_blind,
-                &output.recipient_commitment,
-                &tx.nullifier,
-            )?;
-            self.import_output_as_note(&tx.tx_hash, &output, change_amount);
+        for output in tx_outputs(&tx) {
+            if let Some((local_output, amount)) =
+                decrypt_private_output_for_wallet(self, &tx, &output)?
+            {
+                self.import_output_as_note(&tx.tx_hash, &local_output, amount);
+            }
+        }
+        if let Some(opening) = tx.fee_opening.clone() {
+            self.private_fee_openings
+                .insert(tx.tx_hash.clone(), opening);
         }
         self.private_transactions.push(tx.clone());
         self.sync_balance_cache();
@@ -2699,6 +2765,89 @@ impl Drop for PrivateWallet {
             key.zeroize();
         }
     }
+}
+
+fn decrypt_private_output_for_wallet(
+    wallet: &PrivateWallet,
+    tx: &PrivateTransaction,
+    output: &PrivateOutput,
+) -> Result<Option<(PrivateOutput, u64)>, BlockError> {
+    let scan_key = if wallet.scan_key.is_empty() {
+        &wallet.spending_key
+    } else {
+        &wallet.scan_key
+    };
+
+    let derived_secret = match derive_output_secret_scalar(&wallet.spending_key, scan_key, output) {
+        Ok(secret) => secret,
+        Err(_) => return Ok(None),
+    };
+    let derived_public = point_to_hex(&(derived_secret * RISTRETTO_BASEPOINT_POINT));
+    if !constant_time_eq_str(&derived_public, &output.one_time_public_key) {
+        return Ok(None);
+    }
+
+    let amount_blind = derive_output_amount_blind_from_note(scan_key, output).ok_or_else(|| {
+        BlockError::TransactionValidationFailed("Failed to derive output amount blind".to_string())
+    })?;
+
+    let (amount, commitment_blind) = if output.encrypted_amount.len() == PRIVATE_NOTE_PAYLOAD_V2_LEN
+    {
+        decrypt_private_note_payload_v2(
+            &output.encrypted_amount,
+            amount_blind,
+            &output.commitment,
+            &tx.nullifier,
+        )?
+    } else {
+        let recipient_commitment = if output.recipient_commitment.is_empty() {
+            wallet.commitment_key.as_str()
+        } else {
+            output.recipient_commitment.as_str()
+        };
+        if output.commitment_blind.is_empty() {
+            return Err(BlockError::TransactionValidationFailed(
+                "Legacy private output is missing commitment blind".to_string(),
+            ));
+        }
+        (
+            decode_amount_from_payload(
+                &output.encrypted_amount,
+                &output.commitment_blind,
+                recipient_commitment,
+                &tx.nullifier,
+            )?,
+            output.commitment_blind.clone(),
+        )
+    };
+
+    let expected_commitment = Commitment::new_blinded(&amount.to_le_bytes(), &commitment_blind);
+    if !constant_time_eq_str(&expected_commitment.to_hex(), &output.commitment) {
+        return Err(BlockError::TransactionValidationFailed(
+            "Commitment mismatch while decrypting private amount".to_string(),
+        ));
+    }
+
+    let expected_amount_commitment = amount_commitment_hex(amount, amount_blind);
+    if !output.amount_commitment.is_empty()
+        && !constant_time_eq_str(&expected_amount_commitment, &output.amount_commitment)
+    {
+        return Err(BlockError::TransactionValidationFailed(
+            "Amount commitment mismatch while decrypting private amount".to_string(),
+        ));
+    }
+    if !output.range_proof.is_empty()
+        && !verify_output_range(&output.amount_commitment, &output.range_proof)?
+    {
+        return Err(BlockError::TransactionValidationFailed(
+            "Range proof mismatch while decrypting private amount".to_string(),
+        ));
+    }
+
+    let mut local_output = output.clone();
+    local_output.recipient_commitment = wallet.commitment_key.clone();
+    local_output.commitment_blind = commitment_blind;
+    Ok(Some((local_output, amount)))
 }
 
 /// Privacy-enabled wallet manager
@@ -3111,6 +3260,42 @@ impl PrivateWalletManager {
         tx_hash: &str,
         miner_commitment_key: &str,
     ) -> Result<PrivateFeeClaimEnvelope, BlockError> {
+        self.create_miner_fee_claim_envelope_with_statuses(
+            from_wallet,
+            tx_hash,
+            miner_commitment_key,
+            &[PrivacyStatus::Confirmed],
+        )
+    }
+
+    /// Build the fee-opening envelope while the transaction is being
+    /// committed into a block. The claim itself is only redeemable after the
+    /// block confirms the referenced private tx hash.
+    pub fn create_miner_fee_claim_envelope_for_block(
+        &self,
+        from_wallet: &str,
+        tx_hash: &str,
+        miner_commitment_key: &str,
+    ) -> Result<PrivateFeeClaimEnvelope, BlockError> {
+        self.create_miner_fee_claim_envelope_with_statuses(
+            from_wallet,
+            tx_hash,
+            miner_commitment_key,
+            &[
+                PrivacyStatus::Pending,
+                PrivacyStatus::Verified,
+                PrivacyStatus::Confirmed,
+            ],
+        )
+    }
+
+    fn create_miner_fee_claim_envelope_with_statuses(
+        &self,
+        from_wallet: &str,
+        tx_hash: &str,
+        miner_commitment_key: &str,
+        allowed_statuses: &[PrivacyStatus],
+    ) -> Result<PrivateFeeClaimEnvelope, BlockError> {
         let wallet = self.private_wallets.get(from_wallet).ok_or_else(|| {
             BlockError::TransactionValidationFailed("Wallet not found".to_string())
         })?;
@@ -3128,16 +3313,25 @@ impl PrivateWalletManager {
                 "Private transaction not found in local pool/history".to_string(),
             )
         })?;
-        if tx.status != PrivacyStatus::Confirmed {
+        if !allowed_statuses.iter().any(|status| status == &tx.status) {
             return Err(BlockError::TransactionValidationFailed(
-                "Miner fee claim is only allowed for confirmed private transactions".to_string(),
+                "Miner fee claim is not allowed for this private transaction status".to_string(),
             ));
         }
-        let opening = tx.fee_opening.clone().ok_or_else(|| {
-            BlockError::TransactionValidationFailed(
-                "Missing local fee opening for this private transaction".to_string(),
-            )
-        })?;
+        let opening = tx
+            .fee_opening
+            .clone()
+            .or_else(|| wallet.private_fee_openings.get(tx_hash).cloned())
+            .ok_or_else(|| {
+                BlockError::TransactionValidationFailed(
+                    "Missing local fee opening for this private transaction".to_string(),
+                )
+            })?;
+        if opening.fee == 0 || tx.fee_commitment.is_empty() {
+            return Err(BlockError::TransactionValidationFailed(
+                "Private transaction has no claimable private fee".to_string(),
+            ));
+        }
 
         let (shared_secret, ephemeral_pubkey) =
             fee_claim_shared_secret_from_sender(miner_commitment_key)?;
@@ -3155,6 +3349,48 @@ impl PrivateWalletManager {
             ephemeral_pubkey,
             ciphertext,
         })
+    }
+
+    /// Create encrypted fee claims for locally owned private txs that are
+    /// about to be committed by this miner. Transactions without a local fee
+    /// opening are skipped; the network still accepts them, but there is no
+    /// private-safe way for this node to claim their fee.
+    pub fn create_local_private_fee_claims_for_block(
+        &self,
+        tx_hashes: &[String],
+        miner_commitment_key: &str,
+    ) -> Result<Vec<crate::types::PrivateFeeClaim>, BlockError> {
+        let mut claims = Vec::new();
+        for tx_hash in tx_hashes {
+            let Some(from_wallet) = self.local_fee_opening_wallet_for_tx(tx_hash) else {
+                continue;
+            };
+            let envelope = self.create_miner_fee_claim_envelope_for_block(
+                &from_wallet,
+                tx_hash,
+                miner_commitment_key,
+            )?;
+            claims.push(envelope.into());
+        }
+        Ok(claims)
+    }
+
+    fn local_fee_opening_wallet_for_tx(&self, tx_hash: &str) -> Option<String> {
+        for (name, wallet) in &self.private_wallets {
+            let Some(tx) = wallet
+                .private_transactions
+                .iter()
+                .find(|candidate| candidate.tx_hash == tx_hash)
+            else {
+                continue;
+            };
+            let has_opening =
+                tx.fee_opening.is_some() || wallet.private_fee_openings.contains_key(tx_hash);
+            if has_opening && !tx.fee_commitment.is_empty() {
+                return Some(name.clone());
+            }
+        }
+        None
     }
 
     /// Decrypt and claim a batch of sender-provided fee openings.
@@ -3240,7 +3476,7 @@ impl PrivateWalletManager {
                 skipped.push(envelope.tx_hash.clone());
                 continue;
             }
-            if tx.fee != payload.fee {
+            if tx.fee_commitment.is_empty() && tx.fee != payload.fee {
                 skipped.push(envelope.tx_hash.clone());
                 continue;
             }
@@ -3317,64 +3553,12 @@ impl PrivateWalletManager {
         let wallet = self.private_wallets.get(wallet_name).ok_or_else(|| {
             BlockError::TransactionValidationFailed("Wallet not found".to_string())
         })?;
-        let scan_key = if wallet.scan_key.is_empty() {
-            &wallet.spending_key
-        } else {
-            &wallet.scan_key
-        };
 
         let mut decrypted = Vec::new();
         for output in tx_outputs(tx) {
-            if !constant_time_eq_str(&wallet.commitment_key, &output.recipient_commitment) {
-                continue;
+            if let Some(match_output) = decrypt_private_output_for_wallet(wallet, tx, &output)? {
+                decrypted.push(match_output);
             }
-
-            let derived_secret =
-                derive_output_secret_scalar(&wallet.spending_key, scan_key, &output)?;
-            let derived_public = point_to_hex(&(derived_secret * RISTRETTO_BASEPOINT_POINT));
-            if point_from_hex(&output.recipient_commitment).is_some()
-                && !constant_time_eq_str(&derived_public, &output.one_time_public_key)
-            {
-                return Err(BlockError::TransactionValidationFailed(
-                    "One-time output public key mismatch for wallet".to_string(),
-                ));
-            }
-
-            let amount = decode_amount_from_payload(
-                &output.encrypted_amount,
-                &output.commitment_blind,
-                &output.recipient_commitment,
-                &tx.nullifier,
-            )?;
-            let expected_commitment =
-                Commitment::new_blinded(&amount.to_le_bytes(), &output.commitment_blind);
-            if !constant_time_eq_str(&expected_commitment.to_hex(), &output.commitment) {
-                return Err(BlockError::TransactionValidationFailed(
-                    "Commitment mismatch while decrypting private amount".to_string(),
-                ));
-            }
-            let amount_blind =
-                derive_output_amount_blind_from_note(scan_key, &output).ok_or_else(|| {
-                    BlockError::TransactionValidationFailed(
-                        "Failed to derive output amount blind".to_string(),
-                    )
-                })?;
-            let expected_amount_commitment = amount_commitment_hex(amount, amount_blind);
-            if !output.amount_commitment.is_empty()
-                && !constant_time_eq_str(&expected_amount_commitment, &output.amount_commitment)
-            {
-                return Err(BlockError::TransactionValidationFailed(
-                    "Amount commitment mismatch while decrypting private amount".to_string(),
-                ));
-            }
-            if !output.range_proof.is_empty()
-                && !verify_output_range(&output.amount_commitment, &output.range_proof)?
-            {
-                return Err(BlockError::TransactionValidationFailed(
-                    "Range proof mismatch while decrypting private amount".to_string(),
-                ));
-            }
-            decrypted.push((output, amount));
         }
 
         Ok(decrypted)
@@ -3469,9 +3653,95 @@ impl PrivateWalletManager {
         Ok(credited)
     }
 
+    /// Apply a private transaction to one local wallet when scanning persisted
+    /// chain data. This marks locally-owned inputs as spent and imports any
+    /// decryptable outputs, including sender change outputs.
+    pub fn apply_private_transaction_for_wallet(
+        &mut self,
+        wallet_name: &str,
+        tx: &PrivateTransaction,
+    ) -> Result<u64, BlockError> {
+        let decrypted_outputs = self.decrypt_matching_outputs_for_wallet(wallet_name, tx)?;
+        let input_nullifiers = tx_input_nullifiers(tx);
+        let input_nullifiers = input_nullifiers.into_iter().collect::<HashSet<_>>();
+        let wallet = self.private_wallets.get_mut(wallet_name).ok_or_else(|| {
+            BlockError::TransactionValidationFailed("Wallet not found".to_string())
+        })?;
+
+        let spent_at = current_timestamp();
+        for note in &mut wallet.private_notes {
+            if note.spent {
+                continue;
+            }
+            let nullifier =
+                derive_note_nullifier(&wallet.spending_key, &note.note_id, &note.commitment);
+            if input_nullifiers.contains(&nullifier) {
+                note.spent = true;
+                note.spent_at = Some(spent_at);
+            }
+        }
+
+        let mut credited = 0u64;
+        for (output, amount) in decrypted_outputs {
+            if wallet
+                .private_notes
+                .iter()
+                .any(|existing| existing.note_id == output.output_id)
+            {
+                continue;
+            }
+            wallet.import_output_as_note(&tx.tx_hash, &output, amount);
+            credited = credited.saturating_add(amount);
+        }
+        if !wallet
+            .private_transactions
+            .iter()
+            .any(|existing| existing.tx_hash == tx.tx_hash)
+        {
+            wallet.private_transactions.push(tx.clone());
+        }
+        wallet.sync_balance_cache();
+        Ok(credited)
+    }
+
     /// Confirm a private transaction (for miners/validators)
     pub fn confirm_private_transaction(&mut self, tx_hash: &str) -> Result<(), BlockError> {
-        self.private_pool.confirm_private_transaction(tx_hash)
+        let pool_result = self.private_pool.confirm_private_transaction(tx_hash);
+        let wallet_updated =
+            self.update_wallet_private_transaction_status(tx_hash, PrivacyStatus::Confirmed);
+        if pool_result.is_ok() || wallet_updated {
+            Ok(())
+        } else {
+            pool_result
+        }
+    }
+
+    /// Mark locally stored wallet copies as confirmed after a mined block
+    /// commits the corresponding private tx hashes.
+    pub fn mark_private_transactions_confirmed_locally(&mut self, tx_hashes: &[String]) -> usize {
+        tx_hashes
+            .iter()
+            .filter(|tx_hash| {
+                self.update_wallet_private_transaction_status(tx_hash, PrivacyStatus::Confirmed)
+            })
+            .count()
+    }
+
+    fn update_wallet_private_transaction_status(
+        &mut self,
+        tx_hash: &str,
+        status: PrivacyStatus,
+    ) -> bool {
+        let mut updated = false;
+        for wallet in self.private_wallets.values_mut() {
+            for tx in &mut wallet.private_transactions {
+                if tx.tx_hash == tx_hash && tx.status != status {
+                    tx.status = status.clone();
+                    updated = true;
+                }
+            }
+        }
+        updated
     }
 
     /// Mark inbound private transaction nullifier as seen and validate optional proof.
@@ -3846,11 +4116,12 @@ impl PrivateWalletManager {
             ))
         })?;
 
+        let ring_domain = tx_ring_domain(tx);
         let message = ring_message(
             &tx.tx_hash,
             &tx.commitment,
             &tx.nullifier,
-            &tx.recipient_commitment,
+            &ring_domain,
             &tx.ring_members,
             &tx.input_public_keys,
             &tx.input_key_images,
@@ -3861,7 +4132,7 @@ impl PrivateWalletManager {
             &tx.input_public_keys,
             &tx.input_key_images,
             &tx.tx_hash,
-            &tx.recipient_commitment,
+            &ring_domain,
             &message,
             &tx.ring_signature,
         ) {
@@ -4137,6 +4408,35 @@ mod tests {
     }
 
     #[test]
+    fn test_private_transaction_hides_public_recipient_fee_and_change_metadata() {
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        let bob_commitment = manager.create_private_wallet("bob").unwrap();
+        manager.deposit_to_private_wallet("alice", 50).unwrap();
+
+        let tx_hash = manager
+            .send_private_transaction_with_fee("alice", bob_commitment, 20, 3)
+            .unwrap();
+        let tx = manager.get_private_transaction(&tx_hash).unwrap();
+
+        assert!(tx.recipient_commitment.is_empty());
+        assert_eq!(tx.fee, 0);
+        assert!(!tx.fee_commitment.is_empty());
+        assert!(tx.outputs.iter().all(|output| {
+            output.recipient_commitment.is_empty()
+                && output.commitment_blind.is_empty()
+                && !output.is_change
+                && output.encrypted_amount.len() == PRIVATE_NOTE_PAYLOAD_V2_LEN
+        }));
+        assert_eq!(
+            manager
+                .decrypt_private_amount_for_wallet("bob", &tx)
+                .expect("bob can still scan one-time output"),
+            20
+        );
+    }
+
+    #[test]
     fn test_rotate_private_wallet_key_changes_commitment() {
         let mut manager = PrivateWalletManager::new();
         let original = manager.create_private_wallet("alice").unwrap();
@@ -4224,18 +4524,19 @@ mod tests {
             .all(|output| !output.one_time_public_key.is_empty()
                 && !output.amount_commitment.is_empty()));
         let backend = backend_for_ring_version(tx.ring_version).expect("known ring version");
+        let ring_domain = tx_ring_domain(&tx);
         assert!(verify_ring_signature_with_backend(
             backend,
             &tx.ring_members,
             &tx.input_public_keys,
             &tx.input_key_images,
             &tx.tx_hash,
-            &tx.recipient_commitment,
+            &ring_domain,
             &ring_message(
                 &tx.tx_hash,
                 &tx.commitment,
                 &tx.nullifier,
-                &tx.recipient_commitment,
+                &ring_domain,
                 &tx.ring_members,
                 &tx.input_public_keys,
                 &tx.input_key_images,
@@ -4532,7 +4833,8 @@ mod tests {
         assert_eq!(alice_wallet.private_balance, 10);
         assert_eq!(
             tx.outputs.iter().filter(|output| output.is_change).count(),
-            1
+            0,
+            "public tx must not reveal which output is sender change"
         );
     }
 
@@ -4549,7 +4851,7 @@ mod tests {
         let tx = manager.get_private_transaction(&tx_hash).unwrap();
         let alice_wallet = manager.get_private_wallet("alice").unwrap();
 
-        assert_eq!(tx.fee, 3);
+        assert_eq!(tx.fee, 0, "private-fee tx must not reveal clear fee");
         assert_eq!(tx.proof_fee, 0);
         assert_eq!(alice_wallet.private_balance, 27);
 
@@ -4570,7 +4872,7 @@ mod tests {
         // The fee_commitment must NOT decompress to `fee·G + 0·H`; if it did,
         // the fee would be trivially recoverable on-chain and we'd have
         // changed nothing. With a random blind, the recovered point differs.
-        let visible_fee_point = fee_amount_commitment_point(tx.fee);
+        let visible_fee_point = fee_amount_commitment_point(3);
         let private_fee_point = point_from_hex(&tx.fee_commitment)
             .expect("fee_commitment must decode as a Ristretto point");
         assert_ne!(
@@ -4597,6 +4899,164 @@ mod tests {
         assert_eq!(tx.fee, 0);
         assert!(tx.fee_commitment.is_empty());
         assert!(tx.fee_range_proof.is_empty());
+    }
+
+    #[test]
+    fn test_confirm_private_transaction_updates_wallet_history_copy() {
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        let bob_commitment = manager.create_private_wallet("bob").unwrap();
+        manager.deposit_to_private_wallet("alice", 30).unwrap();
+
+        let tx_hash = manager
+            .send_private_transaction("alice", bob_commitment, 10)
+            .unwrap();
+        let before = manager
+            .get_private_wallet("alice")
+            .unwrap()
+            .private_transactions
+            .iter()
+            .find(|tx| tx.tx_hash == tx_hash)
+            .unwrap();
+        assert_eq!(before.status, PrivacyStatus::Pending);
+
+        manager.confirm_private_transaction(&tx_hash).unwrap();
+
+        let after = manager
+            .get_private_wallet("alice")
+            .unwrap()
+            .private_transactions
+            .iter()
+            .find(|tx| tx.tx_hash == tx_hash)
+            .unwrap();
+        assert_eq!(after.status, PrivacyStatus::Confirmed);
+    }
+
+    #[test]
+    fn test_private_fee_opening_persists_in_local_wallet_map_only() {
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        let bob_commitment = manager.create_private_wallet("bob").unwrap();
+        manager.deposit_to_private_wallet("alice", 30).unwrap();
+
+        let tx_hash = manager
+            .send_private_transaction_with_fee("alice", bob_commitment, 10, 2)
+            .unwrap();
+        let tx = manager.get_private_transaction(&tx_hash).unwrap();
+        assert!(tx.fee_opening.is_some());
+
+        let tx_json = serde_json::to_string(&tx).unwrap();
+        assert!(
+            !tx_json.contains("fee_opening"),
+            "public private-tx serialization must not expose the fee opening"
+        );
+
+        let wallet = manager.get_private_wallet("alice").unwrap();
+        assert!(wallet.private_fee_openings.contains_key(&tx_hash));
+        let wallet_json = serde_json::to_string(wallet).unwrap();
+        assert!(wallet_json.contains("private_fee_openings"));
+        let restored: PrivateWallet = serde_json::from_str(&wallet_json).unwrap();
+        assert!(restored.private_fee_openings.contains_key(&tx_hash));
+    }
+
+    #[test]
+    fn test_local_private_fee_claims_for_block_credit_miner() {
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        let bob_commitment = manager.create_private_wallet("bob").unwrap();
+        let miner_commitment = manager.create_private_wallet("miner").unwrap();
+
+        manager.deposit_to_private_wallet("alice", 40).unwrap();
+        let tx_hash = manager
+            .send_private_transaction_with_fee("alice", bob_commitment, 10, 3)
+            .unwrap();
+
+        let claims = manager
+            .create_local_private_fee_claims_for_block(
+                std::slice::from_ref(&tx_hash),
+                &miner_commitment,
+            )
+            .unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].tx_hash, tx_hash);
+        assert!(!claims[0].ephemeral_pubkey.is_empty());
+        assert!(!claims[0].ciphertext.is_empty());
+
+        manager.confirm_private_transaction(&tx_hash).unwrap();
+        let outcome = manager
+            .claim_private_fees_from_block_claims("miner", &claims)
+            .unwrap();
+
+        assert_eq!(outcome.total_fee_claimed, 3);
+        assert_eq!(outcome.claimed_tx_hashes, vec![tx_hash]);
+        assert!(outcome.skipped_tx_hashes.is_empty());
+        assert_eq!(manager.get_private_balance("miner"), Some(3));
+    }
+
+    #[test]
+    fn test_fractional_zka_private_tx_fee_claim_uses_atomic_units() {
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        let bob_commitment = manager.create_private_wallet("bob").unwrap();
+        let miner_commitment = manager.create_private_wallet("miner").unwrap();
+
+        let deposit = crate::economics::parse_zka_amount("2.5").unwrap();
+        let amount = crate::economics::parse_zka_amount("0.001").unwrap();
+        let fee = crate::economics::parse_zka_amount("0.0001").unwrap();
+        manager.deposit_to_private_wallet("alice", deposit).unwrap();
+
+        let tx_hash = manager
+            .send_private_transaction_with_fee("alice", bob_commitment, amount, fee)
+            .unwrap();
+        let tx = manager.get_private_transaction(&tx_hash).unwrap().clone();
+
+        assert_eq!(
+            manager.get_private_balance("alice"),
+            Some(deposit - amount - fee)
+        );
+        assert_eq!(tx.fee, 0, "private fee must not reveal clear atoms");
+        assert!(!tx.fee_commitment.is_empty());
+
+        let credited = manager
+            .receive_private_transaction_for_wallet("bob", &tx)
+            .unwrap();
+        assert_eq!(credited, amount);
+        assert_eq!(manager.get_private_balance("bob"), Some(amount));
+
+        let claims = manager
+            .create_local_private_fee_claims_for_block(
+                std::slice::from_ref(&tx_hash),
+                &miner_commitment,
+            )
+            .unwrap();
+        assert_eq!(claims.len(), 1);
+
+        manager.confirm_private_transaction(&tx_hash).unwrap();
+        let outcome = manager
+            .claim_private_fees_from_block_claims("miner", &claims)
+            .unwrap();
+
+        assert_eq!(outcome.total_fee_claimed, fee);
+        assert_eq!(manager.get_private_balance("miner"), Some(fee));
+        assert_eq!(crate::economics::format_zka_amount(fee), "0.0001");
+    }
+
+    #[test]
+    fn test_zero_fee_transaction_creates_no_local_fee_claim() {
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        let bob_commitment = manager.create_private_wallet("bob").unwrap();
+        let miner_commitment = manager.create_private_wallet("miner").unwrap();
+
+        manager.deposit_to_private_wallet("alice", 30).unwrap();
+        let tx_hash = manager
+            .send_private_transaction("alice", bob_commitment, 10)
+            .unwrap();
+
+        let claims = manager
+            .create_local_private_fee_claims_for_block(&[tx_hash], &miner_commitment)
+            .unwrap();
+        assert!(claims.is_empty());
     }
 
     #[test]

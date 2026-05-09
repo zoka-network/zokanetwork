@@ -19,18 +19,32 @@
 //! function so the consensus rules can be exercised without a libp2p
 //! swarm.
 
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 
 use crate::network::message::BlockResponseMessage;
-use crate::state::chain::{apply_block, read_chain_head, ChainError, ChainHead};
+use crate::state::chain::{
+    apply_block, apply_block_with_expected_difficulty, read_chain_head, ChainError, ChainHead,
+};
 use crate::storage::RocksDbStorage;
 use crate::types::Block;
 
+const MAX_PENDING_BLOCK_RESPONSES: usize = 256;
+const MAX_PENDING_BLOCKS_PER_HEIGHT: usize = 4;
+const MAX_PENDING_BLOCK_AHEAD: u64 = 512;
+const MAX_BRANCH_BACKFILL_REQUEST_FAILURES: u8 = 4;
+
 /// Highest block height any peer has revealed since this node booted.
 /// Treat 0 as "no peer has announced a block yet" — IBD is then a no-op.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct PeerChainView {
     pub perceived_max_height: u64,
+    pub branch_backfill_height: Option<u64>,
+    pub branch_backfill_ceiling: Option<u64>,
+    pub branch_expected_hashes: BTreeMap<u64, String>,
+    branch_backfill_request_failures: u8,
+    pending_block_responses: BTreeMap<u64, BTreeMap<String, BlockResponseMessage>>,
 }
 
 impl PeerChainView {
@@ -39,6 +53,232 @@ impl PeerChainView {
             self.perceived_max_height = height;
         }
     }
+
+    pub fn record_sync_outcome(&mut self, outcome: &SyncOutcome) {
+        match outcome {
+            SyncOutcome::Applied(head) => {
+                if self.matches_or_learns_branch_hash(head.height, &head.hash) {
+                    self.advance_branch_backfill(head.height);
+                }
+            }
+            SyncOutcome::AlreadyKnown { height, hash } => {
+                if self.matches_or_learns_branch_hash(*height, hash) {
+                    self.advance_branch_backfill(*height);
+                }
+            }
+            SyncOutcome::BehindOrSibling {
+                candidate,
+                candidate_hash,
+                ..
+            } => {
+                if self.matches_or_learns_branch_hash(*candidate, candidate_hash) {
+                    self.advance_branch_backfill(*candidate)
+                }
+            }
+            SyncOutcome::GapAhead { .. } => {}
+            SyncOutcome::MissingParent {
+                local_head,
+                candidate,
+                candidate_hash,
+                parent_hash,
+            } => {
+                let continuing_expected_branch = self.branch_backfill_ceiling.is_some()
+                    && self.matches_or_learns_branch_hash(*candidate, candidate_hash);
+                if *candidate > *local_head || continuing_expected_branch {
+                    self.backfill_before(*candidate, candidate_hash, parent_hash);
+                }
+            }
+            SyncOutcome::BadPayload(_)
+            | SyncOutcome::AnnouncedHashMismatch { .. }
+            | SyncOutcome::Rejected(_) => {}
+        }
+    }
+
+    pub fn remember_block_response(
+        &mut self,
+        outcome: &SyncOutcome,
+        response: &BlockResponseMessage,
+    ) {
+        let (local_head, candidate, candidate_hash) = match outcome {
+            SyncOutcome::GapAhead {
+                local_head,
+                candidate,
+            } => (*local_head, *candidate, response.block_hash.as_str()),
+            SyncOutcome::MissingParent {
+                local_head,
+                candidate,
+                candidate_hash,
+                ..
+            } => (*local_head, *candidate, candidate_hash.as_str()),
+            _ => return,
+        };
+        if response.block_height != candidate || response.block_hash != candidate_hash {
+            return;
+        }
+        if candidate > local_head.saturating_add(MAX_PENDING_BLOCK_AHEAD) {
+            return;
+        }
+
+        let responses_at_height = self.pending_block_responses.entry(candidate).or_default();
+        if !responses_at_height.contains_key(candidate_hash)
+            && responses_at_height.len() >= MAX_PENDING_BLOCKS_PER_HEIGHT
+        {
+            if let Some(oldest_hash) = responses_at_height.keys().next().cloned() {
+                responses_at_height.remove(&oldest_hash);
+            }
+        }
+        responses_at_height.insert(candidate_hash.to_string(), response.clone());
+        self.trim_pending_block_responses();
+    }
+
+    pub fn take_pending_block_response(
+        &mut self,
+        request: &SyncRequest,
+    ) -> Option<BlockResponseMessage> {
+        let responses_at_height = self.pending_block_responses.get_mut(&request.height)?;
+        let response = match request.expected_hash.as_deref() {
+            Some(expected_hash) => responses_at_height.remove(expected_hash),
+            None => responses_at_height
+                .keys()
+                .next()
+                .cloned()
+                .and_then(|hash| responses_at_height.remove(&hash)),
+        };
+        if responses_at_height.is_empty() {
+            self.pending_block_responses.remove(&request.height);
+        }
+        response
+    }
+
+    fn pending_block_response_count(&self) -> usize {
+        self.pending_block_responses
+            .values()
+            .map(BTreeMap::len)
+            .sum()
+    }
+
+    pub fn abandon_branch_backfill(&mut self) -> bool {
+        let was_active = self.branch_backfill_ceiling.is_some()
+            || self.branch_backfill_height.is_some()
+            || !self.branch_expected_hashes.is_empty();
+        self.branch_backfill_height = None;
+        self.branch_backfill_ceiling = None;
+        self.branch_expected_hashes.clear();
+        self.branch_backfill_request_failures = 0;
+        was_active
+    }
+
+    pub fn has_active_branch_backfill(&self) -> bool {
+        self.branch_backfill_ceiling.is_some()
+            || self.branch_backfill_height.is_some()
+            || !self.branch_expected_hashes.is_empty()
+    }
+
+    pub fn mining_pause_target(&self, local_height: u64) -> Option<u64> {
+        if self.has_active_branch_backfill() {
+            return self.branch_backfill_ceiling.or(self.branch_backfill_height);
+        }
+        if self.perceived_max_height > local_height {
+            return Some(self.perceived_max_height);
+        }
+        None
+    }
+
+    pub fn record_branch_backfill_request_failure(&mut self) -> bool {
+        if !self.has_active_branch_backfill() {
+            return false;
+        }
+        self.branch_backfill_request_failures =
+            self.branch_backfill_request_failures.saturating_add(1);
+        if self.branch_backfill_request_failures >= MAX_BRANCH_BACKFILL_REQUEST_FAILURES {
+            self.abandon_branch_backfill()
+        } else {
+            false
+        }
+    }
+
+    fn matches_or_learns_branch_hash(&mut self, height: u64, hash: &str) -> bool {
+        if self.branch_backfill_ceiling.is_none() {
+            return true;
+        }
+        if let Some(expected) = self.branch_expected_hashes.get(&height) {
+            return expected == hash;
+        }
+        if self.branch_backfill_height == Some(height) {
+            self.branch_expected_hashes.insert(height, hash.to_string());
+            return true;
+        }
+        false
+    }
+
+    fn backfill_before(&mut self, candidate_height: u64, candidate_hash: &str, parent_hash: &str) {
+        if candidate_height <= 1 {
+            return;
+        }
+        let ceiling = self
+            .branch_backfill_ceiling
+            .unwrap_or(candidate_height)
+            .max(candidate_height);
+        let next_height = candidate_height.saturating_sub(1);
+        self.branch_backfill_ceiling = Some(ceiling);
+        self.branch_backfill_height = Some(match self.branch_backfill_height {
+            Some(current) => current.min(next_height),
+            None => next_height,
+        });
+        self.branch_expected_hashes
+            .insert(candidate_height, candidate_hash.to_string());
+        self.branch_expected_hashes
+            .insert(next_height, parent_hash.to_string());
+        self.branch_backfill_request_failures = 0;
+    }
+
+    fn advance_branch_backfill(&mut self, applied_or_known_height: u64) {
+        let Some(ceiling) = self.branch_backfill_ceiling else {
+            return;
+        };
+        self.branch_backfill_request_failures = 0;
+        if applied_or_known_height < ceiling {
+            self.branch_backfill_height = Some(applied_or_known_height.saturating_add(1));
+        } else if self.perceived_max_height > applied_or_known_height {
+            let next_height = applied_or_known_height.saturating_add(1);
+            self.branch_backfill_height = Some(next_height);
+            self.branch_backfill_ceiling = Some(self.perceived_max_height);
+            self.branch_expected_hashes
+                .retain(|height, _| *height >= applied_or_known_height);
+        } else {
+            self.branch_backfill_height = None;
+            self.branch_backfill_ceiling = None;
+            self.branch_expected_hashes.clear();
+            self.branch_backfill_request_failures = 0;
+        }
+    }
+
+    fn trim_pending_block_responses(&mut self) {
+        while self.pending_block_response_count() > MAX_PENDING_BLOCK_RESPONSES {
+            let Some(height) = self.pending_block_responses.keys().next_back().cloned() else {
+                return;
+            };
+            let remove_height = {
+                let Some(responses_at_height) = self.pending_block_responses.get_mut(&height)
+                else {
+                    return;
+                };
+                if let Some(hash) = responses_at_height.keys().next_back().cloned() {
+                    responses_at_height.remove(&hash);
+                }
+                responses_at_height.is_empty()
+            };
+            if remove_height {
+                self.pending_block_responses.remove(&height);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncRequest {
+    pub height: u64,
+    pub expected_hash: Option<String>,
 }
 
 /// Outcome of feeding a `BlockResponse` payload into the chain. Each
@@ -53,9 +293,22 @@ pub enum SyncOutcome {
     /// Block is at a height beyond `local_head + 1`. The local node has
     /// to fetch missing intermediate blocks before this one will fit.
     GapAhead { local_head: u64, candidate: u64 },
-    /// Block is at a height already covered by the local chain. We don't
-    /// reorg here; this is a sibling that loses fork choice for now.
-    BehindOrSibling { local_head: u64, candidate: u64 },
+    /// Block is at a height already covered by the local chain and was
+    /// not heavy enough to replace the current canonical head.
+    BehindOrSibling {
+        local_head: u64,
+        candidate: u64,
+        candidate_hash: String,
+    },
+    /// The block belongs to a side branch whose parent is not in local
+    /// storage yet. IBD should walk backward until it finds a known
+    /// ancestor, then replay forward.
+    MissingParent {
+        local_head: u64,
+        candidate: u64,
+        candidate_hash: String,
+        parent_hash: String,
+    },
     /// Decoding the payload failed. The peer sent garbage.
     BadPayload(String),
     /// Hash announced in the response does not match the header. The
@@ -72,6 +325,31 @@ pub fn try_apply_synced_block_payload(
     storage: &RocksDbStorage,
     chain_id: &str,
     response: &BlockResponseMessage,
+) -> SyncOutcome {
+    try_apply_synced_block_payload_inner(storage, chain_id, response, None)
+}
+
+/// Same as [`try_apply_synced_block_payload`], but drives validation at an
+/// explicit difficulty for unsafe local rehearsals.
+pub fn try_apply_synced_block_payload_with_expected_difficulty(
+    storage: &RocksDbStorage,
+    chain_id: &str,
+    response: &BlockResponseMessage,
+    expected_difficulty_bits: u32,
+) -> SyncOutcome {
+    try_apply_synced_block_payload_inner(
+        storage,
+        chain_id,
+        response,
+        Some(expected_difficulty_bits),
+    )
+}
+
+fn try_apply_synced_block_payload_inner(
+    storage: &RocksDbStorage,
+    chain_id: &str,
+    response: &BlockResponseMessage,
+    expected_difficulty_bits: Option<u32>,
 ) -> SyncOutcome {
     let block: Block = match serde_json::from_slice(&response.encrypted_block) {
         Ok(b) => b,
@@ -92,33 +370,61 @@ pub fn try_apply_synced_block_payload(
     let local_height = local_head.as_ref().map(|h| h.height).unwrap_or(0);
 
     let candidate_height = block.header.block_height;
-    if storage.block_exists(&block.header.hash).unwrap_or(false) {
-        return SyncOutcome::AlreadyKnown {
-            height: candidate_height,
-            hash: block.header.hash,
-        };
-    }
-    if candidate_height > local_height.saturating_add(1) {
+    let candidate_known = storage.block_exists(&block.header.hash).unwrap_or(false);
+    if candidate_height > local_height.saturating_add(1) && !candidate_known {
         return SyncOutcome::GapAhead {
             local_head: local_height,
             candidate: candidate_height,
         };
     }
-    if candidate_height < local_height.saturating_add(1) {
-        return SyncOutcome::BehindOrSibling {
-            local_head: local_height,
-            candidate: candidate_height,
-        };
-    }
-
-    match apply_block(storage, chain_id, &block) {
+    let applied = match expected_difficulty_bits {
+        Some(bits) => apply_block_with_expected_difficulty(storage, chain_id, &block, bits),
+        None => apply_block(storage, chain_id, &block),
+    };
+    match applied {
         Ok(head) => SyncOutcome::Applied(head),
         Err(ChainError::BlockAlreadyKnown(hash)) => SyncOutcome::AlreadyKnown {
             height: candidate_height,
             hash,
         },
+        Err(ChainError::SideBranchNotHeavier { .. }) => SyncOutcome::BehindOrSibling {
+            local_head: local_height,
+            candidate: candidate_height,
+            candidate_hash: block.header.hash,
+        },
+        Err(ChainError::DoesNotExtendHead { .. }) => SyncOutcome::MissingParent {
+            local_head: local_height,
+            candidate: candidate_height,
+            candidate_hash: block.header.hash,
+            parent_hash: block.header.prev_hash,
+        },
         Err(err) => SyncOutcome::Rejected(err.to_string()),
     }
+}
+
+pub fn next_required_block(
+    storage: &RocksDbStorage,
+    peer_view: &PeerChainView,
+) -> Result<Option<SyncRequest>, String> {
+    if let Some(height) = peer_view.branch_backfill_height {
+        if height > 0 {
+            return Ok(Some(SyncRequest {
+                height,
+                expected_hash: peer_view.branch_expected_hashes.get(&height).cloned(),
+            }));
+        }
+    }
+
+    let local_height = storage
+        .get_chain_height()
+        .map_err(|e| format!("read chain height failed: {e:?}"))?;
+    if local_height >= peer_view.perceived_max_height {
+        return Ok(None);
+    }
+    Ok(Some(SyncRequest {
+        height: local_height.saturating_add(1),
+        expected_hash: None,
+    }))
 }
 
 /// Convenience: returns the next block height the local chain needs in
@@ -128,13 +434,7 @@ pub fn next_required_height(
     storage: &RocksDbStorage,
     peer_view: &PeerChainView,
 ) -> Result<Option<u64>, String> {
-    let local_height = storage
-        .get_chain_height()
-        .map_err(|e| format!("read chain height failed: {e:?}"))?;
-    if local_height >= peer_view.perceived_max_height {
-        return Ok(None);
-    }
-    Ok(Some(local_height.saturating_add(1)))
+    Ok(next_required_block(storage, peer_view)?.map(|request| request.height))
 }
 
 /// Schema-tolerant deserializer for incoming peer block payloads. Used
@@ -254,7 +554,9 @@ mod tests {
             block_hash: "deadbeef".to_string(),
             timestamp: 0,
         };
-        match try_apply_synced_block_payload(&storage, chain_id, &response) {
+        match try_apply_synced_block_payload_with_expected_difficulty(
+            &storage, chain_id, &response, 4,
+        ) {
             SyncOutcome::BadPayload(_) => {}
             other => panic!("expected BadPayload, got: {other:?}"),
         }
@@ -275,7 +577,9 @@ mod tests {
         );
         let mut response = response_for(&block);
         response.block_hash = "deadbeef".to_string();
-        match try_apply_synced_block_payload(&storage, chain_id, &response) {
+        match try_apply_synced_block_payload_with_expected_difficulty(
+            &storage, chain_id, &response, 4,
+        ) {
             SyncOutcome::AnnouncedHashMismatch { announced, header } => {
                 assert_eq!(announced, "deadbeef");
                 assert_eq!(header, block.header.hash);
@@ -340,6 +644,53 @@ mod tests {
     }
 
     #[test]
+    fn try_apply_known_body_without_parent_requests_branch_backfill() {
+        let chain_id = "zoka-test-net";
+        let (storage, _dir) = open_temp_storage();
+        let block1 = mine_test_block(
+            chain_id,
+            &genesis_parent_for(chain_id).header.hash,
+            0,
+            0,
+            &"zka1miner".to_string(),
+            4,
+            1_700_000_000,
+        );
+        apply_block_with_expected_difficulty(&storage, chain_id, &block1, 4).expect("apply 1");
+
+        let orphan = mine_test_block(
+            chain_id,
+            "missing-parent-hash",
+            1,
+            economics::block_reward_for_height(1, 0),
+            &"zka1miner".to_string(),
+            4,
+            1_700_000_120,
+        );
+        storage
+            .save_block_body(&orphan)
+            .expect("cache orphan body by hash");
+
+        let response = response_for(&orphan);
+        match try_apply_synced_block_payload_with_expected_difficulty(
+            &storage, chain_id, &response, 4,
+        ) {
+            SyncOutcome::MissingParent {
+                local_head,
+                candidate,
+                candidate_hash,
+                parent_hash,
+            } => {
+                assert_eq!(local_head, 1);
+                assert_eq!(candidate, 2);
+                assert_eq!(candidate_hash, orphan.header.hash);
+                assert_eq!(parent_hash, "missing-parent-hash");
+            }
+            other => panic!("expected MissingParent, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn try_apply_marks_behind_when_block_height_is_below_local() {
         let chain_id = "zoka-test-net";
         let (storage, _dir) = open_temp_storage();
@@ -377,13 +728,17 @@ mod tests {
             1_700_000_777,
         );
         let response = response_for(&sibling);
-        match try_apply_synced_block_payload(&storage, chain_id, &response) {
+        match try_apply_synced_block_payload_with_expected_difficulty(
+            &storage, chain_id, &response, 4,
+        ) {
             SyncOutcome::BehindOrSibling {
                 local_head,
                 candidate,
+                candidate_hash,
             } => {
                 assert_eq!(local_head, 2);
                 assert_eq!(candidate, 1);
+                assert_eq!(candidate_hash, sibling.header.hash);
             }
             other => panic!("expected BehindOrSibling, got: {other:?}"),
         }
@@ -404,5 +759,276 @@ mod tests {
         view.observe(5);
         let next = next_required_height(&storage, &view).expect("query");
         assert_eq!(next, Some(1));
+    }
+
+    #[test]
+    fn next_required_height_prefers_branch_backfill() {
+        let (storage, _dir) = open_temp_storage();
+        let mut view = PeerChainView::default();
+        view.observe(20);
+        view.branch_backfill_height = Some(7);
+        view.branch_backfill_ceiling = Some(12);
+        view.branch_expected_hashes
+            .insert(7, "branch-h7".to_string());
+
+        let next = next_required_height(&storage, &view).expect("query");
+        assert_eq!(next, Some(7));
+        let request = next_required_block(&storage, &view)
+            .expect("request")
+            .expect("some request");
+        assert_eq!(request.height, 7);
+        assert_eq!(request.expected_hash.as_deref(), Some("branch-h7"));
+    }
+
+    #[test]
+    fn peer_chain_view_backfills_then_replays_to_ceiling() {
+        let mut view = PeerChainView::default();
+        view.record_sync_outcome(&SyncOutcome::MissingParent {
+            local_head: 11,
+            candidate: 12,
+            candidate_hash: "h12".to_string(),
+            parent_hash: "h11".to_string(),
+        });
+        assert_eq!(view.branch_backfill_height, Some(11));
+        assert_eq!(view.branch_backfill_ceiling, Some(12));
+        assert_eq!(
+            view.branch_expected_hashes.get(&11).map(String::as_str),
+            Some("h11")
+        );
+
+        view.record_sync_outcome(&SyncOutcome::MissingParent {
+            local_head: 11,
+            candidate: 11,
+            candidate_hash: "h11".to_string(),
+            parent_hash: "h10".to_string(),
+        });
+        assert_eq!(view.branch_backfill_height, Some(10));
+        assert_eq!(view.branch_backfill_ceiling, Some(12));
+        assert_eq!(
+            view.branch_expected_hashes.get(&10).map(String::as_str),
+            Some("h10")
+        );
+
+        view.record_sync_outcome(&SyncOutcome::MissingParent {
+            local_head: 11,
+            candidate: 12,
+            candidate_hash: "h12".to_string(),
+            parent_hash: "h11".to_string(),
+        });
+        assert_eq!(view.branch_backfill_height, Some(10));
+        assert_eq!(view.branch_backfill_ceiling, Some(12));
+
+        view.record_sync_outcome(&SyncOutcome::BehindOrSibling {
+            local_head: 11,
+            candidate: 10,
+            candidate_hash: "h10".to_string(),
+        });
+        assert_eq!(view.branch_backfill_height, Some(11));
+
+        view.record_sync_outcome(&SyncOutcome::BehindOrSibling {
+            local_head: 11,
+            candidate: 11,
+            candidate_hash: "h11".to_string(),
+        });
+        assert_eq!(view.branch_backfill_height, Some(12));
+
+        view.record_sync_outcome(&SyncOutcome::AlreadyKnown {
+            height: 12,
+            hash: "h12".to_string(),
+        });
+        assert_eq!(view.branch_backfill_height, None);
+        assert_eq!(view.branch_backfill_ceiling, None);
+        assert!(view.branch_expected_hashes.is_empty());
+    }
+
+    #[test]
+    fn peer_chain_view_does_not_backfill_simple_gap_ahead() {
+        let mut view = PeerChainView::default();
+        view.record_sync_outcome(&SyncOutcome::GapAhead {
+            local_head: 0,
+            candidate: 5,
+        });
+
+        assert_eq!(view.branch_backfill_height, None);
+        assert_eq!(view.branch_backfill_ceiling, None);
+    }
+
+    #[test]
+    fn peer_chain_view_caches_gap_ahead_response_for_later_ibd() {
+        let mut view = PeerChainView::default();
+        let response = BlockResponseMessage {
+            block_height: 5,
+            encrypted_block: b"cached-block".to_vec(),
+            block_hash: "h5".to_string(),
+            timestamp: 1_700_000_000,
+        };
+        let outcome = SyncOutcome::GapAhead {
+            local_head: 2,
+            candidate: 5,
+        };
+
+        view.remember_block_response(&outcome, &response);
+        assert_eq!(view.pending_block_response_count(), 1);
+
+        let replayed = view
+            .take_pending_block_response(&SyncRequest {
+                height: 5,
+                expected_hash: Some("h5".to_string()),
+            })
+            .expect("cached response");
+        assert_eq!(replayed.block_hash, "h5");
+        assert_eq!(replayed.encrypted_block, b"cached-block".to_vec());
+        assert_eq!(view.pending_block_response_count(), 0);
+    }
+
+    #[test]
+    fn peer_chain_view_does_not_cache_unbounded_future_responses() {
+        let mut view = PeerChainView::default();
+        let future_height = MAX_PENDING_BLOCK_AHEAD.saturating_add(10);
+        let response = BlockResponseMessage {
+            block_height: future_height,
+            encrypted_block: b"far-future-block".to_vec(),
+            block_hash: "too-far".to_string(),
+            timestamp: 1_700_000_000,
+        };
+        let outcome = SyncOutcome::GapAhead {
+            local_head: 0,
+            candidate: future_height,
+        };
+
+        view.remember_block_response(&outcome, &response);
+        assert_eq!(view.pending_block_response_count(), 0);
+    }
+
+    #[test]
+    fn peer_chain_view_ignores_stale_missing_parent_without_active_backfill() {
+        let mut view = PeerChainView::default();
+        view.record_sync_outcome(&SyncOutcome::MissingParent {
+            local_head: 5,
+            candidate: 4,
+            candidate_hash: "old-side-4".to_string(),
+            parent_hash: "old-side-3".to_string(),
+        });
+
+        assert_eq!(view.branch_backfill_height, None);
+        assert_eq!(view.branch_backfill_ceiling, None);
+        assert!(view.branch_expected_hashes.is_empty());
+    }
+
+    #[test]
+    fn peer_chain_view_ignores_unrelated_known_blocks_while_backfilling() {
+        let mut view = PeerChainView::default();
+        view.record_sync_outcome(&SyncOutcome::MissingParent {
+            local_head: 16,
+            candidate: 17,
+            candidate_hash: "winner-17".to_string(),
+            parent_hash: "winner-16".to_string(),
+        });
+
+        view.record_sync_outcome(&SyncOutcome::AlreadyKnown {
+            height: 17,
+            hash: "local-17".to_string(),
+        });
+
+        assert_eq!(view.branch_backfill_height, Some(16));
+        assert_eq!(view.branch_backfill_ceiling, Some(17));
+    }
+
+    #[test]
+    fn peer_chain_view_can_abandon_unavailable_branch_backfill() {
+        let mut view = PeerChainView::default();
+        view.record_sync_outcome(&SyncOutcome::MissingParent {
+            local_head: 6,
+            candidate: 7,
+            candidate_hash: "gone-7".to_string(),
+            parent_hash: "gone-6".to_string(),
+        });
+
+        assert!(view.abandon_branch_backfill());
+        assert_eq!(view.branch_backfill_height, None);
+        assert_eq!(view.branch_backfill_ceiling, None);
+        assert!(view.branch_expected_hashes.is_empty());
+        assert!(!view.abandon_branch_backfill());
+    }
+
+    #[test]
+    fn peer_chain_view_keeps_branch_backfill_across_transient_request_misses() {
+        let mut view = PeerChainView::default();
+        view.record_sync_outcome(&SyncOutcome::MissingParent {
+            local_head: 6,
+            candidate: 7,
+            candidate_hash: "winner-7".to_string(),
+            parent_hash: "winner-6".to_string(),
+        });
+
+        for _ in 1..MAX_BRANCH_BACKFILL_REQUEST_FAILURES {
+            assert!(!view.record_branch_backfill_request_failure());
+            assert_eq!(view.branch_backfill_height, Some(6));
+            assert_eq!(view.branch_backfill_ceiling, Some(7));
+        }
+
+        assert!(view.record_branch_backfill_request_failure());
+        assert_eq!(view.branch_backfill_height, None);
+        assert_eq!(view.branch_backfill_ceiling, None);
+        assert!(view.branch_expected_hashes.is_empty());
+    }
+
+    #[test]
+    fn peer_chain_view_pauses_mining_when_behind_or_backfilling() {
+        let mut view = PeerChainView::default();
+        assert_eq!(view.mining_pause_target(3), None);
+
+        view.observe(8);
+        assert_eq!(view.mining_pause_target(3), Some(8));
+        assert_eq!(view.mining_pause_target(8), None);
+
+        view.record_sync_outcome(&SyncOutcome::MissingParent {
+            local_head: 8,
+            candidate: 9,
+            candidate_hash: "winner-9".to_string(),
+            parent_hash: "winner-8".to_string(),
+        });
+        assert_eq!(view.mining_pause_target(9), Some(9));
+    }
+
+    #[test]
+    fn peer_chain_view_continues_forward_side_branch_until_peer_tip() {
+        let mut view = PeerChainView::default();
+        view.observe(6);
+        view.record_sync_outcome(&SyncOutcome::MissingParent {
+            local_head: 1,
+            candidate: 2,
+            candidate_hash: "peer-2".to_string(),
+            parent_hash: "peer-1".to_string(),
+        });
+        assert_eq!(view.branch_backfill_height, Some(1));
+        assert_eq!(view.branch_backfill_ceiling, Some(2));
+
+        view.record_sync_outcome(&SyncOutcome::BehindOrSibling {
+            local_head: 1,
+            candidate: 1,
+            candidate_hash: "peer-1".to_string(),
+        });
+        assert_eq!(view.branch_backfill_height, Some(2));
+
+        view.record_sync_outcome(&SyncOutcome::BehindOrSibling {
+            local_head: 1,
+            candidate: 2,
+            candidate_hash: "peer-2".to_string(),
+        });
+        assert_eq!(view.branch_backfill_height, Some(3));
+        assert_eq!(view.branch_backfill_ceiling, Some(6));
+        assert!(!view.branch_expected_hashes.contains_key(&3));
+
+        view.record_sync_outcome(&SyncOutcome::BehindOrSibling {
+            local_head: 1,
+            candidate: 3,
+            candidate_hash: "peer-3".to_string(),
+        });
+        assert_eq!(view.branch_backfill_height, Some(4));
+        assert_eq!(
+            view.branch_expected_hashes.get(&3).map(String::as_str),
+            Some("peer-3")
+        );
     }
 }

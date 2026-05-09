@@ -2,6 +2,7 @@
 name = "zoka"
 version = "0.1.0"
 edition = "2021"
+autobins = false
 
 description = "100% private blockchain with Zero-Knowledge proofs (zk) in Rust."
 
@@ -19,6 +20,8 @@ path = "src/lib.rs"
 
 [features]
 default = []
+ops-tools = []
+test-p2p-worker-bin = []
 # Enables the RandomX PoW backend (the canonical mainnet algorithm).
 # Pulls in the `randomx-rs` crate which links to the official RandomX
 # C++ library; mainnet binaries MUST be built with this feature.
@@ -129,8 +132,15 @@ opt-level = 3
 [[bin]]
 name = "zoka-trusted-setup"
 path = "src/bin/generate_trusted_setup.rs"
+required-features = ["ops-tools"]
 
 [[bin]]
 name = "zoka-ceremony-contribute"
 path = "src/bin/zoka_ceremony_contribute.rs"
+required-features = ["ops-tools"]
+
+[[bin]]
+name = "p2p_worker"
+path = "src/bin/p2p_worker.rs"
+required-features = ["test-p2p-worker-bin"]
 

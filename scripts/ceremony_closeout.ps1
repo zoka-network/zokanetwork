@@ -22,7 +22,7 @@ if (-not (Test-Path -LiteralPath $FinalDir)) {
 }
 
 Write-Host "==> Step 1/6: verify transcript against final setup"
-cargo run --bin zoka-ceremony-contribute -- `
+cargo run --features ops-tools --bin zoka-ceremony-contribute -- `
     verify `
     --transcript $Transcript `
     --final-dir $FinalDir
@@ -30,7 +30,7 @@ cargo run --bin zoka-ceremony-contribute -- `
 $readinessPath = Join-Path $BundleDir "readiness.json"
 Write-Host ""
 Write-Host "==> Step 2/6: readiness gate"
-cargo run --bin zoka-ceremony-contribute -- `
+cargo run --features ops-tools --bin zoka-ceremony-contribute -- `
     readiness `
     --transcript $Transcript `
     --final-dir $FinalDir `
@@ -40,7 +40,7 @@ cargo run --bin zoka-ceremony-contribute -- `
 Write-Host ""
 Write-Host "==> Step 3/6: publish bundle"
 $publishArgs = @(
-    "run", "--bin", "zoka-ceremony-contribute", "--",
+    "run", "--features", "ops-tools", "--bin", "zoka-ceremony-contribute", "--",
     "publish-bundle",
     "--transcript", $Transcript,
     "--final-dir", $FinalDir,
@@ -54,7 +54,7 @@ cargo @publishArgs
 
 Write-Host ""
 Write-Host "==> Step 4/6: verify bundle"
-cargo run --bin zoka-ceremony-contribute -- `
+cargo run --features ops-tools --bin zoka-ceremony-contribute -- `
     verify-bundle `
     --bundle-dir $BundleDir
 
@@ -64,7 +64,7 @@ if ([string]::IsNullOrWhiteSpace($ReleaseEnvOut)) {
 
 Write-Host ""
 Write-Host "==> Step 5/6: generate release pin env"
-cargo run --bin zoka-ceremony-contribute -- `
+cargo run --features ops-tools --bin zoka-ceremony-contribute -- `
     release-pin `
     --setup-dir $FinalDir `
     --transcript $Transcript `

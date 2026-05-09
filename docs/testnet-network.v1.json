@@ -1,0 +1,23 @@
+{
+  "schema": "zoka-testnet-network-v1",
+  "status": "local-draft",
+  "chain_id": "zoka-testnet-v1",
+  "protocol_freeze_id": "/zoka/1.0.0",
+  "transport_policy": {
+    "anonymous_transport_preferred": true,
+    "clearnet_requires_explicit_operator_choice": false,
+    "supported": [
+      "tor",
+      "i2p",
+      "tcp"
+    ]
+  },
+  "seed_nodes": [],
+  "public_rpc": [],
+  "snapshot_signers": [],
+  "notes": [
+    "Local draft until public seed operators are assigned.",
+    "Testnet mirrors mainnet blockchain logic and RandomX PoW.",
+    "Bugs found on testnet must be fixed in shared code, not testnet-only blockchain paths."
+  ]
+}

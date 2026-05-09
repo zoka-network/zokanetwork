@@ -9,9 +9,10 @@ const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 fn print_usage() {
     println!("zokahd (automatic fullnode)");
     println!(
-        "Usage: zokahd [--address <wallet-address>] [--password <pwd>] [--seed <multiaddr>] [--network-config <file>] [--no-network-config] [--allow-clearnet-seeds] [--seconds <n>] [--show-keys] [--no-mine] [--db <path>] [--genesis <file>] [--inline]"
+        "Usage: zokahd [--network mainnet|testnet] [--address <wallet-address>] [--password <pwd>] [--seed <multiaddr>] [--network-config <file>] [--no-network-config] [--allow-clearnet-seeds] [--allow-isolated-start] [--seconds <n>] [--show-keys] [--no-mine] [--power low|normal|max] [--threads <n>] [--db <path>] [--genesis <file>] [--inline]"
     );
     println!("Runs fullnode + sync warmup + auto-mining by default until interrupted.");
+    println!("Without arguments, opens the autopilot launcher: wallet, sync, then mining.");
     println!("On Windows it opens in its own console window by default. Use --inline to keep it in the current terminal.");
 }
 
@@ -30,6 +31,7 @@ fn main() -> ExitCode {
     } else {
         false
     };
+    let guided = args.is_empty();
 
     let current_exe = match std::env::current_exe() {
         Ok(path) => path,
@@ -50,7 +52,7 @@ fn main() -> ExitCode {
     }
 
     #[cfg(windows)]
-    if !inline {
+    if !inline && !guided {
         let mut command = Command::new(&zoka_exe);
         command
             .arg("fullnode")
@@ -69,7 +71,12 @@ fn main() -> ExitCode {
         }
     }
 
-    let status = match Command::new(&zoka_exe).arg("fullnode").args(&args).status() {
+    let command_name = if guided { "zokahd-guided" } else { "fullnode" };
+    let status = match Command::new(&zoka_exe)
+        .arg(command_name)
+        .args(&args)
+        .status()
+    {
         Ok(status) => status,
         Err(err) => {
             eprintln!("failed to launch '{}': {}", zoka_exe.display(), err);

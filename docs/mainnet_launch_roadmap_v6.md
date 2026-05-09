@@ -1,4 +1,4 @@
-# ZOKA Mainnet Launch Roadmap v6
+﻿# ZOKA Mainnet Launch Roadmap v6
 
 Objetivo: convertir la base tecnica actual en una mainnet publica lanzable, verificable y operable por usuarios reales.
 
@@ -69,7 +69,7 @@ Bloqueante de mainnet.
 - [x] Integrar coinbase privada final o congelar un esquema alternativo honesto para v1.
 - [x] Agregar tests de emision por era, halving, cap y maturity.
 
-Nota: parametros canonicos vivos en `src/economics.rs` y publicables en `docs/economics.mainnet.v1.json`. La contabilidad v1 actual usa unidades enteras `ZKA`; no declarar decimales atomicos en mainnet hasta migrar wallet/circuitos/estado a una unidad menor.
+Nota: parametros canonicos vivos en `src/economics.rs` y publicables en `docs/economics.mainnet.v2-atoms.json`. La contabilidad activa es `zoka-economics-v2-atoms`: `1 ZKA = 1,000,000 atoms`, con conversion en el borde CLI/genesis. El artifact `docs/economics.mainnet.v1.json` queda como referencia historica whole-ZKA; DBs locales sin marker atomico deben relanzarse con genesis nuevo o migrarse de forma explicita.
 
 Nota distribucion al productor: la coinbase es ahora una `Transaction` real, sentinel sender `zoka:coinbase:v1`, en `block.transactions[0]`, con monto = `block_reward_for_height(h, parent_supply)`. El miner construye un `Block` completo y lo pasa por `validate_pow_block` antes de avanzar la cadena, con las mismas reglas que aplicaria un nodo verificador. Validador puro y pluggable en `src/mining/block_validator.rs` (20 tests cubriendo coinbase faltante/duplicada/monto/cap/destinatario, private coinbase requerida/maturity, prev_hash, height, merkle, header hash, PoW seal, PoW por debajo de dificultad, y mainnet sin feature `randomx`). El acreditamiento al wallet productor usa `private_coinbase` comprometida por Merkle root y `coinbase maturity = 60` antes de importar la nota privada al wallet.
 
@@ -141,7 +141,7 @@ Bloqueante de mainnet.
 - [x] Definir estrategia de pruning/snapshots. Ver `docs/pruning-snapshots-strategy.md`.
 - [x] Firmar snapshots si se habilita fast sync. `src/snapshot.rs::sign` (ed25519, raw 64 bytes hex); CLI `snapshot-export --sign-key-hex <hex>` y `snapshot-import --public-key <hex>`.
 
-Nota fast sync: `zoka-snapshot-v1` definido en `src/snapshot.rs`. Export captura header + todos los bloques + chain metadata + firma ed25519 opcional. Import re-corre `state::chain::apply_block` por bloque, asi que el snapshot acelera (no atajo) — cualquier bloque invalido se rechaza con la misma regla de consenso. CLI: `zoka snapshot-export <out> [--db <path>] [--sign-key-hex <hex>]` y `zoka snapshot-import <in> [--db <path>] [--require-signature] [--public-key <hex>]`. 14 tests cubren roundtrip, deny_unknown_fields, height gap rechazado, chain_id mismatch, firma valida/invalida, byte tampering, idempotencia.
+Nota fast sync: `zoka-snapshot-v1` definido en `src/snapshot.rs`. Export captura header + todos los bloques + chain metadata + firma ed25519 opcional. Import re-corre `state::chain::apply_block` por bloque, asi que el snapshot acelera (no atajo) â€” cualquier bloque invalido se rechaza con la misma regla de consenso. CLI: `zoka snapshot-export <out> [--db <path>] [--sign-key-hex <hex>]` y `zoka snapshot-import <in> [--db <path>] [--require-signature] [--public-key <hex>]`. 14 tests cubren roundtrip, deny_unknown_fields, height gap rechazado, chain_id mismatch, firma valida/invalida, byte tampering, idempotencia.
 
 Salida de fase:
 
@@ -177,19 +177,38 @@ Salida de fase:
 Bloqueante de mainnet.
 
 - [ ] Ejecutar rehearsal local multi-nodo antes de abrir testnet publica.
-- [ ] Levantar 2-4 nodos locales con DBs, puertos y wallets separados.
-- [ ] Confirmar conexion P2P entre nodos locales.
-- [ ] Confirmar mineria en un nodo y propagacion/aplicacion del bloque en los
-  demas.
-- [ ] Confirmar IBD/sync de un nodo que arranca desde DB vacia contra peers ya
-  avanzados.
-- [ ] Confirmar restart limpio: nodos conservan chain head, reconectan y siguen
-  minando/sincronizando.
-- [ ] Probar wallet de usuario sobre esa red local: create, backup, restore,
-  balance, history, coinbase maturity y transferencia privada cuando haya fondos
-  spendables.
-- [ ] Guardar evidencia de rehearsal: comandos, logs minimos, heights, head
-  hashes y resultado por nodo.
+- [x] Levantar 2-4 nodos locales con DBs, puertos y wallets separados.
+- [x] Confirmar conexion P2P entre nodos locales.
+- [x] Confirmar mineria en un nodo y propagacion/aplicacion del bloque en peers
+  locales de 2, 3 y 4 nodos (`local-multinode-20260501-115813`,
+  `local-multinode-20260501-123604`, `local-multinode-20260501-123747`).
+- [x] Endurecer propagacion 3+ nodos con reconnect automatico al seed y
+  `--min-mine-peers` para impedir que el minero publique antes de tener peers
+  suficientes.
+- [x] Confirmar IBD/sync de un nodo que arranca desde DB vacia contra peers ya
+  avanzados (`late-sync-20260501-120928`: seed height 2, late height 1).
+- [x] Confirmar restart limpio: nodos conservan chain head, reconectan y siguen
+  sincronizando (`restart-20260501-121200`: both restarted nodes height 2).
+- [x] Confirmar sincronizacion escalonada natural: nodo 1 mina solo hasta
+  altura 5, nodo 2 entra y sincroniza hasta altura 3, luego nodo 3 entra y los
+  tres alcanzan al menos altura 5 (`staged-sync-20260501-135058`: milestones
+  node1=7, node2=5, node3=5; persisted heights node1=17, node2=5, node3=5).
+- [x] Aplicar el patron de bootstrap a mainnet code path: `fullnode`/`zokahd`
+  aceptan multiples `--seed`, los scripts conectan nodos tardios contra varias
+  semillas, se rebroadcasten bloques recientes y el IBD usa cadencia/backoff
+  para no bloquear el servicio de mensajes P2P mientras el nodo sincroniza.
+- [x] Cerrar churn cotidiano de nodos: entradas tardias, salidas, retorno con
+  DB vieja, nodo fresco desde cero, seed original caido y retorno del seed.
+  Evidencia `.zoka\rehearsal\churn-20260502-184407\summary.json`: los 4 nodos
+  cerraron en height 5 con head unico
+  `88c9ddf7eabec43883514009ca0737d90cdc5df36c2709011e8eb3601c6867ab`.
+- [x] Probar wallet de usuario sobre esa red local: create, backup/export,
+  balance, coinbase maturity y transferencia privada cuando hay fondos
+  spendables. Evidencia
+  `.zoka\rehearsal\wallet-network-20260502-211129\manual-summary.json`.
+- [x] Guardar evidencia de rehearsal: comandos, logs minimos, heights, head
+  hashes y resultado por nodo. Script base:
+  `scripts/local_wallet_network_rehearsal.ps1`.
 - [ ] Lanzar testnet publica con genesis propio.
 - [ ] Mantenerla 8 a 12 semanas sin reset no planificado.
 - [ ] Probar wallets nuevas/restauradas.
@@ -209,37 +228,32 @@ Salida de fase:
 
 ---
 
-## Fase 6.5 - CLI/UX y agente AI privado
+## Fase 6.5 - CLI/UX sin asistente conversacional
 
 Bloqueante de calidad antes de invitar usuarios no tecnicos.
 
-- [ ] Ejecutar auditoria intensiva de todos los comandos `zoka` y `zokahd`.
+- [ ] Ejecutar auditoria total de todos los comandos `zoka` y `zokahd`.
 - [ ] Cubrir casos OK, errores esperados, `--json`, wallets inexistentes,
   passwords incorrectos, DB vacia, rutas invalidas, red sin peers y comandos de
   ayuda.
-- [ ] Convertir la matriz en script reproducible para CI/local smoke.
+- [x] Convertir la matriz en script reproducible para CI/local smoke:
+  `scripts/cli_smoke_test.ps1` cubre comandos largos, alias UX, RPC read-only,
+  snapshots, mining/node smoke y `zokahd`; el asistente conversacional fue
+  removido.
 - [ ] Mejorar presentacion visual de consola: help, tablas, errores, dashboard
   de nodo, mineria y estados de wallet.
 - [ ] Mantener estable toda salida `--json` para integraciones externas.
-- [ ] Disenar `zoka ai` o `zoka assistant` como feature opcional para operar por
-  lenguaje natural.
-- [ ] El agente AI solo puede invocar acciones existentes del CLI/core; no puede
-  saltarse validaciones de wallet, transaccion, mineria o nodo.
-- [ ] El agente nunca debe leer, imprimir, enviar ni guardar seed phrases,
-  spend keys, passphrases o material privado.
-- [ ] Modo offline/local por defecto; cualquier proveedor externo debe ser
-  opcional, explicito y apagado por defecto.
-- [ ] Acciones sensibles como crear wallet, exportar secretos, enviar fondos,
-  borrar wallet o iniciar mineria requieren confirmacion explicita.
-- [ ] Tests contra prompt injection, exfiltracion de secretos y ejecucion de
-  acciones sin confirmacion.
+- [x] Decision de alcance: remover la capa conversacional del binario y de la
+  referencia de usuario. La superficie publica queda en CLI explicito `zoka` +
+  daemon/wrapper `zokahd`.
+- [x] Mantener RPC mainnet read-only como comandos explicitos: `rpc-list`,
+  `rpc-status`, `rpc-height` y `rpc-mempool`, sin proveedores externos ni
+  permisos de firma.
 
 Salida de fase:
 
-- un usuario puede operar ZOKA desde consola con comandos claros o con un agente
-  asistido, sin degradar privacidad ni seguridad de claves.
-
----
+- un usuario puede operar ZOKA desde consola con comandos claros, sin degradar
+  privacidad ni seguridad de claves.
 
 ## Fase 7 - Release reproducible y publicacion
 
@@ -309,7 +323,7 @@ Orden recomendado de trabajo desde el estado actual:
 10. ~~Release tooling + user-facing docs (Fases 7-8 codeable).~~ Cerrado: `scripts/package_release.ps1`, `scripts/release_checksums.{ps1,sh}`, `scripts/check_randomx_toolchain.ps1`, `scripts/mainnet_readiness_check.ps1`, runbooks (`docs/runbook-*.md`), reference de usuario (`docs/user-cli-reference.en.md`), build reproducible (`docs/reproducible-builds.md`), verification (`docs/release-verification.md`), regression gate del genesis publicado.
 11. ~~Operability helpers finales.~~ Cerrado: test de integracion mainnet boot, `zoka chain-stats`, `zoka chain-prune`, `zoka snapshot-info` y smoke CLI reproducible.
 12. Pendiente inmediato codeable: rehearsal local multi-nodo, auditoria total de
-    CLI, mejora visual de consola y agente AI privado opcional.
+    CLI y mejora visual de consola.
 13. Pendiente externo/operativo: commit-freeze del release, auditoria externa
     (Fase 5), testnet publica 8-12 semanas (Fase 6), bug bounty + ventana de
     launch + dry-run T-24/48h (Fase 8).

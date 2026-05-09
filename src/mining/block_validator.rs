@@ -273,7 +273,7 @@ fn validate_coinbase_amount(
             height,
         });
     }
-    let remaining_cap = economics::MAX_SUPPLY_ZKA.saturating_sub(ctx.parent_total_supply_emitted);
+    let remaining_cap = economics::MAX_SUPPLY_ATOMS.saturating_sub(ctx.parent_total_supply_emitted);
     if coinbase.amount > remaining_cap {
         return Err(CoinbaseExceedsCap {
             requested: coinbase.amount,
@@ -480,6 +480,10 @@ mod tests {
         }
     }
 
+    fn initial_reward() -> u64 {
+        economics::INITIAL_BLOCK_REWARD_ATOMS
+    }
+
     /// Builds a parent block consistent with a fresh chain.
     fn build_genesis_parent(chain_id: &str) -> Block {
         let prev_hash = {
@@ -578,7 +582,14 @@ mod tests {
     fn happy_path_block_validates() {
         let chain_id = "zoka-test-net";
         let parent = build_genesis_parent(chain_id);
-        let block = mine_block(chain_id, &parent, "zka1miner", 12, 4, 1_700_000_000);
+        let block = mine_block(
+            chain_id,
+            &parent,
+            "zka1miner",
+            initial_reward(),
+            4,
+            1_700_000_000,
+        );
         validate_pow_block(&block, &ctx_for(chain_id, &parent, 4)).expect("block must validate");
     }
 
@@ -586,7 +597,14 @@ mod tests {
     fn missing_coinbase_is_rejected() {
         let chain_id = "zoka-test-net";
         let parent = build_genesis_parent(chain_id);
-        let mut block = mine_block(chain_id, &parent, "zka1miner", 12, 4, 1_700_000_000);
+        let mut block = mine_block(
+            chain_id,
+            &parent,
+            "zka1miner",
+            initial_reward(),
+            4,
+            1_700_000_000,
+        );
         block.transactions.clear();
         block.header.merkle_root = block.compute_merkle_root();
         block.header.hash = block.compute_hash();
@@ -598,7 +616,14 @@ mod tests {
     fn non_coinbase_at_index_zero_is_rejected() {
         let chain_id = "zoka-test-net";
         let parent = build_genesis_parent(chain_id);
-        let mut block = mine_block(chain_id, &parent, "zka1miner", 12, 4, 1_700_000_000);
+        let mut block = mine_block(
+            chain_id,
+            &parent,
+            "zka1miner",
+            initial_reward(),
+            4,
+            1_700_000_000,
+        );
         block.transactions[0].sender = "zka1somebodyelse".to_string();
         block.transactions[0].hash = block.transactions[0].compute_hash();
         block.header.merkle_root = block.compute_merkle_root();
@@ -611,7 +636,14 @@ mod tests {
     fn extra_coinbase_is_rejected() {
         let chain_id = "zoka-test-net";
         let parent = build_genesis_parent(chain_id);
-        let mut block = mine_block(chain_id, &parent, "zka1miner", 12, 4, 1_700_000_000);
+        let mut block = mine_block(
+            chain_id,
+            &parent,
+            "zka1miner",
+            initial_reward(),
+            4,
+            1_700_000_000,
+        );
         let phantom = build_coinbase_tx("zka1ghost".to_string(), 0, 1, 1_700_000_000);
         block.transactions.push(phantom);
         block.header.merkle_root = block.compute_merkle_root();
@@ -628,12 +660,19 @@ mod tests {
     fn private_fee_claim_must_reference_private_tx_in_same_block() {
         let chain_id = "zoka-test-net";
         let parent = build_genesis_parent(chain_id);
-        let block = mine_block(chain_id, &parent, "zka1miner", 12, 4, 1_700_000_000)
-            .with_private_fee_claims(vec![PrivateFeeClaim {
-                tx_hash: "missing-private-tx".to_string(),
-                ephemeral_pubkey: vec![1, 2, 3],
-                ciphertext: vec![4, 5, 6],
-            }]);
+        let block = mine_block(
+            chain_id,
+            &parent,
+            "zka1miner",
+            initial_reward(),
+            4,
+            1_700_000_000,
+        )
+        .with_private_fee_claims(vec![PrivateFeeClaim {
+            tx_hash: "missing-private-tx".to_string(),
+            ephemeral_pubkey: vec![1, 2, 3],
+            ciphertext: vec![4, 5, 6],
+        }]);
         let err = validate_pow_block(&block, &ctx_for(chain_id, &parent, 4)).unwrap_err();
         assert!(matches!(err, FeeClaimForMissingPrivateTx(_)));
     }
@@ -647,9 +686,16 @@ mod tests {
             ephemeral_pubkey: vec![1, 2, 3],
             ciphertext: vec![4, 5, 6],
         };
-        let block = mine_block(chain_id, &parent, "zka1miner", 12, 4, 1_700_000_000)
-            .with_private_tx_hashes(vec!["private-tx-1".to_string()])
-            .with_private_fee_claims(vec![claim.clone(), claim]);
+        let block = mine_block(
+            chain_id,
+            &parent,
+            "zka1miner",
+            initial_reward(),
+            4,
+            1_700_000_000,
+        )
+        .with_private_tx_hashes(vec!["private-tx-1".to_string()])
+        .with_private_fee_claims(vec![claim.clone(), claim]);
         let err = validate_pow_block(&block, &ctx_for(chain_id, &parent, 4)).unwrap_err();
         assert!(matches!(err, DuplicatePrivateFeeClaim(_)));
     }
@@ -658,15 +704,22 @@ mod tests {
     fn valid_private_fee_claim_is_committed_without_changing_coinbase() {
         let chain_id = "zoka-test-net";
         let parent = build_genesis_parent(chain_id);
-        let block = mine_block(chain_id, &parent, "zka1miner", 12, 4, 1_700_000_000)
-            .with_private_tx_hashes(vec!["private-tx-1".to_string()])
-            .with_private_fee_claims(vec![PrivateFeeClaim {
-                tx_hash: "private-tx-1".to_string(),
-                ephemeral_pubkey: vec![1, 2, 3],
-                ciphertext: vec![4, 5, 6],
-            }]);
+        let block = mine_block(
+            chain_id,
+            &parent,
+            "zka1miner",
+            initial_reward(),
+            4,
+            1_700_000_000,
+        )
+        .with_private_tx_hashes(vec!["private-tx-1".to_string()])
+        .with_private_fee_claims(vec![PrivateFeeClaim {
+            tx_hash: "private-tx-1".to_string(),
+            ephemeral_pubkey: vec![1, 2, 3],
+            ciphertext: vec![4, 5, 6],
+        }]);
 
-        assert_eq!(block.transactions[0].amount, 12);
+        assert_eq!(block.transactions[0].amount, initial_reward());
         validate_pow_block(&block, &ctx_for(chain_id, &parent, 4))
             .expect("block with encrypted fee claim must validate");
     }
@@ -675,7 +728,14 @@ mod tests {
     fn non_zero_subsidy_requires_private_coinbase_output() {
         let chain_id = "zoka-test-net";
         let parent = build_genesis_parent(chain_id);
-        let mut block = mine_block(chain_id, &parent, "zka1miner", 12, 4, 1_700_000_000);
+        let mut block = mine_block(
+            chain_id,
+            &parent,
+            "zka1miner",
+            initial_reward(),
+            4,
+            1_700_000_000,
+        );
         block.private_coinbase = None;
         block.header.merkle_root = block.compute_merkle_root();
         block.header.hash = block.compute_hash();
@@ -688,7 +748,14 @@ mod tests {
     fn private_coinbase_maturity_is_consensus_checked() {
         let chain_id = "zoka-test-net";
         let parent = build_genesis_parent(chain_id);
-        let mut block = mine_block(chain_id, &parent, "zka1miner", 12, 4, 1_700_000_000);
+        let mut block = mine_block(
+            chain_id,
+            &parent,
+            "zka1miner",
+            initial_reward(),
+            4,
+            1_700_000_000,
+        );
         block.private_coinbase.as_mut().unwrap().unlock_height = 1;
         block.header.merkle_root = block.compute_merkle_root();
         block.header.hash = block.compute_hash();
@@ -701,15 +768,22 @@ mod tests {
     fn coinbase_amount_mismatch_is_rejected() {
         let chain_id = "zoka-test-net";
         let parent = build_genesis_parent(chain_id);
-        // Subsidy at height 1 with 0 emitted is 12. Build with 11 instead.
-        let block = mine_block(chain_id, &parent, "zka1miner", 11, 4, 1_700_000_000);
+        // Subsidy at height 1 with 0 emitted is 12 ZKA. Build one atom short.
+        let block = mine_block(
+            chain_id,
+            &parent,
+            "zka1miner",
+            initial_reward() - 1,
+            4,
+            1_700_000_000,
+        );
         let err = validate_pow_block(&block, &ctx_for(chain_id, &parent, 4)).unwrap_err();
         match err {
             CoinbaseAmountMismatch {
                 expected, actual, ..
             } => {
-                assert_eq!(expected, 12);
-                assert_eq!(actual, 11);
+                assert_eq!(expected, initial_reward());
+                assert_eq!(actual, initial_reward() - 1);
             }
             other => panic!("expected CoinbaseAmountMismatch, got: {other:?}"),
         }
@@ -719,20 +793,27 @@ mod tests {
     fn coinbase_exceeds_cap_is_rejected() {
         let chain_id = "zoka-test-net";
         let parent = build_genesis_parent(chain_id);
-        let block = mine_block(chain_id, &parent, "zka1miner", 12, 4, 1_700_000_000);
+        let block = mine_block(
+            chain_id,
+            &parent,
+            "zka1miner",
+            initial_reward(),
+            4,
+            1_700_000_000,
+        );
         // Tell the validator the cap is already fully emitted; the
-        // coinbase amount of 12 must clash with remaining=0.
+        // Coinbase amount of 12 ZKA must clash with remaining=0.
         let mut ctx = ctx_for(chain_id, &parent, 4);
-        ctx.parent_total_supply_emitted = economics::MAX_SUPPLY_ZKA;
+        ctx.parent_total_supply_emitted = economics::MAX_SUPPLY_ATOMS;
         // Now the expected subsidy is 0 (cap reached) — this should fire
-        // CoinbaseAmountMismatch first because amount is 12 vs expected 0.
+        // CoinbaseAmountMismatch first because amount is 12 ZKA vs expected 0.
         let err = validate_pow_block(&block, &ctx).unwrap_err();
         match err {
             CoinbaseAmountMismatch {
                 expected, actual, ..
             } => {
                 assert_eq!(expected, 0);
-                assert_eq!(actual, 12);
+                assert_eq!(actual, initial_reward());
             }
             other => panic!("expected CoinbaseAmountMismatch, got: {other:?}"),
         }
@@ -742,7 +823,14 @@ mod tests {
     fn empty_coinbase_recipient_is_rejected() {
         let chain_id = "zoka-test-net";
         let parent = build_genesis_parent(chain_id);
-        let mut block = mine_block(chain_id, &parent, "zka1miner", 12, 4, 1_700_000_000);
+        let mut block = mine_block(
+            chain_id,
+            &parent,
+            "zka1miner",
+            initial_reward(),
+            4,
+            1_700_000_000,
+        );
         block.transactions[0].receiver = String::new();
         block.transactions[0].hash = block.transactions[0].compute_hash();
         block.header.merkle_root = block.compute_merkle_root();
@@ -755,7 +843,14 @@ mod tests {
     fn wrong_height_is_rejected() {
         let chain_id = "zoka-test-net";
         let parent = build_genesis_parent(chain_id);
-        let mut block = mine_block(chain_id, &parent, "zka1miner", 12, 4, 1_700_000_000);
+        let mut block = mine_block(
+            chain_id,
+            &parent,
+            "zka1miner",
+            initial_reward(),
+            4,
+            1_700_000_000,
+        );
         block.header.block_height = 5; // skip ahead
         block.header.hash = block.compute_hash();
         let err = validate_pow_block(&block, &ctx_for(chain_id, &parent, 4)).unwrap_err();
@@ -777,7 +872,14 @@ mod tests {
     fn detached_block_is_rejected() {
         let chain_id = "zoka-test-net";
         let parent = build_genesis_parent(chain_id);
-        let mut block = mine_block(chain_id, &parent, "zka1miner", 12, 4, 1_700_000_000);
+        let mut block = mine_block(
+            chain_id,
+            &parent,
+            "zka1miner",
+            initial_reward(),
+            4,
+            1_700_000_000,
+        );
         block.header.prev_hash = "deadbeef".to_string();
         block.header.hash = block.compute_hash();
         let err = validate_pow_block(&block, &ctx_for(chain_id, &parent, 4)).unwrap_err();
@@ -788,7 +890,14 @@ mod tests {
     fn tampered_header_hash_is_rejected() {
         let chain_id = "zoka-test-net";
         let parent = build_genesis_parent(chain_id);
-        let mut block = mine_block(chain_id, &parent, "zka1miner", 12, 4, 1_700_000_000);
+        let mut block = mine_block(
+            chain_id,
+            &parent,
+            "zka1miner",
+            initial_reward(),
+            4,
+            1_700_000_000,
+        );
         block.header.hash = "00deadbeef".to_string();
         let err = validate_pow_block(&block, &ctx_for(chain_id, &parent, 4)).unwrap_err();
         assert!(matches!(err, HeaderHashMismatch { .. }));
@@ -798,7 +907,14 @@ mod tests {
     fn tampered_merkle_root_is_rejected() {
         let chain_id = "zoka-test-net";
         let parent = build_genesis_parent(chain_id);
-        let mut block = mine_block(chain_id, &parent, "zka1miner", 12, 4, 1_700_000_000);
+        let mut block = mine_block(
+            chain_id,
+            &parent,
+            "zka1miner",
+            initial_reward(),
+            4,
+            1_700_000_000,
+        );
         block.header.merkle_root = "ff".to_string();
         block.header.hash = block.compute_hash();
         let err = validate_pow_block(&block, &ctx_for(chain_id, &parent, 4)).unwrap_err();
@@ -810,7 +926,14 @@ mod tests {
         let chain_id = "zoka-test-net";
         let parent = build_genesis_parent(chain_id);
         // Mine for 4 bits but require 24 — same block can't satisfy.
-        let block = mine_block(chain_id, &parent, "zka1miner", 12, 4, 1_700_000_000);
+        let block = mine_block(
+            chain_id,
+            &parent,
+            "zka1miner",
+            initial_reward(),
+            4,
+            1_700_000_000,
+        );
         let err = validate_pow_block(&block, &ctx_for(chain_id, &parent, 24)).unwrap_err();
         assert!(matches!(err, PowBelowDifficulty { .. }));
     }
@@ -819,7 +942,14 @@ mod tests {
     fn tampered_pow_seal_is_rejected() {
         let chain_id = "zoka-test-net";
         let parent = build_genesis_parent(chain_id);
-        let mut block = mine_block(chain_id, &parent, "zka1miner", 12, 4, 1_700_000_000);
+        let mut block = mine_block(
+            chain_id,
+            &parent,
+            "zka1miner",
+            initial_reward(),
+            4,
+            1_700_000_000,
+        );
         // Flip a byte of the seal so it stops matching the PoW preimage.
         if let Some(byte) = block.header.seal.0.first_mut() {
             *byte ^= 0xff;
@@ -847,7 +977,8 @@ mod tests {
         // We can't mine a real mainnet block without the feature, so we
         // construct a syntactically well-formed block and verify the
         // backend complaint is what surfaces.
-        let coinbase = build_coinbase_tx("zka1miner".to_string(), 12, 1, 1_700_000_000);
+        let coinbase =
+            build_coinbase_tx("zka1miner".to_string(), initial_reward(), 1, 1_700_000_000);
         let mut block = Block {
             header: BlockHeader {
                 hash: String::new(),

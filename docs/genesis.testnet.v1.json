@@ -1,0 +1,16 @@
+{
+  "schema": "zoka-genesis-v1",
+  "chain_id": "zoka-testnet-v1",
+  "pow_algorithm": "zoka-randomx-v1",
+  "genesis_timestamp": 1778198400,
+  "economics": {
+    "max_supply_zka": 23000000,
+    "initial_block_reward_zka": 12,
+    "halving_interval_blocks": 1051200,
+    "target_block_time_secs": 120,
+    "coinbase_maturity_blocks": 60
+  },
+  "validators": [],
+  "pre_mine": [],
+  "initial_accounts": []
+}

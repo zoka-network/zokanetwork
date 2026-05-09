@@ -12,7 +12,7 @@ if (-not (Test-Path -LiteralPath $SetupDir)) {
 }
 
 if (-not $NoCheck) {
-    cargo run --quiet --bin zoka-ceremony-contribute -- release-pin --setup-dir $SetupDir > $null
+    cargo run --quiet --features ops-tools --bin zoka-ceremony-contribute -- release-pin --setup-dir $SetupDir > $null
 }
 
 $digestPath = Join-Path $SetupDir "DIGEST"

@@ -3,6 +3,9 @@ use rocksdb::{IteratorMode, Options, WriteBatch, DB};
 use std::path::Path;
 use std::sync::Arc;
 
+const PENDING_PRIVATE_TX_PREFIX: &str = "mempool:private:pending:";
+const PENDING_PRIVATE_TX_COUNT_KEY: &str = "mempool:private:count";
+
 /// Storage trait defining the interface for blockchain persistence
 pub trait StorageBackend: Send + Sync {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError>;
@@ -61,6 +64,35 @@ impl RocksDbStorage {
     pub fn set_block_hash_at_height(&self, height: u64, hash: &str) -> Result<(), StorageError> {
         let height_key = format!("chain:block_height:{}", height);
         self.put_raw(&height_key, hash.as_bytes().to_vec())
+    }
+
+    /// Return the canonical block hash for a height, if the direct
+    /// height index exists. This deliberately does not scan block bodies:
+    /// side-branch bodies may exist at the same height but are not
+    /// canonical unless the height index points at them.
+    pub fn get_canonical_block_hash_at_height(
+        &self,
+        height: u64,
+    ) -> Result<Option<String>, StorageError> {
+        let height_key = format!("chain:block_height:{}", height);
+        let Some(hash_raw) = self.get_raw(&height_key)? else {
+            return Ok(None);
+        };
+        let hash = String::from_utf8(hash_raw)
+            .map_err(|_| StorageError::SerializationError("Invalid UTF-8".to_string()))?;
+        Ok(Some(hash))
+    }
+
+    /// Retrieve the canonical block body for a height using only the
+    /// direct height index.
+    pub fn get_canonical_block_by_height(
+        &self,
+        height: u64,
+    ) -> Result<Option<Block>, StorageError> {
+        let Some(hash) = self.get_canonical_block_hash_at_height(height)? else {
+            return Ok(None);
+        };
+        self.get_block(&hash)
     }
 
     /// Remove the canonical height index entry. Used when a reorg selects
@@ -154,10 +186,7 @@ impl RocksDbStorage {
     /// Uses the direct height index when present, and falls back to block scan
     /// for compatibility with data persisted before index support.
     pub fn get_block_by_height(&self, height: u64) -> Result<Option<Block>, StorageError> {
-        let height_key = format!("chain:block_height:{}", height);
-        if let Some(hash_raw) = self.get_raw(&height_key)? {
-            let hash = String::from_utf8(hash_raw)
-                .map_err(|_| StorageError::SerializationError("Invalid UTF-8".to_string()))?;
+        if let Some(hash) = self.get_canonical_block_hash_at_height(height)? {
             return self.get_block(&hash);
         }
 
@@ -237,6 +266,74 @@ impl RocksDbStorage {
             out.push((hash, value.to_vec()));
         }
         Ok(out)
+    }
+
+    /// Mark a private transaction body as pending for local miner inclusion.
+    ///
+    /// The body itself remains under `priv_tx:<hash>` so APIs can still serve
+    /// it after block inclusion; this marker is only the local mempool index.
+    pub fn save_pending_private_transaction_hash(&self, hash: &str) -> Result<(), StorageError> {
+        let hash = hash.trim();
+        if hash.is_empty() {
+            return Err(StorageError::SerializationError(
+                "pending private tx hash cannot be empty".to_string(),
+            ));
+        }
+        let key = format!("{PENDING_PRIVATE_TX_PREFIX}{hash}");
+        self.put_raw(&key, b"1".to_vec())?;
+        self.refresh_pending_private_transaction_count()
+    }
+
+    /// Remove a private transaction from the local pending index after it is
+    /// committed to a block. The persisted body is intentionally preserved.
+    pub fn delete_pending_private_transaction_hash(&self, hash: &str) -> Result<(), StorageError> {
+        let key = format!("{PENDING_PRIVATE_TX_PREFIX}{}", hash.trim());
+        self.db
+            .delete(key.as_bytes())
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        self.refresh_pending_private_transaction_count()
+    }
+
+    /// Return pending private tx hashes in deterministic key order.
+    pub fn iterate_pending_private_transaction_hashes(&self) -> Result<Vec<String>, StorageError> {
+        let prefix = PENDING_PRIVATE_TX_PREFIX.as_bytes();
+        let mut out = Vec::new();
+        for item in self
+            .db
+            .iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward))
+        {
+            let (key, _value) = item.map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let hash = String::from_utf8(key[prefix.len()..].to_vec()).map_err(|_| {
+                StorageError::SerializationError(
+                    "Invalid UTF-8 in pending private tx key".to_string(),
+                )
+            })?;
+            out.push(hash);
+        }
+        Ok(out)
+    }
+
+    /// Return the cached pending private tx count, repairing it from the
+    /// marker index when older DBs do not have the count key yet.
+    pub fn pending_private_transaction_count(&self) -> Result<u64, StorageError> {
+        if let Some(raw) = self.get_raw(PENDING_PRIVATE_TX_COUNT_KEY)? {
+            if let Ok(text) = std::str::from_utf8(&raw) {
+                if let Ok(value) = text.trim().parse::<u64>() {
+                    return Ok(value);
+                }
+            }
+        }
+        let count = self.iterate_pending_private_transaction_hashes()?.len() as u64;
+        self.put_raw(PENDING_PRIVATE_TX_COUNT_KEY, count.to_string().into_bytes())?;
+        Ok(count)
+    }
+
+    fn refresh_pending_private_transaction_count(&self) -> Result<(), StorageError> {
+        let count = self.iterate_pending_private_transaction_hashes()?.len() as u64;
+        self.put_raw(PENDING_PRIVATE_TX_COUNT_KEY, count.to_string().into_bytes())
     }
 
     /// Retrieve a transaction by hash
@@ -801,6 +898,60 @@ mod tests {
     }
 
     #[test]
+    fn test_storage_pending_private_tx_index_roundtrip() {
+        let test_dir = ".zoka/test-suite/.test_storage_pending_priv_tx";
+        let _ = fs::remove_dir_all(test_dir);
+
+        let storage = RocksDbStorage::new(test_dir).expect("storage");
+        assert_eq!(storage.pending_private_transaction_count().unwrap(), 0);
+
+        storage
+            .save_private_transaction_bytes("hash_alpha", b"serialized-tx-alpha")
+            .unwrap();
+        storage
+            .save_private_transaction_bytes("hash_beta", b"serialized-tx-beta")
+            .unwrap();
+        storage
+            .save_pending_private_transaction_hash("hash_beta")
+            .unwrap();
+        storage
+            .save_pending_private_transaction_hash("hash_alpha")
+            .unwrap();
+        storage
+            .save_pending_private_transaction_hash("hash_alpha")
+            .unwrap();
+
+        let pending = storage
+            .iterate_pending_private_transaction_hashes()
+            .unwrap();
+        assert_eq!(
+            pending,
+            vec!["hash_alpha".to_string(), "hash_beta".to_string()]
+        );
+        assert_eq!(storage.pending_private_transaction_count().unwrap(), 2);
+
+        storage
+            .delete_pending_private_transaction_hash("hash_alpha")
+            .unwrap();
+        assert_eq!(
+            storage
+                .iterate_pending_private_transaction_hashes()
+                .unwrap(),
+            vec!["hash_beta".to_string()]
+        );
+        assert_eq!(storage.pending_private_transaction_count().unwrap(), 1);
+        assert!(
+            storage
+                .get_private_transaction_bytes("hash_alpha")
+                .unwrap()
+                .is_some(),
+            "committed private tx bodies remain available after pending marker deletion"
+        );
+
+        let _ = fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
     fn test_storage_account_state() {
         let test_dir = ".zoka/test-suite/.test_storage_account";
         let _ = fs::remove_dir_all(test_dir);
@@ -877,6 +1028,38 @@ mod tests {
             .unwrap()
             .expect("fallback block by height");
         assert_eq!(by_height.header.hash, legacy_block.header.hash);
+
+        let _ = fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn test_storage_canonical_block_by_height_ignores_body_only_side_blocks() {
+        let test_dir = ".zoka/test-suite/.test_storage_canonical_block_index";
+        let _ = fs::remove_dir_all(test_dir);
+
+        let storage = RocksDbStorage::new(test_dir).expect("Failed to create storage");
+        let side_block = Block::new(
+            "side-prev".to_string(),
+            88,
+            0,
+            14,
+            vec![],
+            PublicKey(vec![4]),
+            Signature(vec![]),
+        );
+
+        storage.save_block_body(&side_block).unwrap();
+        assert!(storage.get_canonical_block_by_height(14).unwrap().is_none());
+        assert!(storage.get_block_by_height(14).unwrap().is_some());
+
+        storage
+            .set_block_hash_at_height(14, &side_block.header.hash)
+            .unwrap();
+        let canonical = storage
+            .get_canonical_block_by_height(14)
+            .unwrap()
+            .expect("canonical block");
+        assert_eq!(canonical.header.hash, side_block.header.hash);
 
         let _ = fs::remove_dir_all(test_dir);
     }

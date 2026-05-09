@@ -4,14 +4,14 @@ Objetivo: cerrar el tramo post-v4 con parametros economicos canonicos y requisit
 
 ## 1) Economia de red (propuesta canonica v1)
 
-Nota v6: este documento queda como referencia historica. La fuente canonica actual es `src/economics.rs` junto con `docs/economics.mainnet.v1.json`.
+Nota v6: este documento queda como referencia historica. La fuente canonica actual es `src/economics.rs` junto con `docs/economics.mainnet.v2-atoms.json`.
 
 ### 1.1 Token
 
 - Nombre: `ZOKA`
 - Ticker: `ZKA`
-- Decimales: `0` en la contabilidad v1 implementada.
-- Unidad de contabilidad v1: `ZKA` entero.
+- Decimales: `6` en la contabilidad activa.
+- Unidad de contabilidad: atom (`1 ZKA = 1_000_000 atoms`).
 - Max supply: `23,000,000 ZKA` (hard cap).
 
 ### 1.2 Emision y recompensa
@@ -21,7 +21,7 @@ Nota v6: este documento queda como referencia historica. La fuente canonica actu
 - Halving cada `1_051_200` bloques (aprox. 4 anios).
 - Formula de recompensa por bloque:
   - `reward(height) = min(halving_reward(height), remaining_supply(height))`
-  - `halving_reward(height) = initial_reward >> era(height)` en unidades enteras v1.
+  - `halving_reward(height) = (initial_reward >> era(height)) * atoms_per_zka`.
   - `era(height) = floor(height / 1_051_200)`
 - Tail emission: `0` (deshabilitada para respetar hard cap).
 - Regla de corte: cuando `remaining_supply = 0`, `reward = 0`.
@@ -29,12 +29,12 @@ Nota v6: este documento queda como referencia historica. La fuente canonica actu
 
 ### 1.3 Fees
 
-- Fee minima por tx privada: `>= 1 ZKA` en la contabilidad v1 implementada (floor anti-spam).
+- Fee minima por tx privada: `0` atoms cuando la red esta quieta; el estimador sube por pasos de `0.0001 ZKA` bajo carga.
 - Politica de priorizacion de mempool:
   - `effective_fee = fee_per_input + fee_per_size`
   - desempate por antiguedad (FIFO).
 - Destino de fees de bloque:
-  - `100%` al productor/proposer del bloque en la fase v1.
+  - `100%` al productor/proposer del bloque via `private_fee_claims` cifrados.
 
 ### 1.4 Genesis y supply inicial
 

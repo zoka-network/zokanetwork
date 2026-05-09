@@ -11,7 +11,7 @@ La base codeable de mainnet v6 esta mayormente cerrada:
 
 - wallet privada por defecto;
 - CLI `zoka` y wrapper `zokahd`;
-- economia mainnet v1 congelada;
+- economia mainnet `zoka-economics-v2-atoms` con 6 decimales;
 - PoW mainnet definido como RandomX;
 - validacion de bloque, coinbase publica auditable, private coinbase y private
   fee claims;
@@ -22,20 +22,20 @@ La base codeable de mainnet v6 esta mayormente cerrada:
 - `chain-stats`, `chain-prune` y test de boot mainnet contra genesis v1;
 - tooling de release y runbooks.
 
-Mainnet publica todavia no esta lista porque faltan operadores reales, claves
+Mainnet abierta todavia no esta lista porque faltan operadores reales, claves
 reales, commit/tag congelado, firma GPG, auditoria externa, testnet publica y
 launch operacional.
 
-## Publico vs privado
+## Privacidad y consenso auditable
 
 **Por defecto privado.** Wallets, balances, recipients, transferencias y fees
 van por el path privado (`private_wallet::*`, CLSAG, Bulletproofs, Pedersen,
 nullifiers, stealth addresses). El CLI de usuario no expone una ruta normal de
-transferencia publica.
+transferencia transparente.
 
-**Publico por consenso:**
+**Auditable por consenso:**
 
-- coinbase publica de cada bloque para auditar emision y max supply;
+- coinbase auditable de cada bloque para auditar emision y max supply;
 - `block.private_coinbase` como nota privada spendable por el minero;
 - `block.private_fee_claims[]` cifrados y comprometidos por Merkle/Pedersen;
 - header de bloque para PoW, altura, enlaces y merkle root.
@@ -44,6 +44,7 @@ transferencia publica.
 
 - comandos publicos legacy de wallet/transfer;
 - binarios legacy `user-cli`, `user-cli-private`, `user-node`;
+- binarios operativos fuera de `zoka`/`zokahd` en builds de usuario;
 - modulo `user_node`;
 - modulo `transaction_pool` legacy;
 - handlers operator/dev antiguos en `src/main.rs`.
@@ -54,7 +55,7 @@ transferencia publica.
 src/
   main.rs                    # CLI principal zoka
   lib.rs                     # Re-exports del crate
-  economics.rs               # Constantes canonicas mainnet v1
+  economics.rs               # Constantes canonicas mainnet, atoms y fees
   genesis.rs                 # zoka-genesis-v1 schema + validate + digest
   snapshot.rs                # zoka-snapshot-v1 export/import/sign
   admin/, api/, health/      # Superficie operacional/RPC
@@ -79,8 +80,9 @@ src/
 ## Modulos mainnet-critical
 
 `economics`
-: Parametros hard-fork sensitive: `ZKA`, max supply `23,000,000`, reward
-  inicial `12`, halving `1,051,200`, target block time `120s`, maturity `60`.
+: Parametros hard-fork sensitive: `ZKA`, `1 ZKA = 1,000,000 atoms`, max
+  supply `23,000,000`, reward inicial `12`, halving `1,051,200`, target block
+  time `120s`, maturity `60`.
 
 `mining::pow`
 : Backend pluggable. Mainnet requiere `zoka-randomx-v1`; sin feature `randomx`,
@@ -131,6 +133,7 @@ src/
 | `zoka height` | OK |
 | `zoka chain-stats` | OK |
 | `zoka chain-prune` | OK |
+| `zoka rpc-list` / `rpc-status` / `rpc-height` / `rpc-mempool` | v0.4 read-only; lista RPCs de config y consulta HTTP simple contra endpoints ZOKA sin wallet/firma/envio. |
 | `zoka sync-status` | OK |
 | `zoka mine` | Gate RandomX correcto en binario debug sin feature. |
 | `zoka mine-status` / `mine-console` | OK |
@@ -140,6 +143,9 @@ src/
 | `zoka snapshot-export` / `snapshot-info` / `snapshot-import` | OK |
 | `zoka fullnode` | OK en modo `--no-network-config --no-mine`. |
 | `zokahd --inline` | OK delegando a `zoka fullnode`. |
+
+Alias UX publicados: `zoka create`, `restore`, `wallets`, `balance`, `send`,
+`fee`, `mine`, `node`, `status`, `sync`, `backup` y `wipe`.
 
 Detalle: [cli-smoke-status.md](cli-smoke-status.md).
 
@@ -156,6 +162,7 @@ Detalle: [cli-smoke-status.md](cli-smoke-status.md).
 | `scripts/release_checksums.ps1` / `.sh` | Genera `SHA256SUMS.txt`. |
 | `scripts/mainnet_readiness_check.ps1 [-BuildRelease]` | Preflight estricto de release: docs, RandomX, genesis, placeholders, network lint, GPG y fingerprint. |
 | `scripts/cli_smoke_test.ps1` | Smoke test reproducible de `zoka`/`zokahd` sobre perfil temporal. |
+| `scripts/local_wallet_network_rehearsal.ps1` | Rehearsal local de wallet real sobre red local: coinbase maturity, transferencia privada e inclusion del hash en bloque sincronizado. |
 | `scripts/build_release_with_setup_digest.ps1` | Build con digest de trusted setup. |
 | `scripts/prepare_audit_package.ps1` | Paquete para auditoria externa. |
 | `scripts/init_ceremony_round*.ps1` | Inicializa rondas de ceremonia MPC. |

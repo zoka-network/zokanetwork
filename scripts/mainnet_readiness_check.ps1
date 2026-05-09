@@ -116,16 +116,16 @@ try {
 
     if ($BuildRelease) {
         Test-Step "release build with RandomX" {
-            & cargo build --release --features randomx --bin zoka --bin zokahd | Out-Host
+            & powershell -ExecutionPolicy Bypass -File scripts/build_mainnet_release.ps1 | Out-Host
             if ($LASTEXITCODE -ne 0) {
-                throw "cargo build failed"
+                throw "scripts/build_mainnet_release.ps1 failed"
             }
         }
     }
 
     Test-Step "release zoka binary exists" {
         if (!(Test-Path -LiteralPath $ZokaExe -PathType Leaf)) {
-            throw "missing release binary; run cargo build --release --features randomx --bin zoka --bin zokahd"
+            throw "missing release binary; run powershell -ExecutionPolicy Bypass -File scripts/build_mainnet_release.ps1"
         }
     }
 

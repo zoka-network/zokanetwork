@@ -16,12 +16,11 @@
 //! one ingress path; that is what makes "real users mining" possible
 //! without consensus drift between nodes.
 //!
-//! Fork-choice today: an incoming block must extend the current head
-//! (its `prev_hash` matches `chain:last_hash` and its height is `head + 1`).
-//! Heavier alternative chains are NOT accepted yet — see
-//! [`would_replace_head_with_reorg`] for the future entry point. A real
-//! reorg implementation has to roll back account state and is out of
-//! scope until the state-layer migration lands. This is documented in
+//! Fork-choice today: blocks that extend the head advance the canonical
+//! chain immediately. Valid side branches are retained by hash, and a
+//! side branch with more cumulative work can replace the canonical
+//! height index once its known branch connects to a common ancestor.
+//! Full state rollback/replay remains a higher-risk migration tracked in
 //! `docs/mainnet_launch_roadmap_v6.md`.
 
 use std::sync::Arc;
@@ -187,6 +186,19 @@ fn get_block_meta(
     Ok(Some(meta))
 }
 
+fn canonical_hash_at_height(
+    storage: &RocksDbStorage,
+    height: u64,
+) -> Result<Option<String>, ChainError> {
+    let key = format!("chain:block_height:{height}");
+    let Some(raw) = storage.get_raw(&key)? else {
+        return Ok(None);
+    };
+    let hash = String::from_utf8(raw)
+        .map_err(|_| ChainError::Storage("canonical height index is not utf-8".to_string()))?;
+    Ok(Some(hash))
+}
+
 fn genesis_meta() -> BlockChainMeta {
     BlockChainMeta {
         height: 0,
@@ -282,10 +294,7 @@ fn collect_branch_to_common_ancestor(
                 head: cursor.header.prev_hash.clone(),
                 candidate: cursor.header.hash.clone(),
             })?;
-        let canonical_at_height = storage.get_block_by_height(parent.header.block_height)?;
-        if canonical_at_height
-            .as_ref()
-            .map(|block| block.header.hash.as_str())
+        if canonical_hash_at_height(storage, parent.header.block_height)?.as_deref()
             == Some(parent.header.hash.as_str())
         {
             break;
@@ -323,6 +332,29 @@ fn promote_branch_to_canonical(
     })
 }
 
+fn maybe_promote_known_side_branch(
+    storage: &RocksDbStorage,
+    candidate: &Block,
+    head: Option<&ChainHead>,
+) -> Result<Option<ChainHead>, ChainError> {
+    if canonical_hash_at_height(storage, candidate.header.block_height)?.as_deref()
+        == Some(candidate.header.hash.as_str())
+    {
+        return Ok(None);
+    }
+
+    let Some(meta) = get_block_meta(storage, &candidate.header.hash)? else {
+        return Ok(None);
+    };
+    let head_work = head.map(|h| h.cumulative_work).unwrap_or(0);
+    if meta.cumulative_work > head_work {
+        return Ok(Some(promote_branch_to_canonical(
+            storage, candidate, &meta,
+        )?));
+    }
+    Ok(None)
+}
+
 /// Production ingress point. Derives the canonical expected difficulty
 /// from `mining::difficulty::expected_for_next_block(storage)` so that
 /// every node — miner or verifier — applies the same rule, then forwards
@@ -333,7 +365,7 @@ pub fn apply_block(
     candidate: &Block,
 ) -> Result<ChainHead, ChainError> {
     let expected = difficulty::expected_for_next_block(storage).map_err(ChainError::Storage)?;
-    apply_block_with_expected_difficulty(storage, chain_id, candidate, expected)
+    apply_block_inner(storage, chain_id, candidate, expected, false)
 }
 
 /// Apply a freshly mined or freshly received block at an explicit
@@ -346,15 +378,35 @@ pub fn apply_block_with_expected_difficulty(
     candidate: &Block,
     expected_difficulty_bits: u32,
 ) -> Result<ChainHead, ChainError> {
+    apply_block_inner(storage, chain_id, candidate, expected_difficulty_bits, true)
+}
+
+fn apply_block_inner(
+    storage: &RocksDbStorage,
+    chain_id: &str,
+    candidate: &Block,
+    expected_difficulty_bits: u32,
+    force_expected_difficulty: bool,
+) -> Result<ChainHead, ChainError> {
     if expected_difficulty_bits == 0 {
         return Err(ChainError::InvalidExpectedDifficulty);
     }
 
+    let head = read_chain_head(storage)?;
     if storage.block_exists(&candidate.header.hash)? {
-        return Err(ChainError::BlockAlreadyKnown(candidate.header.hash.clone()));
+        if let Some(promoted) = maybe_promote_known_side_branch(storage, candidate, head.as_ref())?
+        {
+            return Ok(promoted);
+        }
+        let is_indexed_canonical =
+            canonical_hash_at_height(storage, candidate.header.block_height)?.as_deref()
+                == Some(candidate.header.hash.as_str());
+        let has_validated_meta = get_block_meta(storage, &candidate.header.hash)?.is_some();
+        if is_indexed_canonical || has_validated_meta {
+            return Err(ChainError::BlockAlreadyKnown(candidate.header.hash.clone()));
+        }
     }
 
-    let head = read_chain_head(storage)?;
     let parent_height = head.as_ref().map(|h| h.height).unwrap_or(0);
     let head_hash = head.as_ref().map(|h| h.hash.clone()).unwrap_or_default();
 
@@ -378,7 +430,7 @@ pub fn apply_block_with_expected_difficulty(
     let extends_head = candidate.header.prev_hash == expected_prev_hash
         && candidate.header.block_height == parent_height.saturating_add(1);
 
-    let effective_expected_difficulty = if extends_head {
+    let effective_expected_difficulty = if force_expected_difficulty || extends_head {
         expected_difficulty_bits
     } else {
         expected_difficulty_after_parent(storage, chain_id, &parent, &parent_meta)?
@@ -687,7 +739,10 @@ mod tests {
             .expect("apply genesis-child");
         assert_eq!(head.height, 1);
         assert_eq!(head.hash, block.header.hash);
-        assert_eq!(head.total_supply_emitted, 12);
+        assert_eq!(
+            head.total_supply_emitted,
+            economics::block_reward_for_height(1, 0)
+        );
         assert!(head.cumulative_work > 0);
 
         let stored = read_chain_head(&storage)
@@ -728,7 +783,12 @@ mod tests {
             .expect("apply block 2");
 
         assert_eq!(head2.height, 2);
-        assert_eq!(head2.total_supply_emitted, 24);
+        assert_eq!(
+            head2.total_supply_emitted,
+            block1.transactions[0]
+                .amount
+                .saturating_add(block2.transactions[0].amount)
+        );
         assert!(head2.cumulative_work >= head1.cumulative_work);
     }
 
@@ -761,7 +821,7 @@ mod tests {
             chain_id,
             &genesis.header.hash,
             1, // pretend height 1 is the parent
-            12,
+            economics::block_reward_for_height(1, 0),
             &"zka1miner".to_string(),
             4,
             1_700_000_000,
@@ -799,7 +859,7 @@ mod tests {
             chain_id,
             "deadbeef",
             block1.header.block_height,
-            12,
+            block1.transactions[0].amount,
             &"zka1miner".to_string(),
             4,
             1_700_000_120,
@@ -814,7 +874,8 @@ mod tests {
         let chain_id = "zoka-test-net";
         let (storage, _dir) = open_temp_storage();
         let genesis = genesis_parent_for(chain_id);
-        // Build a block with the WRONG coinbase amount: 5 instead of 12.
+        // Build a block with the WRONG coinbase amount: 5 atoms instead of
+        // the expected atomic subsidy.
         let mut block = mine_block(
             chain_id,
             &genesis.header.hash,
@@ -897,6 +958,68 @@ mod tests {
     }
 
     #[test]
+    fn known_heavier_side_branch_replaces_canonical_head() {
+        let chain_id = "zoka-test-net";
+        let (storage, _dir) = open_temp_storage();
+        let genesis = genesis_parent_for(chain_id);
+
+        let canonical = mine_block(
+            chain_id,
+            &genesis.header.hash,
+            0,
+            0,
+            &"zka1miner".to_string(),
+            economics::POW_INITIAL_DIFFICULTY_BITS,
+            1_700_000_000,
+        );
+        let canonical_head = apply_block(&storage, chain_id, &canonical).expect("apply canonical");
+
+        let stronger_bits = (canonical_head.cumulative_work as u32)
+            .saturating_add(1)
+            .clamp(
+                economics::POW_INITIAL_DIFFICULTY_BITS,
+                economics::POW_MAX_DIFFICULTY_BITS,
+            );
+        let side_branch = mine_block(
+            chain_id,
+            &genesis.header.hash,
+            0,
+            0,
+            &"zka1miner".to_string(),
+            stronger_bits,
+            1_700_000_777,
+        );
+        let side_work = pow::leading_zero_bits(&side_branch.header.seal.0) as u128;
+        assert!(side_work > canonical_head.cumulative_work);
+
+        storage
+            .save_block_body(&side_branch)
+            .expect("store known side branch body");
+        save_block_meta(
+            &storage,
+            &side_branch.header.hash,
+            &BlockChainMeta {
+                height: side_branch.header.block_height,
+                total_supply_emitted: side_branch.transactions[0].amount,
+                cumulative_work: side_work,
+                difficulty_bits: stronger_bits,
+            },
+        )
+        .expect("store known side branch meta");
+
+        let new_head = apply_block(&storage, chain_id, &side_branch)
+            .expect("promote known stronger side branch");
+        assert_eq!(new_head.hash, side_branch.header.hash);
+        assert!(new_head.cumulative_work > canonical_head.cumulative_work);
+
+        let canonical_at_height = storage
+            .get_block_by_height(1)
+            .expect("height lookup")
+            .expect("height 1 block");
+        assert_eq!(canonical_at_height.header.hash, side_branch.header.hash);
+    }
+
+    #[test]
     fn next_block_metadata_falls_back_to_genesis_when_db_is_empty() {
         let chain_id = "zoka-test-net";
         let (storage, _dir) = open_temp_storage();
@@ -953,7 +1076,12 @@ mod tests {
         let (storage, _dir) = open_temp_storage();
 
         let parent = genesis_parent_for(chain_id);
-        let coinbase = build_coinbase_tx("zka1miner".to_string(), 12, 1, 1_700_000_000);
+        let coinbase = build_coinbase_tx(
+            "zka1miner".to_string(),
+            economics::block_reward_for_height(1, 0),
+            1,
+            1_700_000_000,
+        );
         let mut block = Block {
             header: BlockHeader {
                 hash: String::new(),

@@ -34,7 +34,8 @@ para tener el panorama y luego saltar al especifico.
 | [`genesis.mainnet.v1.json`](genesis.mainnet.v1.json) | Genesis canonico publicado (digest verificado contra `genesis-dry-run-evidence.md`). |
 | [`mainnet-network.v1.json`](mainnet-network.v1.json) | Configuracion de seeds/RPC/snapshot signers. |
 | [`mainnet-launch-material.template.json`](mainnet-launch-material.template.json) | Template para reunir claves reales, endpoints reales y fingerprint GPG antes de aplicar el launch material. |
-| [`economics.mainnet.v1.json`](economics.mainnet.v1.json) | Constantes economicas en formato publicable. |
+| [`economics.mainnet.v2-atoms.json`](economics.mainnet.v2-atoms.json) | Constantes economicas actuales: unidad atomica, 6 decimales y fee market fraccionario. |
+| [`economics.mainnet.v1.json`](economics.mainnet.v1.json) | Artifact historico whole-ZKA retenido para trazabilidad pre-migracion. |
 | [`pruning-snapshots-strategy.md`](pruning-snapshots-strategy.md) | Schema `zoka-snapshot-v1` y politica de fast sync. |
 | [`infrastructure-logs-policy.md`](infrastructure-logs-policy.md) | Que se loguea y que no en infraestructura oficial. |
 | [`tor_i2p_transport.md`](tor_i2p_transport.md) | Politica de transporte anonimo (`enforce_anonymous_transport`). |

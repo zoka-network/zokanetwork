@@ -1,6 +1,6 @@
 # ZOKA CLI smoke status
 
-Fecha: 2026-04-28
+Fecha: 2026-05-05
 
 Objetivo: verificar que los comandos user-facing de `zoka` y el wrapper
 `zokahd` arrancan y ejercitan su ruta real sobre un entorno temporal, sin tocar
@@ -9,7 +9,7 @@ wallets ni DBs del usuario.
 Script reproducible: [`../scripts/cli_smoke_test.ps1`](../scripts/cli_smoke_test.ps1)
 
 Ultima corrida local: `PowerShell -ExecutionPolicy Bypass -File
-scripts\cli_smoke_test.ps1` paso 31/31 pasos.
+scripts\cli_smoke_test.ps1` paso 41/41 pasos.
 
 ## Resultado
 
@@ -26,6 +26,7 @@ scripts\cli_smoke_test.ps1` paso 31/31 pasos.
 | `zoka wallet-restore-from-seed` | OK | Restaura desde frase BIP39 creada por wallet-create. |
 | `zoka wallet-restore-from-keys` | OK | Restaura desde scan/spend keys exportadas. |
 | `zoka wallet-change-passphrase` | OK | Re-cifra wallet y permite abrirla con la passphrase nueva. |
+| `zoka rpc-list` | OK | Lista RPCs activos desde config sin contactar proveedores externos. |
 | `zoka estimate-fee` | OK | Devuelve fee estimada. |
 | `zoka tx-send` | OK esperado | En wallet sin fondos rechaza con `insufficient`, que es la respuesta correcta. |
 | `zoka height --db ... --json` | OK | DB temporal vacia reporta height 0. |
@@ -43,7 +44,7 @@ scripts\cli_smoke_test.ps1` paso 31/31 pasos.
 | `zoka mine --blocks 1` | OK esperado | Rechaza porque el binario debug actual no fue compilado con `--features randomx`. |
 | `zoka fullnode --no-network-config --no-mine --seconds 1` | OK | Arranca, carga wallet, muestra dashboard y cierra por limite de tiempo. |
 | `zokahd --inline --no-network-config --no-mine --seconds 1` | OK | Wrapper delega correctamente a `zoka fullnode`. |
-| `zoka wallet-wipe --force` | OK | Borra wallet temporal restaurada por keys. |
+| `zoka wallet-wipe --force` | OK | Delete local wallet: borra solo el archivo cifrado local. |
 
 ## Limitaciones del smoke
 
@@ -53,6 +54,8 @@ scripts\cli_smoke_test.ps1` paso 31/31 pasos.
   maduros; si no hay fondos, `tx-send` debe rechazar.
 - No valida peers reales porque `fullnode`/`zokahd` se ejecutaron con
   `--no-network-config` para evitar usar placeholders o red externa.
+- El smoke no contacta RPC remoto; cubre listado/config local. Para probar RPC
+  real, usar `zoka rpc-status --rpc http://host:port`.
 - `mainnet-network-lint` valida el RC local. Para mainnet publica, reemplazar
   endpoints locales por seeds/RPC/snapshot signers de operadores reales.
 - No reemplaza la testnet publica ni auditoria externa.

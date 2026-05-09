@@ -38,7 +38,7 @@ if ([string]::IsNullOrWhiteSpace($Note)) {
 }
 
 Write-Host "==> Finalizing R$RoundNumber"
-cargo run --bin zoka-ceremony-contribute -- `
+cargo run --features ops-tools --bin zoka-ceremony-contribute -- `
   finalize-adapter `
   --adapter-dir $roundDir `
   --phase2-out-dir $outputDir `
@@ -49,7 +49,7 @@ cargo run --bin zoka-ceremony-contribute -- `
 
 Write-Host ""
 Write-Host "==> Verifying transcript after R$RoundNumber"
-cargo run --bin zoka-ceremony-contribute -- `
+cargo run --features ops-tools --bin zoka-ceremony-contribute -- `
   verify `
   --transcript $transcript `
   --final-dir $nextCurrent

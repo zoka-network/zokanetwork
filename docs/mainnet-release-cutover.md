@@ -28,11 +28,19 @@
 
 ## Local multi-node rehearsal
 
-- [ ] 2-4 local nodes boot with separate DBs, ports and wallets.
-- [ ] Nodes discover/connect to each other.
-- [ ] A mined block propagates from one node to the others.
-- [ ] A fresh node syncs from height 0 to current head.
-- [ ] Restarted nodes preserve chain head and reconnect.
+- [x] 2-4 local nodes boot with separate DBs, ports and wallets.
+- [x] Nodes discover/connect to each other.
+- [x] A mined block propagates from one node to local peers in 2-, 3- and
+  4-node rehearsals.
+- [x] 3+ node mining propagation hardened with seed reconnect and
+  `--min-mine-peers`.
+- [x] A fresh node syncs from height 0 to an observed peer head.
+- [x] Restarted nodes preserve chain head and reconnect.
+- [x] Staged late-join sync passes: node 1 reaches height 5, node 2 joins and
+  reaches height 3, node 3 joins, and all three reach at least height 5
+  (`staged-sync-20260501-135058`).
+- [x] Mainnet fullnode bootstrap hardened with repeated `--seed`, multi-seed
+  fallback, recent block rebroadcast and IBD retry cadence.
 - [ ] Wallet flow over local network passes: create, backup, restore, balance,
   mine/receive coinbase, maturity, private transfer.
 - [ ] Evidence archived: commands, node IDs, heights, head hashes and logs.

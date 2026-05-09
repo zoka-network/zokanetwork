@@ -7,11 +7,10 @@ use crate::wallet::UserWallet;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use zeroize::Zeroize;
 
-const WALLET_DIR: &str = ".zoka/wallets";
-const PRIVATE_WALLET_DIR: &str = ".zoka/private_wallets";
+const DEFAULT_WALLET_BASE_DIR: &str = ".zoka/mainnet";
 
 /// Encrypted wallet storage on disk
 pub struct WalletStorage {
@@ -38,15 +37,30 @@ struct EncryptedPrivateWallet {
     pub encrypted_scan_key: Vec<u8>,
 }
 
+#[derive(Clone, Debug)]
+pub struct PrivateWalletMetadata {
+    pub name: String,
+    pub commitment_key: String,
+    pub private_balance: u64,
+    pub private_transaction_count: usize,
+    pub encrypted: bool,
+}
+
 impl WalletStorage {
     /// Create new wallet storage with default paths
     pub fn new() -> Result<Self, BlockError> {
-        let home_dir = home::home_dir().ok_or(BlockError::TransactionValidationFailed(
-            "Cannot determine home directory".to_string(),
-        ))?;
+        Self::from_base_dir(DEFAULT_WALLET_BASE_DIR)
+    }
 
-        let wallets_path = home_dir.join(WALLET_DIR);
-        let private_wallets_path = home_dir.join(PRIVATE_WALLET_DIR);
+    /// Create wallet storage rooted under a network/profile directory.
+    ///
+    /// For example, `.zoka/mainnet` stores private wallets in
+    /// `.zoka/mainnet/private_wallets`, while `.zoka/testnet` stores them in
+    /// `.zoka/testnet/private_wallets`.
+    pub fn from_base_dir(base_dir: impl AsRef<Path>) -> Result<Self, BlockError> {
+        let base_dir = base_dir.as_ref();
+        let wallets_path = base_dir.join("wallets");
+        let private_wallets_path = base_dir.join("private_wallets");
 
         // Create directories if they don't exist
         fs::create_dir_all(&wallets_path).map_err(|e| {
@@ -75,6 +89,11 @@ impl WalletStorage {
     pub fn private_wallet_file_exists(&self, wallet_name: &str) -> bool {
         let filename = format!("{}.private.json", wallet_name);
         self.private_wallets_path.join(filename).is_file()
+    }
+
+    /// Directory where encrypted private wallet files are stored.
+    pub fn private_wallets_dir(&self) -> &Path {
+        &self.private_wallets_path
     }
 
     /// Save public wallet to disk
@@ -329,6 +348,70 @@ impl WalletStorage {
         Ok(encrypted.wallet)
     }
 
+    /// Load non-secret private wallet metadata from disk.
+    ///
+    /// This reads the sanitized wallet body without decrypting key material, so
+    /// wallet-list can show local wallet files even before the user unlocks
+    /// them.
+    pub fn load_private_wallet_metadata(
+        &self,
+        wallet_name: &str,
+    ) -> Result<PrivateWalletMetadata, BlockError> {
+        let filename = format!("{}.private.json", wallet_name);
+        let filepath = self.private_wallets_path.join(&filename);
+
+        if !filepath.exists() {
+            return Err(BlockError::TransactionValidationFailed(format!(
+                "private wallet '{}' not found: run 'wallet-list' to see available wallets, or 'wallet-create --name {}' to create it",
+                wallet_name, wallet_name
+            )));
+        }
+
+        let mut file = fs::File::open(&filepath).map_err(|e| {
+            BlockError::TransactionValidationFailed(format!(
+                "failed to open private wallet file '{}': {}",
+                filepath.display(),
+                e
+            ))
+        })?;
+
+        let mut json_bytes = Vec::new();
+        file.read_to_end(&mut json_bytes).map_err(|e| {
+            BlockError::TransactionValidationFailed(format!(
+                "failed to read private wallet file '{}': {}",
+                filepath.display(),
+                e
+            ))
+        })?;
+
+        let json_str = String::from_utf8(json_bytes).map_err(|e| {
+            BlockError::TransactionValidationFailed(format!(
+                "private wallet file '{}' is corrupted (invalid UTF-8): {}",
+                filepath.display(),
+                e
+            ))
+        })?;
+
+        let encrypted: EncryptedPrivateWallet = serde_json::from_str(&json_str).map_err(|e| {
+            BlockError::TransactionValidationFailed(format!(
+                "private wallet file '{}' is corrupted (invalid JSON): {}",
+                filepath.display(),
+                e
+            ))
+        })?;
+
+        Ok(PrivateWalletMetadata {
+            name: encrypted.wallet.name.clone(),
+            commitment_key: encrypted.wallet.commitment_key.clone(),
+            private_balance: encrypted.wallet.private_balance,
+            private_transaction_count: encrypted.wallet.private_transaction_count(),
+            encrypted: encrypted
+                .encrypted_spending_key
+                .starts_with(ENCRYPTION_MAGIC)
+                || encrypted.encrypted_scan_key.starts_with(ENCRYPTION_MAGIC),
+        })
+    }
+
     /// Load all public wallets from disk
     pub fn load_all_public_wallets(
         &self,
@@ -392,6 +475,39 @@ impl WalletStorage {
             }
         }
 
+        Ok(wallets)
+    }
+
+    /// Load non-secret metadata for all local private wallet files.
+    pub fn load_all_private_wallet_metadata(
+        &self,
+    ) -> Result<Vec<PrivateWalletMetadata>, BlockError> {
+        let mut wallets = Vec::new();
+
+        if !self.private_wallets_path.exists() {
+            return Ok(wallets);
+        }
+
+        for entry in fs::read_dir(&self.private_wallets_path).map_err(|e| {
+            BlockError::TransactionValidationFailed(format!("Failed to read wallets dir: {}", e))
+        })? {
+            let entry = entry.map_err(|e| {
+                BlockError::TransactionValidationFailed(format!("Dir entry error: {}", e))
+            })?;
+
+            let path = entry.path();
+            if path.extension().map(|e| e == "json").unwrap_or(false) {
+                if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                    if let Some(wallet_name) = filename.strip_suffix(".private.json") {
+                        if let Ok(wallet) = self.load_private_wallet_metadata(wallet_name) {
+                            wallets.push(wallet);
+                        }
+                    }
+                }
+            }
+        }
+
+        wallets.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(wallets)
     }
 
@@ -600,6 +716,22 @@ mod tests {
     }
 
     #[test]
+    fn test_wallet_storage_from_base_dir_uses_network_local_paths() {
+        let mut suffix = [0u8; 4];
+        rand::rngs::OsRng.fill_bytes(&mut suffix);
+        let base = std::env::temp_dir()
+            .join("zoka-wallet-storage")
+            .join(hex::encode(suffix));
+
+        let storage = WalletStorage::from_base_dir(&base).expect("profile storage");
+        assert_eq!(storage.private_wallets_dir(), base.join("private_wallets"));
+        assert!(base.join("wallets").is_dir());
+        assert!(base.join("private_wallets").is_dir());
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn test_encrypt_decrypt_roundtrip_modern_format() {
         let data = b"wallet-sensitive-payload";
         let password = "correct horse battery staple";
@@ -685,6 +817,49 @@ mod tests {
         storage
             .delete_wallet(&wallet_name, true)
             .expect("cleanup private wallet file");
+    }
+
+    #[test]
+    fn test_private_wallet_metadata_loads_encrypted_wallet_without_password() {
+        let mut random_suffix = [0u8; 4];
+        rand::rngs::OsRng.fill_bytes(&mut random_suffix);
+        let base = std::env::temp_dir()
+            .join("zoka-wallet-metadata")
+            .join(hex::encode(random_suffix));
+        let storage = WalletStorage::from_base_dir(&base).expect("storage");
+        let mut manager = PrivateWalletManager::new();
+        let wallet_name = "metadata-encrypted-test";
+        let password = "metadata-password";
+
+        manager
+            .create_private_wallet(wallet_name)
+            .expect("create private wallet");
+        let wallet = manager
+            .get_private_wallet(wallet_name)
+            .expect("wallet exists")
+            .clone();
+
+        storage
+            .save_private_wallet(&wallet, Some(password))
+            .expect("save encrypted private wallet");
+
+        let without_password = storage.load_private_wallet(wallet_name, None);
+        assert!(without_password.is_err());
+
+        let metadata = storage
+            .load_private_wallet_metadata(wallet_name)
+            .expect("load metadata without password");
+        assert_eq!(metadata.name, wallet_name);
+        assert_eq!(metadata.commitment_key, wallet.commitment_key);
+        assert!(metadata.encrypted);
+
+        let all_metadata = storage
+            .load_all_private_wallet_metadata()
+            .expect("load all metadata");
+        assert_eq!(all_metadata.len(), 1);
+        assert_eq!(all_metadata[0].name, wallet_name);
+
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]

@@ -24,6 +24,10 @@ rejects a config whose `chain_id` or `protocol_freeze_id` does not match the
 binary. Operators can override the path with `--network-config <file>` or turn
 off auto-load with `--no-network-config`.
 
+Manual bootstrap supports repeated `--seed <multiaddr>` values. A late or
+recovering node should receive several independent seed addresses so it can
+fall back if one bootstrap peer is busy, unreachable or partitioned.
+
 ## Seed Node Entry
 
 Each seed node entry uses this shape:

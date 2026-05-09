@@ -1,13 +1,13 @@
 # ZOKA Emission Schedule v1
 
-Fuente canonica: `src/economics.rs` y `docs/economics.mainnet.v1.json`
+Fuente canonica: `src/economics.rs` y `docs/economics.mainnet.v2-atoms.json`
 
 Parametros:
 
 - Initial reward: `12 ZKA`
 - Halving interval: `1,051,200` blocks
 - Max supply: `23,000,000 ZKA`
-- Accounting unit v1: whole `ZKA`
+- Accounting unit v2: atomic units, `1 ZKA = 1,000,000 atoms`
 - Target block time: `120` seconds
 - Rule: `reward(height) = min(halving_reward(height), remaining_supply(height))`
 
@@ -26,4 +26,7 @@ Resultados:
 
 ## Nota operativa
 
-La version v1 implementada no declara decimales atomicos. Si se decide agregar subunidades futuras, wallet, circuitos, fees, documentos y estado deben migrarse juntos antes de genesis.
+La implementacion activa usa `zoka-economics-v2-atoms`: wallets, fees,
+estado y emision persisten montos en atoms y muestran ZKA solo en la interfaz.
+DBs locales creadas antes de esta migracion no deben mezclarse con la nueva
+contabilidad sin una migracion explicita.
