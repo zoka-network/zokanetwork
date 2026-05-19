@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -23,6 +25,7 @@ use zoka::private_wallet::PrivateWalletManager;
 use zoka::state::StateManager;
 use zoka::storage::RocksDbStorage;
 use zoka::wallet::storage::WalletStorage;
+use zoka::zk::groth16_backend::PRIVATE_TX_MAX_INPUTS;
 
 fn print_usage() {
     println!();
@@ -44,27 +47,29 @@ fn print_usage() {
     );
     println!("{}", dashboard_divider());
     println!("{}", dashboard_section("Everyday commands", ANSI_GREEN));
-    println!("  zoka create <label> --network mainnet|testnet --password <pwd>");
+    println!("  zoka create <label> --network mainnet|testnet --password <pwd>|--password-env <var>|--password-stdin [--seed-words 12|24]");
     println!(
-        "  zoka restore \"<recovery phrase>\" --network mainnet|testnet --password <pwd> [--name <label>]"
+        "  zoka restore \"<recovery phrase>\" --network mainnet|testnet --password <pwd>|--password-env <var>|--password-stdin [--name <label>]"
     );
     println!("  zoka wallets [--network mainnet|testnet] [--password <pwd>]");
     println!("  zoka balance <wallet> [--network mainnet|testnet] [--password <pwd>]");
     println!("  zoka receive <wallet> [--network mainnet|testnet] [--password <pwd>]");
     println!(
-        "  zoka send <from> <to> <amount> [--network mainnet|testnet] [--password <pwd>] --yes"
+        "  zoka send <from-zka1> <to-zka1> <amount> [--network mainnet|testnet] [--password <pwd>] --yes"
     );
     println!("  zoka pending [--network mainnet|testnet] [--db <path>]");
     println!("  zoka backup <wallet> <path> [--password <pwd>]");
+    println!("  zoka restore-backup <path> [--name <label>] --password <pwd>|--password-env <var>|--password-stdin");
+    println!("  zoka wallet-generate-seed [--seed-words 12|24] [--json]");
     println!(
-        "  zoka mine <wallet> [--network mainnet|testnet] [--password <pwd>] [--db <path>] [--minutes <n>] [--blocks <n>] [--power low|normal|max]"
+        "  zoka mine <wallet-zka1> [--network mainnet|testnet] [--password <pwd>] [--db <path>] [--minutes <n>] [--blocks <n>] [--power low|normal|max] [--allow-unsynced-mining]"
     );
-    println!("  zoka node [--network mainnet|testnet] [--password <pwd>] [--seed <multiaddr> ...] [--power low|normal|max]");
+    println!("  zoka node [--network mainnet|testnet] [--password <pwd>|--password-env <var>|--password-stdin] [--seed <multiaddr> ...] [--power low|normal|max] [--tor-proxy host:port] [--tor-only]");
     println!("  zoka node-status [--db <path>] [--password <pwd>]");
     println!("  zoka status");
     println!("  Wallet files stay local under .zoka/<network>/private_wallets");
     println!("{}", dashboard_section("Full command names", ANSI_MAGENTA));
-    println!("  wallet-create | wallet-restore-from-seed | wallet-list");
+    println!("  wallet-generate-seed | wallet-create | wallet-restore-from-seed | wallet-restore-from-backup | wallet-list");
     println!(
         "  wallet-balance | wallet-receive | wallet-history | wallet-backup | wallet-wipe (delete local wallet)"
     );
@@ -73,19 +78,22 @@ fn print_usage() {
         "  tx-send | tx-pending | private-tx-audit | estimate-fee | mine | fullnode | node-status | sync-status"
     );
     println!("{}", dashboard_section("Chain and operators", ANSI_YELLOW));
-    println!("  height [--db <path>] [--json]");
+    println!("  height [--network mainnet|testnet] [--db <path>] [--json]");
     println!(
-        "  block-info --height <n> [--db <path>] [--json]  (miner address and reward for a specific block height)"
+        "  block-info --height <n> [--network mainnet|testnet] [--db <path>] [--json]  (miner address and reward for a specific block height)"
     );
-    println!("  chain-stats [--db <path>] [--json]");
+    println!("  chain-stats [--network mainnet|testnet] [--db <path>] [--json]");
     println!(
-        "  rpc-list [--network-config <file>] [--json]  (lists configured read-only public RPC endpoints)"
+        "  rpc-list [--network mainnet|testnet] [--network-config <file>] [--json]  (lists configured read-only public RPC endpoints)"
     );
     println!(
         "  rpc-status [--rpc <http-url>] [--network-config <file>] [--json]  (read-only RPC health + height)"
     );
     println!(
         "  rpc-height [--rpc <http-url>] [--network-config <file>] [--json]  (read-only RPC chain height)"
+    );
+    println!(
+        "  rpc-sync [--network mainnet|testnet] [--network-config <file>] [--db <path>] [--limit <n>] [--json]  (bootstrap local chain from configured RPC)"
     );
     println!(
         "  rpc-mempool [--rpc <http-url>] [--network-config <file>] [--json]  (read-only RPC mempool size)"
@@ -247,6 +255,8 @@ struct MainnetNetworkConfig {
     #[serde(default)]
     public_rpc: Vec<MainnetRpcEndpoint>,
     #[serde(default)]
+    desktop: MainnetDesktopConfig,
+    #[serde(default)]
     snapshot_signers: Vec<String>,
     #[serde(default)]
     notes: Vec<String>,
@@ -330,6 +340,13 @@ struct MainnetRpcEndpoint {
     i2p: Option<String>,
     status: String,
     logging_policy: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MainnetDesktopConfig {
+    #[serde(default)]
+    local_rpc_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -477,11 +494,11 @@ fn lint_mainnet_network_config(
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
 
-    if !config.status.eq_ignore_ascii_case("active")
-        && !config.status.eq_ignore_ascii_case("launch-ready")
-    {
-        errors.push(format!(
-            "network status is '{}'; expected active or launch-ready for release",
+    let release_ready_status = config.status.eq_ignore_ascii_case("active")
+        || config.status.eq_ignore_ascii_case("launch-ready");
+    if !release_ready_status {
+        warnings.push(format!(
+            "network status is '{}'; this config is usable for runtime bootstrap but is not release-ready",
             if config.status.is_empty() {
                 "unknown"
             } else {
@@ -496,9 +513,14 @@ fn lint_mainnet_network_config(
         .filter(|seed| seed.status.eq_ignore_ascii_case("active"))
         .count();
     if active_seed_count < 3 {
-        errors.push(format!(
+        let msg = format!(
             "only {active_seed_count} active seed node(s); release policy expects at least 3"
-        ));
+        );
+        if release_ready_status {
+            errors.push(msg);
+        } else {
+            warnings.push(msg);
+        }
     }
     let active_regions = config
         .seed_nodes
@@ -507,14 +529,24 @@ fn lint_mainnet_network_config(
         .map(|seed| seed.region.as_str())
         .collect::<std::collections::HashSet<_>>();
     if active_seed_count > 0 && active_regions.len() < 3 {
-        errors.push(format!(
+        let msg = format!(
             "active seed nodes cover {} region(s); release policy expects multiple independent regions",
             active_regions.len()
-        ));
+        );
+        if release_ready_status {
+            errors.push(msg);
+        } else {
+            warnings.push(msg);
+        }
     }
 
     if config.snapshot_signers.is_empty() {
-        errors.push("no snapshot signer public keys configured".to_string());
+        let msg = "no snapshot signer public keys configured".to_string();
+        if release_ready_status {
+            errors.push(msg);
+        } else {
+            warnings.push(msg);
+        }
     }
     for signer in &config.snapshot_signers {
         if hex::decode(signer)
@@ -592,6 +624,18 @@ fn lint_mainnet_network_config(
         }
     }
 
+    if let Some(local_rpc) = non_empty_opt(Some(config.desktop.local_rpc_url.as_str())) {
+        match parse_rpc_http_url(local_rpc) {
+            Ok(parsed) if parsed.host == "localhost" || parsed.host.starts_with("127.") => {}
+            Ok(_) | Err(_) => {
+                warnings.push(
+                    "desktop.local_rpc_url is not a localhost HTTP endpoint; desktop wallets should talk to a local node by default"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
     Ok(MainnetNetworkLintReport {
         path: path.display().to_string(),
         ok: errors.is_empty(),
@@ -615,8 +659,89 @@ fn non_empty_opt(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|v| !v.is_empty())
 }
 
+fn env_non_empty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn default_mainnet_network_config_path() -> PathBuf {
     PathBuf::from("docs").join("mainnet-network.v1.json")
+}
+
+fn network_config_path_from_env(network: NetworkProfile) -> Option<PathBuf> {
+    let network_specific = match network {
+        NetworkProfile::Mainnet => "ZOKA_MAINNET_NETWORK_CONFIG",
+        NetworkProfile::Testnet => "ZOKA_TESTNET_NETWORK_CONFIG",
+    };
+    env_non_empty(network_specific)
+        .or_else(|| env_non_empty("ZOKA_NETWORK_CONFIG"))
+        .map(PathBuf::from)
+}
+
+fn network_config_path_from_args(args: &[String], network: NetworkProfile) -> PathBuf {
+    option_value(args, "--network-config")
+        .map(PathBuf::from)
+        .or_else(|| network_config_path_from_env(network))
+        .unwrap_or_else(|| PathBuf::from(network.default_network_config_path()))
+}
+
+fn configured_local_rpc_url_from_path(
+    network: NetworkProfile,
+    config_path: Option<&Path>,
+) -> Option<String> {
+    env_non_empty("ZOKA_LOCAL_RPC_URL")
+        .or_else(|| env_non_empty("ZOKA_NODE_ENDPOINT"))
+        .or_else(|| env_non_empty("ZOKA_CLI_NODE_ENDPOINT"))
+        .or_else(|| {
+            let path = config_path
+                .map(PathBuf::from)
+                .or_else(|| network_config_path_from_env(network))
+                .unwrap_or_else(|| PathBuf::from(network.default_network_config_path()));
+            // load_network_config_for now falls back to the embedded manifest
+            // when the file is missing on disk (typical for users who run the
+            // CLI standalone, outside of a checkout that has docs/).
+            load_network_config_for(&path, network)
+                .ok()
+                .and_then(|config| {
+                    non_empty_opt(Some(config.desktop.local_rpc_url.as_str())).map(str::to_string)
+                })
+        })
+        .map(|url| url.trim_end_matches('/').to_string())
+}
+
+fn configured_local_rpc_url(network: NetworkProfile) -> Option<String> {
+    configured_local_rpc_url_from_path(network, None)
+}
+
+fn required_local_rpc_url(network: NetworkProfile) -> Result<String, String> {
+    configured_local_rpc_url(network).ok_or_else(|| {
+        format!(
+            "local RPC is not configured for {}. Set ZOKA_LOCAL_RPC_URL, ZOKA_NODE_ENDPOINT, or desktop.local_rpc_url in the network manifest.",
+            network.label()
+        )
+    })
+}
+
+fn api_bind_addr_from_local_rpc_url(url: &str) -> Result<String, String> {
+    let parsed = parse_rpc_http_url(url)?;
+    Ok(format!("{}:{}", parsed.host, parsed.port))
+}
+
+fn configured_api_bind_addr(args: &[String], network: NetworkProfile) -> Result<String, String> {
+    if let Some(bind) = env_non_empty("ZOKA_API_BIND") {
+        return Ok(bind);
+    }
+    let path = network_config_path_from_args(args, network);
+    let rpc = configured_local_rpc_url_from_path(network, Some(&path)).ok_or_else(|| {
+        format!(
+            "API bind address is not configured for {}. Set ZOKA_API_BIND or desktop.local_rpc_url in '{}'.",
+            network.label(),
+            path.display()
+        )
+    })?;
+    api_bind_addr_from_local_rpc_url(&rpc)
 }
 
 #[cfg(test)]
@@ -638,13 +763,32 @@ fn load_mainnet_network_config(path: &Path) -> Result<MainnetNetworkConfig, Stri
     load_network_config_for(path, NetworkProfile::Mainnet)
 }
 
+/// Network manifests are baked into the binary so a fresh `zoka.exe` works in
+/// any working directory, even when shipped without the `docs/` folder. The
+/// loader still prefers a real file on disk if it exists (for operators
+/// pointing at a custom config) and falls back to the embedded copy otherwise.
+const EMBEDDED_MAINNET_NETWORK_CONFIG: &str =
+    include_str!("../docs/mainnet-network.v1.json");
+const EMBEDDED_TESTNET_NETWORK_CONFIG: &str =
+    include_str!("../docs/testnet-network.v1.json");
+
+fn embedded_network_config_for(network: NetworkProfile) -> &'static str {
+    match network {
+        NetworkProfile::Mainnet => EMBEDDED_MAINNET_NETWORK_CONFIG,
+        NetworkProfile::Testnet => EMBEDDED_TESTNET_NETWORK_CONFIG,
+    }
+}
+
 fn load_network_config_for(
     path: &Path,
     network: NetworkProfile,
 ) -> Result<MainnetNetworkConfig, String> {
-    let raw = fs::read_to_string(path)
-        .map_err(|e| format!("failed to read network config '{}': {e}", path.display()))?;
-    parse_network_config_for(&raw, network)
+    if path.exists() {
+        let raw = fs::read_to_string(path)
+            .map_err(|e| format!("failed to read network config '{}': {e}", path.display()))?;
+        return parse_network_config_for(&raw, network);
+    }
+    parse_network_config_for(embedded_network_config_for(network), network)
 }
 
 fn write_secrets_export(path: &str, payload: &WalletSecretsExport) -> Result<(), String> {
@@ -763,18 +907,44 @@ fn local_private_wallet_file_names(storage: &WalletStorage) -> Vec<String> {
     names
 }
 
+fn local_private_wallet_address_choices(storage: &WalletStorage) -> Vec<(String, String)> {
+    storage
+        .load_all_private_wallet_metadata()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|wallet| {
+            (
+                wallet.name,
+                user_private_address_display(&wallet.commitment_key),
+            )
+        })
+        .collect()
+}
+
 fn prompt_wallet_selector_with_single_default() -> Result<String, String> {
     let (_, storage) = wallet_storage_for_default_network()?;
-    let names = local_private_wallet_file_names(&storage);
-    if names.len() == 1 {
-        let default = names
+    let wallets = local_private_wallet_address_choices(&storage);
+    if wallets.len() == 1 {
+        let (name, default) = wallets
             .first()
             .cloned()
             .ok_or_else(|| "wallet list changed while reading local storage".to_string())?;
-        let prompt = format!("Wallet name or address [{default}]: ");
+        let prompt = format!("Wallet address [{default}] ({name}): ");
         return Ok(prompt_optional(&prompt)?.unwrap_or(default));
     }
-    prompt_required("Wallet name or address: ")
+    if !wallets.is_empty() {
+        println!(
+            "{}",
+            dashboard_section("Local wallet addresses", ANSI_MAGENTA)
+        );
+        for (name, address) in wallets.iter().take(8) {
+            println!("  {}  {}", paint(name, ANSI_DIM), address);
+        }
+        if wallets.len() > 8 {
+            println!("  ... {} more", wallets.len().saturating_sub(8));
+        }
+    }
+    prompt_required("Wallet address (zka1...): ")
 }
 
 fn private_wallet_file_path_text(storage: &WalletStorage, wallet_name: &str) -> String {
@@ -1082,11 +1252,51 @@ fn interactive_transfer_menu() -> Result<bool, String> {
 
         match prompt_line("> ")?.as_str() {
             "1" => {
-                let from = prompt_required("From wallet (name or address): ")?;
-                let to = prompt_required("To wallet or address: ")?;
+                let from = prompt_required("From wallet address (zka1...): ")?;
+                let to = prompt_required("To wallet address (zka1...): ")?;
                 let amount = prompt_required("Amount in ZKA: ")?;
                 let password = prompt_optional("Password (optional): ")?;
                 let db_path = DEFAULT_CHAIN_DB_PATH.to_string();
+                let from_commitment = match require_private_network_address(&from, "--from") {
+                    Ok(value) => value,
+                    Err(err) => {
+                        eprintln!("{}", err);
+                        continue;
+                    }
+                };
+                let to_commitment = match require_private_network_address(&to, "--to") {
+                    Ok(value) => value,
+                    Err(err) => {
+                        eprintln!("{}", err);
+                        continue;
+                    }
+                };
+                let storage = match wallet_storage_for_network(NetworkProfile::Mainnet) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        eprintln!("{}", err);
+                        continue;
+                    }
+                };
+                let manager = match load_private_wallet_manager_for_network(
+                    &storage,
+                    password.as_deref(),
+                    NetworkProfile::Mainnet,
+                ) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        eprintln!("{}", err);
+                        continue;
+                    }
+                };
+                if let Err(err) =
+                    resolve_network_wallet_address_required(&manager, &storage, &from, "--from")
+                {
+                    eprintln!("{}", err);
+                    continue;
+                }
+                let from_display = user_private_address_display(&from_commitment);
+                let to_display = user_private_address_display(&to_commitment);
                 let preview_args = vec![
                     "--amount".to_string(),
                     amount.clone(),
@@ -1109,8 +1319,8 @@ fn interactive_transfer_menu() -> Result<bool, String> {
                 };
                 println!("{}", dashboard_divider());
                 println!("{}", dashboard_section("Confirm Private Send", ANSI_YELLOW));
-                println!("{}", dashboard_line("From", &from));
-                println!("{}", dashboard_line("To", &to));
+                println!("{}", dashboard_line("From", &from_display));
+                println!("{}", dashboard_line("To", &to_display));
                 println!("{}", dashboard_line("Amount", format_zka(amount_atoms)));
                 println!("{}", dashboard_line("Estimated fee", format_zka(fee_atoms)));
                 println!("{}", dashboard_line("Node queue", &db_path));
@@ -1120,9 +1330,9 @@ fn interactive_transfer_menu() -> Result<bool, String> {
                 }
                 let mut args = vec![
                     "--from".to_string(),
-                    from,
+                    from_display,
                     "--to".to_string(),
-                    to,
+                    to_display,
                     "--amount".to_string(),
                     amount,
                     "--db".to_string(),
@@ -1258,7 +1468,7 @@ async fn interactive_node_menu() -> Result<bool, String> {
         match prompt_line("> ")?.as_str() {
             "1" => {
                 println!("Leave fields empty to use defaults.");
-                let wallet = prompt_optional("Wallet name or address (optional): ")?;
+                let wallet = prompt_optional("Wallet address (zka1..., optional): ")?;
                 let password = prompt_optional("Wallet password (optional): ")?;
                 let seed = prompt_optional("Seed peer multiaddr (optional): ")?;
                 let use_network_config =
@@ -1290,7 +1500,7 @@ async fn interactive_node_menu() -> Result<bool, String> {
             }
             "2" => {
                 println!("Verifier mode keeps the node online and syncing without local PoW.");
-                let wallet = prompt_optional("Wallet name or address (optional): ")?;
+                let wallet = prompt_optional("Wallet address (zka1..., optional): ")?;
                 let password = prompt_optional("Wallet password (optional): ")?;
                 let seed = prompt_optional("Seed peer multiaddr (optional): ")?;
                 let use_network_config =
@@ -1316,7 +1526,7 @@ async fn interactive_node_menu() -> Result<bool, String> {
             }
             "3" => {
                 let db = prompt_optional("Node DB path (empty = .zoka/blockchain.db): ")?;
-                let wallet = prompt_optional("Wallet name or address (optional): ")?;
+                let wallet = prompt_optional("Wallet address (zka1..., optional): ")?;
                 let password = prompt_optional("Wallet password (optional): ")?;
                 let mut args = Vec::new();
                 push_opt_arg(&mut args, "--db", db);
@@ -1327,7 +1537,7 @@ async fn interactive_node_menu() -> Result<bool, String> {
                 }
             }
             "4" => {
-                let wallet = prompt_optional("Wallet name or address (optional): ")?;
+                let wallet = prompt_optional("Wallet address (zka1..., optional): ")?;
                 let password = prompt_optional("Wallet password (optional): ")?;
                 let create_if_missing = prompt_yes("Create if missing? [y/N]: ")?;
                 let mut args = Vec::new();
@@ -1615,6 +1825,17 @@ fn mining_power_label_for_threads(threads: usize) -> String {
     }
 }
 
+fn seed_words_to_entropy_bytes(words: u64) -> Result<usize, String> {
+    match words {
+        12 => Ok(16),
+        24 => Ok(32),
+        other => Err(format!(
+            "invalid --seed-words '{}'; expected 12 or 24",
+            other
+        )),
+    }
+}
+
 fn parse_thread_count_arg(args: &[String]) -> Result<usize, String> {
     if let Some(raw) = option_value(args, "--threads") {
         let parsed = parse_u64_arg(Some(raw), default_mining_threads() as u64, "--threads")?;
@@ -1638,8 +1859,44 @@ fn required_option_value(args: &[String], flag: &str) -> Result<String, String> 
         .ok_or_else(|| format!("missing required argument: {flag} (run with no args to see usage)"))
 }
 
+fn secret_from_env_var(var_name: &str, flag: &str) -> Result<String, String> {
+    if var_name.trim().is_empty() {
+        return Err(format!("{flag} cannot be empty"));
+    }
+    std::env::var(var_name)
+        .map_err(|_| format!("{flag} references unset environment variable: {var_name}"))
+}
+
+fn stdin_secret(flag: &str) -> Result<String, String> {
+    let mut secret = String::new();
+    io::stdin()
+        .read_to_string(&mut secret)
+        .map_err(|e| format!("failed to read {flag}: {e}"))?;
+    Ok(secret.trim_end_matches(&['\r', '\n'][..]).to_string())
+}
+
+fn password_value(args: &[String]) -> Result<Option<String>, String> {
+    if let Some(password) = option_value(args, "--password") {
+        return Ok(Some(password));
+    }
+    if let Some(password) = option_value(args, "--wallet-password") {
+        return Ok(Some(password));
+    }
+    if let Some(var_name) =
+        option_value(args, "--password-env").or_else(|| option_value(args, "--wallet-password-env"))
+    {
+        return secret_from_env_var(&var_name, "--password-env").map(Some);
+    }
+    if has_flag(args, "--password-stdin") || has_flag(args, "--wallet-password-stdin") {
+        return stdin_secret("--password-stdin").map(Some);
+    }
+    Ok(None)
+}
+
 fn required_password_value(args: &[String]) -> Result<String, String> {
-    let password = required_option_value(args, "--password")?;
+    let password = password_value(args)?.ok_or_else(|| {
+        "missing required argument: --password, --password-env, or --password-stdin".to_string()
+    })?;
     if password.is_empty() {
         return Err(
             "--password cannot be empty: choose a non-empty passphrase to protect this wallet"
@@ -1647,6 +1904,21 @@ fn required_password_value(args: &[String]) -> Result<String, String> {
         );
     }
     Ok(password)
+}
+
+fn required_seed_phrase_value(args: &[String]) -> Result<String, String> {
+    if let Some(seed) = option_value(args, "--seed").or_else(|| option_value(args, "--mnemonic")) {
+        return Ok(seed);
+    }
+    if let Some(var_name) =
+        option_value(args, "--seed-env").or_else(|| option_value(args, "--mnemonic-env"))
+    {
+        return secret_from_env_var(&var_name, "--seed-env");
+    }
+    if has_flag(args, "--seed-stdin") || has_flag(args, "--mnemonic-stdin") {
+        return stdin_secret("--seed-stdin");
+    }
+    Err("missing required argument: --seed, --seed-env, or --seed-stdin".to_string())
 }
 
 fn wallet_selector_value(args: &[String]) -> Option<String> {
@@ -1659,6 +1931,63 @@ fn wallet_selector_value(args: &[String]) -> Option<String> {
 fn required_wallet_selector(args: &[String]) -> Result<String, String> {
     wallet_selector_value(args)
         .ok_or_else(|| "missing wallet selector: use --address <wallet-address|name>".to_string())
+}
+
+fn require_private_network_address(raw: &str, flag: &str) -> Result<String, String> {
+    if !(raw.starts_with("zka1") || raw.starts_with("zpriv:")) {
+        return Err(format!(
+            "{flag}: expected a full zka1 wallet address; local wallet names are not accepted for transfers, mining, or node operation"
+        ));
+    }
+    validate_user_private_address(raw).map_err(|reason| format!("{flag}: {reason}"))
+}
+
+fn find_private_wallet_name_by_commitment(
+    manager: &PrivateWalletManager,
+    commitment: &str,
+) -> Option<String> {
+    manager.get_private_wallet_names().into_iter().find(|name| {
+        manager
+            .get_private_wallet(name)
+            .map(|wallet| wallet.commitment_key == commitment)
+            .unwrap_or(false)
+    })
+}
+
+fn find_private_wallet_metadata_name_by_commitment(
+    storage: &WalletStorage,
+    commitment: &str,
+) -> Option<String> {
+    storage
+        .load_all_private_wallet_metadata()
+        .ok()?
+        .into_iter()
+        .find(|wallet| wallet.commitment_key == commitment)
+        .map(|wallet| wallet.name)
+}
+
+fn resolve_network_wallet_address_required(
+    manager: &PrivateWalletManager,
+    storage: &WalletStorage,
+    wallet_address: &str,
+    flag: &str,
+) -> Result<(String, String), String> {
+    let commitment = require_private_network_address(wallet_address, flag)?;
+    if let Some(wallet_name) = find_private_wallet_name_by_commitment(manager, &commitment) {
+        return Ok((wallet_name, commitment));
+    }
+    let display_address = user_private_address_display(&commitment);
+    if let Some(wallet_name) = find_private_wallet_metadata_name_by_commitment(storage, &commitment)
+    {
+        return Err(format!(
+            "{flag}: wallet address '{}' belongs to local wallet '{}' but it could not be unlocked with the provided password",
+            display_address, wallet_name
+        ));
+    }
+    Err(format!(
+        "{flag}: wallet address '{}' is valid but no unlocked local wallet matches it; run 'wallet-list' to see available wallet addresses",
+        display_address
+    ))
 }
 
 fn resolve_private_wallet_name(
@@ -1844,7 +2173,7 @@ const POW_INITIAL_DIFFICULTY_BITS: u32 = economics::POW_INITIAL_DIFFICULTY_BITS;
 const POW_MIN_DIFFICULTY_BITS: u32 = economics::POW_MIN_DIFFICULTY_BITS;
 const POW_MAX_DIFFICULTY_BITS: u32 = economics::POW_MAX_DIFFICULTY_BITS;
 const COINBASE_MATURITY_BLOCKS: u64 = economics::COINBASE_MATURITY_BLOCKS;
-const LOCAL_PRIVATE_TXS_PER_BLOCK_LIMIT: usize = 128;
+const LOCAL_PRIVATE_TXS_PER_BLOCK_LIMIT: usize = economics::PRIVATE_TX_HASHES_PER_BLOCK_LIMIT;
 const MINING_STALE_AFTER_SECS: u64 = 30;
 const DEFAULT_CHAIN_DB_PATH: &str = ".zoka/mainnet/blockchain.db";
 const DEFAULT_TESTNET_CHAIN_DB_PATH: &str = ".zoka/testnet/blockchain.db";
@@ -1934,6 +2263,13 @@ impl NetworkProfile {
             Self::Testnet => "testnet",
         }
     }
+}
+
+fn chain_db_path_for_args(args: &[String]) -> Result<(NetworkProfile, String), String> {
+    let network = NetworkProfile::from_args(args)?;
+    let db_path =
+        option_value(args, "--db").unwrap_or_else(|| network.default_db_path().to_string());
+    Ok((network, db_path))
 }
 
 /// Algorithm id chosen for the chain ZOKA currently runs against. With
@@ -2169,14 +2505,34 @@ fn retarget_difficulty(current: u32, solve_secs: f64, target_block_time_secs: u6
     }
 }
 
+fn mining_log(message: &str) {
+    eprintln!("mining: {message}");
+    let path = PathBuf::from(NetworkProfile::Mainnet.local_dir()).join("mining_diagnostic.log");
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write as _;
+        let _ = writeln!(f, "{} mining: {}", now_secs(), message);
+    }
+}
+
+fn mining_progress_log(progress: &MiningProgressSnapshot) {
+    mining_log(&format!(
+        "progress height={} difficulty_bits={} hashes={} nonce={} elapsed={:.1}s hashrate={}",
+        progress.height,
+        progress.difficulty_bits,
+        progress.hashes_attempted,
+        progress.nonce,
+        progress.elapsed_secs,
+        format_hashrate_hps(progress.estimated_hashrate_hps)
+    ));
+}
+
 fn user_mining_state_path_for_network(network: NetworkProfile) -> Result<PathBuf, String> {
     let dir = PathBuf::from(network.local_dir());
     fs::create_dir_all(&dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
     Ok(dir.join("user_mining_state.json"))
-}
-
-fn load_user_mining_state() -> Result<UserMiningState, String> {
-    load_user_mining_state_for_network(NetworkProfile::Mainnet)
 }
 
 fn load_user_mining_state_for_network(network: NetworkProfile) -> Result<UserMiningState, String> {
@@ -2287,11 +2643,50 @@ fn network_pending_private_txs(db_path: Option<&str>) -> u64 {
 }
 
 fn local_pending_private_tx_hashes(db_path: &str, limit: usize) -> Result<Vec<String>, String> {
-    let storage = open_storage(db_path)?;
+    let storage = match open_storage(db_path) {
+        Ok(storage) => storage,
+        Err(e) if is_storage_lock_error(&e) => {
+            return Ok(sidecar_pending_private_tx_hashes(db_path, limit));
+        }
+        Err(e) => return Err(e),
+    };
     storage
         .iterate_pending_private_transaction_hashes()
         .map(|hashes| hashes.into_iter().take(limit).collect())
         .map_err(|e| format!("failed to read pending private txs: {e}"))
+}
+
+/// Return the sidecar queue directory for a given chain DB path.
+/// When the DB is locked by the miner another process writes pending private
+/// transactions here so the miner can import them between blocks.
+fn private_tx_sidecar_dir(db_path: &str) -> std::path::PathBuf {
+    let base = std::path::Path::new(db_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    base.join("pending_private_queue")
+}
+
+fn sidecar_pending_private_tx_hashes(db_path: &str, limit: usize) -> Vec<String> {
+    let sidecar = private_tx_sidecar_dir(db_path);
+    let entries = match std::fs::read_dir(&sidecar) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    let mut hashes: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("privtx") {
+                return None;
+            }
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    hashes.sort();
+    hashes.truncate(limit);
+    hashes
 }
 
 fn persist_local_private_tx_for_node(
@@ -2299,17 +2694,76 @@ fn persist_local_private_tx_for_node(
     tx_hash: &str,
     tx: &zoka::private_wallet::PrivateTransaction,
 ) -> Result<(), String> {
-    let storage = open_storage(db_path)?;
-    ensure_atomic_economics_db(&storage)?;
     let body = serde_json::to_vec(tx)
         .map_err(|e| format!("failed to serialize private transaction: {e}"))?;
-    storage
-        .save_private_transaction_bytes(tx_hash, &body)
-        .map_err(|e| format!("failed to persist private tx body: {e}"))?;
-    storage
-        .save_pending_private_transaction_hash(tx_hash)
-        .map_err(|e| format!("failed to mark private tx pending: {e}"))?;
+
+    // Try to write directly to the chain DB.  If the miner holds the LOCK
+    // (different process) fall back to the sidecar queue directory so the
+    // send always succeeds.  The miner imports sidecar files at the
+    // beginning of every block.
+    match open_storage(db_path) {
+        Ok(storage) => {
+            storage
+                .save_private_transaction_bytes(tx_hash, &body)
+                .map_err(|e| format!("failed to persist private tx body: {e}"))?;
+            storage
+                .save_pending_private_transaction_hash(tx_hash)
+                .map_err(|e| format!("failed to mark private tx pending: {e}"))?;
+        }
+        Err(_) => {
+            // DB is locked — write to sidecar directory instead.
+            let sidecar = private_tx_sidecar_dir(db_path);
+            std::fs::create_dir_all(&sidecar)
+                .map_err(|e| format!("failed to create sidecar queue dir: {e}"))?;
+            let file = sidecar.join(format!("{tx_hash}.privtx"));
+            std::fs::write(&file, &body)
+                .map_err(|e| format!("failed to write pending tx to sidecar: {e}"))?;
+        }
+    }
     Ok(())
+}
+
+/// Import any private transactions sitting in the sidecar queue into the
+/// chain DB and return the count of newly imported entries.
+fn import_sidecar_private_txs(db_path: &str, storage: &RocksDbStorage) -> usize {
+    let sidecar = private_tx_sidecar_dir(db_path);
+    if !sidecar.exists() {
+        return 0;
+    }
+    let entries = match std::fs::read_dir(&sidecar) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let mut imported = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("privtx") {
+            continue;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let tx_hash = match path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+        {
+            Some(h) => h,
+            None => continue,
+        };
+        if storage
+            .save_private_transaction_bytes(&tx_hash, &bytes)
+            .is_ok()
+            && storage
+                .save_pending_private_transaction_hash(&tx_hash)
+                .is_ok()
+        {
+            let _ = std::fs::remove_file(&path);
+            imported += 1;
+        }
+    }
+    imported
 }
 
 fn clear_committed_local_private_txs(
@@ -2597,17 +3051,6 @@ fn settle_mature_mining_rewards(
             remaining.push(reward);
             continue;
         };
-        if storage.private_wallet_file_exists(&wallet_name) {
-            let fresh_wallet = storage
-                .load_private_wallet(&wallet_name, password)
-                .map_err(|e| {
-                    format!("failed to reload wallet '{wallet_name}' before reward settlement: {e}")
-                })?;
-            if let Some(slot) = manager.get_private_wallet_mut(&wallet_name) {
-                *slot = fresh_wallet;
-                slot.normalize_key_material();
-            }
-        }
         if let Some(private_coinbase) = &reward.private_coinbase {
             manager
                 .claim_private_coinbase_output(
@@ -2634,22 +3077,292 @@ fn settle_mature_mining_rewards(
     Ok(matured_total)
 }
 
+fn pending_private_coinbase_exists(
+    state: &UserMiningState,
+    wallet_address: &str,
+    block_hash: &str,
+    output_id: &str,
+) -> bool {
+    state.pending_rewards.iter().any(|reward| {
+        reward.wallet_address == wallet_address
+            && reward.block_hash == block_hash
+            && reward
+                .private_coinbase
+                .as_ref()
+                .map(|coinbase| coinbase.output_id.as_str() == output_id)
+                .unwrap_or(false)
+    })
+}
+
+fn wallet_has_private_note(
+    manager: &PrivateWalletManager,
+    wallet_name: &str,
+    output_id: &str,
+) -> bool {
+    manager
+        .get_private_wallet(wallet_name)
+        .map(|wallet| {
+            wallet
+                .private_notes
+                .iter()
+                .any(|note| note.note_id == output_id)
+        })
+        .unwrap_or(false)
+}
+
+fn register_private_coinbase_reward_from_block(
+    manager: &PrivateWalletManager,
+    wallet_name: &str,
+    wallet_address: &str,
+    wallet_commitment: &str,
+    state: &mut UserMiningState,
+    block: &zoka::types::Block,
+) -> bool {
+    let Some(private_coinbase) = block.private_coinbase.as_ref() else {
+        return false;
+    };
+    if private_coinbase.recipient_commitment != wallet_commitment {
+        return false;
+    }
+    if wallet_has_private_note(manager, wallet_name, &private_coinbase.output_id) {
+        return false;
+    }
+    if pending_private_coinbase_exists(
+        state,
+        wallet_address,
+        &block.header.hash,
+        &private_coinbase.output_id,
+    ) {
+        return false;
+    }
+
+    let amount = block.transactions.first().map(|tx| tx.amount).unwrap_or(0);
+    if amount == 0 {
+        return false;
+    }
+
+    state.pending_rewards.push(PendingMiningReward {
+        wallet_address: wallet_address.to_string(),
+        amount,
+        source_height: block.header.block_height,
+        unlock_height: private_coinbase.unlock_height,
+        block_hash: block.header.hash.clone(),
+        private_coinbase: Some(private_coinbase.clone()),
+    });
+    true
+}
+
+fn settle_synced_private_coinbase_rewards(
+    storage: &WalletStorage,
+    manager: &mut PrivateWalletManager,
+    password: Option<&str>,
+    network: NetworkProfile,
+    state: &mut UserMiningState,
+    registered: usize,
+) -> Result<usize, String> {
+    let settled = settle_mature_mining_rewards(storage, manager, password, network, state)?;
+    if registered > 0 && settled == 0 {
+        save_user_mining_state_for_network(network, state)?;
+    }
+    Ok(registered.saturating_add(if settled > 0 { 1 } else { 0 }))
+}
+
+fn sync_private_coinbase_outputs_from_blocks<I>(
+    storage: &WalletStorage,
+    manager: &mut PrivateWalletManager,
+    wallet_name: &str,
+    password: Option<&str>,
+    network: NetworkProfile,
+    chain_height: u64,
+    blocks: I,
+) -> Result<usize, String>
+where
+    I: IntoIterator<Item = zoka::types::Block>,
+{
+    let wallet = manager
+        .get_private_wallet(wallet_name)
+        .ok_or_else(|| format!("private wallet not found: {wallet_name}"))?;
+    let wallet_commitment = wallet.commitment_key.clone();
+    let wallet_address = user_private_address_display(&wallet_commitment);
+    let restore_height = wallet.restore_height.max(1);
+
+    let mut state = load_user_mining_state_for_network(network).unwrap_or_default();
+    state.chain_height = state.chain_height.max(chain_height);
+
+    let mut registered = 0usize;
+    for block in blocks {
+        if block.header.block_height < restore_height {
+            continue;
+        }
+        if register_private_coinbase_reward_from_block(
+            manager,
+            wallet_name,
+            &wallet_address,
+            &wallet_commitment,
+            &mut state,
+            &block,
+        ) {
+            registered = registered.saturating_add(1);
+        }
+    }
+
+    settle_synced_private_coinbase_rewards(
+        storage, manager, password, network, &mut state, registered,
+    )
+}
+
+fn sync_private_coinbase_outputs_from_rpc(
+    storage: &WalletStorage,
+    manager: &mut PrivateWalletManager,
+    wallet_name: &str,
+    password: Option<&str>,
+    network: NetworkProfile,
+    rpc: &str,
+) -> Result<usize, String> {
+    let height_body = rpc_http_get_json(rpc, "/chain/height", 3)?;
+    let chain_height = rpc_json_u64(&height_body, &["height", "chain_height"])
+        .ok_or_else(|| "local RPC height response did not include height".to_string())?;
+    let mut state = load_user_mining_state_for_network(network).unwrap_or_default();
+    state.chain_height = state.chain_height.max(chain_height);
+
+    let wallet = manager
+        .get_private_wallet(wallet_name)
+        .ok_or_else(|| format!("private wallet not found: {wallet_name}"))?;
+    let wallet_commitment = wallet.commitment_key.clone();
+    let wallet_address = user_private_address_display(&wallet_commitment);
+    let restore_height = wallet.restore_height.max(1);
+
+    let mut registered = 0usize;
+    let mut from = restore_height;
+    while from <= chain_height {
+        let to = from.saturating_add(255).min(chain_height);
+        let responses = fetch_rpc_block_range(rpc, from, to)?;
+        for response in responses {
+            let block: zoka::types::Block = serde_json::from_slice(&response.encrypted_block)
+                .map_err(|e| format!("RPC private coinbase block decode failed: {e}"))?;
+            if register_private_coinbase_reward_from_block(
+                manager,
+                wallet_name,
+                &wallet_address,
+                &wallet_commitment,
+                &mut state,
+                &block,
+            ) {
+                registered = registered.saturating_add(1);
+            }
+        }
+        from = to.saturating_add(1);
+    }
+
+    settle_synced_private_coinbase_rewards(
+        storage, manager, password, network, &mut state, registered,
+    )
+}
+
+fn sync_private_coinbase_outputs_from_chain_db(
+    storage: &WalletStorage,
+    manager: &mut PrivateWalletManager,
+    wallet_name: &str,
+    password: Option<&str>,
+    network: NetworkProfile,
+    db_path: Option<&str>,
+) -> Result<usize, String> {
+    let Some(db_path) = db_path else {
+        return Ok(0);
+    };
+    let chain_storage = match open_storage(db_path) {
+        Ok(storage) => storage,
+        Err(e) if is_storage_lock_error(&e) => {
+            let local_rpc = required_local_rpc_url(network)?;
+            return sync_private_coinbase_outputs_from_rpc(
+                storage,
+                manager,
+                wallet_name,
+                password,
+                network,
+                &local_rpc,
+            );
+        }
+        Err(e) => return Err(e),
+    };
+    let chain_height = chain_storage
+        .get_chain_height()
+        .map_err(|e| format!("failed to read chain height: {e}"))?;
+    let mut blocks = Vec::new();
+    for height in 1..=chain_height {
+        if let Some(block) = chain_storage
+            .get_block_by_height(height)
+            .map_err(|e| format!("failed to read block at height {height}: {e}"))?
+        {
+            blocks.push(block);
+        }
+    }
+    sync_private_coinbase_outputs_from_blocks(
+        storage,
+        manager,
+        wallet_name,
+        password,
+        network,
+        chain_height,
+        blocks,
+    )
+}
+
 fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
 }
 
-fn current_known_height(db_path: Option<&str>) -> u64 {
+fn is_storage_lock_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("lock")
+        || lower.contains("locked")
+        || lower.contains("being used by another process")
+        || lower.contains("utilizado por otro proceso")
+        || lower.contains("acceso al archivo")
+}
+
+fn local_rpc_height(network: NetworkProfile) -> Option<u64> {
+    let rpc = configured_local_rpc_url(network)?;
+    rpc_http_get_json(&rpc, "/chain/height", 2)
+        .ok()
+        .and_then(|body| rpc_json_u64(&body, &["height", "chain_height"]))
+}
+
+fn current_known_height_for_network(db_path: Option<&str>, network: NetworkProfile) -> u64 {
     let mut height = 0u64;
-    let db = db_path.unwrap_or(DEFAULT_CHAIN_DB_PATH);
-    if let Ok(storage) = RocksDbStorage::new(db) {
-        if let Ok(h) = storage.get_chain_height() {
-            height = height.max(h);
+    let db = db_path.unwrap_or_else(|| network.default_db_path());
+    for attempt in 0..3 {
+        match RocksDbStorage::new(db) {
+            Ok(storage) => {
+                match storage.get_chain_height() {
+                    Ok(h) => height = height.max(h),
+                    Err(err) => {
+                        let err = err.to_string();
+                        if attempt < 2 && is_storage_lock_error(&err) {
+                            thread::sleep(Duration::from_millis(150));
+                            continue;
+                        }
+                    }
+                }
+                break;
+            }
+            Err(err) => {
+                let err = err.to_string();
+                if attempt < 2 && is_storage_lock_error(&err) {
+                    thread::sleep(Duration::from_millis(150));
+                    continue;
+                }
+                if let Some(h) = local_rpc_height(network) {
+                    height = height.max(h);
+                }
+                break;
+            }
         }
     }
     if db_path.is_some() {
         return height;
     }
-    if let Ok(state) = load_user_mining_state() {
+    if let Ok(state) = load_user_mining_state_for_network(network) {
         height = height.max(state.chain_height);
     }
     height
@@ -3498,13 +4211,29 @@ fn draw_fullnode_runtime_screen(
     session_mined_rewards: u64,
     last_event: &str,
 ) -> Result<(), String> {
-    let wallet_snapshot = load_wallet_runtime_snapshot_from_storage(
+    let wallet_snapshot = match load_wallet_runtime_snapshot_from_storage(
         wallet_storage,
         wallet_selector,
         password,
         network,
-    )?;
-    let state = load_user_mining_state_for_network(network)?;
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            mining_log(&format!(
+                "dashboard wallet load transient error (non-fatal): {err}"
+            ));
+            return Ok(());
+        }
+    };
+    let state = match load_user_mining_state_for_network(network) {
+        Ok(state) => state,
+        Err(err) => {
+            mining_log(&format!(
+                "dashboard state load transient error (non-fatal): {err}"
+            ));
+            return Ok(());
+        }
+    };
     let fee_snapshot = if avoid_db_reads {
         FeeMarketSnapshot {
             pending_private_txs: 0,
@@ -3517,7 +4246,7 @@ fn draw_fullnode_runtime_screen(
     let known_height = if avoid_db_reads {
         state.chain_height
     } else {
-        current_known_height(db_path)
+        current_known_height_for_network(db_path, network)
     };
     let screen = render_fullnode_dashboard(
         &wallet_snapshot,
@@ -3548,10 +4277,6 @@ fn draw_fullnode_runtime_screen(
     Ok(())
 }
 
-fn run_mining_batch(config: &MiningEngineConfig) -> Result<MiningBatchSummary, String> {
-    run_mining_batch_with_progress(config, None)
-}
-
 fn run_mining_batch_with_progress(
     config: &MiningEngineConfig,
     mut progress: Option<&mut dyn FnMut(&MiningProgressSnapshot) -> Result<(), String>>,
@@ -3567,6 +4292,7 @@ fn run_mining_batch_with_progress(
         ));
     }
 
+    mining_log(&format!("batch starting (chain={}, threads={}, blocks={})", config.chain_id, config.threads, config.blocks));
     let mut state = load_user_mining_state_for_network(network)?;
     if !state.is_mining {
         state.is_mining = true;
@@ -3574,12 +4300,18 @@ fn run_mining_batch_with_progress(
     state.mining_process_id = Some(std::process::id());
     state.last_updated = now_secs();
     save_user_mining_state_for_network(network, &state)?;
+    mining_log("state file initialized");
 
     let storage = wallet_storage_for_chain_id(&config.chain_id)?;
     let mut private_manager =
         load_private_wallet_manager_for_network(&storage, config.password.as_deref(), network)?;
-    let wallet_name =
-        resolve_private_wallet_name_required(&private_manager, &config.wallet_selector)?;
+    mining_log("wallet manager loaded");
+    let (wallet_name, _) = resolve_network_wallet_address_required(
+        &private_manager,
+        &storage,
+        &config.wallet_selector,
+        "--address",
+    )?;
     let wallet_address = private_manager
         .get_private_wallet(&wallet_name)
         .map(|wallet| user_private_address_display(&wallet.commitment_key))
@@ -3634,6 +4366,7 @@ fn run_mining_batch_with_progress(
     state.chain_height = chain_tip_height;
     state.last_block_hash = chain_tip_hash.clone();
     state.total_supply_emitted = chain_tip_supply;
+    mining_log(&format!("chain head height={} hash={}", chain_tip_height, &chain_tip_hash[..chain_tip_hash.len().min(16)]));
 
     let pow_epoch_blocks = economics::POW_KEY_EPOCH_BLOCKS;
     let mut next_height = chain_tip_height.saturating_add(1);
@@ -3649,6 +4382,14 @@ fn run_mining_batch_with_progress(
         })?;
     }
     for _ in 0..config.blocks {
+        // Import any private txs queued in the sidecar directory by other
+        // processes that could not write to the DB while we held the lock.
+        if let Some(path) = config.chain_db_path.as_deref() {
+            if let Ok(storage) = open_storage(path) {
+                import_sidecar_private_txs(path, &storage);
+            }
+        }
+
         let height = next_height;
         let reward_for_block = next_block_reward(height, state.total_supply_emitted, None);
         if reward_for_block == 0 {
@@ -3683,6 +4424,8 @@ fn run_mining_batch_with_progress(
                 estimated_hashrate_hps: config.hashrate_hps as f64,
             })?;
         }
+        mining_log(&format!("starting PoW solve for height={} difficulty_bits={} threads={}", height, difficulty_bits, config.threads));
+        let solve_started = Instant::now();
         let (pow_hash_bytes, found_nonce, block_hashes, solve_secs) = solve_pow_nonce(
             &config.chain_id,
             height,
@@ -3699,6 +4442,8 @@ fn run_mining_batch_with_progress(
                 Ok(())
             },
         )?;
+        mining_log(&format!("solved height={} in {:.2}s ({} hashes, ~{:.0} H/s)", height, solve_secs, block_hashes, block_hashes as f64 / solve_secs.max(0.001)));
+        let _ = solve_started;
         total_hashes = total_hashes.saturating_add(block_hashes);
 
         // Construct the canonical Block this miner just produced and run
@@ -3712,6 +4457,14 @@ fn run_mining_batch_with_progress(
             height,
             timestamp,
         );
+        // A private transfer can arrive while PoW is already being solved.
+        // Import the sidecar queue again here so the block we just solved can
+        // carry those txs instead of making the user wait for the next block.
+        if let Some(path) = config.chain_db_path.as_deref() {
+            if let Ok(storage) = open_storage(path) {
+                import_sidecar_private_txs(path, &storage);
+            }
+        }
         let private_tx_hashes_for_block = match config.chain_db_path.as_deref() {
             Some(path) => local_pending_private_tx_hashes(path, LOCAL_PRIVATE_TXS_PER_BLOCK_LIMIT)?,
             None => Vec::new(),
@@ -3818,16 +4571,76 @@ fn run_mining_batch_with_progress(
                 .mark_private_transactions_confirmed_locally(&private_tx_hashes_for_block)
                 > 0
                 || !private_fee_claims_for_block.is_empty();
+            // Scan the private tx bodies included in this block and credit any
+            // outputs destined for the miner's own wallet.  This handles the
+            // case where a third party (e.g. another local wallet) submitted a
+            // tx while the miner batch was already running so the wallet was
+            // loaded before the send, and also the normal case where the miner
+            // is the intended recipient of an incoming transfer.
+            for hash in &private_tx_hashes_for_block {
+                let body = chain_storage
+                    .get_private_transaction_bytes(hash)
+                    .unwrap_or(None);
+                if let Some(bytes) = body {
+                    if let Ok(incoming_tx) =
+                        serde_json::from_slice::<zoka::private_wallet::PrivateTransaction>(&bytes)
+                    {
+                        match private_manager.apply_relevant_private_transaction_for_wallet(
+                            &wallet_name,
+                            &incoming_tx,
+                        ) {
+                            Ok(true) => {
+                                wallet_state_changed = true;
+                            }
+                            Ok(false) | Err(_) => {}
+                        }
+                    }
+                }
+            }
             if !private_fee_claims_for_block.is_empty() {
-                private_manager
-                    .claim_private_fees_from_block_claims(
-                        &wallet_name,
-                        &private_fee_claims_for_block,
-                    )
-                    .map_err(|e| format!("failed to claim private fees for mined block: {e}"))?;
                 wallet_state_changed = true;
             }
             if wallet_state_changed {
+                // Re-load the on-disk wallet manager so that any concurrent
+                // updates (e.g. another local wallet sending while this batch
+                // was running) are not silently overwritten.  Then replay the
+                // confirmed-status updates, incoming-output credits, and fee
+                // claims before flushing back to disk.
+                let mut fresh_manager = load_private_wallet_manager_for_network(
+                    &storage,
+                    config.password.as_deref(),
+                    network,
+                )
+                .unwrap_or(private_manager);
+                fresh_manager
+                    .mark_private_transactions_confirmed_locally(&private_tx_hashes_for_block);
+                for hash in &private_tx_hashes_for_block {
+                    let body = chain_storage
+                        .get_private_transaction_bytes(hash)
+                        .unwrap_or(None);
+                    if let Some(bytes) = body {
+                        if let Ok(incoming_tx) = serde_json::from_slice::<
+                            zoka::private_wallet::PrivateTransaction,
+                        >(&bytes)
+                        {
+                            let _ = fresh_manager.apply_relevant_private_transaction_for_wallet(
+                                &wallet_name,
+                                &incoming_tx,
+                            );
+                        }
+                    }
+                }
+                if !private_fee_claims_for_block.is_empty() {
+                    fresh_manager
+                        .claim_private_fees_from_block_claims(
+                            &wallet_name,
+                            &private_fee_claims_for_block,
+                        )
+                        .map_err(|e| {
+                            format!("failed to claim private fees for mined block: {e}")
+                        })?;
+                }
+                private_manager = fresh_manager;
                 persist_all_private_wallets(
                     &storage,
                     &private_manager,
@@ -4286,6 +5099,311 @@ async fn run_sync_step(
     )))
 }
 
+fn fetch_rpc_block_response(
+    rpc: &str,
+    height: u64,
+) -> Result<zoka::network::message::BlockResponseMessage, String> {
+    let body = rpc_http_get_json(rpc, &format!("/blocks/{height}/raw"), 5)?;
+    let difficulty_bits = rpc_difficulty_bits_from_json(&body).or_else(|| {
+        rpc_http_get_json(rpc, &format!("/blocks/{height}"), 5)
+            .ok()
+            .and_then(|metadata| rpc_difficulty_bits_from_json(&metadata))
+    });
+    let block: zoka::types::Block = serde_json::from_value(body)
+        .map_err(|e| format!("RPC block {height} decode failed: {e}"))?;
+    block_to_response(block, difficulty_bits)
+}
+
+fn block_to_response(
+    block: zoka::types::Block,
+    difficulty_bits: Option<u32>,
+) -> Result<zoka::network::message::BlockResponseMessage, String> {
+    let block_hash = block.header.hash.clone();
+    let block_height = block.header.block_height;
+    let encrypted_block = serde_json::to_vec(&block)
+        .map_err(|e| format!("RPC block {block_height} encode failed: {e}"))?;
+    Ok(zoka::network::message::BlockResponseMessage {
+        block_height,
+        encrypted_block,
+        block_hash,
+        difficulty_bits,
+        timestamp: now_secs(),
+    })
+}
+
+fn rpc_difficulty_bits_from_json(body: &serde_json::Value) -> Option<u32> {
+    body.get("difficulty_bits")
+        .or_else(|| body.get("difficulty"))
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn fetch_rpc_block_range(
+    rpc: &str,
+    from_height: u64,
+    to_height: u64,
+) -> Result<Vec<zoka::network::message::BlockResponseMessage>, String> {
+    let body = rpc_http_get_json(
+        rpc,
+        &format!("/blocks/range/{from_height}/{to_height}/raw"),
+        10,
+    )?;
+    let blocks = body
+        .get("blocks")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| "RPC raw block range response did not include blocks".to_string())?;
+    let mut responses = Vec::with_capacity(blocks.len());
+    for value in blocks {
+        let difficulty_bits = rpc_difficulty_bits_from_json(value).ok_or_else(|| {
+            "RPC raw block range response did not include difficulty_bits; falling back to single-block sync"
+                .to_string()
+        })?;
+        let block: zoka::types::Block = serde_json::from_value(value.clone())
+            .map_err(|e| format!("RPC block range decode failed: {e}"))?;
+        responses.push(block_to_response(block, Some(difficulty_bits))?);
+    }
+    Ok(responses)
+}
+
+#[derive(Debug, Clone)]
+struct RpcHeightSample {
+    rpc: String,
+    height: u64,
+}
+
+fn rpc_chain_height(rpc: &str, timeout_secs: u64) -> Result<u64, String> {
+    let height_body = rpc_http_get_json(rpc, "/chain/height", timeout_secs)?;
+    rpc_json_u64(&height_body, &["height", "chain_height"])
+        .ok_or_else(|| format!("{rpc}: height response did not include height"))
+}
+
+fn sample_rpc_heights(
+    rpc_endpoints: &[String],
+    timeout_secs: u64,
+) -> (Vec<RpcHeightSample>, Vec<String>) {
+    let mut samples = Vec::new();
+    let mut errors = Vec::new();
+    for rpc in rpc_endpoints {
+        match rpc_chain_height(rpc, timeout_secs) {
+            Ok(height) => samples.push(RpcHeightSample {
+                rpc: rpc.clone(),
+                height,
+            }),
+            Err(err) => errors.push(format!("{rpc}: {err}")),
+        }
+    }
+    samples.sort_by(|left, right| {
+        right
+            .height
+            .cmp(&left.height)
+            .then_with(|| left.rpc.cmp(&right.rpc))
+    });
+    (samples, errors)
+}
+
+fn best_rpc_height_sample(rpc_endpoints: &[String], timeout_secs: u64) -> Option<RpcHeightSample> {
+    sample_rpc_heights(rpc_endpoints, timeout_secs)
+        .0
+        .into_iter()
+        .next()
+}
+
+fn run_rpc_sync_batch(
+    chain_id: &str,
+    chain_db_path: Option<&str>,
+    rpc_endpoints: &[String],
+    peer_view: &mut zoka::state::sync::PeerChainView,
+    unsafe_rehearsal_difficulty_bits: Option<u32>,
+    max_blocks: u64,
+) -> Result<Option<String>, String> {
+    if rpc_endpoints.is_empty() || max_blocks == 0 {
+        return Ok(None);
+    }
+    let Some(path) = chain_db_path else {
+        return Ok(None);
+    };
+    let storage = match RocksDbStorage::new(path) {
+        Ok(storage) => storage,
+        Err(err) => return Ok(Some(format!("RPC sync storage open failed ({err})"))),
+    };
+    let local_height = storage
+        .get_chain_height()
+        .map_err(|err| format!("read chain height failed: {err}"))?;
+
+    let (samples, height_errors) = sample_rpc_heights(rpc_endpoints, 3);
+    let mut last_error = if height_errors.is_empty() {
+        None
+    } else {
+        Some(height_errors.join("; "))
+    };
+    let reachable_rpc_count = samples.len();
+    let candidates = samples
+        .into_iter()
+        .filter(|sample| sample.height > local_height)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return if reachable_rpc_count == 0 && last_error.is_some() && rpc_endpoints.len() > 0 {
+            Ok(last_error.map(|err| format!("RPC sync unavailable: {err}")))
+        } else {
+            Ok(None)
+        };
+    }
+
+    for candidate in candidates {
+        let rpc = candidate.rpc.as_str();
+        let remote_height = candidate.height;
+
+        peer_view.observe(remote_height);
+        let mut applied = 0u64;
+        let mut validated_side_branch = 0u64;
+        let mut last_event = String::new();
+        let mut endpoint_rejected = false;
+        let mut range_sync_supported = true;
+        let mut range_cache: VecDeque<zoka::network::message::BlockResponseMessage> =
+            VecDeque::new();
+        for _ in 0..max_blocks {
+            let request = match zoka::state::sync::next_required_block(&storage, peer_view)? {
+                Some(request) if request.height <= remote_height => request,
+                Some(request) => {
+                    last_event = format!(
+                        "RPC sync waiting for height {} beyond {rpc} height {remote_height}.",
+                        request.height
+                    );
+                    break;
+                }
+                None => break,
+            };
+            let response = if let Some(cached) = peer_view.take_pending_block_response(&request) {
+                cached
+            } else if request.expected_hash.is_none() && range_sync_supported {
+                if range_cache.front().map(|response| response.block_height) != Some(request.height)
+                {
+                    range_cache.clear();
+                    let to_height = request.height.saturating_add(127).min(remote_height);
+                    match fetch_rpc_block_range(rpc, request.height, to_height) {
+                        Ok(responses) if !responses.is_empty() => range_cache.extend(responses),
+                        Ok(_) => {}
+                        Err(err) => {
+                            range_sync_supported = false;
+                            last_error = Some(format!(
+                                "{rpc}: failed to fetch block range {}..{} ({err})",
+                                request.height, to_height
+                            ));
+                        }
+                    }
+                }
+
+                match range_cache.pop_front() {
+                    Some(response) if response.block_height == request.height => response,
+                    Some(response) => {
+                        last_error = Some(format!(
+                            "{rpc}: raw block range returned height {}, expected {}",
+                            response.block_height, request.height
+                        ));
+                        endpoint_rejected = true;
+                        break;
+                    }
+                    None => match fetch_rpc_block_response(rpc, request.height) {
+                        Ok(response) => response,
+                        Err(err) => {
+                            last_error = Some(format!(
+                                "{rpc}: failed to fetch block {} ({err})",
+                                request.height
+                            ));
+                            endpoint_rejected = true;
+                            break;
+                        }
+                    },
+                }
+            } else {
+                match fetch_rpc_block_response(rpc, request.height) {
+                    Ok(response) => response,
+                    Err(err) => {
+                        last_error = Some(format!(
+                            "{rpc}: failed to fetch block {} ({err})",
+                            request.height
+                        ));
+                        endpoint_rejected = true;
+                        break;
+                    }
+                }
+            };
+            if let Some(expected_hash) = request.expected_hash.as_deref() {
+                if response.block_hash != expected_hash {
+                    last_error = Some(format!(
+                        "{rpc}: fork backfill hash mismatch at height {}: expected {}, got {}",
+                        request.height, expected_hash, response.block_hash
+                    ));
+                    endpoint_rejected = true;
+                    break;
+                }
+            }
+            let height = response.block_height;
+            let outcome = match unsafe_rehearsal_difficulty_bits {
+                Some(bits) => {
+                    zoka::state::sync::try_apply_synced_block_payload_with_expected_difficulty(
+                        &storage, chain_id, &response, bits,
+                    )
+                }
+                None => {
+                    zoka::state::sync::try_apply_synced_block_payload(&storage, chain_id, &response)
+                }
+            };
+            peer_view.record_sync_outcome(&outcome);
+            peer_view.remember_block_response(&outcome, &response);
+            let imported = matches!(
+                &outcome,
+                zoka::state::sync::SyncOutcome::Applied(_)
+                    | zoka::state::sync::SyncOutcome::AlreadyKnown { .. }
+            );
+            let side_branch_validated = matches!(
+                &outcome,
+                zoka::state::sync::SyncOutcome::BehindOrSibling { .. }
+            );
+            let rejected = matches!(
+                &outcome,
+                zoka::state::sync::SyncOutcome::BadPayload(_)
+                    | zoka::state::sync::SyncOutcome::AnnouncedHashMismatch { .. }
+                    | zoka::state::sync::SyncOutcome::Rejected(_)
+            );
+            last_event = sync_outcome_to_event(outcome);
+            if imported {
+                applied = applied.saturating_add(1);
+            }
+            if side_branch_validated {
+                validated_side_branch = validated_side_branch.saturating_add(1);
+            }
+            if rejected {
+                last_error = Some(format!(
+                    "RPC sync rejected block {height} from {rpc}: {last_event}"
+                ));
+                endpoint_rejected = true;
+                break;
+            }
+            let current_height = storage.get_chain_height().unwrap_or(local_height);
+            if current_height >= remote_height && !peer_view.has_active_branch_backfill() {
+                break;
+            }
+        }
+
+        if endpoint_rejected {
+            continue;
+        }
+
+        if applied > 0 || validated_side_branch > 0 {
+            let new_height = storage.get_chain_height().unwrap_or(local_height);
+            return Ok(Some(format!(
+                "RPC sync imported {applied} block(s), validated {validated_side_branch} fork block(s) from {rpc}: local height {new_height}/{remote_height}. {last_event}"
+            )));
+        }
+        last_error = Some(format!(
+            "RPC sync saw remote height {remote_height} from {rpc}, but no block was imported. {last_event}"
+        ));
+    }
+
+    Ok(last_error.map(|err| format!("RPC sync unavailable: {err}")))
+}
+
 fn ibd_retry_delay(event: &str) -> Duration {
     if event.contains("pending") || event.contains("storage open failed") {
         Duration::from_secs(3)
@@ -4302,6 +5420,11 @@ fn is_transient_storage_lock_error(err: &str) -> bool {
         || err.contains("utilizado por otro proceso")
         || err.contains("no tiene acceso al archivo")
         || err.contains("siendo utilizado por otro proceso")
+}
+
+fn is_nonrecoverable_mining_batch_error(err: &str) -> bool {
+    err.contains("chain DB has no atomic economics marker")
+        || err.contains("chain DB was created with economics version")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4741,41 +5864,28 @@ fn select_or_create_private_node_wallet(
 ) -> Result<(PrivateWalletManager, String, bool), String> {
     let mut manager = load_private_wallet_manager_for_network(storage, password, network)?;
     if let Some(selector) = wallet_selector {
-        if let Some(existing_name) = resolve_private_wallet_name(&manager, selector) {
+        let commitment = require_private_network_address(selector, "--address")?;
+        if let Some(existing_name) = find_private_wallet_name_by_commitment(&manager, &commitment) {
             return Ok((manager, existing_name, false));
         }
-
-        if selector.starts_with("zka1") || selector.starts_with("zpriv:") {
-            validate_user_private_address(selector)
-                .map_err(|reason| format!("--address: {reason}"))?;
+        let display_address = user_private_address_display(&commitment);
+        if let Some(wallet_name) =
+            find_private_wallet_metadata_name_by_commitment(storage, &commitment)
+        {
             return Err(format!(
-                "wallet address '{}' not found locally; import it with 'wallet-restore-from-seed' or 'wallet-restore-from-keys' first",
-                selector
+                "--address: wallet address '{}' belongs to local wallet '{}' but it could not be unlocked with the provided password",
+                display_address, wallet_name
             ));
         }
-        if !create_if_missing {
-            return Err(format!(
-                "wallet '{}' not found locally; run 'wallet-list' to see available wallets, 'wallet-create --name {}' to create it, or pass --create-if-missing to auto-create",
-                selector, selector
-            ));
-        }
-        if storage.private_wallet_file_exists(selector) {
-            return Err(format!(
-                "wallet '{}' exists on disk but could not be unlocked. Check the password; ZOKA will not overwrite an encrypted wallet with the same name.",
-                selector
-            ));
-        }
-        let Some(password) = password else {
-            return Err(
-                "wallet auto-create requires --password so the new wallet is encrypted".to_string(),
-            );
+        let create_hint = if create_if_missing {
+            "; --create-if-missing only applies when no --address is provided"
+        } else {
+            ""
         };
-
-        manager
-            .create_private_wallet(selector)
-            .map_err(|e| format!("private wallet create failed: {e}"))?;
-        persist_private_wallet(storage, &manager, selector, Some(password))?;
-        return Ok((manager, selector.to_string(), true));
+        return Err(format!(
+            "--address: wallet address '{}' not found locally; import it with 'wallet-restore-from-seed' or 'wallet-restore-from-keys' first{}",
+            display_address, create_hint
+        ));
     }
 
     let mut existing = manager.get_private_wallet_names();
@@ -4804,8 +5914,7 @@ fn select_or_create_private_node_wallet(
 fn cmd_node_wallet_info(args: &[String]) -> Result<(), String> {
     let (network, storage) = wallet_storage_for_args(args)?;
     let wallet_selector = wallet_selector_value(args);
-    let password =
-        option_value(args, "--password").or_else(|| option_value(args, "--wallet-password"));
+    let password = password_value(args)?;
     let create_if_missing = has_flag(args, "--create-if-missing");
     let (manager, wallet_name, created) = select_or_create_private_node_wallet(
         &storage,
@@ -4844,14 +5953,25 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let network = NetworkProfile::from_args(args)?;
     let chain_id = network.chain_id().to_string();
     let wallet_selector = wallet_selector_value(args);
-    let password =
-        option_value(args, "--password").or_else(|| option_value(args, "--wallet-password"));
+    let password = password_value(args)?;
     let mut manual_seed_peers = option_values(args, "--seed");
     manual_seed_peers.extend(option_values(args, "--dial"));
     let network_config_arg = option_value(args, "--network-config");
     let use_network_config = !has_flag(args, "--no-network-config");
     let allow_clearnet_seeds = has_flag(args, "--allow-clearnet-seeds");
     let allow_isolated_start = has_flag(args, "--allow-isolated-start");
+    let tor_proxy = option_value(args, "--tor-proxy")
+        .or_else(|| std::env::var("ZOKA_TOR_PROXY").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let tor_only = has_flag(args, "--tor-only")
+        || has_flag(args, "--anonymous-only")
+        || std::env::var("ZOKA_TOR_ONLY").as_deref() == Ok("1");
+    if tor_only && tor_proxy.is_none() {
+        return Err(
+            "--tor-only requires --tor-proxy <host:port> or ZOKA_TOR_PROXY=host:port".to_string(),
+        );
+    }
     let db_path =
         option_value(args, "--db").or_else(|| Some(network.default_db_path().to_string()));
     let genesis_path = option_value(args, "--genesis")
@@ -4885,12 +6005,10 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     .clamp(0, 300);
     let mine_blocks =
         parse_u64_arg(option_value(args, "--mine-blocks"), 1, "--mine-blocks")?.clamp(1, 32);
-    let min_mine_peers = parse_u64_arg(
-        option_value(args, "--min-mine-peers"),
-        0,
-        "--min-mine-peers",
-    )?
-    .clamp(0, 128) as usize;
+    let auto_mine = !has_flag(args, "--no-mine");
+    let min_mine_peers_arg = option_value(args, "--min-mine-peers");
+    let mut min_mine_peers =
+        parse_u64_arg(min_mine_peers_arg.clone(), 0, "--min-mine-peers")?.clamp(0, 128) as usize;
     let sync_rebroadcast_recent_blocks = parse_u64_arg(
         option_value(args, "--sync-rebroadcast-recent-blocks"),
         0,
@@ -4922,7 +6040,6 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         }
         None => None,
     };
-    let auto_mine = !has_flag(args, "--no-mine");
     let show_keys = has_flag(args, "--show-keys");
     let verbose = has_flag(args, "--verbose");
     let mining_threads = parse_thread_count_arg(args)?;
@@ -5005,8 +6122,10 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
 
     if let Some(db) = db_path.as_ref() {
         if let Some(genesis_file) = genesis_path.as_ref() {
-            let digest = apply_genesis_file_to_db(genesis_file, db, false).await?;
-            startup_notes.push(format!("Genesis ready on {} (digest={}).", db, digest));
+            if std::path::Path::new(genesis_file).exists() {
+                let digest = apply_genesis_file_to_db(genesis_file, db, false).await?;
+                startup_notes.push(format!("Genesis ready on {} (digest={}).", db, digest));
+            }
         }
         let manager = open_state_manager(db).await?;
         let state = manager.get_state().await;
@@ -5032,6 +6151,16 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 }),
             )?;
         }
+        let api_mempool = Arc::new(zoka::mempool::Mempool::new(10_000));
+        let api_bind_addr = configured_api_bind_addr(args, network)?;
+        let api_public_url = format!("http://{api_bind_addr}");
+        tokio::spawn(async move {
+            if let Err(e) = zoka::api::start_api_on_bind(manager, api_mempool, api_bind_addr).await
+            {
+                eprintln!("API server error: {e}");
+            }
+        });
+        startup_notes.push(format!("HTTP API listening on {api_public_url}"));
     } else if genesis_path.is_some() {
         return Err("--genesis requires --db in fullnode".to_string());
     }
@@ -5039,6 +6168,14 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut node = Node::new(0)
         .await
         .map_err(|e| format!("node init error: {e}"))?;
+    if let Some(proxy) = tor_proxy.as_ref() {
+        node.configure_tor_proxy(proxy.clone(), tor_only);
+        startup_notes.push(if tor_only {
+            format!("Tor-only transport policy active via SOCKS5 {proxy}.")
+        } else {
+            format!("Tor SOCKS5 proxy configured at {proxy}.")
+        });
+    }
     node.listen(&listen_addr)
         .await
         .map_err(|e| format!("listen error: {e}"))?;
@@ -5070,7 +6207,38 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     }
 
     let mut seed_peer_display = None::<String>;
+    let mut reconnect_seed_peers = manual_seed_peers.clone();
+    let mut rpc_sync_endpoints = Vec::<String>::new();
     if !manual_seed_peers.is_empty() {
+        if use_network_config {
+            let config_path = network_config_arg
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(network.default_network_config_path()));
+            if config_path.exists() {
+                let network_config = load_network_config_for(&config_path, network)?;
+                rpc_sync_endpoints = network_config
+                    .public_rpc
+                    .iter()
+                    .filter(|rpc| rpc.status.eq_ignore_ascii_case("active"))
+                    .map(|rpc| rpc.url.clone())
+                    .collect();
+                startup_notes.push(format!(
+                    "{} network config loaded from {} for public RPCs: status={}, active_rpc={}.",
+                    network.label(),
+                    config_path.display(),
+                    if network_config.status.is_empty() {
+                        "unknown"
+                    } else {
+                        network_config.status.as_str()
+                    },
+                    network_config.active_rpc_count(),
+                ));
+            }
+        }
+        if auto_mine && min_mine_peers_arg.is_none() {
+            min_mine_peers = min_mine_peers.max(1);
+        }
         let initial_seed_connect_timeout = if allow_isolated_start {
             Duration::from_secs(4)
         } else {
@@ -5122,6 +6290,19 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         if config_path.exists() {
             let network_config = load_network_config_for(&config_path, network)?;
             let seed_candidates = network_config.active_seed_candidates(allow_clearnet_seeds);
+            rpc_sync_endpoints = network_config
+                .public_rpc
+                .iter()
+                .filter(|rpc| rpc.status.eq_ignore_ascii_case("active"))
+                .map(|rpc| rpc.url.clone())
+                .collect();
+            reconnect_seed_peers = seed_candidates
+                .iter()
+                .map(|seed| seed.address.clone())
+                .collect();
+            if auto_mine && min_mine_peers_arg.is_none() && !reconnect_seed_peers.is_empty() {
+                min_mine_peers = min_mine_peers.max(1);
+            }
             startup_notes.push(format!(
                 "{} network config loaded from {}: status={}, active_seeds={}, active_rpc={}, snapshot_signers={}, notes={}.",
                 network.label(),
@@ -5206,9 +6387,9 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     while tokio::time::Instant::now() < warmup_deadline {
         let mut now = tokio::time::Instant::now();
         if now >= next_warmup_seed_reconnect_at {
-            let target_seed_peers = manual_seed_peers.len().min(3).max(1);
+            let target_seed_peers = reconnect_seed_peers.len().min(3).max(1);
             if let Some(reconnect_event) =
-                maintain_seed_connections(&mut node, &manual_seed_peers, target_seed_peers).await
+                maintain_seed_connections(&mut node, &reconnect_seed_peers, target_seed_peers).await
             {
                 last_event = reconnect_event;
             }
@@ -5270,7 +6451,18 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     "Warmup traffic received.".to_string()
                 };
                 if tokio::time::Instant::now() >= next_warmup_ibd_at {
-                    if let Some(sync_event) = run_sync_step(
+                    if let Some(sync_event) = run_rpc_sync_batch(
+                        &chain_id,
+                        db_path.as_deref(),
+                        &rpc_sync_endpoints,
+                        &mut peer_chain_view,
+                        unsafe_rehearsal_difficulty_bits,
+                        32,
+                    )? {
+                        next_warmup_ibd_at =
+                            tokio::time::Instant::now() + ibd_retry_delay(&sync_event);
+                        last_event = sync_event;
+                    } else if let Some(sync_event) = run_sync_step(
                         &mut node,
                         &chain_id,
                         db_path.as_deref(),
@@ -5293,7 +6485,18 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     .await
                     .map_err(|e| format!("pump error: {e}"))?;
                 if tokio::time::Instant::now() >= next_warmup_ibd_at {
-                    if let Some(sync_event) = run_sync_step(
+                    if let Some(sync_event) = run_rpc_sync_batch(
+                        &chain_id,
+                        db_path.as_deref(),
+                        &rpc_sync_endpoints,
+                        &mut peer_chain_view,
+                        unsafe_rehearsal_difficulty_bits,
+                        32,
+                    )? {
+                        next_warmup_ibd_at =
+                            tokio::time::Instant::now() + ibd_retry_delay(&sync_event);
+                        last_event = sync_event;
+                    } else if let Some(sync_event) = run_sync_step(
                         &mut node,
                         &chain_id,
                         db_path.as_deref(),
@@ -5340,6 +6543,10 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut next_sync_state_at = tokio::time::Instant::now();
     let mut next_seed_reconnect_at = tokio::time::Instant::now();
     let mut next_ibd_at = tokio::time::Instant::now();
+    let mut next_miner_heartbeat_at = tokio::time::Instant::now();
+    let mut heartbeat_last_status_log = HashMap::<String, bool>::new();
+    let mut heartbeat_recent_failures: VecDeque<(String, String)> = VecDeque::with_capacity(8);
+    let mut last_runtime_mining_enabled = auto_mine;
     let mut mining_task: Option<tokio::task::JoinHandle<Result<MiningBatchSummary, String>>> = None;
     loop {
         if let Some(deadline) = maybe_deadline {
@@ -5350,9 +6557,100 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         }
 
         let mining_active = mining_task.is_some();
+        let mining_control = zoka::api::global_local_mining_control().snapshot();
+        let runtime_mining_enabled = auto_mine || mining_control.enabled;
+        let runtime_mining_threads = if mining_control.threads > 0 {
+            mining_control.threads.clamp(1, 128) as usize
+        } else {
+            mining_threads
+        };
+        if runtime_mining_enabled && !last_runtime_mining_enabled {
+            next_mine_at = tokio::time::Instant::now();
+            last_event = format!(
+                "Runtime mining enabled from local control with {}.",
+                mining_power_label_for_threads(runtime_mining_threads)
+            );
+        } else if !runtime_mining_enabled && last_runtime_mining_enabled {
+            last_event =
+                "Runtime mining disabled; fullnode remains online for peers and RPC.".to_string();
+        }
+        last_runtime_mining_enabled = runtime_mining_enabled;
+
+        let mut runtime_mining_state = load_user_mining_state_for_network(network).unwrap_or_default();
+        if !runtime_mining_enabled && !mining_active && runtime_mining_state.is_mining {
+            runtime_mining_state.is_mining = false;
+            runtime_mining_state.mining_process_id = None;
+            runtime_mining_state.last_updated = now_secs();
+            let _ = save_user_mining_state_for_network(network, &runtime_mining_state);
+        }
+        zoka::api::global_network_runtime().set_connected_peers(node.connected_peer_count());
+        zoka::api::global_network_runtime()
+            .set_local_miner(
+                node.peer_id().to_string(),
+                runtime_mining_enabled || mining_active,
+                runtime_mining_state.chain_height,
+                if runtime_mining_enabled || mining_active {
+                    runtime_mining_state.estimated_hashrate_hps
+                } else {
+                    0
+                },
+            )
+            .await;
+
+        if runtime_mining_enabled && tokio::time::Instant::now() >= next_miner_heartbeat_at {
+            let heartbeat = serde_json::json!({
+                "peer_id": node.peer_id().to_string(),
+                "address": wallet_address.as_str(),
+                "chain_height": runtime_mining_state.chain_height,
+                "hashrate_hps": runtime_mining_state.estimated_hashrate_hps,
+                "mining": true,
+            });
+            if rpc_sync_endpoints.is_empty() {
+                let key = "__no_endpoints__".to_string();
+                if heartbeat_last_status_log.insert(key, false) != Some(false) {
+                    eprintln!(
+                        "miner heartbeat: no public RPC endpoints configured; the explorer will not detect this miner."
+                    );
+                }
+            } else {
+                for rpc in &rpc_sync_endpoints {
+                    let ok = rpc_http_post_json(rpc, "/network/miners/heartbeat", &heartbeat, 2);
+                    let prev = heartbeat_last_status_log.insert(rpc.clone(), ok.is_ok());
+                    match (&ok, prev) {
+                        (Ok(_), Some(false)) | (Ok(_), None) => {
+                            eprintln!(
+                                "miner heartbeat: explorer link OK via {rpc} (height={}, hps={}).",
+                                runtime_mining_state.chain_height,
+                                runtime_mining_state.estimated_hashrate_hps
+                            );
+                        }
+                        (Err(err), Some(true)) | (Err(err), None) => {
+                            let msg = format!("miner heartbeat: failed via {rpc}: {err}");
+                            eprintln!("{msg}");
+                            heartbeat_recent_failures.push_back((rpc.clone(), err.clone()));
+                            while heartbeat_recent_failures.len() > 8 {
+                                heartbeat_recent_failures.pop_front();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            next_miner_heartbeat_at = tokio::time::Instant::now() + Duration::from_secs(15);
+        }
 
         if !mining_active && tokio::time::Instant::now() >= next_ibd_at {
-            if let Some(sync_event) = run_sync_step(
+            if let Some(sync_event) = run_rpc_sync_batch(
+                &chain_id,
+                db_path.as_deref(),
+                &rpc_sync_endpoints,
+                &mut peer_chain_view,
+                unsafe_rehearsal_difficulty_bits,
+                64,
+            )? {
+                next_ibd_at = tokio::time::Instant::now() + ibd_retry_delay(&sync_event);
+                last_event = sync_event;
+            } else if let Some(sync_event) = run_sync_step(
                 &mut node,
                 &chain_id,
                 db_path.as_deref(),
@@ -5369,9 +6667,9 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         }
 
         if tokio::time::Instant::now() >= next_seed_reconnect_at {
-            let target_seed_peers = manual_seed_peers.len().min(3).max(1);
+            let target_seed_peers = reconnect_seed_peers.len().min(3).max(1);
             if let Some(reconnect_event) =
-                maintain_seed_connections(&mut node, &manual_seed_peers, target_seed_peers).await
+                maintain_seed_connections(&mut node, &reconnect_seed_peers, target_seed_peers).await
             {
                 last_event = reconnect_event;
             }
@@ -5413,8 +6711,31 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     next_mine_at = tokio::time::Instant::now() + Duration::from_secs(2);
                     continue;
                 }
-                Ok(Err(err)) => return Err(format!("auto-mining failed: {err}")),
-                Err(err) => return Err(format!("auto-mining task failed: {err}")),
+                Ok(Err(err)) => {
+                    if is_nonrecoverable_mining_batch_error(&err) {
+                        zoka::api::global_local_mining_control().disable();
+                        mining_log(&format!("batch error (mining disabled): {err}"));
+                        last_event = format!(
+                            "Auto-mining disabled after non-recoverable batch error; fullnode stayed online: {err}"
+                        );
+                        next_mine_at = tokio::time::Instant::now() + Duration::from_secs(5);
+                        continue;
+                    }
+                    last_event = format!(
+                        "Auto-mining batch failed but the fullnode stayed online: {err}"
+                    );
+                    mining_log(&format!("batch error (will retry): {err}"));
+                    next_mine_at = tokio::time::Instant::now() + Duration::from_secs(5);
+                    continue;
+                }
+                Err(err) => {
+                    last_event = format!(
+                        "Auto-mining task failed but the fullnode stayed online: {err}"
+                    );
+                    mining_log(&format!("task join error (will retry): {err}"));
+                    next_mine_at = tokio::time::Instant::now() + Duration::from_secs(5);
+                    continue;
+                }
             };
             session_mined_blocks = session_mined_blocks.saturating_add(batch.blocks_mined);
             session_mined_rewards = session_mined_rewards.saturating_add(batch.reward_credited);
@@ -5465,7 +6786,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             next_mine_at = tokio::time::Instant::now() + Duration::from_secs(mine_interval_secs);
         }
 
-        if auto_mine && mining_task.is_none() && tokio::time::Instant::now() >= next_mine_at {
+        if runtime_mining_enabled && mining_task.is_none() && tokio::time::Instant::now() >= next_mine_at {
             if node.connected_peer_count() < min_mine_peers {
                 last_event = format!(
                     "Auto-mining waiting for peers: connected {}, required {}.",
@@ -5478,7 +6799,34 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             if let Some(path) = db_path.as_deref() {
                 match RocksDbStorage::new(path).and_then(|storage| storage.get_chain_height()) {
                     Ok(local_height) => {
-                        if !manual_seed_peers.is_empty()
+                        if let Some(sample) = best_rpc_height_sample(&rpc_sync_endpoints, 3) {
+                            if let Err(err) = ensure_local_chain_matches_rpc_at_height(
+                                &sample.rpc,
+                                Some(path),
+                                local_height.min(sample.height),
+                            ) {
+                                last_event = err;
+                                next_mine_at = tokio::time::Instant::now() + Duration::from_secs(2);
+                                continue;
+                            }
+                            if sample.height > local_height {
+                                last_event = format!(
+                                    "Auto-mining paused for RPC sync: local height {local_height}, network height {} via {}.",
+                                    sample.height, sample.rpc
+                                );
+                                next_mine_at = tokio::time::Instant::now() + Duration::from_secs(1);
+                                continue;
+                            }
+                            if local_height > sample.height {
+                                last_event = format!(
+                                    "Auto-mining paused: local height {local_height} is ahead of network bootstrap height {} via {}; waiting for network agreement.",
+                                    sample.height, sample.rpc
+                                );
+                                next_mine_at = tokio::time::Instant::now() + Duration::from_secs(2);
+                                continue;
+                            }
+                        }
+                        if !reconnect_seed_peers.is_empty()
                             && node.connected_peer_count() > 0
                             && local_height == 0
                             && peer_chain_view.perceived_max_height == 0
@@ -5513,27 +6861,52 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 blocks: mine_blocks,
                 mode: network.mining_mode().to_string(),
                 hashrate_hps: mining_hashrate_hps,
-                threads: mining_threads,
+                threads: runtime_mining_threads,
                 base_difficulty: mining_base_difficulty,
                 unsafe_rehearsal_difficulty_bits,
                 target_block_time_secs: mining_target_block_time_secs,
                 chain_db_path: db_path.clone(),
             };
+            let progress_network = network;
             mining_task = Some(tokio::task::spawn_blocking(move || {
-                run_mining_batch(&mining_config)
+                let mut last_state_write = Instant::now();
+                let mut last_progress_log = Instant::now() - Duration::from_secs(10);
+                let mut publish_progress =
+                    |snapshot: &MiningProgressSnapshot| -> Result<(), String> {
+                        if last_progress_log.elapsed() >= Duration::from_secs(3) {
+                            mining_progress_log(snapshot);
+                            last_progress_log = Instant::now();
+                        }
+                        if last_state_write.elapsed() < Duration::from_secs(2) {
+                            return Ok(());
+                        }
+                        last_state_write = Instant::now();
+                        let mut live_state =
+                            load_user_mining_state_for_network(progress_network)
+                                .unwrap_or_default();
+                        live_state.is_mining = true;
+                        live_state.mining_process_id = Some(std::process::id());
+                        live_state.current_difficulty_bits = snapshot.difficulty_bits;
+                        live_state.estimated_hashrate_hps =
+                            snapshot.estimated_hashrate_hps as u64;
+                        live_state.last_updated = now_secs();
+                        let _ = save_user_mining_state_for_network(progress_network, &live_state);
+                        Ok(())
+                    };
+                run_mining_batch_with_progress(&mining_config, Some(&mut publish_progress))
             }));
             last_event = format!(
                 "Auto-mining solving {} block(s) with {} using {}; network loop remains active.",
                 mine_blocks,
                 active_pow_algorithm_for_chain(&chain_id),
-                mining_power_label_for_threads(mining_threads)
+                mining_power_label_for_threads(runtime_mining_threads)
             );
             next_mine_at = tokio::time::Instant::now() + Duration::from_secs(1);
             // here are non-fatal; the block is already persisted
         }
 
         let now = tokio::time::Instant::now();
-        let next_mine_in = if auto_mine {
+        let next_mine_in = if runtime_mining_enabled {
             Some(if next_mine_at > now {
                 next_mine_at - now
             } else {
@@ -5542,7 +6915,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         } else {
             None
         };
-        draw_fullnode_runtime_screen(
+        if let Err(err) = draw_fullnode_runtime_screen(
             &node,
             network,
             &storage,
@@ -5555,11 +6928,11 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             None,
             &announced,
             seed_peer_display.as_deref(),
-            auto_mine,
+            runtime_mining_enabled,
             mine_interval_secs,
             mine_blocks,
-            if auto_mine {
-                Some(mining_threads)
+            if runtime_mining_enabled {
+                Some(runtime_mining_threads)
             } else {
                 None
             },
@@ -5567,7 +6940,9 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             session_mined_blocks,
             session_mined_rewards,
             &last_event,
-        )?;
+        ) {
+            mining_log(&format!("dashboard render error (non-fatal): {err}"));
+        }
 
         match timeout(Duration::from_millis(800), node.next_message()).await {
             Ok(Ok(message)) => {
@@ -5651,6 +7026,7 @@ async fn run_zokahd_guided_default() -> Result<(), String> {
     );
     let storage = wallet_storage_for_network(NetworkProfile::Mainnet)?;
     let wallet_names = local_private_wallet_file_names(&storage);
+    let wallet_addresses = local_private_wallet_address_choices(&storage);
     println!(
         "{}",
         dashboard_line("Wallet storage", wallet_storage_path_text())
@@ -5659,18 +7035,18 @@ async fn run_zokahd_guided_default() -> Result<(), String> {
         println!("No local wallet files found. ZOKA will create an encrypted node wallet now.");
     } else {
         println!("{}", dashboard_section("Local Wallets", ANSI_MAGENTA));
-        for name in wallet_names.iter().take(8) {
-            println!("  {}", paint(name, ANSI_WHITE));
+        for (name, address) in wallet_addresses.iter().take(8) {
+            println!("  {}  {}", paint(name, ANSI_WHITE), address);
         }
-        if wallet_names.len() > 8 {
-            println!("  ... {} more", wallet_names.len().saturating_sub(8));
+        if wallet_addresses.len() > 8 {
+            println!("  ... {} more", wallet_addresses.len().saturating_sub(8));
         }
     }
 
-    let default_wallet = wallet_names.first().cloned();
-    if let Some(wallet) = default_wallet.as_deref() {
+    let default_wallet_address = wallet_addresses.first().map(|(_, address)| address.clone());
+    if let Some(wallet) = default_wallet_address.as_deref() {
         println!("{}", dashboard_line("Selected wallet", wallet));
-        println!("To use a different wallet, run: zokahd --address <wallet-name>");
+        println!("To use a different wallet, run: zokahd --address <wallet-address>");
     } else {
         println!(
             "{}",
@@ -5692,7 +7068,7 @@ async fn run_zokahd_guided_default() -> Result<(), String> {
     );
     println!("{}", dashboard_divider());
 
-    let password = if default_wallet.is_some() {
+    let password = if default_wallet_address.is_some() {
         prompt_required("Wallet password: ")?
     } else {
         prompt_required("Create wallet password: ")?
@@ -5720,7 +7096,7 @@ async fn run_zokahd_guided_default() -> Result<(), String> {
         "--sync-warmup-secs".to_string(),
         "10".to_string(),
     ];
-    push_opt_arg(&mut args, "--address", default_wallet);
+    push_opt_arg(&mut args, "--address", default_wallet_address);
     push_opt_arg(&mut args, "--seconds", seconds);
     if !auto_mine {
         args.push("--no-mine".to_string());
@@ -5825,6 +7201,8 @@ fn cmd_private_wallet_create(args: &[String]) -> Result<(), String> {
     let password = required_password_value(args)?;
     let export_path = option_value(args, "--export-secrets");
     let show_keys = has_flag(args, "--show-keys");
+    let seed_words = parse_u64_arg(option_value(args, "--seed-words"), 24, "--seed-words")?;
+    let entropy_bytes = seed_words_to_entropy_bytes(seed_words)?;
     let (network, storage) = wallet_storage_for_args(args)?;
     let wallet_name = option_value(args, "--name")
         .unwrap_or_else(|| generate_available_private_wallet_name(&storage, "wallet"));
@@ -5833,7 +7211,7 @@ fn cmd_private_wallet_create(args: &[String]) -> Result<(), String> {
     }
     let mut manager = load_private_wallet_manager_for_network(&storage, Some(&password), network)?;
     let commitment = manager
-        .create_private_wallet(&wallet_name)
+        .create_private_wallet_with_entropy_bytes(&wallet_name, entropy_bytes)
         .map_err(|e| format!("private wallet create failed: {e}"))?;
     persist_private_wallet(&storage, &manager, &wallet_name, Some(&password))?;
     let wallet = manager
@@ -5865,9 +7243,34 @@ fn cmd_private_wallet_create(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_wallet_generate_seed(args: &[String]) -> Result<(), String> {
+    let seed_words = parse_u64_arg(option_value(args, "--seed-words"), 24, "--seed-words")?;
+    let entropy_bytes = seed_words_to_entropy_bytes(seed_words)?;
+    let as_json = has_flag(args, "--json");
+    let seed = HDWallet::generate_seed(entropy_bytes)
+        .map_err(|e| format!("failed to generate recovery seed: {e}"))?;
+    let mnemonic = HDWallet::new(seed)
+        .and_then(|wallet| wallet.seed_to_mnemonic())
+        .map_err(|e| format!("failed to encode recovery phrase: {e}"))?;
+    let phrase = mnemonic.join(" ");
+    if as_json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "seed_words": seed_words,
+                "recovery_phrase": phrase,
+            })
+        );
+    } else {
+        println!("Recovery phrase: {}", phrase);
+        println!("Seed words: {}", seed_words);
+    }
+    Ok(())
+}
+
 fn cmd_wallet_export_secrets(args: &[String]) -> Result<(), String> {
     let wallet_selector = required_wallet_selector(args)?;
-    let password = option_value(args, "--password");
+    let password = password_value(args)?;
     let out = option_value(args, "--out");
     let as_json = has_flag(args, "--json");
 
@@ -5909,14 +7312,42 @@ fn cmd_wallet_export_secrets(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_private_wallet_list(args: &[String]) -> Result<(), String> {
-    let password = option_value(args, "--password");
+    let password = password_value(args)?;
     let as_json = has_flag(args, "--json");
     let (network, storage) = wallet_storage_for_args(args)?;
+    let db_path =
+        option_value(args, "--db").or_else(|| Some(network.default_db_path().to_string()));
     let disk_wallets = storage
         .load_all_private_wallet_metadata()
         .map_err(|e| format!("failed to read private wallet files: {e}"))?;
-    let manager = load_private_wallet_manager_for_network(&storage, password.as_deref(), network)?;
-    let mining_state = load_user_mining_state_for_network(network).unwrap_or_default();
+    let mut manager =
+        load_private_wallet_manager_for_network(&storage, password.as_deref(), network)?;
+    if password.is_some() {
+        let wallet_names: Vec<String> = manager
+            .list_private_wallets()
+            .into_iter()
+            .map(|(name, _, _, _)| name)
+            .collect();
+        for wallet_name in wallet_names {
+            let storage_ref = &storage;
+            let manager_ref: &mut PrivateWalletManager = &mut manager;
+            let pwd = password.as_deref();
+            let db = db_path.as_deref();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                sync_private_coinbase_outputs_from_chain_db(
+                    storage_ref,
+                    manager_ref,
+                    &wallet_name,
+                    pwd,
+                    network,
+                    db,
+                )
+            }));
+        }
+    }
+    let mining_state =
+        std::panic::catch_unwind(|| load_user_mining_state_for_network(network).unwrap_or_default())
+            .unwrap_or_default();
     let unlocked_by_name: std::collections::HashMap<_, _> = manager
         .list_private_wallets()
         .into_iter()
@@ -6024,7 +7455,7 @@ fn cmd_private_wallet_list(args: &[String]) -> Result<(), String> {
 fn cmd_private_balance(args: &[String]) -> Result<(), String> {
     let (network, storage) = wallet_storage_for_args(args)?;
     let wallet_selector = required_wallet_selector(args)?;
-    let password = option_value(args, "--password");
+    let password = password_value(args)?;
     let db_path =
         option_value(args, "--db").or_else(|| Some(network.default_db_path().to_string()));
     let as_json = has_flag(args, "--json");
@@ -6036,6 +7467,15 @@ fn cmd_private_balance(args: &[String]) -> Result<(), String> {
         &mut manager,
         &wallet_name,
         password.as_deref(),
+        network,
+        db_path.as_deref(),
+    )?;
+    sync_private_coinbase_outputs_from_chain_db(
+        &storage,
+        &mut manager,
+        &wallet_name,
+        password.as_deref(),
+        network,
         db_path.as_deref(),
     )?;
     let wallet = manager
@@ -6075,7 +7515,7 @@ fn cmd_private_balance(args: &[String]) -> Result<(), String> {
 
 fn cmd_receive_address(args: &[String]) -> Result<(), String> {
     let wallet_selector = required_wallet_selector(args)?;
-    let password = option_value(args, "--password");
+    let password = password_value(args)?;
     let as_json = has_flag(args, "--json");
     let (network, storage) = wallet_storage_for_args(args)?;
     let manager = load_private_wallet_manager_for_network(&storage, password.as_deref(), network)?;
@@ -6105,10 +7545,11 @@ fn cmd_receive_address(args: &[String]) -> Result<(), String> {
 fn cmd_private_history(args: &[String]) -> Result<(), String> {
     let (network, storage) = wallet_storage_for_args(args)?;
     let wallet_selector = required_wallet_selector(args)?;
-    let password = option_value(args, "--password");
+    let password = password_value(args)?;
     let db_path =
         option_value(args, "--db").or_else(|| Some(network.default_db_path().to_string()));
     let as_json = has_flag(args, "--json");
+    let verbose = has_flag(args, "--verbose");
     let limit = parse_u64_arg(option_value(args, "--limit"), 20, "--limit")? as usize;
     let mut manager =
         load_private_wallet_manager_for_network(&storage, password.as_deref(), network)?;
@@ -6118,6 +7559,15 @@ fn cmd_private_history(args: &[String]) -> Result<(), String> {
         &mut manager,
         &wallet_name,
         password.as_deref(),
+        network,
+        db_path.as_deref(),
+    )?;
+    sync_private_coinbase_outputs_from_chain_db(
+        &storage,
+        &mut manager,
+        &wallet_name,
+        password.as_deref(),
+        network,
         db_path.as_deref(),
     )?;
     let wallet = manager
@@ -6131,12 +7581,45 @@ fn cmd_private_history(args: &[String]) -> Result<(), String> {
         .cloned()
         .collect();
     if as_json {
+        if verbose {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "wallet": wallet_name,
+                    "count": txs.len(),
+                    "privacy": {
+                        "amounts_hidden": false,
+                        "full_private_transaction_bodies": true
+                    },
+                    "transactions": txs
+                })
+            );
+            return Ok(());
+        }
+        let summaries: Vec<_> = txs
+            .iter()
+            .map(|tx| {
+                serde_json::json!({
+                    "tx_hash": tx.tx_hash,
+                    "status": tx.status.to_string(),
+                    "timestamp": tx.timestamp,
+                    "outputs": tx.outputs.len(),
+                    "amount_hidden": true,
+                    "fee_hidden": true,
+                })
+            })
+            .collect();
         println!(
             "{}",
             serde_json::json!({
                 "wallet": wallet_name,
                 "count": txs.len(),
-                "transactions": txs
+                "privacy": {
+                    "amounts_hidden": true,
+                    "fees_hidden": true,
+                    "full_private_transaction_bodies": false
+                },
+                "transactions": summaries
             })
         );
         return Ok(());
@@ -6163,6 +7646,7 @@ fn sync_private_wallet_history_from_chain_db(
     manager: &mut PrivateWalletManager,
     wallet_name: &str,
     password: Option<&str>,
+    network: NetworkProfile,
     db_path: Option<&str>,
 ) -> Result<usize, String> {
     let Some(db_path) = db_path else {
@@ -6177,15 +7661,26 @@ fn sync_private_wallet_history_from_chain_db(
         .filter(|tx| tx.status != zoka::private_wallet::PrivacyStatus::Confirmed)
         .map(|tx| tx.tx_hash.clone())
         .collect();
-    if candidate_hashes.is_empty() {
-        return Ok(0);
-    }
 
-    let chain_storage = open_storage(db_path)?;
+    let chain_storage = match open_storage(db_path) {
+        Ok(storage) => storage,
+        Err(e) if is_storage_lock_error(&e) => {
+            let local_rpc = required_local_rpc_url(network)?;
+            return sync_private_wallet_history_from_rpc(
+                storage,
+                manager,
+                wallet_name,
+                password,
+                &local_rpc,
+            );
+        }
+        Err(e) => return Err(e),
+    };
     let height = chain_storage
         .get_chain_height()
         .map_err(|e| format!("failed to read chain height: {e}"))?;
     let mut confirmed = Vec::new();
+    let mut imported = 0usize;
     for h in 1..=height {
         let Some(block) = chain_storage
             .get_block_by_height(h)
@@ -6194,23 +7689,119 @@ fn sync_private_wallet_history_from_chain_db(
             continue;
         };
         for hash in block.private_tx_hashes {
+            confirmed.push(hash.clone());
             if candidate_hashes.contains(&hash) {
-                confirmed.push(hash);
+                continue;
+            }
+            let Some(body) = chain_storage
+                .get_private_transaction_bytes(&hash)
+                .map_err(|e| format!("failed to read private tx body {hash}: {e}"))?
+            else {
+                continue;
+            };
+            let tx: zoka::private_wallet::PrivateTransaction = serde_json::from_slice(&body)
+                .map_err(|e| format!("failed to parse private tx body {hash}: {e}"))?;
+            let changed = manager
+                .apply_relevant_private_transaction_for_wallet(wallet_name, &tx)
+                .map_err(|e| {
+                    format!("failed to scan private tx {hash} for wallet '{wallet_name}': {e}")
+                })?;
+            if changed {
+                imported += 1;
             }
         }
     }
     confirmed.sort();
     confirmed.dedup();
     let updated = manager.mark_private_transactions_confirmed_locally(&confirmed);
-    if updated > 0 {
+    if imported > 0 || updated > 0 {
         persist_private_wallet(storage, manager, wallet_name, password)?;
     }
-    Ok(updated)
+    Ok(imported + updated)
+}
+
+fn sync_private_wallet_history_from_rpc(
+    storage: &WalletStorage,
+    manager: &mut PrivateWalletManager,
+    wallet_name: &str,
+    password: Option<&str>,
+    rpc: &str,
+) -> Result<usize, String> {
+    let height_body = rpc_http_get_json(rpc, "/chain/height", 3)?;
+    let height = rpc_json_u64(&height_body, &["height", "chain_height"])
+        .ok_or_else(|| "RPC height response did not include height".to_string())?;
+
+    let wallet = manager
+        .get_private_wallet(wallet_name)
+        .ok_or_else(|| format!("private wallet not found: {wallet_name}"))?;
+    let candidate_hashes: std::collections::HashSet<String> = wallet
+        .private_transactions
+        .iter()
+        .filter(|tx| tx.status != zoka::private_wallet::PrivacyStatus::Confirmed)
+        .map(|tx| tx.tx_hash.clone())
+        .collect();
+
+    let mut confirmed = Vec::new();
+    let mut imported = 0usize;
+    let from_height = wallet.restore_height.max(1);
+    let mut range_from = from_height;
+    while range_from <= height {
+        let range_to = range_from.saturating_add(255).min(height);
+        let range_private = rpc_http_get_json(
+            rpc,
+            &format!("/blocks/range/{range_from}/{range_to}/private_tx_hashes"),
+            5,
+        )?;
+        let blocks = range_private
+            .get("blocks")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for block_private in blocks {
+            let hashes = block_private
+                .get("private_tx_hashes")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for value in hashes {
+                let Some(hash) = value.as_str() else {
+                    continue;
+                };
+                confirmed.push(hash.to_string());
+                if candidate_hashes.contains(hash) {
+                    continue;
+                }
+                let tx_json = match rpc_http_get_json(rpc, &format!("/private/tx/{hash}"), 3) {
+                    Ok(body) => body,
+                    Err(_) => continue,
+                };
+                let tx: zoka::private_wallet::PrivateTransaction = serde_json::from_value(tx_json)
+                    .map_err(|e| format!("failed to parse private tx {hash} from RPC: {e}"))?;
+                let changed = manager
+                    .apply_relevant_private_transaction_for_wallet(wallet_name, &tx)
+                    .map_err(|e| {
+                        format!("failed to scan private tx {hash} for wallet '{wallet_name}': {e}")
+                    })?;
+                if changed {
+                    imported += 1;
+                }
+            }
+        }
+        range_from = range_to.saturating_add(1);
+    }
+
+    confirmed.sort();
+    confirmed.dedup();
+    let updated = manager.mark_private_transactions_confirmed_locally(&confirmed);
+    if imported > 0 || updated > 0 {
+        persist_private_wallet(storage, manager, wallet_name, password)?;
+    }
+    Ok(imported + updated)
 }
 
 fn cmd_private_tx_import(args: &[String]) -> Result<(), String> {
     let wallet_selector = required_wallet_selector(args)?;
-    let password = option_value(args, "--password");
+    let password = password_value(args)?;
     let db_path = required_option_value(args, "--db")?;
     let tx_hash = required_option_value(args, "--hash")?;
     let (network, storage) = wallet_storage_for_args(args)?;
@@ -6375,12 +7966,16 @@ fn cmd_private_send(args: &[String]) -> Result<(), String> {
         "--amount",
     )?;
     let fee = parse_zka_amount_arg(option_value(args, "--fee"), 0, "--fee")?;
-    let password = option_value(args, "--password");
+    let password = password_value(args)?;
     let db_path =
         option_value(args, "--db").or_else(|| Some(network.default_db_path().to_string()));
+    // Best-effort economics version check.  If the DB is locked by the miner
+    // (another process) skip the check rather than aborting the send — the tx
+    // will land in the sidecar queue and the miner will import it.
     if let Some(path) = db_path.as_deref() {
-        let storage = open_storage(path)?;
-        ensure_atomic_economics_db(&storage)?;
+        if let Ok(storage) = open_storage(path) {
+            let _ = ensure_atomic_economics_db(&storage);
+        }
     }
     let confirm = has_flag(args, "--yes");
     if !confirm {
@@ -6393,36 +7988,12 @@ fn cmd_private_send(args: &[String]) -> Result<(), String> {
     let storage = wallet_storage_for_network(network)?;
     let mut manager =
         load_private_wallet_manager_for_network(&storage, password.as_deref(), network)?;
-    let from_wallet = if manager.get_private_wallet(&from_raw).is_some() {
-        from_raw.clone()
-    } else if from_raw.starts_with("zka1") || from_raw.starts_with("zpriv:") {
-        let sender_commitment = validate_user_private_address(&from_raw)
-            .map_err(|reason| format!("--from: {reason}"))?;
-        manager
-            .get_private_wallet_names()
-            .into_iter()
-            .find(|name| {
-                manager
-                    .get_private_wallet(name)
-                    .map(|wallet| wallet.commitment_key == sender_commitment)
-                    .unwrap_or(false)
-            })
-            .ok_or_else(|| {
-                format!(
-                    "--from: address '{}' is valid but no local wallet matches it; run 'wallet-list' to see available wallets",
-                    from_raw
-                )
-            })?
-    } else {
-        return Err(format!(
-            "--from: '{}' is not a known wallet name or zka1 address; run 'wallet-list' to see your wallets",
-            from_raw
-        ));
-    };
+    let (from_wallet, from_commitment) =
+        resolve_network_wallet_address_required(&manager, &storage, &from_raw, "--from")?;
     let sender = manager
         .get_private_wallet(&from_wallet)
         .ok_or_else(|| format!("private wallet not found: {from_wallet}"))?;
-    let sender_display = user_private_address_display(&sender.commitment_key);
+    let sender_display = user_private_address_display(&from_commitment);
     if sender.view_only || sender.spending_key.is_empty() {
         return Err("cannot send from view-only private wallet".to_string());
     }
@@ -6446,101 +8017,125 @@ fn cmd_private_send(args: &[String]) -> Result<(), String> {
         ));
     }
 
-    let looks_like_address = to_raw.starts_with("zka1") || to_raw.starts_with("zpriv:");
-    let (to_commitment, recipient_wallet_name) = if let Some(target_wallet) =
-        manager.get_private_wallet(&to_raw)
-    {
-        (target_wallet.commitment_key.clone(), Some(to_raw.clone()))
-    } else if let Ok(target_wallet) = storage.load_private_wallet(&to_raw, None) {
-        if !looks_like_address {
+    let to_commitment = require_private_network_address(&to_raw, "--to")?;
+    let recipient_wallet_name = find_private_wallet_name_by_commitment(&manager, &to_commitment);
+
+    let mut remaining_amount = amount;
+    let mut remaining_fee = fee;
+    let mut sent_chunks: Vec<(String, u64, u64)> = Vec::new();
+    while remaining_amount > 0 {
+        let sender = manager
+            .get_private_wallet(&from_wallet)
+            .ok_or_else(|| format!("private wallet not found: {from_wallet}"))?;
+        let max_total = max_private_tx_total_for_wallet(sender);
+        if max_total == 0 {
+            return Err("private send failed: no spendable private inputs available".to_string());
+        }
+        if remaining_fee >= max_total {
             return Err(format!(
-                "recipient wallet '{}' exists but could not be unlocked with provided password; local delivery requires both wallets loaded in the same session",
-                to_raw
+                "private send failed: fee {} exceeds one-transaction input capacity {}",
+                format_zka(remaining_fee),
+                format_zka(max_total)
             ));
         }
-        (target_wallet.commitment_key.clone(), None)
-    } else if looks_like_address {
-        let decoded =
-            validate_user_private_address(&to_raw).map_err(|reason| format!("--to: {reason}"))?;
-        let matched_local = manager.get_private_wallet_names().into_iter().find(|name| {
+        let chunk_amount = remaining_amount.min(max_total.saturating_sub(remaining_fee));
+        if chunk_amount == 0 {
+            return Err(
+                "private send failed: unable to create a non-empty private transfer chunk"
+                    .to_string(),
+            );
+        }
+        let chunk_fee = remaining_fee;
+        let tx_hash = if chunk_fee > 0 {
             manager
-                .get_private_wallet(name)
-                .map(|wallet| wallet.commitment_key == decoded)
+                .send_private_transaction_with_fee(
+                    &from_wallet,
+                    to_commitment.clone(),
+                    chunk_amount,
+                    chunk_fee,
+                )
+                .map_err(|e| format!("private send failed: {e}"))?
+        } else {
+            manager
+                .send_private_transaction(&from_wallet, to_commitment.clone(), chunk_amount)
+                .map_err(|e| format!("private send failed: {e}"))?
+        };
+
+        let tx = manager
+            .get_private_transaction(&tx_hash)
+            .ok_or_else(|| "private tx not found after creation".to_string())?
+            .clone();
+        manager
+            .validate_inbound_private_transaction(&tx)
+            .map_err(|e| format!("private inbound validation failed: {e}"))?;
+        if let Some(db_path) = db_path.as_deref() {
+            persist_local_private_tx_for_node(db_path, &tx_hash, &tx)?;
+        }
+
+        if let Some(recipient_name) = recipient_wallet_name.as_deref() {
+            let decrypted = manager
+                .decrypt_private_amount_for_wallet(recipient_name, &tx)
+                .map_err(|e| format!("recipient decryption check failed: {e}"))?;
+            if decrypted != chunk_amount {
+                return Err(format!(
+                    "privacy integrity check failed: recipient decrypted amount {} but expected {}",
+                    decrypted, chunk_amount
+                ));
+            }
+        }
+
+        for candidate in manager.get_private_wallet_names() {
+            if candidate == from_wallet {
+                continue;
+            }
+            if recipient_wallet_name
+                .as_deref()
+                .map(|name| name == candidate.as_str())
                 .unwrap_or(false)
-        });
-        (decoded, matched_local)
-    } else {
-        return Err(format!(
-            "--to: '{}' is not a known wallet name or zka1 address; run 'wallet-list' to see your wallets, or paste a recipient zka1 address",
-            to_raw
-        ));
-    };
-
-    let tx_hash = if fee > 0 {
-        manager
-            .send_private_transaction_with_fee(&from_wallet, to_commitment.clone(), amount, fee)
-            .map_err(|e| format!("private send failed: {e}"))?
-    } else {
-        manager
-            .send_private_transaction(&from_wallet, to_commitment.clone(), amount)
-            .map_err(|e| format!("private send failed: {e}"))?
-    };
-
-    let tx = manager
-        .get_private_transaction(&tx_hash)
-        .ok_or_else(|| "private tx not found after creation".to_string())?;
-    manager
-        .validate_inbound_private_transaction(&tx)
-        .map_err(|e| format!("private inbound validation failed: {e}"))?;
-    if let Some(db_path) = db_path.as_deref() {
-        persist_local_private_tx_for_node(db_path, &tx_hash, &tx)?;
-    }
-    manager
-        .confirm_private_transaction(&tx_hash)
-        .map_err(|e| format!("private confirm failed: {e}"))?;
-
-    if let Some(recipient_name) = recipient_wallet_name.as_deref() {
-        let decrypted = manager
-            .decrypt_private_amount_for_wallet(recipient_name, &tx)
-            .map_err(|e| format!("recipient decryption check failed: {e}"))?;
-        if decrypted != amount {
-            return Err(format!(
-                "privacy integrity check failed: recipient decrypted amount {} but expected {}",
-                decrypted, amount
-            ));
+            {
+                continue;
+            }
+            let can_decrypt = manager
+                .can_wallet_decrypt_private_tx(&candidate, &tx)
+                .map_err(|e| format!("privacy isolation check failed for '{candidate}': {e}"))?;
+            if can_decrypt {
+                return Err(format!(
+                    "privacy isolation check failed: unrelated wallet '{}' can decrypt private transfer",
+                    candidate
+                ));
+            }
         }
-    }
 
-    for candidate in manager.get_private_wallet_names() {
-        if candidate == from_wallet {
-            continue;
+        let wallet_names = manager.get_private_wallet_names();
+        for name in wallet_names {
+            let _ = manager.receive_private_transaction_for_wallet(&name, &tx);
         }
-        if recipient_wallet_name
-            .as_deref()
-            .map(|name| name == candidate.as_str())
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let can_decrypt = manager
-            .can_wallet_decrypt_private_tx(&candidate, &tx)
-            .map_err(|e| format!("privacy isolation check failed for '{candidate}': {e}"))?;
-        if can_decrypt {
-            return Err(format!(
-                "privacy isolation check failed: unrelated wallet '{}' can decrypt private transfer",
-                candidate
-            ));
-        }
-    }
-
-    let wallet_names = manager.get_private_wallet_names();
-    for name in wallet_names {
-        let _ = manager.receive_private_transaction_for_wallet(&name, &tx);
+        sent_chunks.push((tx_hash, chunk_amount, chunk_fee));
+        remaining_amount = remaining_amount.saturating_sub(chunk_amount);
+        remaining_fee = 0;
     }
     persist_all_private_wallets(&storage, &manager, password.as_deref())?;
 
-    println!("Private transfer confirmed");
-    println!("Hash: {}", tx_hash);
+    println!("Private transfer queued");
+    println!(
+        "Hash: {}",
+        sent_chunks
+            .first()
+            .map(|chunk| chunk.0.as_str())
+            .unwrap_or("unavailable")
+    );
+    if sent_chunks.len() > 1 {
+        println!("Split transactions: {}", sent_chunks.len());
+        for (idx, (hash, chunk_amount, chunk_fee)) in sent_chunks.iter().enumerate() {
+            println!(
+                "- {} | hash={} | amount={} | fee={}",
+                idx + 1,
+                hash,
+                format_zka(*chunk_amount),
+                format_zka(*chunk_fee)
+            );
+        }
+    }
     println!("From: {}", sender_display);
     println!("To: {}", user_private_address_display(&to_commitment));
     println!("Amount: [HIDDEN]");
@@ -6549,6 +8144,23 @@ fn cmd_private_send(args: &[String]) -> Result<(), String> {
         println!("Queued for local node DB: {}", db_path);
     }
     Ok(())
+}
+
+fn max_private_tx_total_for_wallet(wallet: &PrivateWallet) -> u64 {
+    let mut amounts = wallet
+        .private_notes
+        .iter()
+        .filter(|note| !note.spent)
+        .map(|note| note.amount)
+        .collect::<Vec<_>>();
+    if amounts.is_empty() && wallet.private_balance > 0 {
+        return wallet.private_balance;
+    }
+    amounts.sort_by(|lhs, rhs| rhs.cmp(lhs));
+    amounts
+        .into_iter()
+        .take(PRIVATE_TX_MAX_INPUTS)
+        .fold(0u64, |total, amount| total.saturating_add(amount))
 }
 
 fn cmd_wallet_create_unified(args: &[String]) -> Result<(), String> {
@@ -6560,8 +8172,7 @@ fn cmd_wallet_restore_from_seed(args: &[String]) -> Result<(), String> {
     let (_, storage) = wallet_storage_for_args(args)?;
     let wallet_name = option_value(args, "--name")
         .unwrap_or_else(|| generate_available_private_wallet_name(&storage, "wallet"));
-    let seed_phrase = required_option_value(args, "--seed")
-        .or_else(|_| required_option_value(args, "--mnemonic"))?;
+    let seed_phrase = required_seed_phrase_value(args)?;
     let restore_height = parse_u64_arg(
         option_value(args, "--restore-height"),
         0,
@@ -6628,9 +8239,25 @@ fn cmd_wallet_history_unified(args: &[String]) -> Result<(), String> {
 
 fn cmd_wallet_change_passphrase_unified(args: &[String]) -> Result<(), String> {
     let wallet_selector = required_wallet_selector(args)?;
-    let old_password =
-        option_value(args, "--old-password").or_else(|| option_value(args, "--password"));
-    let new_password = required_option_value(args, "--new-password")?;
+    let old_password = option_value(args, "--old-password")
+        .or_else(|| option_value(args, "--password"))
+        .map(Ok)
+        .or_else(|| {
+            option_value(args, "--old-password-env")
+                .or_else(|| option_value(args, "--password-env"))
+                .map(|var_name| secret_from_env_var(&var_name, "--old-password-env"))
+        })
+        .transpose()?;
+    let new_password = option_value(args, "--new-password")
+        .map(Ok)
+        .or_else(|| {
+            option_value(args, "--new-password-env")
+                .map(|var_name| secret_from_env_var(&var_name, "--new-password-env"))
+        })
+        .transpose()?
+        .ok_or_else(|| {
+            "missing required argument: --new-password or --new-password-env".to_string()
+        })?;
     if new_password.is_empty() {
         return Err("--new-password cannot be empty".to_string());
     }
@@ -6657,7 +8284,7 @@ fn cmd_wallet_change_passphrase_unified(args: &[String]) -> Result<(), String> {
 fn cmd_sync_status_unified(args: &[String]) -> Result<(), String> {
     let (network, storage) = wallet_storage_for_args(args)?;
     let wallet_selector = required_wallet_selector(args)?;
-    let password = option_value(args, "--password");
+    let password = password_value(args)?;
     let db_path =
         option_value(args, "--db").or_else(|| Some(network.default_db_path().to_string()));
     let as_json = has_flag(args, "--json");
@@ -6666,7 +8293,7 @@ fn cmd_sync_status_unified(args: &[String]) -> Result<(), String> {
     let wallet = manager
         .get_private_wallet(&wallet_name)
         .ok_or_else(|| format!("wallet not found: {wallet_name}"))?;
-    let chain_height = current_known_height(db_path.as_deref());
+    let chain_height = current_known_height_for_network(db_path.as_deref(), network);
     let scanned_height = chain_height;
     let restore_height = wallet.restore_height;
     let progress = if chain_height == 0 {
@@ -6702,7 +8329,7 @@ fn cmd_sync_status_unified(args: &[String]) -> Result<(), String> {
 fn cmd_wallet_backup_unified(args: &[String]) -> Result<(), String> {
     let wallet_selector = required_wallet_selector(args)?;
     let out_path = required_option_value(args, "--out")?;
-    let password = option_value(args, "--password");
+    let password = password_value(args)?;
     let (network, storage) = wallet_storage_for_args(args)?;
     let manager = load_private_wallet_manager_for_network(&storage, password.as_deref(), network)?;
     let wallet_name = resolve_private_wallet_name_required(&manager, &wallet_selector)?;
@@ -6731,9 +8358,110 @@ fn cmd_wallet_backup_unified(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_wallet_restore_from_backup_unified(args: &[String]) -> Result<(), String> {
+    let in_path = required_option_value(args, "--in")?;
+    let password = required_password_value(args)?;
+    let import_name = option_value(args, "--name");
+    let (network, storage) = wallet_storage_for_args(args)?;
+    let src = PathBuf::from(&in_path);
+    if !src.is_file() {
+        return Err(format!("backup file not found: {}", src.display()));
+    }
+
+    let raw = fs::read_to_string(&src)
+        .map_err(|e| format!("failed to read backup '{}': {e}", src.display()))?;
+    let mut backup: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("backup file is not valid encrypted wallet JSON: {e}"))?;
+
+    let wallet = backup
+        .get_mut("wallet")
+        .and_then(|value| value.as_object_mut())
+        .ok_or_else(|| "backup file is missing wallet metadata".to_string())?;
+    let original_name = wallet
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let wallet_name = import_name.unwrap_or(original_name);
+    if wallet_name.trim().is_empty() {
+        return Err("backup wallet name is empty; pass --name <wallet-name>".to_string());
+    }
+    if wallet_name == "."
+        || wallet_name == ".."
+        || wallet_name.chars().any(|ch| {
+            ch.is_control() || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        })
+    {
+        return Err(
+            "wallet name contains characters that are not safe for a wallet file".to_string(),
+        );
+    }
+    wallet.insert(
+        "name".to_string(),
+        serde_json::Value::String(wallet_name.clone()),
+    );
+    let address = wallet
+        .get("commitment_key")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    if address.trim().is_empty() {
+        return Err("backup file is missing the wallet address".to_string());
+    }
+    let has_spending_key = backup
+        .get("encrypted_spending_key")
+        .and_then(|value| value.as_array())
+        .map(|items| !items.is_empty())
+        .unwrap_or(false);
+    let has_scan_key = backup
+        .get("encrypted_scan_key")
+        .and_then(|value| value.as_array())
+        .map(|items| !items.is_empty())
+        .unwrap_or(false);
+    if !has_spending_key || !has_scan_key {
+        return Err("backup file is not an encrypted private wallet backup".to_string());
+    }
+
+    fs::create_dir_all(storage.private_wallets_dir())
+        .map_err(|e| format!("failed to create private wallet directory: {e}"))?;
+    let dst = storage
+        .private_wallets_dir()
+        .join(format!("{}.private.json", wallet_name));
+    if dst.exists() {
+        return Err(format!(
+            "wallet '{}' already exists locally; choose another --name or remove the existing wallet first",
+            wallet_name
+        ));
+    }
+
+    let encoded = serde_json::to_string_pretty(&backup)
+        .map_err(|e| format!("failed to encode restored backup JSON: {e}"))?;
+    fs::write(&dst, encoded)
+        .map_err(|e| format!("failed to write restored wallet '{}': {e}", dst.display()))?;
+
+    let manager = load_private_wallet_manager_for_network(&storage, Some(&password), network)?;
+    let wallet = match manager.get_private_wallet(&wallet_name) {
+        Some(wallet) => wallet,
+        None => {
+            let _ = fs::remove_file(&dst);
+            return Err(
+                "backup was copied but could not be unlocked with the provided password; import was rolled back"
+                    .to_string(),
+            );
+        }
+    };
+    let address = user_private_address_display(&wallet.commitment_key);
+    println!("Encrypted wallet backup restored");
+    println!("Name: {}", wallet_name);
+    println!("Address: {}", address);
+    print_wallet_ready_notice(&storage, &wallet_name);
+    Ok(())
+}
+
 fn cmd_wallet_wipe_unified(args: &[String]) -> Result<(), String> {
     let wallet_selector = required_wallet_selector(args)?;
-    let password = option_value(args, "--password");
+    let password = password_value(args)?;
     let force = args.iter().any(|a| a == "--force");
     if !force {
         return Err(
@@ -6790,8 +8518,14 @@ fn cmd_tx_send_unified(args: &[String]) -> Result<(), String> {
     let network = NetworkProfile::from_args(args)?;
     let from = required_option_value(args, "--from")?;
     let to = required_option_value(args, "--to")?;
+    let from_commitment = require_private_network_address(&from, "--from")?;
+    let to_commitment = require_private_network_address(&to, "--to")?;
     let amount = required_option_value(args, "--amount")?;
     let password = option_value(args, "--password");
+    let password_env = option_value(args, "--password-env")
+        .or_else(|| option_value(args, "--wallet-password-env"));
+    let password_stdin =
+        has_flag(args, "--password-stdin") || has_flag(args, "--wallet-password-stdin");
     let db_path =
         option_value(args, "--db").or_else(|| Some(network.default_db_path().to_string()));
     let confirm = has_flag(args, "--yes");
@@ -6807,9 +8541,9 @@ fn cmd_tx_send_unified(args: &[String]) -> Result<(), String> {
 
     let mut forwarded = vec![
         "--from".to_string(),
-        from,
+        user_private_address_display(&from_commitment),
         "--to".to_string(),
-        to,
+        user_private_address_display(&to_commitment),
         "--amount".to_string(),
         amount,
         "--fee".to_string(),
@@ -6819,14 +8553,18 @@ fn cmd_tx_send_unified(args: &[String]) -> Result<(), String> {
         network.label().to_string(),
     ];
     push_opt_arg(&mut forwarded, "--password", password);
+    push_opt_arg(&mut forwarded, "--password-env", password_env);
+    if password_stdin {
+        forwarded.push("--password-stdin".to_string());
+    }
     push_opt_arg(&mut forwarded, "--db", db_path);
     cmd_private_send(&forwarded)
 }
 
 fn cmd_height(args: &[String]) -> Result<(), String> {
-    let db_path = option_value(args, "--db");
+    let (network, db_path) = chain_db_path_for_args(args)?;
     let as_json = has_flag(args, "--json");
-    let h = current_known_height(db_path.as_deref());
+    let h = current_known_height_for_network(Some(&db_path), network);
     if as_json {
         println!("{}", serde_json::json!({ "height": h }));
         return Ok(());
@@ -6835,17 +8573,103 @@ fn cmd_height(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_block_info_from_local_rpc(
+    height: u64,
+    as_json: bool,
+    network: NetworkProfile,
+) -> Result<(), String> {
+    let rpc = required_local_rpc_url(network)?;
+    let block = rpc_http_get_json(&rpc, &format!("/blocks/{height}"), 3)?;
+    let private = rpc_http_get_json(&rpc, &format!("/blocks/{height}/private_tx_hashes"), 3)
+        .unwrap_or_else(|_| serde_json::json!({ "private_tx_hashes": [] }));
+    let private_tx_hashes = private
+        .get("private_tx_hashes")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    if as_json {
+        let mut out = block.as_object().cloned().unwrap_or_default();
+        out.insert(
+            "private_tx_hashes".to_string(),
+            serde_json::Value::Array(private_tx_hashes),
+        );
+        out.insert(
+            "source".to_string(),
+            serde_json::Value::String("local_rpc".to_string()),
+        );
+        println!("{}", serde_json::Value::Object(out));
+        return Ok(());
+    }
+
+    println!(
+        "Height:    {}",
+        rpc_json_u64(&block, &["height"]).unwrap_or(height)
+    );
+    println!(
+        "Hash:      {}",
+        block
+            .get("hash")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+    );
+    println!(
+        "Prev hash: {}",
+        block
+            .get("previous_hash")
+            .or_else(|| block.get("prev_hash"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+    );
+    println!(
+        "Timestamp: {}",
+        rpc_json_u64(&block, &["timestamp"]).unwrap_or_default()
+    );
+    println!(
+        "Nonce:     {}",
+        rpc_json_u64(&block, &["nonce"]).unwrap_or_default()
+    );
+    println!(
+        "Reward:    {}",
+        format_zka(rpc_json_u64(&block, &["reward_atoms"]).unwrap_or_default())
+    );
+    println!(
+        "Txs:       {}",
+        rpc_json_u64(&block, &["transactions_count", "tx_count"]).unwrap_or_default()
+    );
+    println!("Private txs: {}", private_tx_hashes.len());
+    if !private_tx_hashes.is_empty() {
+        println!("Private tx hashes:");
+        for hash in &private_tx_hashes {
+            if let Some(hash) = hash.as_str() {
+                println!("- {hash}");
+            }
+        }
+    }
+    println!("Source:    local RPC");
+    Ok(())
+}
+
 fn cmd_block_info(args: &[String]) -> Result<(), String> {
-    let db_path_owned = option_value(args, "--db");
-    let db_path = db_path_owned.as_deref().unwrap_or(".zoka/blockchain.db");
+    let (network, db_path) = chain_db_path_for_args(args)?;
     let height_str = required_option_value(args, "--height")?;
     let height: u64 = height_str
         .parse()
         .map_err(|_| format!("--height must be a non-negative integer (got '{height_str}')"))?;
     let as_json = has_flag(args, "--json");
 
-    let storage = RocksDbStorage::new(db_path)
-        .map_err(|e| format!("failed to open chain db '{db_path}': {e}"))?;
+    let storage = match RocksDbStorage::new(&db_path) {
+        Ok(storage) => storage,
+        Err(e) => {
+            let open_err = format!("failed to open chain db '{db_path}': {e}");
+            if is_storage_lock_error(&open_err) {
+                return cmd_block_info_from_local_rpc(height, as_json, network).map_err(
+                    |rpc_err| format!("{open_err}; local RPC fallback failed: {rpc_err}"),
+                );
+            }
+            return Err(open_err);
+        }
+    };
 
     let block = storage
         .get_block_by_height(height)
@@ -6904,10 +8728,9 @@ fn cmd_block_info(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_chain_stats(args: &[String]) -> Result<(), String> {
-    let db_path_owned = option_value(args, "--db");
-    let db_path = db_path_owned.as_deref().unwrap_or(".zoka/blockchain.db");
+    let (network, db_path) = chain_db_path_for_args(args)?;
     let as_json = has_flag(args, "--json");
-    let storage = RocksDbStorage::new(db_path)
+    let storage = RocksDbStorage::new(&db_path)
         .map_err(|e| format!("failed to open chain db '{db_path}': {e}"))?;
 
     let height = storage
@@ -6946,7 +8769,7 @@ fn cmd_chain_stats(args: &[String]) -> Result<(), String> {
             "{}",
             serde_json::json!({
                 "db": db_path,
-                "chain_id": MAINNET_CHAIN_ID,
+                "chain_id": network.chain_id(),
                 "height": height,
                 "head_hash": head_hash,
                 "state_root": state_root,
@@ -6966,7 +8789,7 @@ fn cmd_chain_stats(args: &[String]) -> Result<(), String> {
                 "amount_unit": "atoms",
                 "atoms_per_zka": economics::ATOMS_PER_ZKA,
                 "halving_in_blocks": halving_in_blocks,
-                "pow_algorithm": active_pow_algorithm(),
+                "pow_algorithm": active_pow_algorithm_for_chain(network.chain_id()),
                 "coinbase_maturity_blocks": COINBASE_MATURITY_BLOCKS,
             })
         );
@@ -6975,7 +8798,7 @@ fn cmd_chain_stats(args: &[String]) -> Result<(), String> {
 
     println!("Chain stats");
     println!("DB:                       {db_path}");
-    println!("Chain id:                 {MAINNET_CHAIN_ID}");
+    println!("Chain id:                 {}", network.chain_id());
     println!("Height:                   {height}");
     println!("Head hash:                {head_hash}");
     println!("State root:               {state_root}");
@@ -6988,7 +8811,10 @@ fn cmd_chain_stats(args: &[String]) -> Result<(), String> {
     println!("Cumulative work:          {cumulative_work}");
     println!("Current difficulty bits:  {current_difficulty_bits}");
     println!("Effective difficulty:     {effective_difficulty_bits} bits");
-    println!("PoW algorithm:            {}", active_pow_algorithm());
+    println!(
+        "PoW algorithm:            {}",
+        active_pow_algorithm_for_chain(network.chain_id())
+    );
     println!("Next height:              {next_height}");
     println!("Next reward:              {}", format_zka(next_reward));
     println!("Halving in:               {halving_in_blocks} block(s)");
@@ -7171,14 +8997,49 @@ fn rpc_http_get_json(
     stream
         .read_to_end(&mut response)
         .map_err(|e| format!("RPC response read failed: {e}"))?;
-    decode_http_json_response(&response, "RPC")
+    decode_http_json_response(&response, &format!("RPC GET {request_path}"))
 }
 
-fn active_rpc_endpoints_from_config(args: &[String]) -> Result<Vec<MainnetRpcEndpoint>, String> {
-    let path = option_value(args, "--network-config")
-        .map(PathBuf::from)
-        .unwrap_or_else(default_mainnet_network_config_path);
-    let config = load_mainnet_network_config(&path)?;
+fn rpc_http_post_json(
+    raw_url: &str,
+    path: &str,
+    body: &serde_json::Value,
+    timeout_secs: u64,
+) -> Result<serde_json::Value, String> {
+    let url = parse_rpc_http_url(raw_url)?;
+    let request_path = rpc_join_path(&url.base_path, path);
+    let timeout = Duration::from_secs(timeout_secs.clamp(1, 10));
+    let payload = serde_json::to_vec(body).map_err(|e| format!("RPC JSON encode failed: {e}"))?;
+    let mut stream = TcpStream::connect((url.host.as_str(), url.port))
+        .map_err(|e| format!("RPC connect failed for {}:{}: {e}", url.host, url.port))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| format!("failed to set RPC read timeout: {e}"))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| format!("failed to set RPC write timeout: {e}"))?;
+    let request = format!(
+        "POST {request_path} HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nUser-Agent: zoka-cli-rpc/0.4\r\n\r\n",
+        url.host,
+        payload.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|_| stream.write_all(&payload))
+        .map_err(|e| format!("RPC request write failed: {e}"))?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(|e| format!("RPC response read failed: {e}"))?;
+    decode_http_json_response(&response, &format!("RPC POST {request_path}"))
+}
+
+fn active_rpc_endpoints_from_config(
+    args: &[String],
+    network: NetworkProfile,
+) -> Result<Vec<MainnetRpcEndpoint>, String> {
+    let path = network_config_path_from_args(args, network);
+    let config = load_network_config_for(&path, network)?;
     Ok(config
         .public_rpc
         .into_iter()
@@ -7186,12 +9047,12 @@ fn active_rpc_endpoints_from_config(args: &[String]) -> Result<Vec<MainnetRpcEnd
         .collect())
 }
 
-fn resolve_rpc_url(args: &[String]) -> Result<String, String> {
+fn resolve_rpc_url(args: &[String], network: NetworkProfile) -> Result<String, String> {
     if let Some(url) = option_value(args, "--rpc") {
         parse_rpc_http_url(&url)?;
         return Ok(url);
     }
-    let active = active_rpc_endpoints_from_config(args)?;
+    let active = active_rpc_endpoints_from_config(args, network)?;
     let Some(rpc) = active.first() else {
         return Err("no active RPC endpoint configured; pass --rpc http://host:port".to_string());
     };
@@ -7199,21 +9060,121 @@ fn resolve_rpc_url(args: &[String]) -> Result<String, String> {
     Ok(rpc.url.clone())
 }
 
+fn best_reachable_rpc_height_from_args(
+    args: &[String],
+    network: NetworkProfile,
+) -> Result<RpcHeightSample, String> {
+    if let Some(rpc) = option_value(args, "--rpc") {
+        parse_rpc_http_url(&rpc)?;
+        let height = rpc_chain_height(&rpc, 3)?;
+        return Ok(RpcHeightSample { rpc, height });
+    }
+
+    let active = active_rpc_endpoints_from_config(args, network)?;
+    let endpoints = active.iter().map(|rpc| rpc.url.clone()).collect::<Vec<_>>();
+    if endpoints.is_empty() {
+        return Err("no active RPC endpoint configured; pass --rpc http://host:port".to_string());
+    }
+    let (samples, errors) = sample_rpc_heights(&endpoints, 3);
+    samples.into_iter().next().ok_or_else(|| {
+        if errors.is_empty() {
+            "no reachable active RPC endpoint configured".to_string()
+        } else {
+            format!(
+                "no reachable active RPC endpoint configured: {}",
+                errors.join("; ")
+            )
+        }
+    })
+}
+
+fn local_canonical_hash_at_height(
+    db_path: Option<&str>,
+    height: u64,
+) -> Result<Option<String>, String> {
+    let Some(path) = db_path else {
+        return Ok(None);
+    };
+    let storage = RocksDbStorage::new(path)
+        .map_err(|err| format!("failed to open local chain DB for sync gate: {err}"))?;
+    storage
+        .get_canonical_block_hash_at_height(height)
+        .map_err(|err| format!("failed to read local canonical hash at height {height}: {err:?}"))
+}
+
+fn ensure_local_chain_matches_rpc_at_height(
+    rpc: &str,
+    db_path: Option<&str>,
+    height: u64,
+) -> Result<(), String> {
+    if height == 0 {
+        return Ok(());
+    }
+    let Some(local_hash) = local_canonical_hash_at_height(db_path, height)? else {
+        return Ok(());
+    };
+    let remote_hash = fetch_rpc_block_response(rpc, height)?.block_hash;
+    if local_hash != remote_hash {
+        return Err(format!(
+            "mining locked: local chain differs from network bootstrap at height {height}. local={local_hash}, bootstrap={remote_hash}. Run rpc-sync/reorg recovery before mining."
+        ));
+    }
+    Ok(())
+}
+
+fn standalone_mining_sync_gate(
+    args: &[String],
+    network: NetworkProfile,
+    db_path: Option<&str>,
+) -> Result<Option<String>, String> {
+    if has_flag(args, "--allow-unsynced-mining") {
+        return Ok(Some(
+            "Sync gate bypassed by --allow-unsynced-mining; this is only for isolated development."
+                .to_string(),
+        ));
+    }
+    if network != NetworkProfile::Mainnet {
+        return Ok(None);
+    }
+
+    let best_rpc = best_reachable_rpc_height_from_args(args, network)?;
+    let rpc = best_rpc.rpc;
+    let network_height = best_rpc.height;
+    let local_height = current_known_height_for_network(db_path, network);
+    ensure_local_chain_matches_rpc_at_height(&rpc, db_path, local_height.min(network_height))?;
+    if network_height > local_height {
+        return Err(format!(
+            "mining locked until sync completes: local height {local_height}, network height {network_height} via {rpc}. Start `zokahd --network {}` first and wait until local height catches up, or pass --allow-unsynced-mining only for isolated development.",
+            network.label()
+        ));
+    }
+    if local_height > network_height {
+        return Err(format!(
+            "mining locked because local height {local_height} is ahead of network bootstrap height {network_height} via {rpc}. Wait for the bootstrap to catch up or run a connected fullnode session; pass --allow-unsynced-mining only for isolated development."
+        ));
+    }
+
+    Ok(Some(format!(
+        "Sync gate OK: local height {local_height}, network height {network_height} via {rpc}."
+    )))
+}
+
 fn cmd_rpc_list(args: &[String]) -> Result<(), String> {
     let as_json = has_flag(args, "--json");
-    let active = active_rpc_endpoints_from_config(args)?;
+    let network = NetworkProfile::from_args(args)?;
+    let active = active_rpc_endpoints_from_config(args, network)?;
     if as_json {
         println!(
             "{}",
             serde_json::json!({
-                "chain_id": MAINNET_CHAIN_ID,
+                "chain_id": network.chain_id(),
                 "active_rpc": active,
             })
         );
         return Ok(());
     }
     println!("Configured active RPC endpoints");
-    println!("Chain id: {MAINNET_CHAIN_ID}");
+    println!("Chain id: {}", network.chain_id());
     if active.is_empty() {
         println!("No active RPC endpoints configured.");
         return Ok(());
@@ -7238,7 +9199,9 @@ fn rpc_json_u64(value: &serde_json::Value, keys: &[&str]) -> Option<u64> {
 
 fn cmd_rpc_height(args: &[String]) -> Result<(), String> {
     let as_json = has_flag(args, "--json");
-    let rpc = resolve_rpc_url(args)?;
+    let network = NetworkProfile::from_args(args)?;
+    let chain_id = network.chain_id();
+    let rpc = resolve_rpc_url(args, network)?;
     let timeout_secs = parse_u64_arg(option_value(args, "--timeout-secs"), 3, "--timeout-secs")?;
     let body = rpc_http_get_json(&rpc, "/chain/height", timeout_secs)?;
     let height = rpc_json_u64(&body, &["height", "chain_height"])
@@ -7248,7 +9211,7 @@ fn cmd_rpc_height(args: &[String]) -> Result<(), String> {
             "{}",
             serde_json::json!({
                 "rpc": rpc,
-                "chain_id": MAINNET_CHAIN_ID,
+                "chain_id": chain_id,
                 "height": height,
                 "raw": body,
             })
@@ -7256,15 +9219,93 @@ fn cmd_rpc_height(args: &[String]) -> Result<(), String> {
     } else {
         println!("RPC height");
         println!("Endpoint: {rpc}");
-        println!("Chain id: {MAINNET_CHAIN_ID}");
+        println!("Chain id: {chain_id}");
         println!("Height:   {height}");
+    }
+    Ok(())
+}
+
+fn cmd_rpc_sync(args: &[String]) -> Result<(), String> {
+    let as_json = has_flag(args, "--json");
+    let (network, db_path) = chain_db_path_for_args(args)?;
+    let chain_id = network.chain_id();
+    let active = active_rpc_endpoints_from_config(args, network)?;
+    let rpc_endpoints = active.iter().map(|rpc| rpc.url.clone()).collect::<Vec<_>>();
+    if rpc_endpoints.is_empty() {
+        return Err("no active RPC endpoint configured for sync".to_string());
+    }
+    let limit = parse_u64_arg(option_value(args, "--limit"), 1024, "--limit")?.clamp(1, 100_000);
+    {
+        let storage = open_storage(&db_path)?;
+        ensure_atomic_economics_db(&storage)?;
+    }
+    let mut peer_view = zoka::state::sync::PeerChainView::default();
+    let start_height = current_known_height_for_network(Some(&db_path), network);
+    let mut imported = 0u64;
+    let mut events = Vec::new();
+    let mut stalled_backfill_rounds = 0u32;
+
+    while imported < limit {
+        let before = current_known_height_for_network(Some(&db_path), network);
+        let batch_limit = (limit - imported).min(64);
+        let Some(event) = run_rpc_sync_batch(
+            chain_id,
+            Some(&db_path),
+            &rpc_endpoints,
+            &mut peer_view,
+            None,
+            batch_limit,
+        )?
+        else {
+            break;
+        };
+        events.push(event);
+        let after = current_known_height_for_network(Some(&db_path), network);
+        if after <= before {
+            if peer_view.has_active_branch_backfill() && stalled_backfill_rounds < 32 {
+                stalled_backfill_rounds = stalled_backfill_rounds.saturating_add(1);
+                continue;
+            }
+            break;
+        }
+        stalled_backfill_rounds = 0;
+        imported = imported.saturating_add(after - before);
+    }
+
+    let end_height = current_known_height_for_network(Some(&db_path), network);
+    if as_json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "chain_id": chain_id,
+                "db": db_path,
+                "start_height": start_height,
+                "end_height": end_height,
+                "imported": imported,
+                "rpc_endpoints": rpc_endpoints,
+                "events": events,
+            })
+        );
+        return Ok(());
+    }
+
+    println!("RPC sync");
+    println!("Chain id:      {chain_id}");
+    println!("DB:            {db_path}");
+    println!("Start height:  {start_height}");
+    println!("End height:    {end_height}");
+    println!("Imported:      {imported}");
+    for event in events.iter().rev().take(5).rev() {
+        println!("- {event}");
     }
     Ok(())
 }
 
 fn cmd_rpc_mempool(args: &[String]) -> Result<(), String> {
     let as_json = has_flag(args, "--json");
-    let rpc = resolve_rpc_url(args)?;
+    let network = NetworkProfile::from_args(args)?;
+    let chain_id = network.chain_id();
+    let rpc = resolve_rpc_url(args, network)?;
     let timeout_secs = parse_u64_arg(option_value(args, "--timeout-secs"), 3, "--timeout-secs")?;
     let body = rpc_http_get_json(&rpc, "/mempool/size", timeout_secs)?;
     let size = rpc_json_u64(&body, &["size", "pending", "mempool_size"])
@@ -7274,7 +9315,7 @@ fn cmd_rpc_mempool(args: &[String]) -> Result<(), String> {
             "{}",
             serde_json::json!({
                 "rpc": rpc,
-                "chain_id": MAINNET_CHAIN_ID,
+                "chain_id": chain_id,
                 "mempool_size": size,
                 "raw": body,
             })
@@ -7282,7 +9323,7 @@ fn cmd_rpc_mempool(args: &[String]) -> Result<(), String> {
     } else {
         println!("RPC mempool");
         println!("Endpoint: {rpc}");
-        println!("Chain id: {MAINNET_CHAIN_ID}");
+        println!("Chain id: {chain_id}");
         println!("Size:     {size}");
     }
     Ok(())
@@ -7290,7 +9331,9 @@ fn cmd_rpc_mempool(args: &[String]) -> Result<(), String> {
 
 fn cmd_rpc_status(args: &[String]) -> Result<(), String> {
     let as_json = has_flag(args, "--json");
-    let rpc = resolve_rpc_url(args)?;
+    let network = NetworkProfile::from_args(args)?;
+    let chain_id = network.chain_id();
+    let rpc = resolve_rpc_url(args, network)?;
     let timeout_secs = parse_u64_arg(option_value(args, "--timeout-secs"), 3, "--timeout-secs")?;
     let health = rpc_http_get_json(&rpc, "/health", timeout_secs)?;
     let height_body = rpc_http_get_json(&rpc, "/chain/height", timeout_secs)?;
@@ -7300,7 +9343,7 @@ fn cmd_rpc_status(args: &[String]) -> Result<(), String> {
             "{}",
             serde_json::json!({
                 "rpc": rpc,
-                "chain_id": MAINNET_CHAIN_ID,
+                "chain_id": chain_id,
                 "reachable": true,
                 "height": height,
                 "health": health,
@@ -7310,7 +9353,7 @@ fn cmd_rpc_status(args: &[String]) -> Result<(), String> {
     } else {
         println!("RPC status");
         println!("Endpoint:  {rpc}");
-        println!("Chain id:  {MAINNET_CHAIN_ID}");
+        println!("Chain id:  {chain_id}");
         println!("Reachable: yes");
         if let Some(height) = height {
             println!("Height:    {height}");
@@ -7493,7 +9536,7 @@ fn cmd_mine_console(args: &[String]) -> Result<(), String> {
         None => None,
     };
     let fee_snapshot = refresh_fee_market_snapshot(db_path.as_deref(), password.as_deref());
-    let known_height = current_known_height(db_path.as_deref());
+    let known_height = current_known_height_for_network(db_path.as_deref(), network);
 
     if as_json {
         println!(
@@ -7575,7 +9618,7 @@ fn cmd_status_overview(args: &[String]) -> Result<(), String> {
     let as_json = has_flag(args, "--json");
     let db_exists = Path::new(&db_path).exists();
     let chain_height = if db_exists {
-        current_known_height(Some(&db_path))
+        current_known_height_for_network(Some(&db_path), network)
     } else {
         0
     };
@@ -7814,7 +9857,7 @@ fn cmd_node_status(args: &[String]) -> Result<(), String> {
     let as_json = has_flag(args, "--json");
     let db_exists = Path::new(&db_path).exists();
     let chain_height = if db_exists {
-        current_known_height(Some(&db_path))
+        current_known_height_for_network(Some(&db_path), network)
     } else {
         0
     };
@@ -7949,11 +9992,14 @@ fn cmd_node_status(args: &[String]) -> Result<(), String> {
 fn cmd_mine_easy(args: &[String]) -> Result<(), String> {
     let network = NetworkProfile::from_args(args)?;
     let chain_id = network.chain_id().to_string();
-    let wallet_selector = wallet_selector_value(args)
-        .ok_or_else(|| "missing required argument: --address <wallet-address|name>".to_string())?;
-    let password = option_value(args, "--password");
+    let wallet_selector_raw = wallet_selector_value(args)
+        .ok_or_else(|| "missing required argument: --address <wallet-address>".to_string())?;
+    let wallet_commitment = require_private_network_address(&wallet_selector_raw, "--address")?;
+    let wallet_selector = user_private_address_display(&wallet_commitment);
+    let password = password_value(args)?;
     let db_path =
         option_value(args, "--db").or_else(|| Some(network.default_db_path().to_string()));
+    let sync_gate_note = standalone_mining_sync_gate(args, network, db_path.as_deref())?;
     if let Some(path) = db_path.as_deref() {
         let storage = open_storage(path)?;
         ensure_atomic_economics_db(&storage)?;
@@ -8037,7 +10083,7 @@ fn cmd_mine_easy(args: &[String]) -> Result<(), String> {
     let session_started = Instant::now();
     let mut session_blocks = 0u64;
     let mut session_rewards = 0u64;
-    let mut status_line = format!(
+    let ready_line = format!(
         "Ready. Mining {} into {} with {} at {} bits using {}.",
         network.label(),
         wallet.address,
@@ -8045,6 +10091,10 @@ fn cmd_mine_easy(args: &[String]) -> Result<(), String> {
         unsafe_rehearsal_difficulty_bits.unwrap_or(base_difficulty),
         mining_power_label_for_threads(mining_threads)
     );
+    let mut status_line = sync_gate_note
+        .as_deref()
+        .map(|note| format!("{note} {ready_line}"))
+        .unwrap_or(ready_line);
 
     let render = |current_state: &UserMiningState,
                   status_line: &str,
@@ -8058,7 +10108,7 @@ fn cmd_mine_easy(args: &[String]) -> Result<(), String> {
             network,
         )?;
         let fee_snapshot = refresh_fee_market_snapshot(db_path.as_deref(), password.as_deref());
-        let known_height = current_known_height(db_path.as_deref());
+        let known_height = current_known_height_for_network(db_path.as_deref(), network);
         let screen = render_mining_dashboard(
             Some(&wallet_snapshot),
             current_state,
@@ -8113,12 +10163,17 @@ fn cmd_mine_easy(args: &[String]) -> Result<(), String> {
         };
         let batch = {
             let mut last_live_render: Option<Instant> = None;
+            let mut last_progress_log = Instant::now() - Duration::from_secs(10);
             let mut progress_callback = |progress: &MiningProgressSnapshot| -> Result<(), String> {
                 let should_render = last_live_render
                     .map(|last| last.elapsed() >= Duration::from_millis(800))
                     .unwrap_or(true);
                 if !should_render {
                     return Ok(());
+                }
+                if last_progress_log.elapsed() >= Duration::from_secs(3) {
+                    mining_progress_log(progress);
+                    last_progress_log = Instant::now();
                 }
 
                 live_state.is_mining = true;
@@ -8191,7 +10246,7 @@ async fn run() -> Result<(), String> {
         if first == "--help" || first == "-h" || first == "help" {
             println!("zokahd (automatic fullnode)");
             println!(
-                "Usage: zokahd [--network mainnet|testnet] [--address <wallet-address>] [--password <pwd>] [--seed <multiaddr> ...] [--network-config <file>] [--no-network-config] [--allow-clearnet-seeds] [--allow-isolated-start] [--seconds <n>] [--show-keys] [--no-mine] [--power low|normal|max] [--threads <n>] [--db <path>] [--genesis <file>] [--inline]"
+                "Usage: zokahd [--network mainnet|testnet] [--address <wallet-address>] [--password <pwd>|--password-env <var>|--password-stdin] [--seed <multiaddr> ...] [--network-config <file>] [--no-network-config] [--allow-clearnet-seeds] [--allow-isolated-start] [--seconds <n>] [--show-keys] [--no-mine] [--power low|normal|max] [--threads <n>] [--db <path>] [--genesis <file>] [--tor-proxy host:port] [--tor-only] [--inline]"
             );
             println!(
                 "Runs fullnode + sync warmup + auto-mining by default until interrupted. --password is required when auto-creating a wallet."
@@ -8231,6 +10286,7 @@ async fn run() -> Result<(), String> {
             let args = normalize_positional_alias_args(tail, &["--seed"]);
             cmd_wallet_restore_from_seed(&args)
         }
+        "generate-seed" => cmd_wallet_generate_seed(tail),
         "wallets" | "list" => cmd_wallet_list_unified(tail),
         "balance" => {
             let args = normalize_positional_alias_args(tail, &["--address"]);
@@ -8265,12 +10321,18 @@ async fn run() -> Result<(), String> {
             let args = normalize_positional_alias_args(tail, &["--address", "--out"]);
             cmd_wallet_backup_unified(&args)
         }
+        "restore-backup" => {
+            let args = normalize_positional_alias_args(tail, &["--in"]);
+            cmd_wallet_restore_from_backup_unified(&args)
+        }
         "wipe" => {
             let args = normalize_positional_alias_args(tail, &["--address"]);
             cmd_wallet_wipe_unified(&args)
         }
         "wallet-create" => cmd_wallet_create_unified(tail),
+        "wallet-generate-seed" => cmd_wallet_generate_seed(tail),
         "wallet-restore-from-seed" => cmd_wallet_restore_from_seed(tail),
+        "wallet-restore-from-backup" => cmd_wallet_restore_from_backup_unified(tail),
         "wallet-restore-from-keys" => cmd_wallet_restore_from_keys_unified(tail),
         "wallet-import" => cmd_wallet_import_disabled(tail),
         "wallet-change-passphrase" => cmd_wallet_change_passphrase_unified(tail),
@@ -8308,12 +10370,14 @@ async fn run() -> Result<(), String> {
         "rpc-list" => cmd_rpc_list(tail),
         "rpc-status" => cmd_rpc_status(tail),
         "rpc-height" => cmd_rpc_height(tail),
+        "rpc-sync" => cmd_rpc_sync(tail),
         "rpc-mempool" => cmd_rpc_mempool(tail),
         "release-keygen" => cmd_release_keygen(tail),
         "snapshot-info" => cmd_snapshot_info(tail),
         "snapshot-export" => cmd_snapshot_export(tail),
         "snapshot-import" => cmd_snapshot_import(tail),
         "chain-prune" => cmd_chain_prune(tail),
+        "trusted-setup-init" => cmd_trusted_setup_init(tail),
         other => Err(format!(
             "unknown command: {other}. Run `zoka` for the guided console or `zoka help` for commands."
         )),
@@ -8813,10 +10877,190 @@ fn cmd_genesis_verify(args: &[String]) -> Result<(), String> {
 
 #[tokio::main]
 async fn main() {
+    setup_zoka_home();
     if let Err(err) = run().await {
         eprintln!("{err}");
         std::process::exit(1);
     }
+}
+
+/// Resolve the canonical Zoka data directory (shared by CLI and ZSilent) and
+/// change the process working directory into it before any subcommand runs.
+/// All existing relative paths like ".zoka/mainnet" then resolve against the
+/// single shared home, regardless of where the binary was launched from.
+fn setup_zoka_home() {
+    let home = zoka_home();
+    if fs::create_dir_all(&home).is_err() {
+        return;
+    }
+    migrate_legacy_zoka_dirs(&home);
+    let _ = std::env::set_current_dir(&home);
+}
+
+/// Canonical per-user Zoka home. Resolution order:
+///   1. $ZOKA_HOME (explicit override)
+///   2. Windows: %APPDATA%\Zoka
+///   3. macOS:   ~/Library/Application Support/Zoka
+///   4. Linux/other: $XDG_DATA_HOME/zoka or ~/.local/share/zoka
+///   5. Fallback: current working directory (legacy behavior)
+fn zoka_home() -> PathBuf {
+    if let Ok(dir) = std::env::var("ZOKA_HOME") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            if !appdata.trim().is_empty() {
+                return PathBuf::from(appdata).join("Zoka");
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.trim().is_empty() {
+                return PathBuf::from(home)
+                    .join("Library")
+                    .join("Application Support")
+                    .join("Zoka");
+            }
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+            if !xdg.trim().is_empty() {
+                return PathBuf::from(xdg).join("zoka");
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.trim().is_empty() {
+                return PathBuf::from(home).join(".local").join("share").join("zoka");
+            }
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// One-shot migration. Looks at known legacy locations and, if the new home is
+/// still empty, copies the `.zoka/` tree over so existing CLI and ZSilent users
+/// keep their wallets and chain state when the binary is upgraded.
+fn migrate_legacy_zoka_dirs(home: &Path) {
+    let target = home.join(".zoka");
+    if zoka_dir_has_data(&target) {
+        return;
+    }
+    // Build the candidate list with the historically-used user data
+    // locations first, so a stray `.zoka/` left behind in a dev or build
+    // directory cannot shadow the real wallet.
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    #[cfg(target_os = "windows")]
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let legacy = PathBuf::from(appdata).join("ZSilent Core").join(".zoka");
+        if legacy != target {
+            candidates.push(legacy);
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let legacy = cwd.join(".zoka");
+        if legacy != target && !candidates.contains(&legacy) {
+            candidates.push(legacy);
+        }
+    }
+
+    // Score each candidate by total bytes of wallet files so we always pick
+    // the "richest" legacy tree instead of the first one we find.
+    let mut best: Option<(u64, PathBuf)> = None;
+    for source in candidates {
+        if !zoka_dir_has_data(&source) {
+            continue;
+        }
+        let score = zoka_dir_wallet_bytes(&source);
+        if score == 0 {
+            continue;
+        }
+        match &best {
+            Some((current, _)) if *current >= score => {}
+            _ => best = Some((score, source)),
+        }
+    }
+    let Some((_, source)) = best else { return };
+
+    if copy_dir_recursive(&source, &target).is_ok() {
+        eprintln!(
+            "zoka: migrated legacy data from '{}' to shared home '{}'",
+            source.display(),
+            target.display()
+        );
+    }
+}
+
+/// Total bytes of every private wallet file under any network subdir. Used as
+/// a heuristic to pick the most meaningful legacy tree during migration.
+fn zoka_dir_wallet_bytes(root: &Path) -> u64 {
+    let mut total: u64 = 0;
+    for network in ["mainnet", "testnet"] {
+        for sub in ["private_wallets", "wallets"] {
+            let dir = root.join(network).join(sub);
+            if let Ok(entries) = fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    if let Ok(meta) = entry.metadata() {
+                        if meta.is_file() {
+                            total = total.saturating_add(meta.len());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    total
+}
+
+/// A Zoka data tree counts as "having data" if at least one wallet file or a
+/// blockchain.db exists under any network subdir. Empty placeholder folders
+/// (e.g. created by an early wallet-storage init) don't count.
+fn zoka_dir_has_data(root: &Path) -> bool {
+    if !root.is_dir() {
+        return false;
+    }
+    for network in ["mainnet", "testnet"] {
+        let net = root.join(network);
+        if !net.is_dir() {
+            continue;
+        }
+        if let Ok(entries) = fs::read_dir(net.join("private_wallets")) {
+            if entries.flatten().next().is_some() {
+                return true;
+            }
+        }
+        if let Ok(entries) = fs::read_dir(net.join("wallets")) {
+            if entries.flatten().next().is_some() {
+                return true;
+            }
+        }
+        if net.join("blockchain.db").is_dir() {
+            return true;
+        }
+    }
+    false
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let dst_path = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&entry.path(), &dst_path)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), dst_path)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -8957,7 +11201,10 @@ mod tests {
         storage.set_chain_height(7).expect("set height");
         drop(storage);
 
-        assert_eq!(current_known_height(Some(&db)), 7);
+        assert_eq!(
+            current_known_height_for_network(Some(&db), NetworkProfile::Mainnet),
+            7
+        );
     }
 
     #[test]
@@ -9010,6 +11257,21 @@ mod tests {
     fn validate_address_accepts_canonical_zka1() {
         let addr = make_valid_zka1();
         let canonical = validate_user_private_address(&addr).expect("valid zka1 address");
+        assert!(canonical.starts_with("zpriv:"));
+    }
+
+    #[test]
+    fn network_operations_reject_local_wallet_names() {
+        let err = require_private_network_address("alice", "--from").unwrap_err();
+        assert!(err.contains("full zka1 wallet address"));
+        assert!(err.contains("local wallet names are not accepted"));
+    }
+
+    #[test]
+    fn network_operations_accept_full_wallet_addresses() {
+        let addr = make_valid_zka1();
+        let canonical =
+            require_private_network_address(&addr, "--address").expect("valid network address");
         assert!(canonical.starts_with("zpriv:"));
     }
 
@@ -9100,12 +11362,12 @@ mod tests {
 
     #[test]
     fn rpc_http_url_parser_accepts_local_http_only() {
-        let parsed = parse_rpc_http_url("http://127.0.0.1:28880/api").expect("http url");
-        assert_eq!(parsed.host, "127.0.0.1");
+        let parsed = parse_rpc_http_url("http://node.local:28880/api").expect("http url");
+        assert_eq!(parsed.host, "node.local");
         assert_eq!(parsed.port, 28880);
         assert_eq!(parsed.base_path, "/api");
         assert!(parse_rpc_http_url("https://rpc.example").is_err());
-        assert!(parse_rpc_http_url("http://user:pass@127.0.0.1").is_err());
+        assert!(parse_rpc_http_url("http://user:pass@node.local").is_err());
     }
 
     #[test]
@@ -9257,4 +11519,146 @@ mod tests {
         assert_eq!(with_clearnet.len(), 2);
         assert_eq!(with_clearnet[1].transport, "tcp");
     }
+}
+
+// ---------------------------------------------------------------------------
+// trusted-setup-init
+// ---------------------------------------------------------------------------
+
+fn cmd_trusted_setup_init(args: &[String]) -> Result<(), String> {
+    use zoka::zk::groth16_backend::generate_circuit_params_with_osrng;
+    use zoka::zk::setup_io::{
+        compute_directory_digest, write_circuit_params, write_digest, REQUIRED_CIRCUITS,
+    };
+
+    let out_dir = option_value(args, "--out").unwrap_or_else(|| "./trusted-setup".to_string());
+    let force = has_flag(args, "--force");
+    let as_json = has_flag(args, "--json");
+    let out_path = std::path::Path::new(&out_dir);
+
+    if out_path.exists() && !force {
+        // Check if it already has params; refuse to overwrite silently.
+        let has_files = std::fs::read_dir(out_path)
+            .ok()
+            .and_then(|mut d| d.next())
+            .is_some();
+        if has_files {
+            return Err(format!(
+                "output directory '{}' already exists and is non-empty. \
+                 Use --force to overwrite.",
+                out_dir
+            ));
+        }
+    }
+
+    std::fs::create_dir_all(out_path)
+        .map_err(|e| format!("failed to create output directory '{}': {e}", out_dir))?;
+
+    if !as_json {
+        println!("{}", dashboard_divider());
+        println!("{}", dashboard_section("Trusted Setup Ceremony", ANSI_CYAN));
+        println!("{}", dashboard_line("Output", &out_dir));
+        println!(
+            "{}",
+            dashboard_line(
+                "Entropy source",
+                "OsRng (kernel entropy — not reproducible, toxic waste never stored)"
+            )
+        );
+        println!(
+            "{}",
+            dashboard_line("Circuits", &REQUIRED_CIRCUITS.join(", "))
+        );
+        println!("{}", dashboard_divider());
+        println!();
+        println!("Generating parameters for 4 circuits. Each circuit takes ~5-30s.");
+        println!("The randomness comes from your OS entropy pool and is discarded");
+        println!("as soon as the Parameters object is written to disk.");
+        println!();
+    }
+
+    let total_start = std::time::Instant::now();
+    let mut circuit_digests: Vec<(String, String, f64)> = Vec::new();
+
+    for circuit in REQUIRED_CIRCUITS {
+        if !as_json {
+            print!(
+                "  [{}/{}] Generating {}... ",
+                circuit_digests.len() + 1,
+                REQUIRED_CIRCUITS.len(),
+                circuit
+            );
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+
+        let t = std::time::Instant::now();
+        let params = generate_circuit_params_with_osrng(circuit)?;
+        let elapsed = t.elapsed().as_secs_f64();
+
+        write_circuit_params(out_path, circuit, &params)
+            .map_err(|e| format!("failed to write {circuit} params: {e}"))?;
+
+        // Hash just this file for per-circuit reporting
+        let file_name = format!("{circuit}.params");
+        let file_path = out_path.join(&file_name);
+        let file_bytes = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
+
+        if !as_json {
+            println!(
+                "done ({:.1}s, {:.0} KB)",
+                elapsed,
+                file_bytes as f64 / 1024.0
+            );
+        }
+
+        circuit_digests.push((circuit.to_string(), file_name, elapsed));
+    }
+
+    // Compute and write the bundle digest
+    let digest = compute_directory_digest(out_path)
+        .map_err(|e| format!("failed to compute setup digest: {e}"))?;
+    write_digest(out_path, &digest).map_err(|e| format!("failed to write DIGEST file: {e}"))?;
+
+    let digest_hex = hex::encode(digest);
+    let total_elapsed = total_start.elapsed().as_secs_f64();
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "ok",
+                "out_dir": out_dir,
+                "digest": digest_hex,
+                "circuits": circuit_digests.iter().map(|(name, file, secs)| {
+                    serde_json::json!({ "circuit": name, "file": file, "secs": secs })
+                }).collect::<Vec<_>>(),
+                "total_secs": total_elapsed,
+                "env_var": format!("ZOKA_TRUSTED_SETUP_DIR={}", out_dir),
+            })
+        );
+    } else {
+        println!();
+        println!("{}", dashboard_divider());
+        println!("{}", dashboard_section("Ceremony Complete", ANSI_GREEN));
+        println!(
+            "{}",
+            dashboard_line("Total time", &format!("{:.1}s", total_elapsed))
+        );
+        println!("{}", dashboard_line("Output dir", &out_dir));
+        println!("{}", dashboard_line("Bundle digest", &digest_hex));
+        println!("{}", dashboard_divider());
+        println!();
+        println!("To use this trusted setup, set the environment variable:");
+        println!();
+        println!("  Windows:  $env:ZOKA_TRUSTED_SETUP_DIR = \"{}\"", out_dir);
+        println!("  Linux:    export ZOKA_TRUSTED_SETUP_DIR={}", out_dir);
+        println!();
+        println!("All nodes using this network must point to the same bundle");
+        println!("(same digest: {}).", &digest_hex[..16]);
+        println!();
+        println!("To bind the binary to this specific CRS at compile time:");
+        println!("  ZOKA_EXPECTED_SETUP_DIGEST_COMPILED={}", digest_hex);
+    }
+
+    Ok(())
 }

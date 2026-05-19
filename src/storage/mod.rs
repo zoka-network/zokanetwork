@@ -1,7 +1,9 @@
 use crate::types::{AccountState, Block, State, StorageError, Transaction};
 use rocksdb::{IteratorMode, Options, WriteBatch, DB};
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::env;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 const PENDING_PRIVATE_TX_PREFIX: &str = "mempool:private:pending:";
 const PENDING_PRIVATE_TX_COUNT_KEY: &str = "mempool:private:count";
@@ -19,15 +21,51 @@ pub struct RocksDbStorage {
     db: Arc<DB>,
 }
 
+static ROCKSDB_HANDLES: OnceLock<Mutex<HashMap<PathBuf, Weak<DB>>>> = OnceLock::new();
+
+fn normalize_db_path(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
 impl RocksDbStorage {
     /// Initialize RocksDB storage at the specified path
     pub fn new(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let path = normalize_db_path(path.as_ref());
+        let handles = ROCKSDB_HANDLES.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut handles = handles.lock().map_err(|e| {
+            StorageError::DatabaseError(format!("rocksdb handle cache poisoned: {e}"))
+        })?;
+        if let Some(db) = handles.get(&path).and_then(Weak::upgrade) {
+            return Ok(RocksDbStorage { db });
+        }
+
         let mut opts = Options::default();
         opts.create_if_missing(true);
 
-        let db = DB::open(&opts, path).map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+        let db = Arc::new(
+            DB::open(&opts, &path).map_err(|e| StorageError::DatabaseError(e.to_string()))?,
+        );
+        handles.insert(path, Arc::downgrade(&db));
 
-        Ok(RocksDbStorage { db: Arc::new(db) })
+        Ok(RocksDbStorage { db })
     }
 
     /// Get raw bytes from storage
@@ -813,6 +851,27 @@ mod tests {
         // Test state root metadata
         storage.set_state_root("root-1").unwrap();
         assert_eq!(storage.get_state_root().unwrap(), "root-1");
+
+        let _ = fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn test_storage_reopens_same_path_in_process() {
+        let test_dir = ".zoka/test-suite/.test_storage_reopen_same_path";
+        let _ = fs::remove_dir_all(test_dir);
+
+        {
+            let first = RocksDbStorage::new(test_dir).expect("first storage");
+            let second = RocksDbStorage::new(test_dir).expect("second storage");
+
+            first
+                .put_raw("shared-key", b"shared-value".to_vec())
+                .unwrap();
+            assert_eq!(
+                second.get_raw("shared-key").unwrap(),
+                Some(b"shared-value".to_vec())
+            );
+        }
 
         let _ = fs::remove_dir_all(test_dir);
     }

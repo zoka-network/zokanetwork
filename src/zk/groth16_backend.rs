@@ -70,7 +70,7 @@ pub const PRIVATE_TX_PUBLIC_INPUT_WORDS: usize = 2
     + PRIVATE_TX_MERKLE_PROVEN_INPUTS
     + (PRIVATE_TX_MERKLE_PROVEN_INPUTS * PRIVATE_TREE_SCALAR_WORDS)
     + PRIVATE_TX_ROOT_WORDS; // header + padded input key images + proven input flags + proven input commitment words + root anchor
-pub const PRIVATE_TX_RANGE_BITS: usize = 32;
+pub const PRIVATE_TX_RANGE_BITS: usize = 64;
 
 const MERKLE_DEPTH: usize = 16;
 
@@ -125,6 +125,30 @@ fn build_bundle_from_params(
 /// and is dropped afterwards. That is strictly better than the seeded
 /// fallback, but still weaker than a multi-party ceremony: one operator
 /// could in principle instrument the RNG. The only cure for that is MPC.
+/// Generate Groth16 parameters for a single named circuit using OS entropy.
+/// Returns an error string if the circuit name is unrecognised.
+pub fn generate_circuit_params_with_osrng(circuit: &str) -> Result<Parameters<Bls12>, String> {
+    match circuit {
+        BALANCE_CIRCUIT => {
+            generate_random_parameters::<Bls12, _, _>(GrothBalanceCircuit::blank(), &mut OsRng)
+                .map_err(|e| format!("setup for {circuit}: {e}"))
+        }
+        MERKLE_CIRCUIT => {
+            generate_random_parameters::<Bls12, _, _>(GrothMerkleCircuit::blank(), &mut OsRng)
+                .map_err(|e| format!("setup for {circuit}: {e}"))
+        }
+        NULLIFIER_CIRCUIT => {
+            generate_random_parameters::<Bls12, _, _>(GrothNullifierCircuit::blank(), &mut OsRng)
+                .map_err(|e| format!("setup for {circuit}: {e}"))
+        }
+        PRIVATE_TX_CIRCUIT => {
+            generate_random_parameters::<Bls12, _, _>(GrothPrivateTxCircuit::blank(), &mut OsRng)
+                .map_err(|e| format!("setup for {circuit}: {e}"))
+        }
+        other => Err(format!("unknown circuit: {other}")),
+    }
+}
+
 pub fn generate_setup_bundle_with_osrng() -> (
     Parameters<Bls12>,
     Parameters<Bls12>,
@@ -701,17 +725,6 @@ pub fn prove_private_tx(
     {
         return Err(BlockError::TransactionValidationFailed(
             "private_tx value conservation constraint not satisfied".to_string(),
-        ));
-    }
-
-    if amount > u32::MAX as u64
-        || input_amounts.iter().any(|amount| *amount > u32::MAX as u64)
-        || input_sum > u32::MAX as u64
-        || output_sum > u32::MAX as u64
-        || fee > u32::MAX as u64
-    {
-        return Err(BlockError::TransactionValidationFailed(
-            "private_tx value exceeds 32-bit range proof bound".to_string(),
         ));
     }
 

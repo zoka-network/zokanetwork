@@ -6,6 +6,22 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+fn configured_cli_node_endpoint() -> String {
+    for var in [
+        "ZOKA_CLI_NODE_ENDPOINT",
+        "ZOKA_NODE_ENDPOINT",
+        "ZOKA_LOCAL_RPC_URL",
+    ] {
+        if let Ok(value) = std::env::var(var) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.trim_end_matches('/').to_string();
+            }
+        }
+    }
+    String::new()
+}
+
 /// CLI configuration file structure
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CliConfig {
@@ -96,7 +112,7 @@ impl Default for CliConfig {
             name: "zoka-cli".to_string(),
             default_wallet: None,
             wallet_storage_path: PathBuf::from("./wallets"),
-            node_endpoint: "http://127.0.0.1:3000".to_string(),
+            node_endpoint: configured_cli_node_endpoint(),
             tx_timeout_secs: 60,
             enable_wallet_encryption: false,
         }
@@ -159,7 +175,7 @@ impl CliConfig {
         if other.wallet_storage_path != PathBuf::from("./wallets") {
             self.wallet_storage_path = other.wallet_storage_path;
         }
-        if !other.node_endpoint.contains("127.0.0.1:3000") {
+        if !other.node_endpoint.trim().is_empty() {
             self.node_endpoint = other.node_endpoint;
         }
         if other.tx_timeout_secs != 60 {
@@ -1991,7 +2007,7 @@ mod tests {
     fn test_cli_config_default() {
         let config = CliConfig::default();
         assert_eq!(config.name, "zoka-cli");
-        assert_eq!(config.node_endpoint, "http://127.0.0.1:3000");
+        assert_eq!(config.node_endpoint, configured_cli_node_endpoint());
         assert_eq!(config.tx_timeout_secs, 60);
         assert!(!config.enable_wallet_encryption);
     }
@@ -2000,7 +2016,7 @@ mod tests {
     fn test_cli_config_new() {
         let config = CliConfig::new("my-config".to_string());
         assert_eq!(config.name, "my-config");
-        assert_eq!(config.node_endpoint, "http://127.0.0.1:3000");
+        assert_eq!(config.node_endpoint, configured_cli_node_endpoint());
     }
 
     #[test]
@@ -2095,7 +2111,7 @@ mod tests {
   "name": "json-config",
   "default_wallet": "main",
   "wallet_storage_path": "./wallets",
-  "node_endpoint": "http://127.0.0.1:3000",
+  "node_endpoint": "",
   "tx_timeout_secs": 60,
   "enable_wallet_encryption": false
 }"#;

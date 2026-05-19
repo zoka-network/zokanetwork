@@ -1,0 +1,46 @@
+{
+  "schema": "zoka-mainnet-network-v1",
+  "status": "fly-bootstrap-mainnet",
+  "chain_id": "zoka-mainnet-v1",
+  "protocol_freeze_id": "/zoka/1.0.0",
+  "transport_policy": {
+    "anonymous_transport_preferred": false,
+    "clearnet_requires_explicit_operator_choice": false,
+    "supported": [
+      "tcp"
+    ]
+  },
+  "seed_nodes": [
+    {
+      "label": "fly-gru-bootstrap-1",
+      "operator": "zoka-core",
+      "region": "gru",
+      "multiaddr": "/ip4/37.16.23.142/tcp/30303/p2p/12D3KooWDbdXAdGxVuSNLicfEf57qTzTRGviDXUbnGKAUV3yT2Xn",
+      "onion": null,
+      "i2p": null,
+      "role": "seed",
+      "status": "active"
+    }
+  ],
+  "public_rpc": [
+    {
+      "label": "fly-gru-bootstrap-rpc",
+      "operator": "zoka-core",
+      "region": "gru",
+      "url": "http://zoka-bootstrap-zokachain.fly.dev",
+      "onion": null,
+      "i2p": null,
+      "status": "active",
+      "logging_policy": "no-wallet-secrets-no-private-keys"
+    }
+  ],
+  "desktop": {
+    "local_rpc_url": "http://127.0.0.1:3000"
+  },
+  "snapshot_signers": [],
+  "notes": [
+    "Public bootstrap for the current Zoka mainnet rehearsal.",
+    "Wallet secrets and private keys must remain local; this RPC is read-only chain status for sync gating.",
+    "Tor/I2P endpoints are not active yet; ZSilent may add Tor routing before public release."
+  ]
+}

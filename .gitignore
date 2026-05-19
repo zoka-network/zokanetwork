@@ -17,3 +17,11 @@ target_*/
 *.lock
 release/
 releases/
+
+# Sister projects (separate repositories)
+zsilent-core/
+zokaexplorer/
+
+# Local snapshots / migration artifacts
+zoka-local-*.snapshot.json
+migration-*.log

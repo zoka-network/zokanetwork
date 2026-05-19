@@ -14,7 +14,9 @@ use libp2p::{
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
+use std::fs;
 use std::io;
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
@@ -293,6 +295,46 @@ pub struct NodeBehaviour {
 }
 
 impl Node {
+    fn node_identity_path() -> Option<PathBuf> {
+        if cfg!(test) && std::env::var_os("ZOKA_NODE_KEY_PATH").is_none() {
+            return None;
+        }
+
+        std::env::var_os("ZOKA_NODE_KEY_PATH")
+            .map(PathBuf::from)
+            .or_else(|| Some(PathBuf::from(".zoka/node_key")))
+    }
+
+    fn load_or_generate_identity_key() -> Result<identity::Keypair, Box<dyn Error>> {
+        let Some(path) = Self::node_identity_path() else {
+            return Ok(identity::Keypair::generate_ed25519());
+        };
+
+        if path.exists() {
+            let encoded_key = fs::read(&path)?;
+            let key = identity::Keypair::from_protobuf_encoding(&encoded_key).map_err(|e| {
+                io::Error::other(format!(
+                    "invalid node identity key at {}: {e}",
+                    path.display()
+                ))
+            })?;
+            info!("Loaded persistent node identity from {}", path.display());
+            return Ok(key);
+        }
+
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
+        }
+
+        let key = identity::Keypair::generate_ed25519();
+        let encoded_key = key
+            .to_protobuf_encoding()
+            .map_err(|e| io::Error::other(format!("failed to encode node identity key: {e}")))?;
+        fs::write(&path, encoded_key)?;
+        info!("Generated persistent node identity at {}", path.display());
+        Ok(key)
+    }
+
     fn endpoint_reachable(endpoint: &str) -> bool {
         use std::net::{TcpStream, ToSocketAddrs};
 
@@ -911,7 +953,7 @@ impl Node {
 
     /// Create a new node with gossipsub + identify + kademlia.
     pub async fn new(_listen_port: u16) -> Result<Self, Box<dyn Error>> {
-        let local_key = identity::Keypair::generate_ed25519();
+        let local_key = Self::load_or_generate_identity_key()?;
         let peer_id = PeerId::from(local_key.public());
         info!("Local PeerId: {}", peer_id);
 
@@ -1384,6 +1426,7 @@ impl Node {
             block_height,
             encrypted_block,
             block_hash,
+            difficulty_bits: None,
             timestamp: now,
         }))
     }

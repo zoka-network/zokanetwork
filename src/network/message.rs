@@ -244,6 +244,13 @@ pub struct BlockResponseMessage {
     pub encrypted_block: Vec<u8>,
     /// Hash de verificación
     pub block_hash: String,
+    /// Historical difficulty bits used when this block was accepted.
+    ///
+    /// Older peer messages may omit this. RPC sync uses it to replay the
+    /// already-published chain history exactly, even across rehearsal-era
+    /// difficulty changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub difficulty_bits: Option<u32>,
     /// Timestamp
     pub timestamp: u64,
 }

@@ -19,7 +19,10 @@ name = "zoka"
 path = "src/lib.rs"
 
 [features]
-default = []
+# `randomx` is on by default so a stock `cargo build --release` produces a
+# binary that can actually mine mainnet. Disable explicitly with
+# `--no-default-features` for CI environments without the RandomX toolchain.
+default = ["randomx"]
 # Enables the RandomX PoW backend used by public ZOKA network binaries.
 # Pulls in the `randomx-rs` crate which links to the official RandomX
 # C++ library; public testnet binaries should be built with this feature.
@@ -48,7 +51,7 @@ bls12_381 = "0.8"
 rocksdb = "0.21"
 axum = "0.7"
 tower = "0.4"
-tower-http = "0.5"
+tower-http = { version = "0.5", features = ["cors"] }
 ed25519-dalek = "2.0"
 curve25519-dalek = "4.1"
 bulletproofs = "5.0"

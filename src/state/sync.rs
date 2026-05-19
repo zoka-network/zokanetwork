@@ -377,7 +377,8 @@ fn try_apply_synced_block_payload_inner(
             candidate: candidate_height,
         };
     }
-    let applied = match expected_difficulty_bits {
+    let resolved_expected_difficulty_bits = expected_difficulty_bits.or(response.difficulty_bits);
+    let applied = match resolved_expected_difficulty_bits {
         Some(bits) => apply_block_with_expected_difficulty(storage, chain_id, &block, bits),
         None => apply_block(storage, chain_id, &block),
     };
@@ -530,6 +531,7 @@ mod tests {
             block_height: block.header.block_height,
             encrypted_block: serde_json::to_vec(block).expect("serialize block"),
             block_hash: block.header.hash.clone(),
+            difficulty_bits: None,
             timestamp: block.header.timestamp,
         }
     }
@@ -552,6 +554,7 @@ mod tests {
             block_height: 1,
             encrypted_block: b"not json".to_vec(),
             block_hash: "deadbeef".to_string(),
+            difficulty_bits: None,
             timestamp: 0,
         };
         match try_apply_synced_block_payload_with_expected_difficulty(
@@ -860,6 +863,7 @@ mod tests {
             block_height: 5,
             encrypted_block: b"cached-block".to_vec(),
             block_hash: "h5".to_string(),
+            difficulty_bits: None,
             timestamp: 1_700_000_000,
         };
         let outcome = SyncOutcome::GapAhead {
@@ -889,6 +893,7 @@ mod tests {
             block_height: future_height,
             encrypted_block: b"far-future-block".to_vec(),
             block_hash: "too-far".to_string(),
+            difficulty_bits: None,
             timestamp: 1_700_000_000,
         };
         let outcome = SyncOutcome::GapAhead {

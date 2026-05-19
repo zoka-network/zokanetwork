@@ -87,7 +87,7 @@ zoka balance testnet-wallet --network testnet --password "<wallet-password>"
 Send a private transfer:
 
 ```sh
-zoka send testnet-wallet <zka1-recipient-address> 0.000001 --network testnet --password "<wallet-password>" --fee 0.0001 --yes
+zoka send <sender-zka1-address> <zka1-recipient-address> 0.000001 --network testnet --password "<wallet-password>" --fee 0.0001 --yes
 ```
 
 ## Mining Notes

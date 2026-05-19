@@ -9,7 +9,7 @@ const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 fn print_usage() {
     println!("zokahd (automatic fullnode)");
     println!(
-        "Usage: zokahd [--network mainnet|testnet] [--address <wallet-address>] [--password <pwd>] [--seed <multiaddr>] [--network-config <file>] [--no-network-config] [--allow-clearnet-seeds] [--allow-isolated-start] [--seconds <n>] [--show-keys] [--no-mine] [--power low|normal|max] [--threads <n>] [--db <path>] [--genesis <file>] [--inline]"
+        "Usage: zokahd [--network mainnet|testnet] [--address <wallet-address>] [--password <pwd>|--password-env <var>|--password-stdin] [--seed <multiaddr>] [--network-config <file>] [--no-network-config] [--allow-clearnet-seeds] [--allow-isolated-start] [--seconds <n>] [--show-keys] [--no-mine] [--power low|normal|max] [--threads <n>] [--db <path>] [--genesis <file>] [--tor-proxy host:port] [--tor-only] [--inline]"
     );
     println!("Runs fullnode + sync warmup + auto-mining by default until interrupted.");
     println!("Without arguments, opens the autopilot launcher: wallet, sync, then mining.");
@@ -25,7 +25,7 @@ fn main() -> ExitCode {
         print_usage();
         return ExitCode::SUCCESS;
     }
-    let inline = if let Some(index) = args.iter().position(|arg| arg == "--inline") {
+    let _inline = if let Some(index) = args.iter().position(|arg| arg == "--inline") {
         args.remove(index);
         true
     } else {
@@ -52,7 +52,7 @@ fn main() -> ExitCode {
     }
 
     #[cfg(windows)]
-    if !inline && !guided {
+    if !_inline && !guided {
         let mut command = Command::new(&zoka_exe);
         command
             .arg("fullnode")

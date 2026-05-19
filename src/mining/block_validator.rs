@@ -130,6 +130,9 @@ pub enum BlockValidationError {
     #[error("duplicate private transaction hash in block: {0}")]
     DuplicatePrivateTxHash(String),
 
+    #[error("too many private transaction hashes in block: {actual} > {max}")]
+    TooManyPrivateTxHashes { actual: usize, max: usize },
+
     #[error("private fee claim references tx not committed in this block: {0}")]
     FeeClaimForMissingPrivateTx(String),
 
@@ -204,6 +207,13 @@ pub fn validate_pow_block(
 }
 
 fn validate_private_fee_claims(block: &Block) -> Result<(), BlockValidationError> {
+    if block.private_tx_hashes.len() > economics::PRIVATE_TX_HASHES_PER_BLOCK_LIMIT {
+        return Err(TooManyPrivateTxHashes {
+            actual: block.private_tx_hashes.len(),
+            max: economics::PRIVATE_TX_HASHES_PER_BLOCK_LIMIT,
+        });
+    }
+
     let mut committed_private_txs = HashSet::new();
     for tx_hash in &block.private_tx_hashes {
         if !committed_private_txs.insert(tx_hash.as_str()) {
@@ -675,6 +685,27 @@ mod tests {
         }]);
         let err = validate_pow_block(&block, &ctx_for(chain_id, &parent, 4)).unwrap_err();
         assert!(matches!(err, FeeClaimForMissingPrivateTx(_)));
+    }
+
+    #[test]
+    fn block_private_tx_hashes_are_consensus_bounded() {
+        let chain_id = "zoka-test-net";
+        let parent = build_genesis_parent(chain_id);
+        let hashes = (0..=economics::PRIVATE_TX_HASHES_PER_BLOCK_LIMIT)
+            .map(|idx| format!("private-tx-{idx}"))
+            .collect::<Vec<_>>();
+        let block = mine_block(
+            chain_id,
+            &parent,
+            "zka1miner",
+            initial_reward(),
+            4,
+            1_700_000_000,
+        )
+        .with_private_tx_hashes(hashes);
+
+        let err = validate_pow_block(&block, &ctx_for(chain_id, &parent, 4)).unwrap_err();
+        assert!(matches!(err, TooManyPrivateTxHashes { .. }));
     }
 
     #[test]

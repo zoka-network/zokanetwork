@@ -813,7 +813,7 @@ mod tests {
 
         #[test]
         fn prop_verifier_accepts_valid_private_tx_proofs(
-            amount in 0u64..=u32::MAX as u64,
+            amount in 0u64..=((u32::MAX as u64) + 10_000),
             blind in 0u64..=1000u64,
             secret in 0u64..=1000u64
         ) {

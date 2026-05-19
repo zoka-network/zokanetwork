@@ -1,0 +1,40 @@
+app = "zoka-bootstrap-zokachain"
+primary_region = "gru"
+kill_signal = "SIGINT"
+kill_timeout = "30s"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  ZOKA_NETWORK = "mainnet"
+  ZOKA_API_BIND = "0.0.0.0:3000"
+  ZOKA_NODE_KEY_PATH = "/data/node_key"
+  ZOKA_CHAIN_DB_PATH = "/data/mainnet-local/blockchain.db"
+  ZOKA_TRUSTED_SETUP_DIR = "/app/trusted-setup"
+  ZOKA_EXPECTED_SETUP_DIGEST = "219fdb5d5e47e115ca899d13a6de284df03c86eaaef05eb4ff4adb395cfb0d8e"
+  ZOKA_MINER_ADDRESS = ""
+  ZOKA_SYNC_WARMUP_SECS = "30"
+  ZOKA_SYNC_REBROADCAST_RECENT_BLOCKS = "32"
+  RUST_LOG = "info"
+
+[mounts]
+  source = "zoka_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 3000
+  force_https = false
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 30303
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 30303

@@ -4,23 +4,24 @@ use crate::consensus::pbft::PbftConsensus;
 use crate::mempool::Mempool;
 use crate::private_wallet::PrivateWalletManager;
 use crate::state::{AccountInclusionProof, StateManager};
-use crate::types::{AccountResponse, StateError, TransactionRequest, TransactionResponse};
+use crate::types::{StateError, TransactionRequest, TransactionResponse};
 use axum::{
     body::{to_bytes, Body},
     extract::{DefaultBodyLimit, Path, Query, Request, State},
-    http::StatusCode,
+    http::{header, Method, StatusCode},
     middleware::{self, Next},
     response::Response,
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
+use tower_http::cors::{Any, CorsLayer};
 
 type SharedState = Arc<StateManager>;
 type SharedMempool = Arc<Mempool>;
@@ -29,6 +30,8 @@ type SharedMempool = Arc<Mempool>;
 /// `RwLock` mirrors the pattern used by `StateManager` and `Mempool`
 /// (shared ownership + interior mutability for the async HTTP handlers).
 type SharedPrivateWalletManager = Arc<RwLock<PrivateWalletManager>>;
+
+const MINER_HEARTBEAT_TTL_SECS: u64 = 90;
 
 #[derive(Clone, Debug)]
 pub struct ApiSecurityConfig {
@@ -229,6 +232,195 @@ pub struct ApiSecurityStats {
     pub bad_request_total: AtomicU64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MinerHeartbeatRequest {
+    pub peer_id: String,
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
+    pub chain_height: u64,
+    #[serde(default)]
+    pub hashrate_hps: u64,
+    #[serde(default)]
+    pub mining: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MinerHeartbeatRecord {
+    pub peer_id: String,
+    pub address: Option<String>,
+    pub chain_height: u64,
+    pub hashrate_hps: u64,
+    pub mining: bool,
+    pub last_seen: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NetworkRuntimeSnapshot {
+    pub connected_peers: u64,
+    pub miners_online: u64,
+    pub remote_miners_online: u64,
+    pub local_mining: bool,
+    pub local_chain_height: u64,
+    pub local_peer_id: Option<String>,
+    pub total_reported_hashrate_hps: u64,
+    pub heartbeat_ttl_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LocalMiningControlSnapshot {
+    pub enabled: bool,
+    pub threads: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Default)]
+pub struct LocalMiningControlState {
+    enabled: AtomicU64,
+    threads: AtomicU64,
+    updated_at: AtomicU64,
+}
+
+impl LocalMiningControlState {
+    pub fn enable(&self, threads: u64) -> LocalMiningControlSnapshot {
+        self.enabled.store(1, Ordering::Relaxed);
+        self.threads.store(threads.max(1), Ordering::Relaxed);
+        self.updated_at
+            .store(ApiRateLimiter::now_secs(), Ordering::Relaxed);
+        self.snapshot()
+    }
+
+    pub fn disable(&self) -> LocalMiningControlSnapshot {
+        self.enabled.store(0, Ordering::Relaxed);
+        self.updated_at
+            .store(ApiRateLimiter::now_secs(), Ordering::Relaxed);
+        self.snapshot()
+    }
+
+    pub fn snapshot(&self) -> LocalMiningControlSnapshot {
+        LocalMiningControlSnapshot {
+            enabled: self.enabled.load(Ordering::Relaxed) == 1,
+            threads: self.threads.load(Ordering::Relaxed),
+            updated_at: self.updated_at.load(Ordering::Relaxed),
+        }
+    }
+}
+
+pub fn global_local_mining_control() -> &'static LocalMiningControlState {
+    static CONTROL: OnceLock<LocalMiningControlState> = OnceLock::new();
+    CONTROL.get_or_init(LocalMiningControlState::default)
+}
+
+#[derive(Default)]
+pub struct NetworkRuntimeState {
+    connected_peers: AtomicU64,
+    local_mining: AtomicU64,
+    local_hashrate_hps: AtomicU64,
+    local_chain_height: AtomicU64,
+    local_peer_id: RwLock<Option<String>>,
+    miner_heartbeats: RwLock<HashMap<String, MinerHeartbeatRecord>>,
+}
+
+impl NetworkRuntimeState {
+    pub fn set_connected_peers(&self, peers: usize) {
+        self.connected_peers.store(peers as u64, Ordering::Relaxed);
+    }
+
+    pub async fn set_local_miner(
+        &self,
+        peer_id: String,
+        active: bool,
+        chain_height: u64,
+        hashrate_hps: u64,
+    ) {
+        self.local_mining
+            .store(if active { 1 } else { 0 }, Ordering::Relaxed);
+        self.local_chain_height
+            .store(chain_height, Ordering::Relaxed);
+        self.local_hashrate_hps
+            .store(hashrate_hps, Ordering::Relaxed);
+        let mut local_peer_id = self.local_peer_id.write().await;
+        *local_peer_id = if peer_id.trim().is_empty() {
+            None
+        } else {
+            Some(peer_id)
+        };
+    }
+
+    pub async fn record_miner_heartbeat(
+        &self,
+        heartbeat: MinerHeartbeatRequest,
+    ) -> Result<(), String> {
+        let peer_id = heartbeat.peer_id.trim();
+        if peer_id.is_empty() || peer_id.len() > 128 {
+            return Err("invalid peer id".to_string());
+        }
+        let now = ApiRateLimiter::now_secs();
+        let mut heartbeats = self.miner_heartbeats.write().await;
+        heartbeats.insert(
+            peer_id.to_string(),
+            MinerHeartbeatRecord {
+                peer_id: peer_id.to_string(),
+                address: heartbeat
+                    .address
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+                chain_height: heartbeat.chain_height,
+                hashrate_hps: heartbeat.hashrate_hps,
+                mining: heartbeat.mining,
+                last_seen: now,
+            },
+        );
+        heartbeats
+            .retain(|_, record| now.saturating_sub(record.last_seen) <= MINER_HEARTBEAT_TTL_SECS);
+        Ok(())
+    }
+
+    pub async fn snapshot(&self) -> NetworkRuntimeSnapshot {
+        let now = ApiRateLimiter::now_secs();
+        let local_peer_id = self.local_peer_id.read().await.clone();
+        let local_mining = self.local_mining.load(Ordering::Relaxed) == 1;
+        let mut miner_ids = HashSet::new();
+        let mut total_hashrate = 0u64;
+        if local_mining {
+            if let Some(peer_id) = local_peer_id.clone() {
+                miner_ids.insert(peer_id);
+            }
+            total_hashrate =
+                total_hashrate.saturating_add(self.local_hashrate_hps.load(Ordering::Relaxed));
+        }
+        let mut remote_miners = 0u64;
+        let mut heartbeats = self.miner_heartbeats.write().await;
+        heartbeats
+            .retain(|_, record| now.saturating_sub(record.last_seen) <= MINER_HEARTBEAT_TTL_SECS);
+        for record in heartbeats.values() {
+            if !record.mining {
+                continue;
+            }
+            if miner_ids.insert(record.peer_id.clone()) {
+                remote_miners = remote_miners.saturating_add(1);
+                total_hashrate = total_hashrate.saturating_add(record.hashrate_hps);
+            }
+        }
+
+        NetworkRuntimeSnapshot {
+            connected_peers: self.connected_peers.load(Ordering::Relaxed),
+            miners_online: miner_ids.len() as u64,
+            remote_miners_online: remote_miners,
+            local_mining,
+            local_chain_height: self.local_chain_height.load(Ordering::Relaxed),
+            local_peer_id,
+            total_reported_hashrate_hps: total_hashrate,
+            heartbeat_ttl_secs: MINER_HEARTBEAT_TTL_SECS,
+        }
+    }
+}
+
+pub fn global_network_runtime() -> &'static NetworkRuntimeState {
+    static RUNTIME: OnceLock<NetworkRuntimeState> = OnceLock::new();
+    RUNTIME.get_or_init(NetworkRuntimeState::default)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ApiRole {
     Read,
@@ -251,15 +443,21 @@ impl RbacConfig {
         endpoint_permissions.insert("/chain/state-root", ApiRole::Read);
         endpoint_permissions.insert("/accounts/:address", ApiRole::Read);
         endpoint_permissions.insert("/blocks/:height", ApiRole::Read);
+        endpoint_permissions.insert("/blocks/:height/raw", ApiRole::Read);
         endpoint_permissions.insert("/blocks/hash/:hash", ApiRole::Read);
         endpoint_permissions.insert("/blocks/latest", ApiRole::Read);
         endpoint_permissions.insert("/blocks/range/:from/:to", ApiRole::Read);
+        endpoint_permissions.insert("/blocks/range/:from/:to/raw", ApiRole::Read);
         endpoint_permissions.insert("/transactions/:hash", ApiRole::Read);
         endpoint_permissions.insert("/mempool/metrics", ApiRole::Read);
+        endpoint_permissions.insert("/network/runtime", ApiRole::Read);
 
         // Write endpoints
         endpoint_permissions.insert("/transactions", ApiRole::Write);
         endpoint_permissions.insert("/accounts/proof/verify", ApiRole::Write);
+        endpoint_permissions.insert("/network/miners/heartbeat", ApiRole::Write);
+        endpoint_permissions.insert("/local/mining/start", ApiRole::Write);
+        endpoint_permissions.insert("/local/mining/stop", ApiRole::Write);
 
         // Admin endpoints
         endpoint_permissions.insert("/admin/rollback", ApiRole::Admin);
@@ -1648,6 +1846,91 @@ async fn get_audit_logs(Query(query): Query<HashMap<String, String>>) -> Json<se
     }))
 }
 
+/// Network-wide stats: height, difficulty, hashrate, emission
+async fn get_stats(State(app_state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    use crate::economics::{
+        HALVING_INTERVAL_BLOCKS, INITIAL_BLOCK_REWARD_ZKA, TARGET_BLOCK_TIME_SECS,
+    };
+
+    let height = app_state.state_manager.get_height().await;
+    let difficulty_bits = app_state.state_manager.get_next_difficulty();
+
+    // Estimated network hashrate in H/s: expected hashes per block / block_time
+    let hashrate_hs = (2u64.pow(difficulty_bits) as f64) / (TARGET_BLOCK_TIME_SECS as f64);
+
+    // Cumulative emission in ZKA from the halving schedule
+    let mut emission_zka = 0u64;
+    let mut remaining = height;
+    let mut reward = INITIAL_BLOCK_REWARD_ZKA;
+    while remaining > 0 && reward > 0 {
+        let in_epoch = remaining.min(HALVING_INTERVAL_BLOCKS);
+        emission_zka = emission_zka.saturating_add(in_epoch * reward);
+        remaining -= in_epoch;
+        reward /= 2;
+    }
+    let emission_zka_f = emission_zka as f64; // reward already expressed in ZKA units
+
+    // Last block timestamp for the client to derive recency
+    let last_block_time = match app_state.state_manager.get_latest_block().await {
+        Ok(Some(b)) => b.header.timestamp,
+        _ => 0,
+    };
+    let runtime = global_network_runtime().snapshot().await;
+
+    Json(serde_json::json!({
+        "height": height,
+        "difficulty": difficulty_bits,
+        "hashrate_hs": hashrate_hs,
+        "emission_zka": emission_zka_f,
+        "last_block_time": last_block_time,
+        "network_version": "0.1.0",
+        "connected_peers": runtime.connected_peers,
+        "miners_online": runtime.miners_online,
+        "remote_miners_online": runtime.remote_miners_online,
+        "local_mining": runtime.local_mining,
+        "reported_hashrate_hps": runtime.total_reported_hashrate_hps,
+    }))
+}
+
+async fn get_network_runtime() -> Json<NetworkRuntimeSnapshot> {
+    Json(global_network_runtime().snapshot().await)
+}
+
+async fn post_miner_heartbeat(
+    Json(heartbeat): Json<MinerHeartbeatRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    global_network_runtime()
+        .record_miner_heartbeat(heartbeat)
+        .await
+        .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
+    let snapshot = global_network_runtime().snapshot().await;
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "miners_online": snapshot.miners_online,
+        "heartbeat_ttl_secs": snapshot.heartbeat_ttl_secs,
+    })))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct LocalMiningControlRequest {
+    #[serde(default)]
+    threads: u64,
+}
+
+async fn get_local_mining_control() -> Json<LocalMiningControlSnapshot> {
+    Json(global_local_mining_control().snapshot())
+}
+
+async fn post_local_mining_start(
+    Json(request): Json<LocalMiningControlRequest>,
+) -> Json<LocalMiningControlSnapshot> {
+    Json(global_local_mining_control().enable(request.threads.max(1)))
+}
+
+async fn post_local_mining_stop() -> Json<LocalMiningControlSnapshot> {
+    Json(global_local_mining_control().disable())
+}
+
 /// Get current block height
 async fn get_height(State(app_state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let height = app_state.state_manager.get_height().await;
@@ -1664,14 +1947,14 @@ async fn get_state_root(State(app_state): State<Arc<AppState>>) -> Json<serde_js
 async fn get_account(
     State(app_state): State<Arc<AppState>>,
     Path(address): Path<String>,
-) -> Result<Json<AccountResponse>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Balance and nonce are private — only confirm the address exists.
     match app_state.state_manager.get_account(&address).await {
-        Some(account) => Ok(Json(AccountResponse {
-            address: account.address,
-            balance: account.balance,
-            nonce: account.nonce,
-        })),
-        None => Err((StatusCode::NOT_FOUND, "Account not found".to_string())),
+        Some(_) => Ok(Json(serde_json::json!({
+            "address": address,
+            "valid": true,
+        }))),
+        None => Err((StatusCode::NOT_FOUND, "Address not found".to_string())),
     }
 }
 
@@ -1712,22 +1995,185 @@ async fn verify_account_proof(
 }
 
 /// Get block by height
+fn block_metadata_json(
+    block: &crate::types::Block,
+    difficulty_bits: Option<u32>,
+) -> serde_json::Value {
+    use crate::economics::{format_zka_amount, ATOMS_PER_ZKA};
+
+    let reward_atoms = block.transactions.first().map(|tx| tx.amount).unwrap_or(0);
+    let reward_zka = reward_atoms as f64 / ATOMS_PER_ZKA as f64;
+    let size_bytes = serde_json::to_vec(block)
+        .map(|bytes| bytes.len())
+        .unwrap_or(0);
+
+    serde_json::json!({
+        "hash": block.header.hash,
+        "height": block.header.block_height,
+        "timestamp": block.header.timestamp,
+        "state_root": block.header.state_root,
+        "previous_hash": block.header.prev_hash,
+        "nonce": block.header.nonce,
+        "difficulty": difficulty_bits,
+        "difficulty_bits": difficulty_bits,
+        "size_bytes": size_bytes,
+        "reward_atoms": reward_atoms,
+        "reward_zka": reward_zka,
+        "reward_zka_display": format_zka_amount(reward_atoms),
+        "transactions_count": block.transactions.len(),
+        "private_tx_count": block.private_tx_hashes.len(),
+        "private_coinbase": block.private_coinbase.is_some(),
+    })
+}
+
+fn raw_block_json(
+    block: &crate::types::Block,
+    difficulty_bits: Option<u32>,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let mut value = serde_json::to_value(block)?;
+    if let (Some(bits), Some(object)) = (difficulty_bits, value.as_object_mut()) {
+        object.insert("difficulty".to_string(), serde_json::json!(bits));
+        object.insert("difficulty_bits".to_string(), serde_json::json!(bits));
+    }
+    Ok(value)
+}
+
 async fn get_block_by_height(
     State(app_state): State<Arc<AppState>>,
     Path(height): Path<u64>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if height == 0 {
+        let block = crate::state::chain::genesis_parent_for(crate::economics::MAINNET_CHAIN_ID);
+        return Ok(Json(block_metadata_json(&block, None)));
+    }
+
     match app_state.state_manager.get_block_by_height(height).await {
-        Ok(Some(block)) => Ok(Json(serde_json::json!({
-            "hash": block.header.hash,
-            "height": block.header.block_height,
-            "timestamp": block.header.timestamp,
-            "state_root": block.header.state_root,
-            "transactions_count": block.transactions.len(),
-        }))),
+        Ok(Some(block)) => {
+            let difficulty_bits = app_state
+                .state_manager
+                .get_block_difficulty_bits(&block.header.hash)
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to get block difficulty: {}", e),
+                    )
+                })?;
+            Ok(Json(block_metadata_json(&block, difficulty_bits)))
+        }
         Ok(None) => Err((StatusCode::NOT_FOUND, "Block not found".to_string())),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to get block: {}", e),
+        )),
+    }
+}
+
+/// Get the full canonical block by height for node bootstrap/sync clients.
+/// This is public chain data. Wallet secrets, seeds and private keys are never
+/// part of a block and are not exposed here.
+async fn get_raw_block_by_height(
+    State(app_state): State<Arc<AppState>>,
+    Path(height): Path<u64>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if height == 0 {
+        let block = crate::state::chain::genesis_parent_for(crate::economics::MAINNET_CHAIN_ID);
+        return raw_block_json(&block, None).map(Json).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to serialize genesis block: {}", e),
+            )
+        });
+    }
+
+    match app_state.state_manager.get_block_by_height(height).await {
+        Ok(Some(block)) => {
+            let difficulty_bits = app_state
+                .state_manager
+                .get_block_difficulty_bits(&block.header.hash)
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to get block difficulty: {}", e),
+                    )
+                })?;
+            raw_block_json(&block, difficulty_bits)
+                .map(Json)
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to serialize block: {}", e),
+                    )
+                })
+        }
+        Ok(None) => Err((StatusCode::NOT_FOUND, "Block not found".to_string())),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to get block: {}", e),
+        )),
+    }
+}
+
+/// Get full canonical blocks in a height range for node bootstrap/sync clients.
+async fn get_raw_blocks_range(
+    State(app_state): State<Arc<AppState>>,
+    Path((from, to)): Path<(u64, u64)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if from > to {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid range: from > to".to_string(),
+        ));
+    }
+    if to - from > 1000 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Range too large: maximum 1000 blocks".to_string(),
+        ));
+    }
+
+    let mut blocks = Vec::new();
+    if from == 0 {
+        let genesis = crate::state::chain::genesis_parent_for(crate::economics::MAINNET_CHAIN_ID);
+        blocks.push(raw_block_json(&genesis, None).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to serialize genesis block: {}", e),
+            )
+        })?);
+    }
+    match app_state
+        .state_manager
+        .get_blocks_in_range(from.max(1), to)
+        .await
+    {
+        Ok(mut range_blocks) => {
+            for block in range_blocks.drain(..) {
+                let difficulty_bits = app_state
+                    .state_manager
+                    .get_block_difficulty_bits(&block.header.hash)
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to get block difficulty: {}", e),
+                        )
+                    })?;
+                blocks.push(raw_block_json(&block, difficulty_bits).map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to serialize block: {}", e),
+                    )
+                })?);
+            }
+            Ok(Json(serde_json::json!({
+                "from_height": from,
+                "to_height": to,
+                "blocks_count": blocks.len(),
+                "blocks": blocks,
+            })))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to get blocks: {}", e),
         )),
     }
 }
@@ -1738,13 +2184,18 @@ async fn get_block_by_hash(
     Path(hash): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match app_state.state_manager.get_block_by_hash(&hash).await {
-        Ok(Some(block)) => Ok(Json(serde_json::json!({
-            "hash": block.header.hash,
-            "height": block.header.block_height,
-            "timestamp": block.header.timestamp,
-            "state_root": block.header.state_root,
-            "transactions_count": block.transactions.len(),
-        }))),
+        Ok(Some(block)) => {
+            let difficulty_bits = app_state
+                .state_manager
+                .get_block_difficulty_bits(&block.header.hash)
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to get block difficulty: {}", e),
+                    )
+                })?;
+            Ok(Json(block_metadata_json(&block, difficulty_bits)))
+        }
         Ok(None) => Err((StatusCode::NOT_FOUND, "Block not found".to_string())),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1758,13 +2209,18 @@ async fn get_latest_block(
     State(app_state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match app_state.state_manager.get_latest_block().await {
-        Ok(Some(block)) => Ok(Json(serde_json::json!({
-            "hash": block.header.hash,
-            "height": block.header.block_height,
-            "timestamp": block.header.timestamp,
-            "state_root": block.header.state_root,
-            "transactions_count": block.transactions.len(),
-        }))),
+        Ok(Some(block)) => {
+            let difficulty_bits = app_state
+                .state_manager
+                .get_block_difficulty_bits(&block.header.hash)
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to get block difficulty: {}", e),
+                    )
+                })?;
+            Ok(Json(block_metadata_json(&block, difficulty_bits)))
+        }
         Ok(None) => Err((StatusCode::NOT_FOUND, "No blocks in the chain".to_string())),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1783,33 +2239,50 @@ async fn get_private_tx_by_hash(
     State(app_state): State<Arc<AppState>>,
     Path(hash): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let manager = match &app_state.private_wallet_manager {
-        Some(m) => m,
-        None => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                "this node does not expose a private transaction pool".to_string(),
-            ));
-        }
-    };
-    let manager = manager.read().await;
-    match manager.get_private_transaction(&hash) {
-        Some(tx) => {
+    if let Some(manager) = &app_state.private_wallet_manager {
+        let manager = manager.read().await;
+        if let Some(tx) = manager.get_private_transaction(&hash) {
             // Serialize with serde_json; the type is serde-derive-friendly
             // and its wire shape already omits sender/receiver/amount
             // clear fields (they don't exist on `PrivateTransaction`).
-            Ok(Json(serde_json::to_value(tx).map_err(|e| {
+            return Ok(Json(serde_json::to_value(tx).map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("failed to serialize private tx: {}", e),
                 )
-            })?))
+            })?));
         }
-        None => Err((
-            StatusCode::NOT_FOUND,
-            format!("private transaction {} not found in this node's pool", hash),
-        )),
     }
+
+    let Some(bytes) = app_state
+        .state_manager
+        .get_private_transaction_bytes(&hash)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to read private tx: {}", e),
+            )
+        })?
+    else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("private transaction {} not found", hash),
+        ));
+    };
+
+    let tx: crate::private_wallet::PrivateTransaction =
+        serde_json::from_slice(&bytes).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to parse private tx: {}", e),
+            )
+        })?;
+    Ok(Json(serde_json::to_value(tx).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize private tx: {}", e),
+        )
+    })?))
 }
 
 /// Get the private-transaction hashes committed at a specific block.
@@ -1820,6 +2293,14 @@ async fn get_block_private_tx_hashes(
     State(app_state): State<Arc<AppState>>,
     Path(height): Path<u64>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if height == 0 {
+        return Ok(Json(serde_json::json!({
+            "block_height": height,
+            "private_tx_count": 0,
+            "private_tx_hashes": [],
+        })));
+    }
+
     match app_state
         .state_manager
         .get_block_private_tx_hashes(height)
@@ -1837,11 +2318,58 @@ async fn get_block_private_tx_hashes(
     }
 }
 
+/// Get private-transaction hashes for a range of blocks in one request.
+async fn get_block_private_tx_hashes_range(
+    State(app_state): State<Arc<AppState>>,
+    Path((from, to)): Path<(u64, u64)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if from > to {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid range: from > to".to_string(),
+        ));
+    }
+    if to - from > 1000 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Range too large: maximum 1000 blocks".to_string(),
+        ));
+    }
+
+    let mut blocks = Vec::new();
+    for height in from..=to {
+        let hashes = app_state
+            .state_manager
+            .get_block_private_tx_hashes(height)
+            .await
+            .unwrap_or_default();
+        blocks.push(serde_json::json!({
+            "height": height,
+            "private_tx_count": hashes.len(),
+            "private_tx_hashes": hashes,
+        }));
+    }
+
+    Ok(Json(serde_json::json!({
+        "from_height": from,
+        "to_height": to,
+        "blocks": blocks,
+    })))
+}
+
 /// Get transactions in a specific block
 async fn get_block_transactions(
     State(app_state): State<Arc<AppState>>,
     Path(height): Path<u64>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if height == 0 {
+        return Ok(Json(serde_json::json!({
+            "block_height": height,
+            "transactions_count": 0,
+            "transactions": [],
+        })));
+    }
+
     match app_state.state_manager.get_block_transactions(height).await {
         Ok(txs) => Ok(Json(serde_json::json!({
             "block_height": height,
@@ -1851,17 +2379,10 @@ async fn get_block_transactions(
             // are in `PrivateTransaction` and never serialize through this
             // endpoint — the old placebo redaction that keyed off a dead
             // `zk_proof` flag is gone.
+            // Only expose the hash — sender/receiver/amount are private by protocol.
             "transactions": txs
                 .iter()
-                .map(|tx| {
-                    serde_json::json!({
-                        "hash": tx.hash,
-                        "sender": tx.sender,
-                        "receiver": tx.receiver,
-                        "amount": tx.amount,
-                        "nonce": tx.nonce,
-                    })
-                })
+                .map(|tx| serde_json::json!({ "hash": tx.hash }))
                 .collect::<Vec<_>>(),
         }))),
         Err(e) => Err((
@@ -1890,19 +2411,31 @@ async fn get_blocks_range(
     }
 
     match app_state.state_manager.get_blocks_in_range(from, to).await {
-        Ok(blocks) => Ok(Json(serde_json::json!({
-            "from_height": from,
-            "to_height": to,
-            "blocks_count": blocks.len(),
-            "blocks": blocks
-                .iter()
-                .map(|b| serde_json::json!({
+        Ok(blocks) => {
+            let mut block_values = Vec::new();
+            if from == 0 {
+                let genesis =
+                    crate::state::chain::genesis_parent_for(crate::economics::MAINNET_CHAIN_ID);
+                block_values.push(serde_json::json!({
+                    "hash": genesis.header.hash,
+                    "height": genesis.header.block_height,
+                    "timestamp": genesis.header.timestamp,
+                }));
+            }
+            block_values.extend(blocks.iter().map(|b| {
+                serde_json::json!({
                     "hash": b.header.hash,
                     "height": b.header.block_height,
                     "timestamp": b.header.timestamp,
-                }))
-                .collect::<Vec<_>>(),
-        }))),
+                })
+            }));
+            Ok(Json(serde_json::json!({
+            "from_height": from,
+            "to_height": to,
+                "blocks_count": block_values.len(),
+                "blocks": block_values,
+            })))
+        }
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to get blocks: {}", e),
@@ -1920,10 +2453,7 @@ async fn get_transaction_by_hash(
     if let Some(tx) = app_state.mempool.get_transaction(&hash).await {
         return Ok(Json(serde_json::json!({
             "hash": tx.hash,
-            "sender": tx.sender,
-            "receiver": tx.receiver,
-            "amount": tx.amount,
-            "nonce": tx.nonce,
+            "timestamp": tx.timestamp,
             "status": "pending_in_mempool",
         })));
     }
@@ -2087,22 +2617,13 @@ async fn get_mempool_size(State(app_state): State<Arc<AppState>>) -> Json<serde_
 /// Get pending transactions from mempool
 async fn get_mempool_pending(State(app_state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let pending = app_state.mempool.get_pending().await;
-    let txs: Vec<serde_json::Value> = pending
+    let hashes: Vec<serde_json::Value> = pending
         .iter()
-        .map(|tx| {
-            serde_json::json!({
-                "hash": tx.hash,
-                "sender": tx.sender,
-                "receiver": tx.receiver,
-                "amount": tx.amount,
-                "nonce": tx.nonce,
-                "timestamp": tx.timestamp,
-            })
-        })
+        .map(|tx| serde_json::json!({ "hash": tx.hash, "timestamp": tx.timestamp }))
         .collect();
     Json(serde_json::json!({
         "count": pending.len(),
-        "pending": txs
+        "pending": hashes
     }))
 }
 
@@ -2133,11 +2654,8 @@ async fn get_mempool_transaction(
     if let Some(tx) = app_state.mempool.get_transaction(&hash).await {
         Ok(Json(serde_json::json!({
             "hash": tx.hash,
-            "sender": tx.sender,
-            "receiver": tx.receiver,
-            "amount": tx.amount,
-            "nonce": tx.nonce,
             "timestamp": tx.timestamp,
+            "status": "pending",
         })))
     } else {
         Err(StatusCode::NOT_FOUND)
@@ -2667,7 +3185,18 @@ pub async fn ws_status(
 }
 
 pub fn create_router(app_state: Arc<AppState>) -> Router {
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
+
     Router::new()
+        .route("/stats", get(get_stats))
+        .route("/network/runtime", get(get_network_runtime))
+        .route("/network/miners/heartbeat", post(post_miner_heartbeat))
+        .route("/local/mining/control", get(get_local_mining_control))
+        .route("/local/mining/start", post(post_local_mining_start))
+        .route("/local/mining/stop", post(post_local_mining_stop))
         .route("/health", get(health))
         .route("/metrics/security", get(get_security_metrics))
         .route("/metrics/audit", get(get_audit_logs))
@@ -2677,6 +3206,7 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         .route("/accounts/:address/proof", get(get_account_proof))
         .route("/accounts/proof/verify", post(verify_account_proof))
         .route("/blocks/:height", get(get_block_by_height))
+        .route("/blocks/:height/raw", get(get_raw_block_by_height))
         .route("/blocks/hash/:hash", get(get_block_by_hash))
         .route("/blocks/latest", get(get_latest_block))
         .route("/blocks/:height/transactions", get(get_block_transactions))
@@ -2684,8 +3214,13 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
             "/blocks/:height/private_tx_hashes",
             get(get_block_private_tx_hashes),
         )
+        .route(
+            "/blocks/range/:from/:to/private_tx_hashes",
+            get(get_block_private_tx_hashes_range),
+        )
         .route("/private/tx/:hash", get(get_private_tx_by_hash))
         .route("/blocks/range/:from/:to", get(get_blocks_range))
+        .route("/blocks/range/:from/:to/raw", get(get_raw_blocks_range))
         .route("/transactions/:hash", get(get_transaction_by_hash))
         .route("/admin/rollback", post(admin_rollback))
         .route("/admin/rollback-points", get(admin_rollback_points))
@@ -2713,6 +3248,7 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
             app_state.clone(),
             auth_and_rate_limit,
         ))
+        .layer(cors)
         .with_state(app_state)
 }
 
@@ -3039,6 +3575,38 @@ pub async fn start_api_with_config(
     mempool: SharedMempool,
     security: ApiSecurityConfig,
 ) -> Result<(), StateError> {
+    let bind_addr = std::env::var("ZOKA_API_BIND")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            StateError::StorageError(
+                "ZOKA_API_BIND must be configured before starting the API server".to_string(),
+            )
+        })?;
+    start_api_with_config_on_bind(state_manager, mempool, security, bind_addr).await
+}
+
+pub async fn start_api_on_bind(
+    state_manager: SharedState,
+    mempool: SharedMempool,
+    bind_addr: String,
+) -> Result<(), StateError> {
+    start_api_with_config_on_bind(
+        state_manager,
+        mempool,
+        ApiSecurityConfig::default(),
+        bind_addr,
+    )
+    .await
+}
+
+pub async fn start_api_with_config_on_bind(
+    state_manager: SharedState,
+    mempool: SharedMempool,
+    security: ApiSecurityConfig,
+    bind_addr: String,
+) -> Result<(), StateError> {
     let app_state = Arc::new(AppState {
         state_manager,
         mempool,
@@ -3050,13 +3618,13 @@ pub async fn start_api_with_config(
         private_wallet_manager: None,
     });
 
-    let router = create_router(app_state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+    let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .map_err(|e| StateError::StorageError(e.to_string()))?;
 
-    println!("API server listening on http://127.0.0.1:3000");
+    println!("API server listening on http://{bind_addr}");
 
+    let router = create_router(app_state);
     axum::serve(listener, router)
         .await
         .map_err(|e| StateError::StorageError(e.to_string()))

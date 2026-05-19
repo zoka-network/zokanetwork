@@ -791,15 +791,23 @@ mod tests {
     }
 
     #[test]
-    fn test_prover_prove_private_tx_circuit_out_of_range() {
+    fn test_prover_prove_private_tx_circuit_accepts_above_32_bit_amount() {
         let prover = Prover::new("private_tx".to_string());
-        let (private, public) =
-            encode_private_tx_case((u32::MAX as u64) + 1, 7, 20, 1, &[10], 10, 0, &[55]);
+        let (private, public) = encode_private_tx_case(
+            (u32::MAX as u64) + 1,
+            7,
+            20,
+            1,
+            &[(u32::MAX as u64) + 1],
+            (u32::MAX as u64) + 1,
+            0,
+            &[55],
+        );
 
         let result = prover.prove(&private, &public);
         assert!(
-            result.is_err(),
-            "range proof should reject out-of-range amount"
+            result.is_ok(),
+            "64-bit range proof should accept amounts above the old 32-bit bound"
         );
     }
 

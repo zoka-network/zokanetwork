@@ -1070,8 +1070,8 @@ mod tests {
     fn apply_block_canonical_rejects_block_solved_at_lower_difficulty() {
         // A peer that announces a block whose seal carries fewer leading
         // zero bits than the canonical expected difficulty MUST be
-        // refused. We construct a seal with a single leading-zero byte
-        // (8 bits) so it fails the warmup INITIAL band (16 bits).
+        // refused. We construct a seal with zero leading-zero bits so it
+        // fails the warmup INITIAL band.
         let chain_id = "zoka-test-net";
         let (storage, _dir) = open_temp_storage();
 

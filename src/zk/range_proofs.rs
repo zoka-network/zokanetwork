@@ -4,7 +4,8 @@ use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
 use merlin::Transcript;
 
-pub const PRIVATE_RANGE_PROOF_BITS: usize = 32;
+pub const LEGACY_PRIVATE_RANGE_PROOF_BITS: usize = 32;
+pub const PRIVATE_RANGE_PROOF_BITS: usize = 64;
 
 fn bulletproof_gens() -> BulletproofGens {
     BulletproofGens::new(64, 1)
@@ -33,11 +34,6 @@ pub fn amount_commitment_from_hex(commitment_hex: &str) -> Result<CompressedRist
 }
 
 pub fn prove_output_range(amount: u64, blind: Scalar) -> Result<Vec<u8>, BlockError> {
-    if amount > u32::MAX as u64 {
-        return Err(BlockError::TransactionValidationFailed(
-            "private amount exceeds Bulletproof range bound".to_string(),
-        ));
-    }
     let mut transcript = Transcript::new(b"zoka-private-range-proof-v1");
     let (proof, _) = RangeProof::prove_single(
         &bulletproof_gens(),
@@ -65,13 +61,27 @@ pub fn verify_output_range(commitment_hex: &str, proof_bytes: &[u8]) -> Result<b
         ))
     })?;
     let mut transcript = Transcript::new(b"zoka-private-range-proof-v1");
-    Ok(proof
+    if proof
         .verify_single(
             &bulletproof_gens(),
             &pedersen_gens(),
             &mut transcript,
             &commitment,
             PRIVATE_RANGE_PROOF_BITS,
+        )
+        .is_ok()
+    {
+        return Ok(true);
+    }
+
+    let mut legacy_transcript = Transcript::new(b"zoka-private-range-proof-v1");
+    Ok(proof
+        .verify_single(
+            &bulletproof_gens(),
+            &pedersen_gens(),
+            &mut legacy_transcript,
+            &commitment,
+            LEGACY_PRIVATE_RANGE_PROOF_BITS,
         )
         .is_ok())
 }

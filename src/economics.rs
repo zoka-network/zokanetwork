@@ -18,8 +18,13 @@ pub const HALVING_INTERVAL_BLOCKS: u64 = 1_051_200;
 pub const TARGET_BLOCK_TIME_SECS: u64 = 120;
 pub const COINBASE_MATURITY_BLOCKS: u64 = 60;
 
+/// Consensus cap for private transaction hash commitments in one block.
+/// Wallets can split large sends across multiple private transactions, but a
+/// block must keep a bounded commitment list so validation remains predictable.
+pub const PRIVATE_TX_HASHES_PER_BLOCK_LIMIT: usize = 128;
+
 pub const POW_MIN_DIFFICULTY_BITS: u32 = 12;
-pub const POW_INITIAL_DIFFICULTY_BITS: u32 = 16;
+pub const POW_INITIAL_DIFFICULTY_BITS: u32 = 12;
 pub const POW_MAX_DIFFICULTY_BITS: u32 = 30;
 pub const POW_KEY_EPOCH_BLOCKS: u64 = 2_048;
 

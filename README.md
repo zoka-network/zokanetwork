@@ -46,6 +46,7 @@ zoka wallets --network testnet
 |---|---|
 | Join the testnet | [docs/testnet.md](docs/testnet.md) |
 | Run a VPS node | [docs/node-operator-guide.md](docs/node-operator-guide.md) |
+| Deploy on Fly.io | [docs/fly-bootstrap.md](docs/fly-bootstrap.md) |
 | CLI commands | [docs/user-cli-reference.md](docs/user-cli-reference.md) |
 | Verify releases | [docs/release-verification.md](docs/release-verification.md) |
 | Protocol overview | [docs/protocol-overview.md](docs/protocol-overview.md) |

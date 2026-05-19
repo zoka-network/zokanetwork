@@ -381,24 +381,48 @@ impl StateManager {
 
     /// Get account state
     pub async fn get_account(&self, address: &str) -> Option<AccountState> {
+        if let Ok(Some(account)) = self.storage.get_account_state(address) {
+            return Some(account);
+        }
+
         let state = self.state.read().await;
         state.get_account(&address.to_string()).cloned()
     }
 
     /// Get current blockchain height
     pub async fn get_height(&self) -> u64 {
+        if let Ok(height) = self.storage.get_chain_height() {
+            return height;
+        }
+
         let state = self.state.read().await;
         state.current_height
     }
 
+    /// Get the PoW difficulty (leading-zero bits) required for the next block.
+    pub fn get_next_difficulty(&self) -> u32 {
+        crate::mining::difficulty::expected_for_next_block(&self.storage)
+            .unwrap_or(crate::economics::POW_INITIAL_DIFFICULTY_BITS)
+    }
+
     /// Get current block hash
     pub async fn get_current_hash(&self) -> String {
+        if let Ok(hash) = self.storage.get_last_block_hash() {
+            return hash;
+        }
+
         let state = self.state.read().await;
         state.current_hash.clone()
     }
 
     /// Get current state root
     pub async fn get_state_root(&self) -> String {
+        if let Ok(root) = self.storage.get_state_root() {
+            if root != "0" {
+                return root;
+            }
+        }
+
         let state = self.state.read().await;
         state.current_state_root.clone()
     }
@@ -415,6 +439,25 @@ impl StateManager {
         self.storage
             .get_block(hash)
             .map_err(|e| StateError::StorageError(e.to_string()))
+    }
+
+    /// Get the persisted PoW difficulty bits for a block, when metadata is available.
+    pub fn get_block_difficulty_bits(&self, hash: &str) -> Result<Option<u32>, StateError> {
+        let key = format!("chain:block_meta:{hash}");
+        let Some(bytes) = self
+            .storage
+            .get_raw(&key)
+            .map_err(|e| StateError::StorageError(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| StateError::StorageError(format!("block meta decode failed: {e}")))?;
+        Ok(value
+            .get("difficulty_bits")
+            .and_then(|bits| bits.as_u64())
+            .and_then(|bits| u32::try_from(bits).ok()))
     }
 
     /// Get the latest block
@@ -464,6 +507,13 @@ impl StateManager {
             Some(block) => Ok(block.private_tx_hashes),
             None => Err(StateError::StorageError("Block not found".to_string())),
         }
+    }
+
+    /// Get the encrypted/canonical private transaction body by hash.
+    pub fn get_private_transaction_bytes(&self, hash: &str) -> Result<Option<Vec<u8>>, StateError> {
+        self.storage
+            .get_private_transaction_bytes(hash)
+            .map_err(|e| StateError::StorageError(e.to_string()))
     }
 
     /// Create an account with initial balance (for testing/genesis)

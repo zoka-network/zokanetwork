@@ -1637,14 +1637,6 @@ impl PrivateTransactionBuilder {
                 "multi-asset inputs are not enabled yet in transaction builder".to_string(),
             ));
         }
-        for amount in &input_amounts {
-            if *amount > u32::MAX as u64 {
-                return Err(BlockError::TransactionValidationFailed(
-                    "private input note exceeds current 32-bit range proof bound".to_string(),
-                ));
-            }
-        }
-
         if input_commitments.is_empty() {
             return Err(BlockError::TransactionValidationFailed(
                 "private transaction requires committed input notes".to_string(),
@@ -1725,17 +1717,6 @@ impl PrivateTransactionBuilder {
         }
         drop(set);
 
-        if self.amount > u32::MAX as u64 {
-            return Err(BlockError::TransactionValidationFailed(
-                "private amount exceeds current 32-bit range proof bound".to_string(),
-            ));
-        }
-        if self.fee > u32::MAX as u64 {
-            return Err(BlockError::TransactionValidationFailed(
-                "private fee exceeds current 32-bit range proof bound".to_string(),
-            ));
-        }
-
         let (primary_commitment, primary_commitment_blind) =
             Commitment::new_random(&self.amount.to_le_bytes());
 
@@ -1780,12 +1761,6 @@ impl PrivateTransactionBuilder {
                 "private witness inputs do not preserve value".to_string(),
             ));
         }
-        if input_sum > u32::MAX as u64 || output_sum > u32::MAX as u64 {
-            return Err(BlockError::TransactionValidationFailed(
-                "private sum exceeds current 32-bit range proof bound".to_string(),
-            ));
-        }
-
         let proof_key_image = input_key_images
             .first()
             .map(|image| first_u64_from_hex(image))
@@ -2506,6 +2481,27 @@ impl PrivateWallet {
             .collect::<Vec<_>>();
         candidates.sort_by(|lhs, rhs| rhs.1.cmp(&lhs.1).then_with(|| lhs.0.cmp(&rhs.0)));
 
+        let available_total = candidates
+            .iter()
+            .fold(0u64, |total, (_, amount)| total.saturating_add(*amount));
+        if available_total < amount {
+            return Err(BlockError::TransactionValidationFailed(
+                "Insufficient private balance".to_string(),
+            ));
+        }
+
+        let max_single_tx_total = candidates
+            .iter()
+            .take(PRIVATE_TX_MAX_INPUTS)
+            .fold(0u64, |total, (_, amount)| total.saturating_add(*amount));
+        if max_single_tx_total < amount {
+            return Err(BlockError::TransactionValidationFailed(format!(
+                "amount requires more than {} private inputs. Max spendable in one transaction right now is {} ZKA; send a smaller amount or split it into multiple transfers.",
+                PRIVATE_TX_MAX_INPUTS,
+                crate::economics::format_zka_amount(max_single_tx_total)
+            )));
+        }
+
         let mut selected = Vec::new();
         let mut total = 0u64;
         for (idx, note_amount) in candidates {
@@ -2515,10 +2511,7 @@ impl PrivateWallet {
                 return Ok(selected);
             }
         }
-
-        Err(BlockError::TransactionValidationFailed(
-            "Insufficient private balance".to_string(),
-        ))
+        unreachable!("available_total precheck guarantees spendable notes are sufficient")
     }
 
     fn prepare_selected_notes(
@@ -2881,6 +2874,16 @@ impl PrivateWalletManager {
 
     /// Create new private wallet
     pub fn create_private_wallet(&mut self, name: &str) -> Result<String, BlockError> {
+        self.create_private_wallet_with_entropy_bytes(name, 32)
+    }
+
+    /// Create new private wallet with explicit BIP39 entropy size.
+    /// 16 bytes yields a 12-word phrase; 32 bytes yields a 24-word phrase.
+    pub fn create_private_wallet_with_entropy_bytes(
+        &mut self,
+        name: &str,
+        entropy_bytes: usize,
+    ) -> Result<String, BlockError> {
         use rand::RngCore;
 
         if self.private_wallets.contains_key(name) {
@@ -2888,10 +2891,16 @@ impl PrivateWalletManager {
                 "Private wallet already exists".to_string(),
             ));
         }
+        if entropy_bytes != 16 && entropy_bytes != 32 {
+            return Err(BlockError::TransactionValidationFailed(
+                "Private wallet seed entropy must be 16 bytes (12 words) or 32 bytes (24 words)"
+                    .to_string(),
+            ));
+        }
 
         // The scan key is the BIP39 entropy. The spend key is derived from it so
         // the printed recovery phrase can restore the full wallet.
-        let mut scan_key = vec![0u8; 32];
+        let mut scan_key = vec![0u8; entropy_bytes];
         rand::rngs::OsRng.fill_bytes(&mut scan_key);
         let spending_key = derive_spending_key_from_recovery_seed(&scan_key);
 
@@ -3661,6 +3670,26 @@ impl PrivateWalletManager {
         wallet_name: &str,
         tx: &PrivateTransaction,
     ) -> Result<u64, BlockError> {
+        let (credited, _) = self.apply_private_transaction_for_wallet_inner(wallet_name, tx)?;
+        Ok(credited)
+    }
+
+    /// Apply a persisted private transaction only when it belongs to this
+    /// wallet. Returns whether wallet state changed.
+    pub fn apply_relevant_private_transaction_for_wallet(
+        &mut self,
+        wallet_name: &str,
+        tx: &PrivateTransaction,
+    ) -> Result<bool, BlockError> {
+        let (_, changed) = self.apply_private_transaction_for_wallet_inner(wallet_name, tx)?;
+        Ok(changed)
+    }
+
+    fn apply_private_transaction_for_wallet_inner(
+        &mut self,
+        wallet_name: &str,
+        tx: &PrivateTransaction,
+    ) -> Result<(u64, bool), BlockError> {
         let decrypted_outputs = self.decrypt_matching_outputs_for_wallet(wallet_name, tx)?;
         let input_nullifiers = tx_input_nullifiers(tx);
         let input_nullifiers = input_nullifiers.into_iter().collect::<HashSet<_>>();
@@ -3669,16 +3698,22 @@ impl PrivateWalletManager {
         })?;
 
         let spent_at = current_timestamp();
+        let mut related = !decrypted_outputs.is_empty();
+        let mut changed = false;
         for note in &mut wallet.private_notes {
-            if note.spent {
-                continue;
-            }
             let nullifier =
                 derive_note_nullifier(&wallet.spending_key, &note.note_id, &note.commitment);
             if input_nullifiers.contains(&nullifier) {
-                note.spent = true;
-                note.spent_at = Some(spent_at);
+                related = true;
+                if !note.spent {
+                    note.spent = true;
+                    note.spent_at = Some(spent_at);
+                    changed = true;
+                }
             }
+        }
+        if !related {
+            return Ok((0, false));
         }
 
         let mut credited = 0u64;
@@ -3692,6 +3727,7 @@ impl PrivateWalletManager {
             }
             wallet.import_output_as_note(&tx.tx_hash, &output, amount);
             credited = credited.saturating_add(amount);
+            changed = true;
         }
         if !wallet
             .private_transactions
@@ -3699,9 +3735,12 @@ impl PrivateWalletManager {
             .any(|existing| existing.tx_hash == tx.tx_hash)
         {
             wallet.private_transactions.push(tx.clone());
+            changed = true;
         }
-        wallet.sync_balance_cache();
-        Ok(credited)
+        if changed {
+            wallet.sync_balance_cache();
+        }
+        Ok((credited, changed))
     }
 
     /// Confirm a private transaction (for miners/validators)
@@ -4327,6 +4366,27 @@ mod tests {
         let result = manager.send_private_transaction("alice", "commitment_key".to_string(), 100);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_private_transaction_reports_single_tx_input_bound() {
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        let bob_address = manager.create_private_wallet("bob").unwrap();
+        let reward_note = 12 * crate::economics::ATOMS_PER_ZKA;
+        for _ in 0..(PRIVATE_TX_MAX_INPUTS + 1) {
+            manager
+                .deposit_to_private_wallet("alice", reward_note)
+                .unwrap();
+        }
+
+        let over_bound_amount = reward_note * (PRIVATE_TX_MAX_INPUTS as u64 + 1);
+        let result = manager.send_private_transaction("alice", bob_address, over_bound_amount);
+
+        let error = result.expect_err("transfer should exceed one-tx input bound");
+        let message = error.to_string();
+        assert!(message.contains("Max spendable in one transaction"));
+        assert!(message.contains(&PRIVATE_TX_MAX_INPUTS.to_string()));
     }
 
     #[test]
@@ -5039,6 +5099,45 @@ mod tests {
         assert_eq!(outcome.total_fee_claimed, fee);
         assert_eq!(manager.get_private_balance("miner"), Some(fee));
         assert_eq!(crate::economics::format_zka_amount(fee), "0.0001");
+    }
+
+    #[test]
+    fn test_chain_scan_applies_only_relevant_private_transactions() {
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        let bob_commitment = manager.create_private_wallet("bob").unwrap();
+        manager.create_private_wallet("carol").unwrap();
+
+        manager.deposit_to_private_wallet("alice", 50).unwrap();
+        let tx_hash = manager
+            .send_private_transaction("alice", bob_commitment, 10)
+            .unwrap();
+        let tx = manager.get_private_transaction(&tx_hash).unwrap().clone();
+
+        let carol_changed = manager
+            .apply_relevant_private_transaction_for_wallet("carol", &tx)
+            .unwrap();
+        assert!(!carol_changed);
+        assert_eq!(manager.get_private_balance("carol"), Some(0));
+        assert!(manager
+            .get_private_wallet("carol")
+            .unwrap()
+            .private_transactions
+            .is_empty());
+
+        let bob_changed = manager
+            .apply_relevant_private_transaction_for_wallet("bob", &tx)
+            .unwrap();
+        assert!(bob_changed);
+        assert_eq!(manager.get_private_balance("bob"), Some(10));
+        assert_eq!(
+            manager
+                .get_private_wallet("bob")
+                .unwrap()
+                .private_transactions
+                .len(),
+            1
+        );
     }
 
     #[test]
