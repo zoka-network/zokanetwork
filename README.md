@@ -13,7 +13,7 @@ to verify and join the testnet.
 Download binaries from GitHub Releases:
 
 ```text
-https://github.com/zokachain/zoka-network/releases
+https://github.com/ZokaNetwork/ZokaNetwork/releases
 ```
 
 Build from source:

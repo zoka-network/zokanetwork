@@ -21,6 +21,7 @@ releases/
 # Sister projects (separate repositories)
 zsilent-core/
 zokaexplorer/
+zokaweb/
 
 # Local snapshots / migration artifacts
 zoka-local-*.snapshot.json
