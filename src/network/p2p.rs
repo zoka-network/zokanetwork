@@ -1418,6 +1418,27 @@ impl Node {
         block_hash: String,
         encrypted_block: Vec<u8>,
     ) -> Result<(), Box<dyn Error>> {
+        self.publish_block_response_with_bodies(
+            block_height,
+            block_hash,
+            encrypted_block,
+            Vec::new(),
+        )
+    }
+
+    /// Publish BlockResponse with private transaction bodies attached so
+    /// receivers can persist them under `priv_tx:<hash>` and serve them via
+    /// `/private/tx/:hash` without depending on the original sender ever
+    /// having POSTed to a central archive. Each body is the serialized
+    /// `PrivateTransaction` JSON whose `tx_hash` MUST be one of the
+    /// `private_tx_hashes` committed in the block.
+    pub fn publish_block_response_with_bodies(
+        &mut self,
+        block_height: u64,
+        block_hash: String,
+        encrypted_block: Vec<u8>,
+        private_tx_bodies: Vec<Vec<u8>>,
+    ) -> Result<(), Box<dyn Error>> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1427,6 +1448,7 @@ impl Node {
             encrypted_block,
             block_hash,
             difficulty_bits: None,
+            private_tx_bodies,
             timestamp: now,
         }))
     }

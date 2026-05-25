@@ -251,6 +251,17 @@ pub struct BlockResponseMessage {
     /// difficulty changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub difficulty_bits: Option<u32>,
+    /// Serialized PrivateTransaction bodies for every `private_tx_hash`
+    /// committed in this block that the publisher had locally. Receivers
+    /// verify each body's `tx_hash` matches a hash in the block and then
+    /// persist it under `priv_tx:<hash>` so future wallet scanners can
+    /// recover spend nullifiers and ownership without needing every
+    /// original sender to POST to a central archive.
+    ///
+    /// Backwards-compatible: older peers omit this field and receive
+    /// `Vec::new()`. Older receivers ignore it entirely.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub private_tx_bodies: Vec<Vec<u8>>,
     /// Timestamp
     pub timestamp: u64,
 }

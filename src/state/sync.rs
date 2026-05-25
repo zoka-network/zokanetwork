@@ -383,11 +383,20 @@ fn try_apply_synced_block_payload_inner(
         None => apply_block(storage, chain_id, &block),
     };
     match applied {
-        Ok(head) => SyncOutcome::Applied(head),
-        Err(ChainError::BlockAlreadyKnown(hash)) => SyncOutcome::AlreadyKnown {
-            height: candidate_height,
-            hash,
-        },
+        Ok(head) => {
+            persist_attached_private_tx_bodies(storage, &block, &response.private_tx_bodies);
+            SyncOutcome::Applied(head)
+        }
+        Err(ChainError::BlockAlreadyKnown(hash)) => {
+            // Persist bodies even when block is already known — this lets a
+            // node that synced the block header earlier (without bodies)
+            // backfill bodies the next time the same block re-circulates.
+            persist_attached_private_tx_bodies(storage, &block, &response.private_tx_bodies);
+            SyncOutcome::AlreadyKnown {
+                height: candidate_height,
+                hash,
+            }
+        }
         Err(ChainError::SideBranchNotHeavier { .. }) => SyncOutcome::BehindOrSibling {
             local_head: local_height,
             candidate: candidate_height,
@@ -444,6 +453,49 @@ pub fn next_required_height(
 pub(crate) fn parse_block_payload(bytes: &[u8]) -> Result<Block, String> {
     let mut de = serde_json::Deserializer::from_slice(bytes);
     Block::deserialize(&mut de).map_err(|e| e.to_string())
+}
+
+/// Persist private transaction bodies that arrived attached to a block
+/// payload. Each body's `tx_hash` is cross-checked against the block's
+/// `private_tx_hashes` list — bodies that don't correspond to a committed
+/// hash are silently dropped (a malicious peer cannot inject arbitrary
+/// bodies). Already-stored bodies are not overwritten by this path.
+///
+/// Failures are logged but never abort the caller: persisting a body is
+/// best-effort, the block apply already succeeded.
+fn persist_attached_private_tx_bodies(storage: &RocksDbStorage, block: &Block, bodies: &[Vec<u8>]) {
+    if bodies.is_empty() || block.private_tx_hashes.is_empty() {
+        return;
+    }
+    let committed: std::collections::HashSet<&str> =
+        block.private_tx_hashes.iter().map(|s| s.as_str()).collect();
+    for body_bytes in bodies {
+        let tx: crate::private_wallet::PrivateTransaction = match serde_json::from_slice(body_bytes)
+        {
+            Ok(tx) => tx,
+            Err(err) => {
+                tracing::debug!("ignoring attached private tx body: deserialize failed: {err}");
+                continue;
+            }
+        };
+        let hash = tx.tx_hash.trim();
+        if hash.is_empty() || !committed.contains(hash) {
+            tracing::debug!(
+                "ignoring attached private tx body: hash {} not committed in block {}",
+                hash,
+                block.header.hash
+            );
+            continue;
+        }
+        // Skip if we already have a body for this hash (avoid clobbering
+        // a copy we trust with a peer-supplied one).
+        if matches!(storage.get_private_transaction_bytes(hash), Ok(Some(_))) {
+            continue;
+        }
+        if let Err(err) = storage.save_private_transaction_bytes(hash, body_bytes) {
+            tracing::warn!("failed to persist attached private tx body {hash}: {err}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -532,6 +584,7 @@ mod tests {
             encrypted_block: serde_json::to_vec(block).expect("serialize block"),
             block_hash: block.header.hash.clone(),
             difficulty_bits: None,
+            private_tx_bodies: Vec::new(),
             timestamp: block.header.timestamp,
         }
     }
@@ -555,6 +608,7 @@ mod tests {
             encrypted_block: b"not json".to_vec(),
             block_hash: "deadbeef".to_string(),
             difficulty_bits: None,
+            private_tx_bodies: Vec::new(),
             timestamp: 0,
         };
         match try_apply_synced_block_payload_with_expected_difficulty(
@@ -864,6 +918,7 @@ mod tests {
             encrypted_block: b"cached-block".to_vec(),
             block_hash: "h5".to_string(),
             difficulty_bits: None,
+            private_tx_bodies: Vec::new(),
             timestamp: 1_700_000_000,
         };
         let outcome = SyncOutcome::GapAhead {
@@ -894,6 +949,7 @@ mod tests {
             encrypted_block: b"far-future-block".to_vec(),
             block_hash: "too-far".to_string(),
             difficulty_bits: None,
+            private_tx_bodies: Vec::new(),
             timestamp: 1_700_000_000,
         };
         let outcome = SyncOutcome::GapAhead {
