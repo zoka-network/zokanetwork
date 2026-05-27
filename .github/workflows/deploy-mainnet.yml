@@ -104,12 +104,15 @@ jobs:
             --mine-interval-secs 30 \
             --mine-blocks 1 \
             --sync-warmup-secs 10 \
-            --sync-rebroadcast-recent-blocks 32
+            --sync-rebroadcast-recent-blocks 32 \
+            --allow-isolated-start \
+            --password-env ZOKA_NODE_PASSWORD
           Environment=RUST_LOG=info
           Environment=ZOKA_HOME=/data/zoka
           Environment=ZOKA_TRUSTED_SETUP_DIR=/opt/zoka/trusted-setup
           Environment=ZOKA_API_BIND=0.0.0.0:3000
           Environment=ZOKA_MINER_ADDRESS=zka1a6n1R8noF6T5vR4YGGv8ibUKpUESu8y5ESdb8BUNx6wGengyZ9mXGJA7u9dpwUh5rxk3gSFXEhBZacXgHUNjb5ET3cJn9
+          Environment=ZOKA_NODE_PASSWORD=${{ secrets.ZOKA_NODE_PASSWORD }}
           Restart=on-failure
           RestartSec=10s
           LimitNOFILE=65536
@@ -189,7 +192,9 @@ jobs:
             --no-mine \
             --seed /ip4/${BOOTSTRAP_IP}/tcp/28080 \
             --sync-warmup-secs 30 \
-            --sync-rebroadcast-recent-blocks 32
+            --sync-rebroadcast-recent-blocks 32 \
+            --allow-isolated-start \
+            --password-env ZOKA_NODE_PASSWORD
           Environment=RUST_LOG=info
           Environment=ZOKA_HOME=/data/zoka
           Environment=ZOKA_TRUSTED_SETUP_DIR=/opt/zoka/trusted-setup
@@ -197,6 +202,7 @@ jobs:
           Environment=ZOKA_API_RATE_LIMIT=1000
           Environment=ZOKA_API_TX_RATE_LIMIT=120
           Environment=ZOKA_API_MAX_BODY_BYTES=1048576
+          Environment=ZOKA_NODE_PASSWORD=${{ secrets.ZOKA_NODE_PASSWORD }}
           Restart=on-failure
           RestartSec=10s
           LimitNOFILE=65536
