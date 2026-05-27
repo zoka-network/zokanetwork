@@ -97,7 +97,7 @@ jobs:
           Type=simple
           User=root
           WorkingDirectory=/data/zoka
-          ExecStart=/usr/local/bin/zoka fullnode-auto \
+          ExecStart=/usr/local/bin/zoka fullnode \
             --network mainnet \
             --db /data/zoka/blockchain.db \
             --listen /ip4/0.0.0.0/tcp/28080 \
@@ -182,7 +182,7 @@ jobs:
           Type=simple
           User=root
           WorkingDirectory=/data/zoka
-          ExecStart=/usr/local/bin/zoka fullnode-auto \
+          ExecStart=/usr/local/bin/zoka fullnode \
             --network mainnet \
             --db /data/zoka/blockchain.db \
             --listen /ip4/0.0.0.0/tcp/28080 \
