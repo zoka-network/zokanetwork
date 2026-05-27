@@ -109,6 +109,7 @@ jobs:
           Environment=ZOKA_HOME=/data/zoka
           Environment=ZOKA_TRUSTED_SETUP_DIR=/opt/zoka/trusted-setup
           Environment=ZOKA_API_BIND=0.0.0.0:3000
+          Environment=ZOKA_MINER_ADDRESS=zka1a6n1R8noF6T5vR4YGGv8ibUKpUESu8y5ESdb8BUNx6wGengyZ9mXGJA7u9dpwUh5rxk3gSFXEhBZacXgHUNjb5ET3cJn9
           Restart=on-failure
           RestartSec=10s
           LimitNOFILE=65536
