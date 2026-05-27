@@ -108,6 +108,7 @@ jobs:
           Environment=RUST_LOG=info
           Environment=ZOKA_HOME=/data/zoka
           Environment=ZOKA_TRUSTED_SETUP_DIR=/opt/zoka/trusted-setup
+          Environment=ZOKA_API_BIND=0.0.0.0:3000
           Restart=on-failure
           RestartSec=10s
           LimitNOFILE=65536
@@ -191,6 +192,7 @@ jobs:
           Environment=RUST_LOG=info
           Environment=ZOKA_HOME=/data/zoka
           Environment=ZOKA_TRUSTED_SETUP_DIR=/opt/zoka/trusted-setup
+          Environment=ZOKA_API_BIND=0.0.0.0:3000
           Environment=ZOKA_API_RATE_LIMIT=1000
           Environment=ZOKA_API_TX_RATE_LIMIT=120
           Environment=ZOKA_API_MAX_BODY_BYTES=1048576
