@@ -27,7 +27,7 @@
       "label": "fly-gru-bootstrap-rpc",
       "operator": "zoka-core",
       "region": "gru",
-      "url": "http://zoka-bootstrap-zokachain.fly.dev",
+      "url": "https://zoka-bootstrap-zokachain.fly.dev",
       "onion": null,
       "i2p": null,
       "status": "active",

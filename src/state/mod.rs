@@ -516,6 +516,41 @@ impl StateManager {
             .map_err(|e| StateError::StorageError(e.to_string()))
     }
 
+    /// Persist the encrypted/canonical private transaction body by hash.
+    pub fn save_private_transaction_bytes(
+        &self,
+        hash: &str,
+        body: &[u8],
+    ) -> Result<(), StateError> {
+        self.storage
+            .save_private_transaction_bytes(hash, body)
+            .map_err(|e| StateError::StorageError(e.to_string()))
+    }
+
+    /// Mark a private transaction body as pending for local miner inclusion.
+    pub fn save_pending_private_transaction_hash(&self, hash: &str) -> Result<(), StateError> {
+        self.storage
+            .save_pending_private_transaction_hash(hash)
+            .map_err(|e| StateError::StorageError(e.to_string()))
+    }
+
+    /// Return whether the chain already commits this private transaction hash.
+    pub async fn has_private_transaction_hash(&self, hash: &str) -> Result<bool, StateError> {
+        let height = self.get_height().await;
+        for h in 1..=height {
+            if let Some(block) = self.get_block_by_height(h).await? {
+                if block
+                    .private_tx_hashes
+                    .iter()
+                    .any(|candidate| candidate == hash)
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Create an account with initial balance (for testing/genesis)
     pub async fn create_account(
         &self,

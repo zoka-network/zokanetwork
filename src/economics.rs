@@ -16,6 +16,7 @@ pub const MAX_SUPPLY_ATOMS: u64 = MAX_SUPPLY_ZKA * ATOMS_PER_ZKA;
 pub const INITIAL_BLOCK_REWARD_ATOMS: u64 = INITIAL_BLOCK_REWARD_ZKA * ATOMS_PER_ZKA;
 pub const HALVING_INTERVAL_BLOCKS: u64 = 1_051_200;
 pub const TARGET_BLOCK_TIME_SECS: u64 = 120;
+/// Mainnet value: coinbase outputs require 60 confirmations before they can be spent.
 pub const COINBASE_MATURITY_BLOCKS: u64 = 60;
 
 /// Consensus cap for private transaction hash commitments in one block.

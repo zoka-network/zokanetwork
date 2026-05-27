@@ -20,7 +20,7 @@ zoka
 zoka create <label> --network testnet --password <password>
 zoka restore "<recovery phrase>" --network testnet --password <password> --name <label>
 zoka wallets --network testnet
-zoka balance <wallet> --network testnet --password <password>
+zoka balance <wallet-address> --network testnet --password <password>
 zoka send <from-zka1-address> <to-zka1-address> <amount> --network testnet --password <password> --fee <fee> --yes
 zoka mine <wallet-zka1-address> --network testnet --password <password>
 zoka node --network testnet --password <password>

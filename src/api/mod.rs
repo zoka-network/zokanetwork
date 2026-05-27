@@ -2,7 +2,7 @@
 use crate::cli::{CliConfig, MultiProfileConfig};
 use crate::consensus::pbft::PbftConsensus;
 use crate::mempool::Mempool;
-use crate::private_wallet::PrivateWalletManager;
+use crate::private_wallet::{PrivateTransaction, PrivateWalletManager};
 use crate::state::{AccountInclusionProof, StateManager};
 use crate::types::{StateError, TransactionRequest, TransactionResponse};
 use axum::{
@@ -30,6 +30,21 @@ type SharedMempool = Arc<Mempool>;
 /// `RwLock` mirrors the pattern used by `StateManager` and `Mempool`
 /// (shared ownership + interior mutability for the async HTTP handlers).
 type SharedPrivateWalletManager = Arc<RwLock<PrivateWalletManager>>;
+
+/// Channel sender used by HTTP handlers (specifically the
+/// `/private/wallet/send-from-seed` endpoint) to hand a freshly built
+/// `PrivateTransaction` to the fullnode main loop so it can:
+///   1. Add the tx to its in-memory private pool (so its own miner sees
+///      it on the next mining cycle).
+///   2. Gossip the tx over libp2p via `ZokaMessage::PrivateTransaction`
+///      so every connected peer (including the user's local mining node)
+///      picks it up and includes it in their next block.
+///
+/// Wrapped in `Option` because tests / non-fullnode contexts spin up the
+/// API without a P2P node â€” those callers leave it `None` and the
+/// endpoint silently skips the broadcast step.
+pub type PrivateTxBroadcastSender =
+    tokio::sync::mpsc::UnboundedSender<crate::private_wallet::PrivateTransaction>;
 
 const MINER_HEARTBEAT_TTL_SECS: u64 = 90;
 
@@ -90,7 +105,7 @@ impl Default for ApiSecurityConfig {
                 .ok()
                 .and_then(|raw| raw.parse::<usize>().ok())
                 .filter(|value| *value > 0)
-                .unwrap_or(16 * 1024),
+                .unwrap_or(1024 * 1024),
             require_tx_signature: std::env::var("ZOKA_API_REQUIRE_TX_SIGNATURE")
                 .ok()
                 .map(|v| {
@@ -649,6 +664,13 @@ pub struct AppState {
     /// private-tx bodies from the node's pool. Left as `None` in tests
     /// that don't spin up a wallet manager.
     pub private_wallet_manager: Option<SharedPrivateWalletManager>,
+    /// Channel into the fullnode main loop for forwarding freshly built
+    /// private transactions. The handler at `/private/wallet/send-from-seed`
+    /// pushes here after the CLI shell-out succeeds; the main loop drains
+    /// it, inserts each tx into its in-memory pool, and gossips it over
+    /// libp2p so any connected miner can include it in the next block.
+    /// `None` in tests / non-fullnode setups.
+    pub private_tx_broadcaster: Option<PrivateTxBroadcastSender>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -776,8 +798,10 @@ fn verify_transaction_request_signature(
     Ok(crate::types::Signature(signature_raw))
 }
 
-fn rate_limit_bucket(path: &str) -> &'static str {
-    if path.starts_with("/transactions") {
+fn rate_limit_bucket(method: &str, path: &str) -> &'static str {
+    if path.starts_with("/transactions")
+        || (!matches!(method, "GET" | "HEAD" | "OPTIONS") && path.starts_with("/private/tx"))
+    {
         "transactions"
     } else {
         "default"
@@ -1781,7 +1805,7 @@ async fn auth_and_rate_limit(
         }
     }
 
-    let bucket = rate_limit_bucket(&path);
+    let bucket = rate_limit_bucket(&method, &path);
     let limit = if bucket == "transactions" {
         app_state.security.transaction_rate_limit_per_minute
     } else {
@@ -1948,7 +1972,7 @@ async fn get_account(
     State(app_state): State<Arc<AppState>>,
     Path(address): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Balance and nonce are private — only confirm the address exists.
+    // Balance and nonce are private â€” only confirm the address exists.
     match app_state.state_manager.get_account(&address).await {
         Some(_) => Ok(Json(serde_json::json!({
             "address": address,
@@ -2231,8 +2255,8 @@ async fn get_latest_block(
 
 /// Fetch a private transaction body by its hash from the local node's
 /// `PrivateTransactionPool`. What comes back is the canonical private tx
-/// shape — commitments, nullifiers, ring metadata, stealth outputs,
-/// zk proof — **never** plaintext sender/receiver/amount. If this node
+/// shape â€” commitments, nullifiers, ring metadata, stealth outputs,
+/// zk proof â€” **never** plaintext sender/receiver/amount. If this node
 /// has no `private_wallet_manager` wired (typical for tests), the
 /// endpoint 404s rather than lying.
 async fn get_private_tx_by_hash(
@@ -2285,8 +2309,107 @@ async fn get_private_tx_by_hash(
     })?))
 }
 
+/// Archive a canonical private transaction body so future wallet restores can
+/// replay confirmed private history from a public RPC node.
+async fn post_private_tx_body(
+    State(app_state): State<Arc<AppState>>,
+    Json(tx): Json<PrivateTransaction>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let hash_owned: String = tx.tx_hash.trim().to_owned();
+    let hash = hash_owned.as_str();
+    if hash.is_empty()
+        || hash.len() > 128
+        || hash
+            .chars()
+            .any(|c| !(c.is_ascii_hexdigit() || matches!(c, '-' | '_')))
+    {
+        app_state
+            .security_stats
+            .bad_request_total
+            .fetch_add(1, Ordering::Relaxed);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "private transaction hash format is invalid".to_string(),
+        ));
+    }
+
+    let mut validator = PrivateWalletManager::new();
+    if let Err(err) = validator.validate_inbound_private_transaction(&tx) {
+        app_state
+            .security_stats
+            .bad_request_total
+            .fetch_add(1, Ordering::Relaxed);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("private transaction validation failed: {err}"),
+        ));
+    }
+
+    let body = serde_json::to_vec(&tx).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize private tx: {e}"),
+        )
+    })?;
+    let already_present = app_state
+        .state_manager
+        .get_private_transaction_bytes(hash)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to read private tx: {e}"),
+            )
+        })?
+        .is_some();
+    app_state
+        .state_manager
+        .save_private_transaction_bytes(hash, &body)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to archive private tx: {e}"),
+            )
+        })?;
+
+    let confirmed = app_state
+        .state_manager
+        .has_private_transaction_hash(hash)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to inspect private tx confirmation: {e}"),
+            )
+        })?;
+    if !confirmed {
+        app_state
+            .state_manager
+            .save_pending_private_transaction_hash(hash)
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to mark private tx pending: {e}"),
+                )
+            })?;
+        if let Some(sender) = &app_state.private_tx_broadcaster {
+            if let Err(e) = sender.send(tx) {
+                tracing::warn!(
+                    "post_private_tx_body: failed to forward tx {hash} to mining pool: {e}"
+                );
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "hash": hash,
+        "status": if already_present { "already_archived" } else { "archived" },
+        "confirmed": confirmed,
+        "pending": !confirmed,
+    })))
+}
+
 /// Get the private-transaction hashes committed at a specific block.
-/// Returns only hashes — by design the full `PrivateTransaction` body is
+/// Returns only hashes â€” by design the full `PrivateTransaction` body is
 /// never exposed through this API; clients that want the body look it up
 /// via `/private/tx/:hash` on a node that holds the body.
 async fn get_block_private_tx_hashes(
@@ -2377,9 +2500,9 @@ async fn get_block_transactions(
             // `Transaction` is the public-ledger type; by construction every
             // row here carries plaintext sender/receiver/amount. Private txs
             // are in `PrivateTransaction` and never serialize through this
-            // endpoint — the old placebo redaction that keyed off a dead
+            // endpoint â€” the old placebo redaction that keyed off a dead
             // `zk_proof` flag is gone.
-            // Only expose the hash — sender/receiver/amount are private by protocol.
+            // Only expose the hash â€” sender/receiver/amount are private by protocol.
             "transactions": txs
                 .iter()
                 .map(|tx| serde_json::json!({ "hash": tx.hash }))
@@ -2606,6 +2729,351 @@ async fn submit_transaction(
             ))
         }
     }
+}
+
+// â”€â”€ /private/wallet/send-from-seed â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//
+// Build, sign and broadcast a private transaction on behalf of a mobile
+// (or any seed-only) client. The client POSTs the BIP-39 entropy of its
+// recovery phrase together with recipient + amount; the node uses the
+// seed *ephemerally* in a sandboxed temp directory to:
+//
+//   1. Restore the wallet keys (`wallet-restore-from-keys`)
+//   2. Sync UTXOs from the local chain DB (`balance` triggers it)
+//   3. Build the PrivateTransaction (CLSAG ring sig + Groth16 ZK proof
+//      using the trusted-setup `.params` files this node already has)
+//      and submit to the mempool (`send`)
+//   4. Delete the temp directory unconditionally
+//
+// The seed never touches disk except inside the temp directory, which is
+// always removed on the response path (success or error). The node
+// operator can still inspect process memory, so this endpoint is a
+// usability/privacy tradeoff: clients who care about full custody should
+// point `Custom RPC` at their own node (see RpcSettings in zkapriv).
+//
+// This is the only path that lets ZKAPriv submit private transfers from
+// Android today â€” generating a Groth16 proof inside Android would require
+// embedding the multi-MB trusted setup and a snark-friendly EC library,
+// which is out of scope. Implemented via shell-out to the bundled `zoka`
+// CLI to reuse the battle-tested send pipeline instead of reimplementing
+// the cryptography in the HTTP handler.
+
+#[derive(Debug, Deserialize)]
+struct SendFromSeedRequest {
+    /// Hex of the BIP-39 entropy (16 or 32 bytes). The scan key for
+    /// Zoka private wallets IS the recovery entropy; the spending key
+    /// is derived from it deterministically.
+    seed_hex: String,
+    /// Recipient zka1â€¦ address.
+    to: String,
+    /// Amount in ZKA atoms (1 ZKA = 1_000_000 atoms).
+    amount_atoms: u64,
+    /// Priority fee in atoms. Defaults to 1_000 (0.001 ZKA) when absent.
+    #[serde(default)]
+    fee_atoms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct SendFromSeedResponse {
+    hash: String,
+    status: String,
+}
+
+async fn send_from_seed(
+    State(app_state): State<Arc<AppState>>,
+    Json(req): Json<SendFromSeedRequest>,
+) -> Result<Json<SendFromSeedResponse>, (StatusCode, String)> {
+    use sha2::{Digest, Sha256};
+
+    // â”€â”€ Validate inputs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    if req.amount_atoms == 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "amount_atoms must be greater than zero".to_string(),
+        ));
+    }
+    let seed_bytes = hex::decode(req.seed_hex.trim())
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid seed_hex".to_string()))?;
+    if seed_bytes.len() != 32 && seed_bytes.len() != 16 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "seed_hex must be 16 or 32 bytes".to_string(),
+        ));
+    }
+    if !req.to.starts_with("zka1") || req.to.len() < 32 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid recipient address (expected zka1â€¦)".to_string(),
+        ));
+    }
+
+    // â”€â”€ Derive the spending key from the seed entropy (matches
+    //    `derive_spending_key_from_recovery_seed` in private_wallet/mod.rs) â”€
+    let mut hasher = Sha256::new();
+    hasher.update(b"zoka-private-wallet-spend-v1");
+    hasher.update([0x1f]);
+    hasher.update(&seed_bytes);
+    let spending_key = hasher.finalize();
+    let spending_key_hex = hex::encode(spending_key);
+    let scan_key_hex = hex::encode(&seed_bytes);
+
+    // â”€â”€ Sandbox the wallet file under a unique temp dir â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let tmp_dir = std::env::temp_dir().join(format!("zk-send-{nanos}"));
+    let wallets_dir = tmp_dir.join(".zoka").join("mainnet").join("private_wallets");
+    if let Err(e) = tokio::fs::create_dir_all(&wallets_dir).await {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to create temp wallet dir: {e}"),
+        ));
+    }
+
+    // RAII-style cleanup: ensure the temp dir is removed on every exit
+    // path so the seed-derived wallet file never persists beyond the
+    // request lifecycle.
+    struct CleanupGuard(PathBuf);
+    impl Drop for CleanupGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = CleanupGuard(tmp_dir.clone());
+
+    let tmp_password = format!("p{nanos}");
+    let tmp_name = format!("send{nanos}");
+
+    let zoka_bin = std::env::var("ZOKA_BIN").unwrap_or_else(|_| "zoka".to_string());
+    let chain_db = std::env::var("ZOKA_CHAIN_DB_PATH").unwrap_or_else(|_| {
+        let network = std::env::var("ZOKA_NETWORK").unwrap_or_else(|_| "mainnet".to_string());
+        format!("/data/{network}/blockchain.db")
+    });
+
+    // â”€â”€ Step 1: restore the wallet from the seed-derived keys â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    let restore_out = tokio::process::Command::new(&zoka_bin)
+        .current_dir(&tmp_dir)
+        .args([
+            "wallet-restore-from-keys",
+            "--scan-key-hex",
+            &scan_key_hex,
+            "--spend-key-hex",
+            &spending_key_hex,
+            "--password",
+            &tmp_password,
+            "--name",
+            &tmp_name,
+            "--network",
+            "mainnet",
+        ])
+        .output()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to spawn wallet-restore-from-keys: {e}"),
+            )
+        })?;
+
+    if !restore_out.status.success() {
+        let stderr = String::from_utf8_lossy(&restore_out.stderr);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("wallet-restore-from-keys failed: {}", stderr.trim()),
+        ));
+    }
+
+    let restore_stdout = String::from_utf8_lossy(&restore_out.stdout).into_owned();
+    let from_addr = restore_stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("Address:").map(|s| s.trim().to_string()))
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not parse restored address from: {restore_stdout}"),
+            )
+        })?;
+
+    // â”€â”€ Step 2: sync UTXOs from the chain DB by querying the balance,
+    //    which triggers `sync_private_wallet_history_from_chain_db` and
+    //    `sync_private_coinbase_outputs_from_chain_db` internally.
+    let balance_out = tokio::process::Command::new(&zoka_bin)
+        .current_dir(&tmp_dir)
+        .args([
+            "balance",
+            &from_addr,
+            "--password",
+            &tmp_password,
+            "--network",
+            "mainnet",
+            "--db",
+            &chain_db,
+            "--json",
+        ])
+        .output()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to spawn balance: {e}"),
+            )
+        })?;
+
+    if !balance_out.status.success() {
+        let stderr = String::from_utf8_lossy(&balance_out.stderr);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("balance/sync failed: {}", stderr.trim()),
+        ));
+    }
+
+    // â”€â”€ Step 3: build + broadcast the private transaction. The CLI
+    //    converts ZKA strings to atoms internally, so format with 6
+    //    decimal places (ATOMS_PER_ZKA = 1_000_000).
+    let fee_atoms = req.fee_atoms.unwrap_or(1_000);
+    let amount_zka = format!(
+        "{}.{:06}",
+        req.amount_atoms / 1_000_000,
+        req.amount_atoms % 1_000_000
+    );
+    let fee_zka = format!("{}.{:06}", fee_atoms / 1_000_000, fee_atoms % 1_000_000);
+
+    let send_out = tokio::process::Command::new(&zoka_bin)
+        .current_dir(&tmp_dir)
+        .args([
+            "send",
+            &from_addr,
+            &req.to,
+            &amount_zka,
+            "--fee",
+            &fee_zka,
+            "--password",
+            &tmp_password,
+            "--network",
+            "mainnet",
+            "--db",
+            &chain_db,
+            "--yes",
+            "--json",
+        ])
+        .output()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to spawn send: {e}"),
+            )
+        })?;
+
+    if !send_out.status.success() {
+        let stderr = String::from_utf8_lossy(&send_out.stderr).into_owned();
+        let stdout = String::from_utf8_lossy(&send_out.stdout).into_owned();
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "send failed: {}\n{}",
+                stderr.trim(),
+                stdout.trim()
+            ),
+        ));
+    }
+
+    // â”€â”€ Parse the CLI's output to extract the tx hash. The `send`
+    //    command's `--json` flag is honored only for some code paths; the
+    //    common chunked-private-transfer branch still prints plain text
+    //    (`Private transfer queued\nHash: <hex>\nFrom: â€¦`). Accept BOTH
+    //    formats so a successful broadcast never bubbles up as a 500.
+    let send_stdout = String::from_utf8_lossy(&send_out.stdout).into_owned();
+    let hash = if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&send_stdout) {
+        parsed
+            .get("transaction_hash")
+            .or_else(|| parsed.get("hash"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                parsed
+                    .get("transaction_hashes")
+                    .and_then(|a| a.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+    } else {
+        // Plain-text path: look for the `Hash: <hex>` line emitted by the
+        // private send pipeline. Tolerates both the singular `Hash:` and
+        // chunked `Transaction hashes:` formats.
+        send_stdout
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("Hash:").map(|s| s.trim().to_string()))
+            .filter(|h| !h.is_empty())
+            .or_else(|| {
+                // Look at lines after a "Transaction hashes:" header (chunked
+                // form) and grab the first hex hash.
+                let mut in_block = false;
+                for line in send_stdout.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("Transaction hashes:") {
+                        in_block = true;
+                        continue;
+                    }
+                    if in_block {
+                        let candidate = trimmed.trim_start_matches('-').trim();
+                        if candidate.len() >= 32
+                            && candidate.chars().all(|c| c.is_ascii_hexdigit())
+                        {
+                            return Some(candidate.to_string());
+                        }
+                        if trimmed.is_empty() {
+                            break;
+                        }
+                    }
+                }
+                None
+            })
+    }
+    .ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("send response missing tx hash: {send_stdout}"),
+        )
+    })?;
+
+    // ── Hand the built tx to the fullnode main loop (if configured) so
+    //    it lands in the in-memory pool AND gets gossiped via libp2p.
+    //    Without this step the body sits in `priv_tx:<hash>` storage but
+    //    no peer's miner ever sees it — exactly the failure mode the
+    //    user hit when mobile sends "succeeded" but balance never moved.
+    //    Best-effort: errors here MUST NOT mask the successful build.
+    if let Some(sender) = &app_state.private_tx_broadcaster {
+        match app_state.state_manager.get_private_transaction_bytes(&hash) {
+            Ok(Some(body)) => {
+                match serde_json::from_slice::<crate::private_wallet::PrivateTransaction>(&body) {
+                    Ok(tx) => {
+                        if let Err(e) = sender.send(tx) {
+                            tracing::warn!(
+                                "send-from-seed: failed to forward tx {hash} to fullnode broadcaster: {e}"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        "send-from-seed: failed to deserialize built tx body {hash} for broadcast: {e}"
+                    ),
+                }
+            }
+            Ok(None) => tracing::warn!(
+                "send-from-seed: built tx {hash} not found in priv_tx storage post-CLI"
+            ),
+            Err(e) => tracing::warn!(
+                "send-from-seed: failed reading tx body {hash} from storage for broadcast: {e}"
+            ),
+        }
+    }
+
+    Ok(Json(SendFromSeedResponse {
+        hash,
+        status: "added_to_mempool".to_string(),
+    }))
 }
 
 /// Get current mempool size
@@ -2885,7 +3353,7 @@ async fn pbft_message(
 
             match consensus.process_message(msg) {
                 Ok(event) => {
-                    // Auto-wire PBFT finality → state-apply pipeline.
+                    // Auto-wire PBFT finality â†’ state-apply pipeline.
                     // When a block is committed by consensus, and this
                     // node holds both a state manager and a private
                     // wallet manager, we immediately apply the block and
@@ -2900,7 +3368,7 @@ async fn pbft_message(
                         drop(pbft); // release the consensus lock before taking other locks
                         commit_report =
                             Some(auto_apply_committed_block(&app_state, block_hash).await);
-                        // Re-take for subsequent calls — cheap since no
+                        // Re-take for subsequent calls â€” cheap since no
                         // work happens here afterwards, but keep the
                         // structure consistent.
                         let _ = app_state.pbft_consensus.lock().await;
@@ -3218,6 +3686,8 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
             "/blocks/range/:from/:to/private_tx_hashes",
             get(get_block_private_tx_hashes_range),
         )
+        .route("/private/tx", post(post_private_tx_body))
+        .route("/private/wallet/send-from-seed", post(send_from_seed))
         .route("/private/tx/:hash", get(get_private_tx_by_hash))
         .route("/blocks/range/:from/:to", get(get_blocks_range))
         .route("/blocks/range/:from/:to/raw", get(get_raw_blocks_range))
@@ -3584,7 +4054,7 @@ pub async fn start_api_with_config(
                 "ZOKA_API_BIND must be configured before starting the API server".to_string(),
             )
         })?;
-    start_api_with_config_on_bind(state_manager, mempool, security, bind_addr).await
+    start_api_with_config_on_bind(state_manager, mempool, security, bind_addr, None).await
 }
 
 pub async fn start_api_on_bind(
@@ -3597,6 +4067,28 @@ pub async fn start_api_on_bind(
         mempool,
         ApiSecurityConfig::default(),
         bind_addr,
+        None,
+    )
+    .await
+}
+
+/// Same as `start_api_on_bind` but accepts a broadcast channel sender that
+/// links the API into the fullnode main loop. Pass `Some(sender)` from a
+/// fullnode boot path so private transactions submitted via the HTTP API
+/// (e.g. `/private/wallet/send-from-seed`) reach the in-memory pool and
+/// the libp2p gossip layer of the running node.
+pub async fn start_api_on_bind_with_broadcaster(
+    state_manager: SharedState,
+    mempool: SharedMempool,
+    bind_addr: String,
+    broadcaster: Option<PrivateTxBroadcastSender>,
+) -> Result<(), StateError> {
+    start_api_with_config_on_bind(
+        state_manager,
+        mempool,
+        ApiSecurityConfig::default(),
+        bind_addr,
+        broadcaster,
     )
     .await
 }
@@ -3606,6 +4098,7 @@ pub async fn start_api_with_config_on_bind(
     mempool: SharedMempool,
     security: ApiSecurityConfig,
     bind_addr: String,
+    private_tx_broadcaster: Option<PrivateTxBroadcastSender>,
 ) -> Result<(), StateError> {
     let app_state = Arc::new(AppState {
         state_manager,
@@ -3616,6 +4109,7 @@ pub async fn start_api_with_config_on_bind(
         ws_manager: WebSocketConnectionManager::new(),
         pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
         private_wallet_manager: None,
+        private_tx_broadcaster,
     });
 
     let listener = tokio::net::TcpListener::bind(&bind_addr)
@@ -3653,6 +4147,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         });
 
         let _router = create_router(state);
@@ -3683,6 +4178,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         });
 
         let root_resp = get_state_root(State(app_state.clone())).await;
@@ -3756,6 +4252,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         });
 
         let resp = get_block_by_height(State(app_state), Path(0)).await;
@@ -3795,6 +4292,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         });
 
         let resp = get_block_by_hash(State(app_state), Path(block_hash.clone())).await;
@@ -3840,6 +4338,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         });
 
         let resp = get_blocks_range(State(app_state), Path((1u64, 3u64))).await;
@@ -3886,6 +4385,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         });
 
         // Check initial height
@@ -3951,9 +4451,14 @@ mod tests {
 
     #[test]
     fn test_rate_limit_bucket_selection() {
-        assert_eq!(rate_limit_bucket("/transactions"), "transactions");
-        assert_eq!(rate_limit_bucket("/transactions/new"), "transactions");
-        assert_eq!(rate_limit_bucket("/chain/height"), "default");
+        assert_eq!(rate_limit_bucket("POST", "/transactions"), "transactions");
+        assert_eq!(
+            rate_limit_bucket("GET", "/transactions/new"),
+            "transactions"
+        );
+        assert_eq!(rate_limit_bucket("POST", "/private/tx"), "transactions");
+        assert_eq!(rate_limit_bucket("GET", "/private/tx/hash"), "default");
+        assert_eq!(rate_limit_bucket("GET", "/chain/height"), "default");
     }
 
     #[test]
@@ -4751,6 +5256,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         });
 
         let req = SubscribeRequest {
@@ -4786,6 +5292,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         });
 
         // First subscribe
@@ -4831,6 +5338,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         });
 
         // Add some connections
@@ -4869,6 +5377,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         });
 
         let req = SubscribeRequest {
@@ -4908,6 +5417,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         });
 
         let _router = create_router(app_state);
@@ -4934,6 +5444,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         });
 
         let req = PbftStartRequest {
@@ -4975,6 +5486,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         });
 
         // First start consensus
@@ -5018,6 +5530,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         });
 
         // First start consensus
@@ -5085,6 +5598,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         });
 
         // First start consensus
@@ -5175,6 +5689,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         });
 
         let req = PbftMessageRequest {
@@ -5212,6 +5727,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         });
 
         let req = PbftMessageRequest {
@@ -5247,6 +5763,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         });
 
         let req = PbftStartRequest {
@@ -5279,6 +5796,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         });
 
         let resp =
@@ -5308,6 +5826,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         });
 
         // Create snapshot first
@@ -5344,6 +5863,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         });
 
         let filter = AdvancedEventFilter {
@@ -5385,6 +5905,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         });
 
         let resp = list_profiles(State(app_state)).await;
@@ -5418,6 +5939,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         });
 
         let res = get_private_tx_by_hash(State(app_state), Path("deadbeef".to_string())).await;
@@ -5449,6 +5971,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         });
 
         let req = ProfileManagementRequest {
@@ -5472,6 +5995,7 @@ mod tests {
             ws_manager: WebSocketConnectionManager::new(),
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
+            private_tx_broadcaster: None,
         })))
         .await
         .unwrap();

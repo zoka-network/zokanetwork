@@ -62,7 +62,9 @@ pub enum ChainError {
     )]
     DoesNotExtendHead { head: String, candidate: String },
 
-    #[error("block height is not head + 1: head={head_height}, candidate={candidate_height}, expected={expected_height}")]
+    #[error(
+        "block height is not head + 1: head={head_height}, candidate={candidate_height}, expected={expected_height}"
+    )]
     NonContiguousHeight {
         head_height: u64,
         candidate_height: u64,
@@ -78,7 +80,9 @@ pub enum ChainError {
     #[error("difficulty bits resolver returned 0; the chain must always require some work")]
     InvalidExpectedDifficulty,
 
-    #[error("side branch stored but not selected: candidate_work={candidate_work}, head_work={head_work}")]
+    #[error(
+        "side branch stored but not selected: candidate_work={candidate_work}, head_work={head_work}"
+    )]
     SideBranchNotHeavier {
         candidate_work: u128,
         head_work: u128,

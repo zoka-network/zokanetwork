@@ -13,9 +13,17 @@ kill_timeout = "30s"
   ZOKA_CHAIN_DB_PATH = "/data/mainnet-local/blockchain.db"
   ZOKA_TRUSTED_SETUP_DIR = "/app/trusted-setup"
   ZOKA_EXPECTED_SETUP_DIGEST = "219fdb5d5e47e115ca899d13a6de284df03c86eaaef05eb4ff4adb395cfb0d8e"
-  ZOKA_MINER_ADDRESS = ""
+  # Wallets/keys live on the persistent volume (/data) instead of /root/.local/share.
+  ZOKA_HOME = "/data/zoka"
+  ZOKA_MINER_ADDRESS = "zka1a6n1R8noF6T5vR4YGGv8ibUKpUESu8y5ESdb8BUNx6wGengyZ9mXGJA7u9dpwUh5rxk3gSFXEhBZacXgHUNjb5ET3cJn9"
+  ZOKA_MINING_THREADS = "2"
+  ZOKA_MINE_INTERVAL_SECS = "30"
+  ZOKA_MINE_BLOCKS = "1"
   ZOKA_SYNC_WARMUP_SECS = "30"
   ZOKA_SYNC_REBROADCAST_RECENT_BLOCKS = "32"
+  ZOKA_API_RATE_LIMIT = "1000"
+  ZOKA_API_TX_RATE_LIMIT = "120"
+  ZOKA_API_MAX_BODY_BYTES = "1048576"
   RUST_LOG = "info"
 
 [mounts]

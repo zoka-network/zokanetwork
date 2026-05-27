@@ -3693,6 +3693,12 @@ impl PrivateWalletManager {
         let decrypted_outputs = self.decrypt_matching_outputs_for_wallet(wallet_name, tx)?;
         let input_nullifiers = tx_input_nullifiers(tx);
         let input_nullifiers = input_nullifiers.into_iter().collect::<HashSet<_>>();
+        let input_commitments = tx
+            .input_commitments
+            .iter()
+            .filter(|commitment| !commitment.is_empty())
+            .cloned()
+            .collect::<HashSet<_>>();
         let wallet = self.private_wallets.get_mut(wallet_name).ok_or_else(|| {
             BlockError::TransactionValidationFailed("Wallet not found".to_string())
         })?;
@@ -3703,7 +3709,8 @@ impl PrivateWalletManager {
         for note in &mut wallet.private_notes {
             let nullifier =
                 derive_note_nullifier(&wallet.spending_key, &note.note_id, &note.commitment);
-            if input_nullifiers.contains(&nullifier) {
+            if input_nullifiers.contains(&nullifier) || input_commitments.contains(&note.commitment)
+            {
                 related = true;
                 if !note.spent {
                     note.spent = true;
@@ -5138,6 +5145,43 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn test_chain_scan_marks_restored_note_spent_by_input_commitment() {
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        let bob_commitment = manager.create_private_wallet("bob").unwrap();
+
+        manager.deposit_to_private_wallet("alice", 50).unwrap();
+        let restored_wallet = manager.get_private_wallet("alice").unwrap().clone();
+        let restored_commitment = restored_wallet.private_notes[0].commitment.clone();
+
+        let tx_hash = manager
+            .send_private_transaction("alice", bob_commitment, 10)
+            .unwrap();
+        let mut tx = manager.get_private_transaction(&tx_hash).unwrap().clone();
+        assert!(tx.input_commitments.contains(&restored_commitment));
+
+        tx.outputs.clear();
+        tx.input_nullifiers = vec!["mismatched-nullifier".to_string()];
+
+        let mut restored = PrivateWalletManager::new();
+        restored
+            .private_wallets
+            .insert("alice".to_string(), restored_wallet);
+
+        let changed = restored
+            .apply_relevant_private_transaction_for_wallet("alice", &tx)
+            .unwrap();
+        assert!(changed);
+        assert_eq!(restored.get_private_balance("alice"), Some(0));
+        assert!(restored
+            .get_private_wallet("alice")
+            .unwrap()
+            .private_notes
+            .iter()
+            .all(|note| note.spent));
     }
 
     #[test]

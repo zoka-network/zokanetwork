@@ -3297,13 +3297,16 @@ fn push_unique_rpc_url(urls: &mut Vec<String>, url: String) {
 
 fn wallet_sync_rpc_urls(network: NetworkProfile) -> Vec<String> {
     let mut urls = Vec::new();
-    if let Some(local) = configured_local_rpc_url(network) {
-        push_unique_rpc_url(&mut urls, local);
-    }
+    // Wallet balance/history must match the mobile wallet view. Prefer the
+    // active public bootstrap archive first (same source ZKAPriv scans), and
+    // keep the local node as a fallback when the bootstrap is unavailable.
     if let Ok(active) = active_rpc_endpoints_from_config(&[], network) {
         for rpc in active {
             push_unique_rpc_url(&mut urls, rpc.url);
         }
+    }
+    if let Some(local) = configured_local_rpc_url(network) {
+        push_unique_rpc_url(&mut urls, local);
     }
     urls
 }
@@ -5055,6 +5058,74 @@ fn handle_fullnode_network_message(
                 )),
             }
         }
+        zoka::network::message::ZokaMessage::PrivateTransaction(message_tx) => {
+            // Persist the gossiped private tx body + mark it pending in
+            // local storage so the local miner picks it up at its next
+            // block-assembly cycle. Without this hop the tx propagates
+            // through the gossip layer but never enters any miner's pool.
+            // Bodies that are already on disk (we sent them ourselves, or
+            // got them via a different route) are no-ops by design.
+            let Some(path) = chain_db_path else { return None };
+            let storage = match RocksDbStorage::new(path) {
+                Ok(s) => s,
+                Err(err) => return Some(format!(
+                    "Ignored gossiped private tx: storage open failed ({err})"
+                )),
+            };
+            let tx_value = match serde_json::to_value(message_tx) {
+                Ok(v) => v,
+                Err(err) => return Some(format!(
+                    "Ignored gossiped private tx: serialize failed ({err})"
+                )),
+            };
+            let tx: zoka::private_wallet::PrivateTransaction =
+                match serde_json::from_value(tx_value.clone()) {
+                    Ok(t) => t,
+                    Err(err) => return Some(format!(
+                        "Ignored gossiped private tx: deserialize as wallet tx failed ({err})"
+                    )),
+                };
+            let hash = tx.tx_hash.trim();
+            if hash.is_empty() {
+                return Some("Ignored gossiped private tx: missing tx_hash".to_string());
+            }
+            // Skip if we already have this body — avoids overwriting a
+            // copy we built ourselves with a peer-supplied one.
+            if matches!(storage.get_private_transaction_bytes(hash), Ok(Some(_))) {
+                return Some(format!(
+                    "Gossiped private tx {} already on disk; ignoring duplicate.",
+                    truncate_dashboard_text(hash, 16)
+                ));
+            }
+            let body = match serde_json::to_vec(&tx) {
+                Ok(b) => b,
+                Err(err) => return Some(format!(
+                    "Ignored gossiped private tx {}: encode failed ({err})",
+                    truncate_dashboard_text(hash, 16)
+                )),
+            };
+            if let Err(err) = storage.save_private_transaction_bytes(hash, &body) {
+                return Some(format!(
+                    "Failed to persist gossiped private tx {}: {err}",
+                    truncate_dashboard_text(hash, 16)
+                ));
+            }
+            // Always mark pending — the miner's block-assembly path
+            // dedupes against the canonical chain when including, so a
+            // stale pending marker for an already-confirmed tx is a
+            // harmless no-op rather than a double-spend risk.
+            if let Err(err) = storage.save_pending_private_transaction_hash(hash) {
+                return Some(format!(
+                    "Persisted gossiped private tx {} but pending-marker failed: {err}",
+                    truncate_dashboard_text(hash, 16)
+                ));
+            }
+            let _ = chain_id; // chain_id retained for future per-chain dedupe
+            Some(format!(
+                "Imported gossiped private tx {} into local pool (marked pending).",
+                truncate_dashboard_text(hash, 16)
+            ))
+        }
         _ => None,
     }
 }
@@ -6313,6 +6384,12 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         ));
     }
 
+    // Receiver half of the API → fullnode-main-loop channel; populated
+    // only when the HTTP API is spun up (i.e. `--db` path present).
+    let mut private_tx_recv_outer: Option<
+        tokio::sync::mpsc::UnboundedReceiver<zoka::private_wallet::PrivateTransaction>,
+    > = None;
+
     if let Some(db) = db_path.as_ref() {
         if let Some(genesis_file) = genesis_path.as_ref() {
             if std::path::Path::new(genesis_file).exists() {
@@ -6347,13 +6424,41 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         let api_mempool = Arc::new(zoka::mempool::Mempool::new(10_000));
         let api_bind_addr = configured_api_bind_addr(args, network)?;
         let api_public_url = format!("http://{api_bind_addr}");
-        tokio::spawn(async move {
-            if let Err(e) = zoka::api::start_api_on_bind(manager, api_mempool, api_bind_addr).await
-            {
-                eprintln!("API server error: {e}");
+        // Channel for the API's /private/wallet/send-from-seed handler to
+        // hand freshly built PrivateTransactions back to the fullnode
+        // main loop. The main loop drains the receiver below, inserts
+        // each tx into the in-memory private pool, AND gossips it via
+        // libp2p so any connected mining peer can include it in their
+        // next block. Without this hop, txs built by the API stay
+        // marooned in `priv_tx:<hash>` storage and no miner ever sees
+        // them.
+        let (private_tx_send, mut private_tx_recv) = tokio::sync::mpsc::unbounded_channel::<
+            zoka::private_wallet::PrivateTransaction,
+        >();
+        let api_broadcaster = Some(private_tx_send);
+        // Keep `private_tx_recv` alive across the main loop below by
+        // shadowing the binding name when we move it into the select.
+        let _ = &mut private_tx_recv;
+        tokio::spawn({
+            let api_broadcaster = api_broadcaster.clone();
+            async move {
+                if let Err(e) = zoka::api::start_api_on_bind_with_broadcaster(
+                    manager,
+                    api_mempool,
+                    api_bind_addr,
+                    api_broadcaster,
+                )
+                .await
+                {
+                    eprintln!("API server error: {e}");
+                }
             }
         });
         startup_notes.push(format!("HTTP API listening on {api_public_url}"));
+        // Bubble the receiver out of this scope so the main fullnode
+        // loop further down can poll it alongside its own P2P events.
+        // Stash into the outer-scope option below.
+        private_tx_recv_outer = Some(private_tx_recv);
     } else if genesis_path.is_some() {
         return Err("--genesis requires --db in fullnode".to_string());
     }
@@ -7127,6 +7232,42 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             &last_event,
         ) {
             mining_log(&format!("dashboard render error (non-fatal): {err}"));
+        }
+
+        // Drain anything the HTTP API pushed onto the private-tx channel
+        // (e.g. `/private/wallet/send-from-seed` calls). For each tx we
+        // received, gossip it over libp2p so connected miners pick it up
+        // and include it in their next block. Best-effort: a serialize
+        // or publish failure is logged but never aborts the main loop.
+        if let Some(rx) = private_tx_recv_outer.as_mut() {
+            while let Ok(broadcast_tx) = rx.try_recv() {
+                let hash_short: String =
+                    broadcast_tx.tx_hash.chars().take(16).collect();
+                match serde_json::to_value(&broadcast_tx)
+                    .and_then(|v| serde_json::from_value::<
+                        zoka::network::message::PrivateTransactionMessage,
+                    >(v))
+                {
+                    Ok(msg) => {
+                        if let Err(e) = node.publish_message(
+                            &zoka::network::message::ZokaMessage::PrivateTransaction(
+                                msg,
+                            ),
+                        ) {
+                            mining_log(&format!(
+                                "p2p gossip private tx {hash_short}…: publish failed: {e}"
+                            ));
+                        } else if verbose {
+                            mining_log(&format!(
+                                "p2p gossip private tx {hash_short}… emitted"
+                            ));
+                        }
+                    }
+                    Err(e) => mining_log(&format!(
+                        "p2p gossip private tx {hash_short}…: convert failed: {e}"
+                    )),
+                }
+            }
         }
 
         match timeout(Duration::from_millis(800), node.next_message()).await {

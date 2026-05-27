@@ -182,9 +182,11 @@ impl Transaction {
     pub fn compute_hash(&self) -> String {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
+        // Timestamp is excluded so clients can pre-compute and sign the hash
+        // before submission (timestamp is server-assigned on receipt).
         let data = format!(
-            "{}:{}:{}:{}:{}",
-            self.sender, self.receiver, self.amount, self.nonce, self.timestamp
+            "{}:{}:{}:{}",
+            self.sender, self.receiver, self.amount, self.nonce
         );
         hasher.update(data.as_bytes());
         format!("{:x}", hasher.finalize())
