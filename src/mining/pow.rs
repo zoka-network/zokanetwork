@@ -252,29 +252,28 @@ mod randomx_backend {
     use randomx_rs::{RandomXCache, RandomXDataset, RandomXFlag, RandomXVM};
     use std::sync::{Mutex, OnceLock};
 
-    static DATASET_CACHE: OnceLock<Mutex<Option<CachedDataset>>> = OnceLock::new();
-
-    #[derive(Clone)]
-    struct CachedDataset {
-        seed: Vec<u8>,
-        flags: u32,
-        dataset: RandomXDataset,
+    // Tracks which mode is cached so we can rebuild VMs without re-allocating
+    // the heavy resources (dataset for full mode, cache for light mode).
+    enum CachedMode {
+        Full(RandomXDataset),
+        Light(RandomXCache),
     }
 
-    // `RandomXDataset` is internally reference-counted by `randomx-rs`, but the
-    // crate does not mark its raw C handle as Send/Sync. We only store it behind
-    // a process-wide mutex and clone it into VMs after lookup.
-    unsafe impl Send for CachedDataset {}
-    unsafe impl Sync for CachedDataset {}
+    struct ResourceCache {
+        seed: Vec<u8>,
+        mode: CachedMode,
+    }
+
+    // Raw C pointers; safe because all access goes through the mutex.
+    unsafe impl Send for ResourceCache {}
+    unsafe impl Sync for ResourceCache {}
+
+    static RESOURCE_CACHE: OnceLock<Mutex<Option<ResourceCache>>> = OnceLock::new();
 
     pub struct RandomXPow {
         vm: Mutex<RandomXVM>,
     }
 
-    // `randomx-rs` wraps raw C pointers and does not declare Send/Sync.
-    // ZOKA never exposes the VM directly: all RandomX calls go through this
-    // mutex, so cross-thread access is serialized and the VM/cache outlive the
-    // engine.
     unsafe impl Send for RandomXPow {}
     unsafe impl Sync for RandomXPow {}
 
@@ -285,32 +284,89 @@ mod randomx_backend {
                 .ok_or_else(|| PowError::Runtime("randomx pool init returned no VMs".to_string()))
         }
 
+        /// Build a pool of VMs sharing the cached dataset / cache for `seed`.
+        /// Tries full-memory mode first (fast, 2 GB); falls back to light mode
+        /// (256 MB cache) when the system lacks enough free RAM.
         pub fn new_pool(seed: Vec<u8>, lanes: usize) -> Result<Vec<Self>, PowError> {
-            let (flags, dataset) = dataset_for_seed_best_effort(&seed)?;
-            let mut pool = Vec::with_capacity(lanes.max(1));
-            for _ in 0..lanes.max(1) {
-                let vm = RandomXVM::new(flags, None, Some(dataset.clone()))
-                    .map_err(|e| PowError::Runtime(format!("randomx vm init failed: {e:?}")))?;
-                pool.push(Self { vm: Mutex::new(vm) });
+            let guard_cell = RESOURCE_CACHE.get_or_init(|| Mutex::new(None));
+            let mut guard = guard_cell
+                .lock()
+                .map_err(|e| PowError::Runtime(format!("randomx cache lock poisoned: {e}")))?;
+
+            // Invalidate if seed changed (new epoch).
+            if guard.as_ref().map(|c| c.seed.as_slice()) != Some(seed.as_slice()) {
+                *guard = None;
             }
-            Ok(pool)
+
+            // Build resources if not cached yet.
+            if guard.is_none() {
+                *guard = Some(build_resources(&seed)?);
+            }
+
+            let cached = guard.as_ref().unwrap();
+            let base = RandomXFlag::get_recommended_flags();
+            let (flags, vms) = match &cached.mode {
+                CachedMode::Full(dataset) => {
+                    let flags = base | RandomXFlag::FLAG_FULL_MEM;
+                    let mut vms = Vec::with_capacity(lanes.max(1));
+                    for _ in 0..lanes.max(1) {
+                        let vm = RandomXVM::new(flags, None, Some(dataset.clone()))
+                            .map_err(|e| PowError::Runtime(format!("randomx vm init failed: {e:?}")))?;
+                        vms.push(Self { vm: Mutex::new(vm) });
+                    }
+                    (flags, vms)
+                }
+                CachedMode::Light(_) => {
+                    // Light mode: each VM gets its own fresh cache (no clone needed).
+                    let flags = base;
+                    let mut vms = Vec::with_capacity(lanes.max(1));
+                    for _ in 0..lanes.max(1) {
+                        let rx_cache = RandomXCache::new(flags, &seed)
+                            .map_err(|e| PowError::Runtime(format!("randomx cache init failed: {e:?}")))?;
+                        let vm = RandomXVM::new(flags, Some(rx_cache), None)
+                            .map_err(|e| PowError::Runtime(format!("randomx vm init failed: {e:?}")))?;
+                        vms.push(Self { vm: Mutex::new(vm) });
+                    }
+                    (flags, vms)
+                }
+            };
+            let _ = flags;
+            Ok(vms)
         }
     }
 
-    /// Returns the flags to use, choosing full-memory mode (fast, 2 GB dataset)
-    /// only when the system has at least 2.5 GB of free RAM.  Otherwise uses
-    /// light mode (256 MB cache).  Both produce identical RandomX hashes.
-    fn select_randomx_flags() -> RandomXFlag {
+    /// Build the best resources for `seed`: full mode when ≥ 2.5 GB free,
+    /// light mode otherwise.
+    fn build_resources(seed: &[u8]) -> Result<ResourceCache, PowError> {
         let base = RandomXFlag::get_recommended_flags();
+
         if free_ram_bytes() >= 2_500 * 1024 * 1024 {
-            base | RandomXFlag::FLAG_FULL_MEM
-        } else {
-            base
+            let full_flags = base | RandomXFlag::FLAG_FULL_MEM;
+            let rx_cache = RandomXCache::new(full_flags, seed)
+                .map_err(|e| PowError::Runtime(format!("randomx cache init failed: {e:?}")))?;
+            match RandomXDataset::new(full_flags, rx_cache, 0) {
+                Ok(dataset) => {
+                    return Ok(ResourceCache {
+                        seed: seed.to_vec(),
+                        mode: CachedMode::Full(dataset),
+                    });
+                }
+                Err(_) => {} // fall through to light mode
+            }
         }
+
+        // Light mode: only keep the seed so we know it's cached; VMs build
+        // their own cache in new_pool above.
+        let rx_cache = RandomXCache::new(base, seed)
+            .map_err(|e| PowError::Runtime(format!("randomx cache init failed (light): {e:?}")))?;
+        Ok(ResourceCache {
+            seed: seed.to_vec(),
+            mode: CachedMode::Light(rx_cache),
+        })
     }
 
-    /// Best-effort estimate of free physical RAM in bytes.  Falls back to 0
-    /// (forces light mode) if /proc/meminfo is unavailable (non-Linux).
+    /// Best-effort free physical RAM in bytes from /proc/meminfo (Linux).
+    /// Returns 0 on failure, forcing light mode.
     fn free_ram_bytes() -> u64 {
         let Ok(content) = std::fs::read_to_string("/proc/meminfo") else {
             return 0;
@@ -327,38 +383,6 @@ mod randomx_backend {
             }
         }
         0
-    }
-
-    fn dataset_for_seed_best_effort(
-        seed: &[u8],
-    ) -> Result<(RandomXFlag, RandomXDataset), PowError> {
-        let flags = select_randomx_flags();
-        let ds = dataset_for_seed(flags, seed)?;
-        Ok((flags, ds))
-    }
-
-    fn dataset_for_seed(flags: RandomXFlag, seed: &[u8]) -> Result<RandomXDataset, PowError> {
-        let cache = DATASET_CACHE.get_or_init(|| Mutex::new(None));
-        let mut guard = cache
-            .lock()
-            .map_err(|e| PowError::Runtime(format!("randomx dataset cache lock poisoned: {e}")))?;
-
-        if let Some(cached) = guard.as_ref() {
-            if cached.seed == seed && cached.flags == flags.bits() {
-                return Ok(cached.dataset.clone());
-            }
-        }
-
-        let rx_cache = RandomXCache::new(flags, seed)
-            .map_err(|e| PowError::Runtime(format!("randomx cache init failed: {e:?}")))?;
-        let dataset = RandomXDataset::new(flags, rx_cache, 0)
-            .map_err(|e| PowError::Runtime(format!("randomx dataset init failed: {e:?}")))?;
-        *guard = Some(CachedDataset {
-            seed: seed.to_vec(),
-            flags: flags.bits(),
-            dataset: dataset.clone(),
-        });
-        Ok(dataset)
     }
 
     impl PowEngine for RandomXPow {
