@@ -46,11 +46,13 @@ jobs:
           export ZOKA_HOME=/data/zoka
           export ZOKA_TRUSTED_SETUP_DIR=/opt/zoka/trusted-setup
           TREASURY_ADDR="zka1EQ8Yph2MVmYGzykzQm8nUqAbngadpz2TtvH8HRw2hnjhiYofLQcavzKEs6maZgh9hS3Ffvgz6cfAqJ4jf5PFbqS5vBGLH"
-          echo "Sending ${{ inputs.amount }} ZKA from treasury to ${{ inputs.to }}"
+          # Recipient is the correct Ristretto-derived address from the user's mnemonic private keys
+          RECIPIENT="${{ inputs.to }}"
+          echo "Sending ${{ inputs.amount }} ZKA from treasury to $RECIPIENT"
           zoka tx-send \
             --network mainnet \
             --from "$TREASURY_ADDR" \
-            --to "${{ inputs.to }}" \
+            --to "$RECIPIENT" \
             --amount "${{ inputs.amount }}" \
             --password-env ZOKA_NODE_PASSWORD \
             --yes \
