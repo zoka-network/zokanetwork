@@ -7246,6 +7246,19 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             while let Ok(broadcast_tx) = rx.try_recv() {
                 let hash_short: String =
                     broadcast_tx.tx_hash.chars().take(16).collect();
+                // Write to the sidecar so the local mining loop, which
+                // cannot open the DB while StateManager holds the write
+                // lock, picks up the TX on its next block attempt.
+                if let Some(db) = db_path.as_deref() {
+                    if let Ok(bytes) = serde_json::to_vec(&broadcast_tx) {
+                        let sidecar = private_tx_sidecar_dir(db);
+                        let _ = std::fs::create_dir_all(&sidecar);
+                        let _ = std::fs::write(
+                            sidecar.join(format!("{}.privtx", broadcast_tx.tx_hash)),
+                            &bytes,
+                        );
+                    }
+                }
                 match serde_json::to_value(&broadcast_tx)
                     .and_then(|v| serde_json::from_value::<
                         zoka::network::message::PrivateTransactionMessage,

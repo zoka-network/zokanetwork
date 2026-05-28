@@ -51,6 +51,7 @@ jobs:
           echo "Sending ${{ inputs.amount }} ZKA from treasury to $RECIPIENT"
           zoka tx-send \
             --network mainnet \
+            --db /data/zoka/blockchain.db \
             --from "$TREASURY_ADDR" \
             --to "$RECIPIENT" \
             --amount "${{ inputs.amount }}" \
