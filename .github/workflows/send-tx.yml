@@ -28,46 +28,45 @@ jobs:
 
       - name: Check wallet and balance before send
         run: |
-          ssh -i ~/.ssh/zoka_do root@${{ env.BOOTSTRAP_IP }} bash -s << 'REMOTE'
-          set -e
+          ssh -i ~/.ssh/zoka_do root@${{ env.BOOTSTRAP_IP }} bash << 'REMOTE'
           export ZOKA_NODE_PASSWORD="${{ secrets.ZOKA_NODE_PASSWORD }}"
           export ZOKA_HOME=/data/zoka
           echo "=== WALLETS ==="
           zoka wallets --network mainnet --password-env ZOKA_NODE_PASSWORD 2>&1
-          echo "=== BALANCE ==="
-          WALLET_NAME=$(zoka wallets --network mainnet --password-env ZOKA_NODE_PASSWORD 2>&1 | grep -oP '(?<=Wallet: )[\w-]+' | head -1)
-          echo "Using wallet: $WALLET_NAME"
-          zoka balance --network mainnet --wallet "$WALLET_NAME" --password-env ZOKA_NODE_PASSWORD 2>&1
+          echo "=== NODE STATS ==="
+          curl -s http://127.0.0.1:3000/stats
           REMOTE
 
-      - name: Send 10 ZKA to recipient
+      - name: Send ${{ inputs.amount }} ZKA to recipient
         run: |
-          ssh -i ~/.ssh/zoka_do root@${{ env.BOOTSTRAP_IP }} bash -s << 'REMOTE'
+          ssh -i ~/.ssh/zoka_do root@${{ env.BOOTSTRAP_IP }} bash << 'REMOTE'
           set -e
           export ZOKA_NODE_PASSWORD="${{ secrets.ZOKA_NODE_PASSWORD }}"
           export ZOKA_HOME=/data/zoka
-          WALLET_NAME=$(zoka wallets --network mainnet --password-env ZOKA_NODE_PASSWORD 2>&1 | grep -oP '(?<=Wallet: )[\w-]+' | head -1)
-          echo "Sending ${{ inputs.amount }} ZKA from $WALLET_NAME to ${{ inputs.to }}"
+          TREASURY_ADDR="zka1EQ8Yph2MVmYGzykzQm8nUqAbngadpz2TtvH8HRw2hnjhiYofLQcavzKEs6maZgh9hS3Ffvgz6cfAqJ4jf5PFbqS5vBGLH"
+          echo "Sending ${{ inputs.amount }} ZKA from treasury to ${{ inputs.to }}"
           zoka tx-send \
             --network mainnet \
-            --wallet "$WALLET_NAME" \
+            --from "$TREASURY_ADDR" \
             --to "${{ inputs.to }}" \
             --amount "${{ inputs.amount }}" \
             --password-env ZOKA_NODE_PASSWORD \
+            --yes \
             2>&1
           REMOTE
 
-      - name: Check balance after send
+      - name: Monitor mempool and balance after send
         run: |
-          sleep 5
-          ssh -i ~/.ssh/zoka_do root@${{ env.BOOTSTRAP_IP }} bash -s << 'REMOTE'
+          echo "Waiting 10s for TX to propagate..."
+          sleep 10
+          ssh -i ~/.ssh/zoka_do root@${{ env.BOOTSTRAP_IP }} bash << 'REMOTE'
           export ZOKA_NODE_PASSWORD="${{ secrets.ZOKA_NODE_PASSWORD }}"
           export ZOKA_HOME=/data/zoka
-          WALLET_NAME=$(zoka wallets --network mainnet --password-env ZOKA_NODE_PASSWORD 2>&1 | grep -oP '(?<=Wallet: )[\w-]+' | head -1)
           echo "=== BALANCE AFTER SEND ==="
-          zoka balance --network mainnet --wallet "$WALLET_NAME" --password-env ZOKA_NODE_PASSWORD 2>&1
-          echo "=== MEMPOOL ==="
+          zoka wallets --network mainnet --password-env ZOKA_NODE_PASSWORD 2>&1
+          echo "=== MEMPOOL PRIVATE ==="
           curl -s http://127.0.0.1:3000/mempool/stats 2>&1 || true
+          curl -s http://127.0.0.1:3000/private/mempool/stats 2>&1 || true
           echo "=== NODE STATS ==="
-          curl -s http://127.0.0.1:3000/stats 2>&1
+          curl -s http://127.0.0.1:3000/stats
           REMOTE
