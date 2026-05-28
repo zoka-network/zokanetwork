@@ -191,6 +191,7 @@ jobs:
           WorkingDirectory=/data/zoka
           ExecStart=/usr/local/bin/zoka fullnode \
             --network mainnet \
+            --no-network-config \
             --db /data/zoka/blockchain.db \
             --listen /ip4/0.0.0.0/tcp/28080 \
             --no-mine \
