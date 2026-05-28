@@ -257,6 +257,7 @@ mod randomx_backend {
     #[derive(Clone)]
     struct CachedDataset {
         seed: Vec<u8>,
+        flags: u32,
         dataset: RandomXDataset,
     }
 
@@ -285,8 +286,7 @@ mod randomx_backend {
         }
 
         pub fn new_pool(seed: Vec<u8>, lanes: usize) -> Result<Vec<Self>, PowError> {
-            let flags = RandomXFlag::get_recommended_flags() | RandomXFlag::FLAG_FULL_MEM;
-            let dataset = dataset_for_seed(flags, &seed)?;
+            let (flags, dataset) = dataset_for_seed_best_effort(&seed)?;
             let mut pool = Vec::with_capacity(lanes.max(1));
             for _ in 0..lanes.max(1) {
                 let vm = RandomXVM::new(flags, None, Some(dataset.clone()))
@@ -297,6 +297,46 @@ mod randomx_backend {
         }
     }
 
+    /// Returns the flags to use, choosing full-memory mode (fast, 2 GB dataset)
+    /// only when the system has at least 2.5 GB of free RAM.  Otherwise uses
+    /// light mode (256 MB cache).  Both produce identical RandomX hashes.
+    fn select_randomx_flags() -> RandomXFlag {
+        let base = RandomXFlag::get_recommended_flags();
+        if free_ram_bytes() >= 2_500 * 1024 * 1024 {
+            base | RandomXFlag::FLAG_FULL_MEM
+        } else {
+            base
+        }
+    }
+
+    /// Best-effort estimate of free physical RAM in bytes.  Falls back to 0
+    /// (forces light mode) if /proc/meminfo is unavailable (non-Linux).
+    fn free_ram_bytes() -> u64 {
+        let Ok(content) = std::fs::read_to_string("/proc/meminfo") else {
+            return 0;
+        };
+        for line in content.lines() {
+            if line.starts_with("MemAvailable:") {
+                if let Some(kb) = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    return kb * 1024;
+                }
+            }
+        }
+        0
+    }
+
+    fn dataset_for_seed_best_effort(
+        seed: &[u8],
+    ) -> Result<(RandomXFlag, RandomXDataset), PowError> {
+        let flags = select_randomx_flags();
+        let ds = dataset_for_seed(flags, seed)?;
+        Ok((flags, ds))
+    }
+
     fn dataset_for_seed(flags: RandomXFlag, seed: &[u8]) -> Result<RandomXDataset, PowError> {
         let cache = DATASET_CACHE.get_or_init(|| Mutex::new(None));
         let mut guard = cache
@@ -304,7 +344,7 @@ mod randomx_backend {
             .map_err(|e| PowError::Runtime(format!("randomx dataset cache lock poisoned: {e}")))?;
 
         if let Some(cached) = guard.as_ref() {
-            if cached.seed == seed {
+            if cached.seed == seed && cached.flags == flags.bits() {
                 return Ok(cached.dataset.clone());
             }
         }
@@ -315,6 +355,7 @@ mod randomx_backend {
             .map_err(|e| PowError::Runtime(format!("randomx dataset init failed: {e:?}")))?;
         *guard = Some(CachedDataset {
             seed: seed.to_vec(),
+            flags: flags.bits(),
             dataset: dataset.clone(),
         });
         Ok(dataset)
