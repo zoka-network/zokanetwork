@@ -142,7 +142,7 @@ jobs:
 
   deploy-rpc:
     name: Deploy RPC node
-    needs: [build, deploy-bootstrap]
+    needs: [build]
     runs-on: ubuntu-22.04
     if: ${{ inputs.target == 'both' || inputs.target == 'rpc' }}
     steps:
