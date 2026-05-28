@@ -73,6 +73,7 @@ jobs:
 
       - name: Upload binary
         run: |
+          ssh -i ~/.ssh/zoka_do root@${{ env.BOOTSTRAP_IP }} "systemctl stop zoka-bootstrap 2>/dev/null || true"
           chmod +x ./bin/zoka
           scp -i ~/.ssh/zoka_do ./bin/zoka root@${{ env.BOOTSTRAP_IP }}:/usr/local/bin/zoka
 
@@ -162,6 +163,7 @@ jobs:
 
       - name: Upload binary
         run: |
+          ssh -i ~/.ssh/zoka_do root@${{ env.RPC_IP }} "systemctl stop zoka-rpc 2>/dev/null || true"
           chmod +x ./bin/zoka
           scp -i ~/.ssh/zoka_do ./bin/zoka root@${{ env.RPC_IP }}:/usr/local/bin/zoka
 
