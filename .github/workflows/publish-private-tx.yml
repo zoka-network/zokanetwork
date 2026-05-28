@@ -88,6 +88,8 @@ jobs:
           export ZOKA_TRUSTED_SETUP_DIR=/opt/zoka/trusted-setup
           echo "=== SIDECAR QUEUE ==="
           ls -la /data/zoka/pending_private_queue/ 2>/dev/null || echo "(empty or missing)"
+          echo "=== WALLET BALANCE RESCAN ==="
+          zoka balance --address "${{ env.WALLET_ADDR }}" --network mainnet --password-env ZOKA_NODE_PASSWORD 2>&1 || true
           echo "=== WALLETS ==="
           zoka wallets --network mainnet --password-env ZOKA_NODE_PASSWORD 2>&1
           echo "=== NODE STATS ==="

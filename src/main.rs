@@ -2748,6 +2748,7 @@ fn import_sidecar_private_txs(db_path: &str, storage: &RocksDbStorage) -> usize 
 fn clear_committed_local_private_txs(
     storage: &RocksDbStorage,
     hashes: &[String],
+    db_path: Option<&str>,
 ) -> Result<(), String> {
     if hashes.is_empty() {
         return Ok(());
@@ -2756,6 +2757,9 @@ fn clear_committed_local_private_txs(
         storage
             .delete_pending_private_transaction_hash(hash)
             .map_err(|e| format!("failed to clear pending private tx '{hash}': {e}"))?;
+        if let Some(path) = db_path {
+            let _ = std::fs::remove_file(private_tx_sidecar_dir(path).join(format!("{hash}.privtx")));
+        }
     }
     Ok(())
 }
@@ -4751,7 +4755,7 @@ fn run_mining_batch_with_progress(
                     format!("chain::apply_block rejected freshly mined block: {e}")
                 })?,
             };
-            clear_committed_local_private_txs(&chain_storage, &private_tx_hashes_for_block)?;
+            clear_committed_local_private_txs(&chain_storage, &private_tx_hashes_for_block, config.chain_db_path.as_deref())?;
             let mut wallet_state_changed = private_manager
                 .mark_private_transactions_confirmed_locally(&private_tx_hashes_for_block)
                 > 0
