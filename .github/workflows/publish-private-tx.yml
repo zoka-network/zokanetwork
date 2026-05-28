@@ -51,14 +51,18 @@ jobs:
           echo "=== WALLETS ==="
           zoka wallets --network mainnet --password-env ZOKA_NODE_PASSWORD 2>&1
           echo "=== NODE STATS ==="
-          curl -s http://127.0.0.1:3000/stats
+          STATS=$(curl -s http://127.0.0.1:3000/stats)
+          echo "$STATS"
           echo ""
-          echo "=== RECENT BLOCKS (private TXs) ==="
-          HEIGHT=$(curl -s http://127.0.0.1:3000/stats | grep -o '"height":[0-9]*' | grep -o '[0-9]*')
-          START=$HEIGHT
-          END=$(( HEIGHT > 10 ? HEIGHT - 10 : 0 ))
-          for H in $(seq "$START" "$END" -1); do
+          echo "=== BLOCKS WITH PRIVATE TXs (last 40) ==="
+          HEIGHT=$(echo "$STATS" | grep -o '"height":[0-9]*' | grep -o '[0-9]*')
+          HEIGHT=${HEIGHT:-0}
+          END=$(( HEIGHT > 40 ? HEIGHT - 40 : 1 ))
+          for H in $(seq "$HEIGHT" -1 "$END"); do
             R=$(curl -s "http://127.0.0.1:3000/blocks/$H/private_tx_hashes")
-            echo "Block $H: $R"
+            if [ "$R" != "[]" ] && [ -n "$R" ]; then
+              echo "Block $H: $R"
+            fi
           done
+          echo "=== SCAN COMPLETE (blocks $END to $HEIGHT) ==="
           REMOTE
