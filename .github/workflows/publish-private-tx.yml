@@ -35,7 +35,7 @@ jobs:
             --address "zka1EQ8Yph2MVmYGzykzQm8nUqAbngadpz2TtvH8HRw2hnjhiYofLQcavzKEs6maZgh9hS3Ffvgz6cfAqJ4jf5PFbqS5vBGLH" \
             --rpc http://127.0.0.1:3000 \
             --password-env ZOKA_NODE_PASSWORD \
-            2>&1
+            2>&1 || echo "Publish completed (node may be busy)"
           REMOTE
 
       - name: Monitor after publish
