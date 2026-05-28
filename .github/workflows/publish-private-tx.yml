@@ -46,13 +46,18 @@ jobs:
           export ZOKA_NODE_PASSWORD="${{ secrets.ZOKA_NODE_PASSWORD }}"
           export ZOKA_HOME=/data/zoka
           export ZOKA_TRUSTED_SETUP_DIR=/opt/zoka/trusted-setup
+          echo "=== SIDECAR QUEUE ==="
+          ls -la /data/zoka/pending_private_queue/ 2>/dev/null || echo "(empty or missing)"
           echo "=== WALLETS ==="
           zoka wallets --network mainnet --password-env ZOKA_NODE_PASSWORD 2>&1
           echo "=== NODE STATS ==="
           curl -s http://127.0.0.1:3000/stats
-          echo "=== RECENT BLOCKS ==="
-          HEIGHT=$(curl -s http://127.0.0.1:3000/stats | python3 -c "import sys,json; print(json.load(sys.stdin)['height'])" 2>/dev/null || echo "0")
-          for H in $(seq "$HEIGHT" $(( HEIGHT > 5 ? HEIGHT - 5 : 0 )) -1); do
+          echo ""
+          echo "=== RECENT BLOCKS (private TXs) ==="
+          HEIGHT=$(curl -s http://127.0.0.1:3000/stats | grep -o '"height":[0-9]*' | grep -o '[0-9]*')
+          START=$HEIGHT
+          END=$(( HEIGHT > 10 ? HEIGHT - 10 : 0 ))
+          for H in $(seq "$START" "$END" -1); do
             R=$(curl -s "http://127.0.0.1:3000/blocks/$H/private_tx_hashes")
             echo "Block $H: $R"
           done
