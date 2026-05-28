@@ -934,6 +934,13 @@ pub struct PrivateNote {
     pub created_at: u64,
     #[serde(default)]
     pub spent_at: Option<u64>,
+    /// True while this note is locked in an unconfirmed outgoing TX.
+    /// Prevents reuse before the TX lands in a block.
+    #[serde(default)]
+    pub reserved: bool,
+    /// The TX hash that reserved this note, used to release it on failure.
+    #[serde(default)]
+    pub reserved_by_tx: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -2277,6 +2284,8 @@ pub struct PrivateWallet {
     #[serde(default)]
     pub private_notes: Vec<PrivateNote>,
     pub private_balance: u64,
+    #[serde(default)]
+    pub pending_balance: u64,
     pub private_transactions: Vec<PrivateTransaction>,
     #[serde(default)]
     pub private_fee_openings: HashMap<String, PrivateFeeOpening>,
@@ -2304,6 +2313,7 @@ impl PrivateWallet {
             anonymity_public_key,
             private_notes: vec![],
             private_balance: 0,
+            pending_balance: 0,
             private_transactions: vec![],
             private_fee_openings: HashMap::new(),
             created_at: current_timestamp(),
@@ -2314,7 +2324,13 @@ impl PrivateWallet {
         self.private_balance = self
             .private_notes
             .iter()
-            .filter(|note| !note.spent)
+            .filter(|note| !note.spent && !note.reserved)
+            .map(|note| note.amount)
+            .sum();
+        self.pending_balance = self
+            .private_notes
+            .iter()
+            .filter(|note| note.reserved && !note.spent)
             .map(|note| note.amount)
             .sum();
     }
@@ -2399,6 +2415,8 @@ impl PrivateWallet {
             spent: false,
             created_at: now,
             spent_at: None,
+            reserved: false,
+            reserved_by_tx: None,
         }
     }
 
@@ -2468,6 +2486,8 @@ impl PrivateWallet {
             spent: false,
             created_at: current_timestamp(),
             spent_at: None,
+            reserved: false,
+            reserved_by_tx: None,
         });
     }
 
@@ -2476,7 +2496,7 @@ impl PrivateWallet {
             .private_notes
             .iter()
             .enumerate()
-            .filter(|(_, note)| !note.spent)
+            .filter(|(_, note)| !note.spent && !note.reserved)
             .map(|(idx, note)| (idx, note.amount))
             .collect::<Vec<_>>();
         candidates.sort_by(|lhs, rhs| rhs.1.cmp(&lhs.1).then_with(|| lhs.0.cmp(&rhs.0)));
@@ -2692,11 +2712,10 @@ impl PrivateWallet {
         }
 
         let tx = builder.build()?;
-        let spend_timestamp = current_timestamp();
         for idx in selected_note_indices {
             if let Some(note) = self.private_notes.get_mut(idx) {
-                note.spent = true;
-                note.spent_at = Some(spend_timestamp);
+                note.reserved = true;
+                note.reserved_by_tx = Some(tx.tx_hash.clone());
             }
         }
         for output in tx_outputs(&tx) {
@@ -2714,6 +2733,31 @@ impl PrivateWallet {
         self.sync_balance_cache();
 
         Ok(tx)
+    }
+
+    /// Release notes reserved by a failed or rejected TX back to available.
+    pub fn release_reserved_notes(&mut self, tx_hash: &str) {
+        for note in self.private_notes.iter_mut() {
+            if note.reserved_by_tx.as_deref() == Some(tx_hash) {
+                note.reserved = false;
+                note.reserved_by_tx = None;
+            }
+        }
+        self.sync_balance_cache();
+    }
+
+    /// Confirm reserved notes as spent when the TX lands in a block.
+    pub fn confirm_reserved_notes(&mut self, tx_hash: &str) {
+        let spend_timestamp = current_timestamp();
+        for note in self.private_notes.iter_mut() {
+            if note.reserved_by_tx.as_deref() == Some(tx_hash) {
+                note.spent = true;
+                note.spent_at = Some(spend_timestamp);
+                note.reserved = false;
+                note.reserved_by_tx = None;
+            }
+        }
+        self.sync_balance_cache();
     }
 
     /// Get private transaction history
@@ -3070,7 +3114,13 @@ impl PrivateWalletManager {
         )?;
 
         let tx_hash = tx.tx_hash.clone();
-        self.private_pool.submit_private_transaction(tx)?;
+        if let Err(e) = self.private_pool.submit_private_transaction(tx) {
+            // Pool rejected the TX — release the notes so they are spendable again.
+            if let Some(wallet) = self.private_wallets.get_mut(from_wallet) {
+                wallet.release_reserved_notes(&tx_hash);
+            }
+            return Err(e);
+        }
 
         Ok(tx_hash)
     }
@@ -3631,9 +3681,14 @@ impl PrivateWalletManager {
         self.private_wallets.keys().cloned().collect()
     }
 
-    /// Get private balance for wallet
+    /// Get confirmed available balance for wallet.
     pub fn get_private_balance(&self, name: &str) -> Option<u64> {
         self.private_wallets.get(name).map(|w| w.private_balance)
+    }
+
+    /// Get pending (reserved, unconfirmed) balance for wallet.
+    pub fn get_pending_balance(&self, name: &str) -> Option<u64> {
+        self.private_wallets.get(name).map(|w| w.pending_balance)
     }
 
     pub fn latest_private_note_commitment(&self, name: &str) -> Option<String> {
@@ -3715,6 +3770,9 @@ impl PrivateWalletManager {
                 if !note.spent {
                     note.spent = true;
                     note.spent_at = Some(spent_at);
+                    // Clear any reservation — the block is now the authority.
+                    note.reserved = false;
+                    note.reserved_by_tx = None;
                     changed = true;
                 }
             }
