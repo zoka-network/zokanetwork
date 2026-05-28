@@ -53,29 +53,27 @@ jobs:
             echo "Attempt $i: EAGAIN or error, waiting 15s..."
             sleep 15
           done
-          echo "=== Direct sidecar write (reliable fallback) ==="
-          if [ -f "$WALLET_FILE" ]; then
-            PENDING_HASHES=$(jq -r '.private_transactions[].tx_hash' "$WALLET_FILE" 2>/dev/null || true)
-            if [ -n "$PENDING_HASHES" ]; then
-              echo "Found wallet TXs: $PENDING_HASHES"
-              for TX_HASH in $PENDING_HASHES; do
-                SIDECAR_FILE="${SIDECAR_DIR}/${TX_HASH}.privtx"
-                if [ ! -f "$SIDECAR_FILE" ]; then
-                  TX_BODY=$(jq -c --arg h "$TX_HASH" '.private_transactions[] | select(.tx_hash == $h)' "$WALLET_FILE" 2>/dev/null || true)
-                  if [ -n "$TX_BODY" ]; then
-                    echo "$TX_BODY" > "$SIDECAR_FILE"
-                    echo "Wrote sidecar: $SIDECAR_FILE"
-                  fi
-                else
-                  echo "Sidecar already exists: $SIDECAR_FILE"
-                fi
-              done
-            else
-              echo "No private TXs found in wallet"
-            fi
-          else
-            echo "Wallet file not found: $WALLET_FILE"
+          echo "=== Direct sidecar write via local RPC (reliable fallback) ==="
+          PENDING_HASHES=$(zoka wallets --network mainnet --password-env ZOKA_NODE_PASSWORD --json 2>/dev/null \
+            | grep -o '"tx_hash":"[^"]*"' | sed 's/"tx_hash":"//;s/"//' || true)
+          if [ -z "$PENDING_HASHES" ]; then
+            PENDING_HASHES=$(zoka wallets --network mainnet --password-env ZOKA_NODE_PASSWORD 2>/dev/null \
+              | grep -o 'tx_hash=[^ ]*' | sed 's/tx_hash=//' || true)
           fi
+          for TX_HASH in $PENDING_HASHES; do
+            SIDECAR_FILE="${SIDECAR_DIR}/${TX_HASH}.privtx"
+            if [ ! -f "$SIDECAR_FILE" ]; then
+              TX_BODY=$(curl -sf "http://127.0.0.1:3000/private/tx/$TX_HASH" 2>/dev/null || true)
+              if echo "$TX_BODY" | grep -q '"tx_hash"'; then
+                echo "$TX_BODY" > "$SIDECAR_FILE"
+                echo "Wrote sidecar from RPC: $TX_HASH"
+              else
+                echo "TX body not in RPC for $TX_HASH (confirmed or not published)"
+              fi
+            else
+              echo "Sidecar already exists for $TX_HASH"
+            fi
+          done
           echo "=== Sidecar after write ==="
           ls -la "$SIDECAR_DIR" 2>/dev/null || echo "(empty or missing)"
           REMOTE
