@@ -2178,6 +2178,23 @@ impl PrivateTransactionPool {
     ) -> Result<String, BlockError> {
         let tx_hash = tx.tx_hash.clone();
 
+        // Reject immediately if any input nullifier is already spent.
+        {
+            let set = self.nullifier_set.lock().unwrap();
+            for nullifier_hex in &tx.input_nullifiers {
+                if let Ok(nullifier) =
+                    crate::transaction::nullifier::Nullifier::from_hex(nullifier_hex)
+                {
+                    if set.is_spent(&nullifier) {
+                        return Err(BlockError::TransactionValidationFailed(format!(
+                            "double spend detected: nullifier {} already spent",
+                            nullifier_hex
+                        )));
+                    }
+                }
+            }
+        }
+
         // Verify ZK proof if present
         if let Some(proof_bytes) = &tx.zk_proof {
             let verifier = Verifier::new();
@@ -2286,6 +2303,10 @@ pub struct PrivateWallet {
     pub private_balance: u64,
     #[serde(default)]
     pub pending_balance: u64,
+    /// Nullifiers of confirmed-spent notes, persisted so the NullifierSet
+    /// can be rebuilt after a node restart without scanning the full chain.
+    #[serde(default)]
+    pub spent_nullifiers: Vec<String>,
     pub private_transactions: Vec<PrivateTransaction>,
     #[serde(default)]
     pub private_fee_openings: HashMap<String, PrivateFeeOpening>,
@@ -2314,6 +2335,7 @@ impl PrivateWallet {
             private_notes: vec![],
             private_balance: 0,
             pending_balance: 0,
+            spent_nullifiers: vec![],
             private_transactions: vec![],
             private_fee_openings: HashMap::new(),
             created_at: current_timestamp(),
@@ -2905,6 +2927,23 @@ impl PrivateWalletManager {
             received_nullifiers: HashSet::new(),
             claimed_fee_tx_hashes: HashSet::new(),
             ring_backend: RingSignatureBackend::default(),
+        }
+    }
+
+    /// Rebuild the in-memory NullifierSet from all loaded wallets' persisted
+    /// spent_nullifiers. Call this after loading wallets from disk so that
+    /// double-spend protection survives node restarts.
+    pub fn rebuild_nullifier_set(&mut self) {
+        let arc = self.private_pool.nullifier_set();
+        let mut set = arc.lock().unwrap();
+        for wallet in self.private_wallets.values() {
+            for nullifier_hex in &wallet.spent_nullifiers {
+                if let Ok(nullifier) =
+                    crate::transaction::nullifier::Nullifier::from_hex(nullifier_hex)
+                {
+                    let _ = set.spend(nullifier);
+                }
+            }
         }
     }
 
@@ -3773,6 +3812,10 @@ impl PrivateWalletManager {
                     // Clear any reservation — the block is now the authority.
                     note.reserved = false;
                     note.reserved_by_tx = None;
+                    // Persist nullifier so the NullifierSet survives restarts.
+                    if !wallet.spent_nullifiers.contains(&nullifier) {
+                        wallet.spent_nullifiers.push(nullifier.clone());
+                    }
                     changed = true;
                 }
             }

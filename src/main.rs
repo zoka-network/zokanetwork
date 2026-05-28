@@ -2976,6 +2976,9 @@ fn load_private_wallet_manager_for_network(
             slot.normalize_key_material();
         }
     }
+    // Rebuild NullifierSet from persisted spent_nullifiers so double-spend
+    // protection is not lost across node restarts.
+    manager.rebuild_nullifier_set();
     if let Ok(mut mining_state) = load_user_mining_state_for_network(network) {
         let _ = settle_mature_mining_rewards(
             storage,
