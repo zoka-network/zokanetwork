@@ -99,10 +99,12 @@ jobs:
           WorkingDirectory=/data/zoka
           ExecStart=/usr/local/bin/zoka fullnode \
             --network mainnet \
+            --no-network-config \
             --db /data/zoka/blockchain.db \
             --listen /ip4/0.0.0.0/tcp/28080 \
             --mine-interval-secs 30 \
             --mine-blocks 1 \
+            --min-mine-peers 0 \
             --sync-warmup-secs 10 \
             --sync-rebroadcast-recent-blocks 32 \
             --allow-isolated-start \
