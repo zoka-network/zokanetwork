@@ -122,11 +122,12 @@ address   = zka1 + Base58(scan_pub || spend_pub || checksum)
 
 - [x] Actualizar `Constants.kt` con RPC DO: `http://157.230.5.103:3000/` (ya hecho).
 - [x] TX de 10 ZKA enviada desde tesorería → confirmada en bloque 77 → propagada por P2P → cuerpo accesible en ambos nodos.
-- [ ] Rebuild APK debug con nuevo endpoint y verificar en dispositivo SM-A135M:
+- [x] Corregir 4 bugs críticos en `Ristretto255.kt` — descifrado de outputs privados ahora funciona (verificado con vector TX 577f851b, Output 1 MATCH).
+- [ ] Rebuild APK debug y verificar en dispositivo SM-A135M:
   - [ ] Dashboard muestra altura de bloque real y estado de red.
   - [ ] Seed → address correcta (vector: `brief simple... → zka1DvXCz...`).
   - [ ] Scan key hex → misma address.
-  - [ ] Recepción: wallet del destinatario (`zka1a6n1R8noF6T5vR...`) detecta los 10 ZKA recibidos en bloque 77.
+  - [ ] Recepción: wallet del destinatario detecta los 10 ZKA recibidos en bloque 77.
   - [ ] Envío ZKA: crear TX → transmitir al nodo → ver en explorer.
 
 ### C2 — Escaneo de outputs privados
@@ -135,10 +136,35 @@ address   = zka1 + Base58(scan_pub || spend_pub || checksum)
 - Escanear bloques raw del nodo y detectar outputs propios.
 - Mostrar balance real basado en outputs descifrados (no solo coinbase maduros).
 
-### C3 — Balance con estados (conectar Fase A)
+### C3 — Balance con estados y actualización en tiempo real
 
-- Una vez implementada la Fase A, conectar los tres estados de balance en la app Android.
+- Conectar los tres estados de balance (Fase A) en la app Android.
 - Mostrar "Disponible", "Pendiente" y "Bloqueado" en el dashboard.
+- **Actualización proactiva de balances:** Los balances (disponible y bloqueado) deben
+  refrescarse automáticamente sin necesidad de cerrar y reabrir la app. Reducir el intervalo
+  de polling a ~15–20 s cuando hay actividad reciente, y hacer que el refresco sea visible
+  (indicador de carga) para que el usuario sepa cuándo se está sincronizando.
+
+### C3b — Recent Activity: entradas, salidas y hash de TX
+
+- Registrar tanto transacciones **entrantes** como **salientes** en la sección Recent Activity.
+- Cada ítem pendiente debe mostrar el **hash de la TX** (no solo un enlace al explorador).
+- El enlace al explorador debe abrirse sobre el hash de la TX correcta
+  (actualmente lleva al explorador sin contexto de hash).
+- Una vez confirmada la TX, marcarla como confirmada en la lista sin reiniciar la app.
+
+### C3c — Fix Reset de wallet (Login y Settings)
+
+- El reset de wallet está roto tanto en la pantalla de Unlock (LockScreen) como en Settings.
+- Verificar y corregir `WalletResetCoordinator` / `clearAllData()` para que limpie
+  correctamente todo el estado local y lleve al onboarding.
+- Probar el flujo completo: reset desde Lock → onboarding → restaurar wallet.
+
+### C3d — UI de Unlock: rediseñar "Forgot Password"
+
+- El botón "Forgot Password?" en LockScreen actualmente es solo texto rojo simple.
+- Rediseñarlo con mejor presentación: ícono + texto descriptivo, diálogo de confirmación
+  más elaborado que explique las consecuencias del reset antes de ejecutarlo.
 
 ### C4 — Settings
 
@@ -184,12 +210,15 @@ address   = zka1 + Base58(scan_pub || spend_pub || checksum)
 
 ## Orden de prioridad
 
-1. **A1–A4** — flujo correcto de TX privadas en el protocolo (fundamento de todo)
-2. **A5** — build, pruebas y deploy
-3. **C1** — prueba end-to-end de ZKAPriv contra mainnet
-4. **B1–B2** — ZSilent Core conectado al nuevo balance
-5. **C2** — escaneo de outputs privados en Android
-6. **D1** — rotar token DO y fix remote zkapriv
-7. **B3–B8** — pulido de ZSilent Core
-8. **C3–C6** — branding y release de ZKAPriv
-9. **D2–D3** — monitoreo y documentación
+1. ✅ **A1–A5** — protocolo completo, build, pruebas, deploy
+2. ✅ **Ristretto255.kt** — 4 bugs corregidos, descifrado de outputs verificado
+3. **C1** — rebuild APK + prueba end-to-end en SM-A135M
+4. **C3c** — fix reset de wallet (Login + Settings) + rediseño Forgot Password (C3d)
+5. **C3** — balance en tiempo real (polling ~15 s, indicador de carga)
+6. **C3b** — Recent Activity: entradas, salidas, hash de TX en pendientes
+7. **B1–B2** — ZSilent Core conectado al nuevo balance
+8. **C2** — escaneo automático de bloques para outputs privados en Android
+9. **D1** — rotar token DO y fix remote zkapriv
+10. **B3–B8** — pulido de ZSilent Core
+11. **C4–C6** — Settings avanzados, branding final, release APK firmado
+12. **D2–D3** — monitoreo y documentación

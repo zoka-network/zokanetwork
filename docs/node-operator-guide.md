@@ -53,6 +53,7 @@ User=zoka
 Group=zoka
 WorkingDirectory=/home/zoka
 Environment=RUST_LOG=info
+Environment=ZOKA_TRUSTED_SETUP_DIR=/opt/zoka/trusted-setup
 ExecStart=/usr/local/bin/zokahd --network testnet --password CHANGE_ME
 Restart=always
 RestartSec=10
@@ -68,6 +69,16 @@ Then:
 sudo systemctl daemon-reload
 sudo systemctl enable --now zokad-testnet
 sudo journalctl -u zokad-testnet -f
+```
+
+Before starting a release binary, copy the ceremony artifacts shipped with the
+release into `/opt/zoka/trusted-setup`. Release builds intentionally refuse to
+generate or verify private proofs with the seeded development setup.
+
+```bash
+sudo mkdir -p /opt/zoka/trusted-setup
+sudo cp trusted-setup/*.params trusted-setup/DIGEST /opt/zoka/trusted-setup/
+sudo chown -R zoka:zoka /opt/zoka/trusted-setup
 ```
 
 Before enabling the service, replace `CHANGE_ME` using an OS-level secret

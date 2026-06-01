@@ -265,6 +265,10 @@ struct MainnetNetworkConfig {
     public_rpc: Vec<MainnetRpcEndpoint>,
     #[serde(default)]
     desktop: MainnetDesktopConfig,
+    #[serde(default, rename = "mining")]
+    _mining: Option<serde_json::Value>,
+    #[serde(default, rename = "joining")]
+    _joining: Option<serde_json::Value>,
     #[serde(default)]
     snapshot_signers: Vec<String>,
     #[serde(default)]
@@ -334,6 +338,8 @@ struct MainnetSeedNode {
     i2p: Option<String>,
     role: String,
     status: String,
+    #[serde(default, rename = "note")]
+    _note: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2629,10 +2635,59 @@ fn local_pending_private_tx_hashes(db_path: &str, limit: usize) -> Result<Vec<St
         }
         Err(e) => return Err(e),
     };
-    storage
+    let hashes = storage
         .iterate_pending_private_transaction_hashes()
-        .map(|hashes| hashes.into_iter().take(limit).collect())
-        .map_err(|e| format!("failed to read pending private txs: {e}"))
+        .map_err(|e| format!("failed to read pending private txs: {e}"))?;
+    Ok(select_non_conflicting_pending_private_tx_hashes(
+        &storage, hashes, limit,
+    ))
+}
+
+fn private_tx_spend_tags(tx: &zoka::private_wallet::PrivateTransaction) -> Vec<String> {
+    let mut tags = Vec::new();
+    let primary = tx.nullifier.trim();
+    if !primary.is_empty() {
+        tags.push(primary.to_string());
+    }
+    for tag in &tx.input_nullifiers {
+        let tag = tag.trim();
+        if !tag.is_empty() {
+            tags.push(tag.to_string());
+        }
+    }
+    tags.sort();
+    tags.dedup();
+    tags
+}
+
+fn select_non_conflicting_pending_private_tx_hashes(
+    storage: &RocksDbStorage,
+    hashes: Vec<String>,
+    limit: usize,
+) -> Vec<String> {
+    let mut selected = Vec::new();
+    let mut seen_spend_tags = HashSet::new();
+
+    for hash in hashes {
+        if selected.len() >= limit {
+            break;
+        }
+        let Some(body) = storage.get_private_transaction_bytes(&hash).ok().flatten() else {
+            continue;
+        };
+        let Ok(tx) = serde_json::from_slice::<zoka::private_wallet::PrivateTransaction>(&body)
+        else {
+            continue;
+        };
+        let tags = private_tx_spend_tags(&tx);
+        if tags.is_empty() || tags.iter().any(|tag| seen_spend_tags.contains(tag)) {
+            continue;
+        }
+        seen_spend_tags.extend(tags);
+        selected.push(hash);
+    }
+
+    selected
 }
 
 /// Return the sidecar queue directory for a given chain DB path.
@@ -2758,7 +2813,8 @@ fn clear_committed_local_private_txs(
             .delete_pending_private_transaction_hash(hash)
             .map_err(|e| format!("failed to clear pending private tx '{hash}': {e}"))?;
         if let Some(path) = db_path {
-            let _ = std::fs::remove_file(private_tx_sidecar_dir(path).join(format!("{hash}.privtx")));
+            let _ =
+                std::fs::remove_file(private_tx_sidecar_dir(path).join(format!("{hash}.privtx")));
         }
     }
     Ok(())
@@ -4755,7 +4811,11 @@ fn run_mining_batch_with_progress(
                     format!("chain::apply_block rejected freshly mined block: {e}")
                 })?,
             };
-            clear_committed_local_private_txs(&chain_storage, &private_tx_hashes_for_block, config.chain_db_path.as_deref())?;
+            clear_committed_local_private_txs(
+                &chain_storage,
+                &private_tx_hashes_for_block,
+                config.chain_db_path.as_deref(),
+            )?;
             let mut wallet_state_changed = private_manager
                 .mark_private_transactions_confirmed_locally(&private_tx_hashes_for_block)
                 > 0
@@ -5072,25 +5132,33 @@ fn handle_fullnode_network_message(
             // through the gossip layer but never enters any miner's pool.
             // Bodies that are already on disk (we sent them ourselves, or
             // got them via a different route) are no-ops by design.
-            let Some(path) = chain_db_path else { return None };
+            let Some(path) = chain_db_path else {
+                return None;
+            };
             let storage = match RocksDbStorage::new(path) {
                 Ok(s) => s,
-                Err(err) => return Some(format!(
-                    "Ignored gossiped private tx: storage open failed ({err})"
-                )),
+                Err(err) => {
+                    return Some(format!(
+                        "Ignored gossiped private tx: storage open failed ({err})"
+                    ))
+                }
             };
             let tx_value = match serde_json::to_value(message_tx) {
                 Ok(v) => v,
-                Err(err) => return Some(format!(
-                    "Ignored gossiped private tx: serialize failed ({err})"
-                )),
+                Err(err) => {
+                    return Some(format!(
+                        "Ignored gossiped private tx: serialize failed ({err})"
+                    ))
+                }
             };
             let tx: zoka::private_wallet::PrivateTransaction =
                 match serde_json::from_value(tx_value.clone()) {
                     Ok(t) => t,
-                    Err(err) => return Some(format!(
-                        "Ignored gossiped private tx: deserialize as wallet tx failed ({err})"
-                    )),
+                    Err(err) => {
+                        return Some(format!(
+                            "Ignored gossiped private tx: deserialize as wallet tx failed ({err})"
+                        ))
+                    }
                 };
             let hash = tx.tx_hash.trim();
             if hash.is_empty() {
@@ -5106,10 +5174,12 @@ fn handle_fullnode_network_message(
             }
             let body = match serde_json::to_vec(&tx) {
                 Ok(b) => b,
-                Err(err) => return Some(format!(
-                    "Ignored gossiped private tx {}: encode failed ({err})",
-                    truncate_dashboard_text(hash, 16)
-                )),
+                Err(err) => {
+                    return Some(format!(
+                        "Ignored gossiped private tx {}: encode failed ({err})",
+                        truncate_dashboard_text(hash, 16)
+                    ))
+                }
             };
             if let Err(err) = storage.save_private_transaction_bytes(hash, &body) {
                 return Some(format!(
@@ -6439,9 +6509,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         // next block. Without this hop, txs built by the API stay
         // marooned in `priv_tx:<hash>` storage and no miner ever sees
         // them.
-        let (private_tx_send, mut private_tx_recv) = tokio::sync::mpsc::unbounded_channel::<
-            zoka::private_wallet::PrivateTransaction,
-        >();
+        let (private_tx_send, mut private_tx_recv) =
+            tokio::sync::mpsc::unbounded_channel::<zoka::private_wallet::PrivateTransaction>();
         let api_broadcaster = Some(private_tx_send);
         // Keep `private_tx_recv` alive across the main loop below by
         // shadowing the binding name when we move it into the select.
@@ -7248,8 +7317,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         // or publish failure is logged but never aborts the main loop.
         if let Some(rx) = private_tx_recv_outer.as_mut() {
             while let Ok(broadcast_tx) = rx.try_recv() {
-                let hash_short: String =
-                    broadcast_tx.tx_hash.chars().take(16).collect();
+                let hash_short: String = broadcast_tx.tx_hash.chars().take(16).collect();
                 // Write to the sidecar so the local mining loop, which
                 // cannot open the DB while StateManager holds the write
                 // lock, picks up the TX on its next block attempt.
@@ -7263,24 +7331,18 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                         );
                     }
                 }
-                match serde_json::to_value(&broadcast_tx)
-                    .and_then(|v| serde_json::from_value::<
-                        zoka::network::message::PrivateTransactionMessage,
-                    >(v))
-                {
+                match serde_json::to_value(&broadcast_tx).and_then(|v| {
+                    serde_json::from_value::<zoka::network::message::PrivateTransactionMessage>(v)
+                }) {
                     Ok(msg) => {
                         if let Err(e) = node.publish_message(
-                            &zoka::network::message::ZokaMessage::PrivateTransaction(
-                                msg,
-                            ),
+                            &zoka::network::message::ZokaMessage::PrivateTransaction(msg),
                         ) {
                             mining_log(&format!(
                                 "p2p gossip private tx {hash_short}…: publish failed: {e}"
                             ));
                         } else if verbose {
-                            mining_log(&format!(
-                                "p2p gossip private tx {hash_short}… emitted"
-                            ));
+                            mining_log(&format!("p2p gossip private tx {hash_short}… emitted"));
                         }
                     }
                     Err(e) => mining_log(&format!(
@@ -9643,7 +9705,9 @@ fn active_rpc_endpoints_from_config(
     Ok(config
         .public_rpc
         .into_iter()
-        .filter(|rpc| rpc.status.eq_ignore_ascii_case("active"))
+        .filter(|rpc| {
+            rpc.status.eq_ignore_ascii_case("active") || rpc.status.eq_ignore_ascii_case("fallback")
+        })
         .collect())
 }
 
@@ -9653,11 +9717,19 @@ fn resolve_rpc_url(args: &[String], network: NetworkProfile) -> Result<String, S
         return Ok(url);
     }
     let active = active_rpc_endpoints_from_config(args, network)?;
-    let Some(rpc) = active.first() else {
+    if active.is_empty() {
         return Err("no active RPC endpoint configured; pass --rpc http://host:port".to_string());
+    }
+    let endpoints = active.iter().map(|rpc| rpc.url.clone()).collect::<Vec<_>>();
+    let (samples, errors) = sample_rpc_heights(&endpoints, 3);
+    let Some(best) = samples.into_iter().next() else {
+        return Err(format!(
+            "no reachable active RPC endpoint configured: {}",
+            errors.join("; ")
+        ));
     };
-    parse_rpc_http_url(&rpc.url)?;
-    Ok(rpc.url.clone())
+    parse_rpc_http_url(&best.rpc)?;
+    Ok(best.rpc)
 }
 
 fn best_reachable_rpc_height_from_args(
@@ -12088,6 +12160,15 @@ mod tests {
         let config = parse_mainnet_network_config(raw).expect("valid config");
         assert_eq!(config.chain_id, MAINNET_CHAIN_ID);
         assert!(config.active_seed_candidates(false).is_empty());
+    }
+
+    #[test]
+    fn embedded_mainnet_network_config_accepts_documentation_fields() {
+        let config =
+            parse_mainnet_network_config(EMBEDDED_MAINNET_NETWORK_CONFIG).expect("valid config");
+
+        assert_eq!(config.chain_id, MAINNET_CHAIN_ID);
+        assert!(!config.active_seed_candidates(true).is_empty());
     }
 
     #[test]

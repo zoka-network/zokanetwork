@@ -3002,6 +3002,39 @@ impl PrivateWalletManager {
         Ok(commitment_key)
     }
 
+    /// Restore a spend-capable wallet from the BIP-39 entropy held by a
+    /// self-custody client. The wallet lives only in this manager unless the
+    /// caller explicitly persists it.
+    pub fn restore_private_wallet_from_recovery_seed(
+        &mut self,
+        name: &str,
+        scan_key: Vec<u8>,
+    ) -> Result<String, BlockError> {
+        if self.private_wallets.contains_key(name) {
+            return Err(BlockError::TransactionValidationFailed(
+                "Private wallet already exists".to_string(),
+            ));
+        }
+        if scan_key.len() != 16 && scan_key.len() != 32 {
+            return Err(BlockError::TransactionValidationFailed(
+                "Private wallet seed entropy must be 16 bytes (12 words) or 32 bytes (24 words)"
+                    .to_string(),
+            ));
+        }
+
+        let spending_key = derive_spending_key_from_recovery_seed(&scan_key);
+        let commitment_key = payment_address_from_keys(&scan_key, &spending_key);
+        let wallet = PrivateWallet::new(
+            name.to_string(),
+            spending_key,
+            scan_key,
+            commitment_key.clone(),
+        );
+        self.private_wallets.insert(name.to_string(), wallet);
+
+        Ok(commitment_key)
+    }
+
     fn build_sender_ring_members(
         &self,
         sender_wallet: &str,

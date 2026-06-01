@@ -229,6 +229,11 @@ impl StateManager {
         }
     }
 
+    /// Expose underlying storage for block sync handlers.
+    pub fn raw_storage(&self) -> Arc<RocksDbStorage> {
+        Arc::clone(&self.storage)
+    }
+
     /// Load state from storage on node startup
     pub async fn load_from_storage(&self) -> Result<(), StateError> {
         let mut state = self.state.write().await;
@@ -531,6 +536,27 @@ impl StateManager {
     pub fn save_pending_private_transaction_hash(&self, hash: &str) -> Result<(), StateError> {
         self.storage
             .save_pending_private_transaction_hash(hash)
+            .map_err(|e| StateError::StorageError(e.to_string()))
+    }
+
+    /// Remove a private transaction from the local pending index.
+    pub fn delete_pending_private_transaction_hash(&self, hash: &str) -> Result<(), StateError> {
+        self.storage
+            .delete_pending_private_transaction_hash(hash)
+            .map_err(|e| StateError::StorageError(e.to_string()))
+    }
+
+    /// Return locally pending private transaction hashes.
+    pub fn iterate_pending_private_transaction_hashes(&self) -> Result<Vec<String>, StateError> {
+        self.storage
+            .iterate_pending_private_transaction_hashes()
+            .map_err(|e| StateError::StorageError(e.to_string()))
+    }
+
+    /// Remove a persisted private transaction body.
+    pub fn delete_private_transaction(&self, hash: &str) -> Result<(), StateError> {
+        self.storage
+            .delete_private_transaction(hash)
             .map_err(|e| StateError::StorageError(e.to_string()))
     }
 

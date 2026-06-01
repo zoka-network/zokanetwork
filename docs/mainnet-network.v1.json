@@ -1,14 +1,12 @@
 {
   "schema": "zoka-mainnet-network-v1",
-  "status": "do-bootstrap-mainnet",
+  "status": "active",
   "chain_id": "zoka-mainnet-v1",
   "protocol_freeze_id": "/zoka/1.0.0",
   "transport_policy": {
     "anonymous_transport_preferred": false,
     "clearnet_requires_explicit_operator_choice": false,
-    "supported": [
-      "tcp"
-    ]
+    "supported": ["tcp"]
   },
   "seed_nodes": [
     {
@@ -19,10 +17,21 @@
       "onion": null,
       "i2p": null,
       "role": "seed",
-      "status": "active"
+      "status": "active",
+      "note": "Primary bootstrap - peer discovery entry point for new nodes"
     }
   ],
   "public_rpc": [
+    {
+      "label": "do-nyc-bootstrap-rpc-fallback",
+      "operator": "zoka-core",
+      "region": "nyc",
+      "url": "http://159.223.119.216:3000",
+      "onion": null,
+      "i2p": null,
+      "status": "active",
+      "logging_policy": "no-wallet-secrets-no-private-keys"
+    },
     {
       "label": "do-nyc-rpc-1",
       "operator": "zoka-core",
@@ -30,17 +39,31 @@
       "url": "http://157.230.5.103:3000",
       "onion": null,
       "i2p": null,
-      "status": "active",
+      "status": "fallback",
       "logging_policy": "no-wallet-secrets-no-private-keys"
     }
   ],
   "desktop": {
     "local_rpc_url": "http://127.0.0.1:3000"
   },
+  "mining": {
+    "algorithm": "randomx",
+    "open_participation": true,
+    "reward_routing": "direct-to-miner",
+    "note": "Any node can mine. Set --address <your-zka1-wallet> to receive block rewards directly.",
+    "min_peers_to_mine": 1,
+    "example_command": "zoka fullnode --network mainnet --network-config mainnet-network.v1.json --mine-interval-secs 30 --mine-blocks 1 --min-mine-peers 1 --address <your-zka1-address> --password <your-password>"
+  },
+  "joining": {
+    "full_node": "zoka fullnode --network mainnet --network-config mainnet-network.v1.json --no-mine --allow-isolated-start --password <your-password>",
+    "miner": "zoka fullnode --network mainnet --network-config mainnet-network.v1.json --mine-interval-secs 30 --mine-blocks 1 --min-mine-peers 1 --address <your-zka1-address> --password <your-password>",
+    "note": "The node auto-discovers peers from the seed node. Block rewards go directly to your wallet by protocol - no pool or intermediary."
+  },
   "snapshot_signers": [],
   "notes": [
-    "Public bootstrap for the Zoka mainnet (DigitalOcean infrastructure).",
-    "Wallet secrets and private keys must remain local; this RPC is read-only chain status for sync gating.",
+    "Primary bootstrap for the Zoka mainnet (DigitalOcean infrastructure).",
+    "Wallet secrets and private keys must remain local; this RPC is read-only chain status.",
+    "Open mining network: anyone can run a node or miner and earn block rewards.",
     "Tor/I2P endpoints are not active yet."
   ]
 }

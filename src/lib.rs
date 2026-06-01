@@ -12,6 +12,7 @@ pub mod identity;
 pub mod mempool;
 pub mod metrics;
 pub mod mining;
+pub mod mobile;
 pub mod network;
 pub mod private_wallet;
 pub mod snapshot;

@@ -32,7 +32,7 @@ type SharedMempool = Arc<Mempool>;
 type SharedPrivateWalletManager = Arc<RwLock<PrivateWalletManager>>;
 
 /// Channel sender used by HTTP handlers (specifically the
-/// `/private/wallet/send-from-seed` endpoint) to hand a freshly built
+/// `/private/tx` endpoint) to hand a validated
 /// `PrivateTransaction` to the fullnode main loop so it can:
 ///   1. Add the tx to its in-memory private pool (so its own miner sees
 ///      it on the next mining cycle).
@@ -456,6 +456,11 @@ impl RbacConfig {
         // Read endpoints
         endpoint_permissions.insert("/chain/height", ApiRole::Read);
         endpoint_permissions.insert("/chain/state-root", ApiRole::Read);
+        endpoint_permissions.insert("/chain/private-commitment-root", ApiRole::Read);
+        endpoint_permissions.insert(
+            "/chain/private-commitments/:commitment/proof",
+            ApiRole::Read,
+        );
         endpoint_permissions.insert("/accounts/:address", ApiRole::Read);
         endpoint_permissions.insert("/blocks/:height", ApiRole::Read);
         endpoint_permissions.insert("/blocks/:height/raw", ApiRole::Read);
@@ -664,9 +669,9 @@ pub struct AppState {
     /// private-tx bodies from the node's pool. Left as `None` in tests
     /// that don't spin up a wallet manager.
     pub private_wallet_manager: Option<SharedPrivateWalletManager>,
-    /// Channel into the fullnode main loop for forwarding freshly built
-    /// private transactions. The handler at `/private/wallet/send-from-seed`
-    /// pushes here after the CLI shell-out succeeds; the main loop drains
+    /// Channel into the fullnode main loop for forwarding validated
+    /// private transactions. The handler at `/private/tx`
+    /// pushes here after accepting a locally built body; the main loop drains
     /// it, inserts each tx into its in-memory pool, and gossips it over
     /// libp2p so any connected miner can include it in the next block.
     /// `None` in tests / non-fullnode setups.
@@ -1916,8 +1921,12 @@ async fn get_stats(State(app_state): State<Arc<AppState>>) -> Json<serde_json::V
     }))
 }
 
-async fn get_network_runtime() -> Json<NetworkRuntimeSnapshot> {
-    Json(global_network_runtime().snapshot().await)
+async fn get_network_runtime(
+    State(app_state): State<Arc<AppState>>,
+) -> Json<NetworkRuntimeSnapshot> {
+    let mut snapshot = global_network_runtime().snapshot().await;
+    snapshot.local_chain_height = app_state.state_manager.get_height().await;
+    Json(snapshot)
 }
 
 async fn post_miner_heartbeat(
@@ -1965,6 +1974,33 @@ async fn get_height(State(app_state): State<Arc<AppState>>) -> Json<serde_json::
 async fn get_state_root(State(app_state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let state_root = app_state.state_manager.get_state_root().await;
     Json(serde_json::json!({ "state_root": state_root }))
+}
+
+/// Return the public Merkle root that anchors spendable private commitments.
+async fn get_private_commitment_root(
+    State(app_state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let root = app_state.state_manager.get_private_commitment_root().await;
+    Json(serde_json::json!({ "private_commitment_root": root }))
+}
+
+/// Return the public inclusion proof needed by a self-custody light client
+/// when it spends one of its locally-decrypted notes.
+async fn get_private_commitment_proof(
+    State(app_state): State<Arc<AppState>>,
+    Path(commitment): Path<String>,
+) -> Result<Json<crate::state::PrivateCommitmentInclusionProof>, (StatusCode, String)> {
+    match app_state
+        .state_manager
+        .get_private_commitment_inclusion_proof(&commitment)
+        .await
+    {
+        Some(proof) => Ok(Json(proof)),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            "Private commitment not found".to_string(),
+        )),
+    }
 }
 
 /// Get account state
@@ -2342,6 +2378,14 @@ async fn post_private_tx_body(
         return Err((
             StatusCode::BAD_REQUEST,
             format!("private transaction validation failed: {err}"),
+        ));
+    }
+    if let Some((existing_hash, nullifier)) =
+        find_pending_private_nullifier_conflict(app_state.as_ref(), hash, &tx)?
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("private spend already pending: tx {existing_hash} uses nullifier {nullifier}"),
         ));
     }
 
@@ -2733,6 +2777,9 @@ async fn submit_transaction(
 
 // â”€â”€ /private/wallet/send-from-seed â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //
+// Legacy implementation intentionally kept unrouted during migration.
+// Mobile clients now publish only a canonical `/private/tx` body.
+//
 // Build, sign and broadcast a private transaction on behalf of a mobile
 // (or any seed-only) client. The client POSTs the BIP-39 entropy of its
 // recovery phrase together with recipient + amount; the node uses the
@@ -2758,6 +2805,7 @@ async fn submit_transaction(
 // CLI to reuse the battle-tested send pipeline instead of reimplementing
 // the cryptography in the HTTP handler.
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct SendFromSeedRequest {
     /// Hex of the BIP-39 entropy (16 or 32 bytes). The scan key for
@@ -2773,12 +2821,80 @@ struct SendFromSeedRequest {
     fee_atoms: Option<u64>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 struct SendFromSeedResponse {
     hash: String,
     status: String,
 }
 
+fn private_tx_nullifier_tags(tx: &crate::private_wallet::PrivateTransaction) -> HashSet<String> {
+    let mut tags = HashSet::new();
+    let primary = tx.nullifier.trim();
+    if !primary.is_empty() {
+        tags.insert(primary.to_string());
+    }
+    for tag in &tx.input_nullifiers {
+        let tag = tag.trim();
+        if !tag.is_empty() {
+            tags.insert(tag.to_string());
+        }
+    }
+    tags
+}
+
+fn find_pending_private_nullifier_conflict(
+    app_state: &AppState,
+    new_hash: &str,
+    new_tx: &crate::private_wallet::PrivateTransaction,
+) -> Result<Option<(String, String)>, (StatusCode, String)> {
+    let new_tags = private_tx_nullifier_tags(new_tx);
+    if new_tags.is_empty() {
+        return Ok(None);
+    }
+
+    let pending_hashes = app_state
+        .state_manager
+        .iterate_pending_private_transaction_hashes()
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to inspect pending private txs: {e}"),
+            )
+        })?;
+
+    for pending_hash in pending_hashes {
+        if pending_hash == new_hash {
+            continue;
+        }
+        let body = app_state
+            .state_manager
+            .get_private_transaction_bytes(&pending_hash)
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to load pending private tx {pending_hash}: {e}"),
+                )
+            })?;
+        let Some(body) = body else {
+            continue;
+        };
+        let Ok(pending_tx) =
+            serde_json::from_slice::<crate::private_wallet::PrivateTransaction>(&body)
+        else {
+            continue;
+        };
+        for tag in private_tx_nullifier_tags(&pending_tx) {
+            if new_tags.contains(&tag) {
+                return Ok(Some((pending_hash, tag)));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+#[allow(dead_code)]
 async fn send_from_seed(
     State(app_state): State<Arc<AppState>>,
     Json(req): Json<SendFromSeedRequest>,
@@ -2823,7 +2939,10 @@ async fn send_from_seed(
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     let tmp_dir = std::env::temp_dir().join(format!("zk-send-{nanos}"));
-    let wallets_dir = tmp_dir.join(".zoka").join("mainnet").join("private_wallets");
+    let wallets_dir = tmp_dir
+        .join(".zoka")
+        .join("mainnet")
+        .join("private_wallets");
     if let Err(e) = tokio::fs::create_dir_all(&wallets_dir).await {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2971,11 +3090,7 @@ async fn send_from_seed(
         let stdout = String::from_utf8_lossy(&send_out.stdout).into_owned();
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "send failed: {}\n{}",
-                stderr.trim(),
-                stdout.trim()
-            ),
+            format!("send failed: {}\n{}", stderr.trim(), stdout.trim()),
         ));
     }
 
@@ -3005,7 +3120,11 @@ async fn send_from_seed(
         // chunked `Transaction hashes:` formats.
         send_stdout
             .lines()
-            .find_map(|line| line.trim().strip_prefix("Hash:").map(|s| s.trim().to_string()))
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("Hash:")
+                    .map(|s| s.trim().to_string())
+            })
             .filter(|h| !h.is_empty())
             .or_else(|| {
                 // Look at lines after a "Transaction hashes:" header (chunked
@@ -3019,8 +3138,7 @@ async fn send_from_seed(
                     }
                     if in_block {
                         let candidate = trimmed.trim_start_matches('-').trim();
-                        if candidate.len() >= 32
-                            && candidate.chars().all(|c| c.is_ascii_hexdigit())
+                        if candidate.len() >= 32 && candidate.chars().all(|c| c.is_ascii_hexdigit())
                         {
                             return Some(candidate.to_string());
                         }
@@ -3039,34 +3157,56 @@ async fn send_from_seed(
         )
     })?;
 
+    let built_tx = match app_state.state_manager.get_private_transaction_bytes(&hash) {
+        Ok(Some(body)) => {
+            match serde_json::from_slice::<crate::private_wallet::PrivateTransaction>(&body) {
+                Ok(tx) => Some(tx),
+                Err(e) => {
+                    tracing::warn!(
+                        "send-from-seed: failed to deserialize built tx body {hash}: {e}"
+                    );
+                    None
+                }
+            }
+        }
+        Ok(None) => {
+            tracing::warn!("send-from-seed: built tx {hash} not found in priv_tx storage");
+            None
+        }
+        Err(e) => {
+            tracing::warn!("send-from-seed: failed reading tx body {hash} from storage: {e}");
+            None
+        }
+    };
+
+    if let Some(tx) = built_tx.as_ref() {
+        if let Some((existing_hash, nullifier)) =
+            find_pending_private_nullifier_conflict(app_state.as_ref(), &hash, tx)?
+        {
+            let _ = app_state
+                .state_manager
+                .delete_pending_private_transaction_hash(&hash);
+            let _ = app_state.state_manager.delete_private_transaction(&hash);
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "private spend already pending: tx {existing_hash} uses nullifier {nullifier}"
+                ),
+            ));
+        }
+    }
+
     // ── Hand the built tx to the fullnode main loop (if configured) so
     //    it lands in the in-memory pool AND gets gossiped via libp2p.
     //    Without this step the body sits in `priv_tx:<hash>` storage but
     //    no peer's miner ever sees it — exactly the failure mode the
     //    user hit when mobile sends "succeeded" but balance never moved.
     //    Best-effort: errors here MUST NOT mask the successful build.
-    if let Some(sender) = &app_state.private_tx_broadcaster {
-        match app_state.state_manager.get_private_transaction_bytes(&hash) {
-            Ok(Some(body)) => {
-                match serde_json::from_slice::<crate::private_wallet::PrivateTransaction>(&body) {
-                    Ok(tx) => {
-                        if let Err(e) = sender.send(tx) {
-                            tracing::warn!(
-                                "send-from-seed: failed to forward tx {hash} to fullnode broadcaster: {e}"
-                            );
-                        }
-                    }
-                    Err(e) => tracing::warn!(
-                        "send-from-seed: failed to deserialize built tx body {hash} for broadcast: {e}"
-                    ),
-                }
-            }
-            Ok(None) => tracing::warn!(
-                "send-from-seed: built tx {hash} not found in priv_tx storage post-CLI"
-            ),
-            Err(e) => tracing::warn!(
-                "send-from-seed: failed reading tx body {hash} from storage for broadcast: {e}"
-            ),
+    if let (Some(sender), Some(tx)) = (&app_state.private_tx_broadcaster, built_tx) {
+        if let Err(e) = sender.send(tx) {
+            tracing::warn!(
+                "send-from-seed: failed to forward tx {hash} to fullnode broadcaster: {e}"
+            );
         }
     }
 
@@ -3652,6 +3792,79 @@ pub async fn ws_status(
     }))
 }
 
+/// POST /sync/block — receive a mined block from any external miner
+/// (including those behind NAT) and apply it to the local chain.
+///
+/// Accepts the same Block JSON returned by `GET /blocks/:height/raw`.
+/// Uses the same code path as `zoka rpc-sync` (try_apply_synced_block_payload)
+/// so validation is identical to the normal block sync flow.
+async fn post_block_submit(
+    State(app_state): State<Arc<AppState>>,
+    Json(block): Json<crate::types::Block>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use crate::network::message::BlockResponseMessage;
+    use crate::state::sync::{try_apply_synced_block_payload, SyncOutcome};
+
+    let current_height = app_state.state_manager.get_height().await;
+    if block.header.block_height <= current_height {
+        return Ok(Json(serde_json::json!({
+            "status": "already_known",
+            "height": block.header.block_height
+        })));
+    }
+
+    // Wrap block in BlockResponseMessage — same format used by rpc-sync
+    let encrypted_block = serde_json::to_vec(&block).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("serialize error: {e}"),
+        )
+    })?;
+    let response = BlockResponseMessage {
+        block_height: block.header.block_height,
+        block_hash: block.header.hash.clone(),
+        encrypted_block,
+        difficulty_bits: None,
+        private_tx_bodies: vec![],
+        timestamp: block.header.timestamp,
+    };
+
+    let storage = app_state.state_manager.raw_storage();
+    let chain_id = crate::economics::MAINNET_CHAIN_ID;
+
+    match try_apply_synced_block_payload(&storage, chain_id, &response) {
+        SyncOutcome::Applied(_) => {
+            tracing::info!(
+                "post_block_submit: applied block h={} hash={}",
+                block.header.block_height,
+                block.header.hash
+            );
+            Ok(Json(serde_json::json!({
+                "status": "applied",
+                "height": block.header.block_height,
+                "hash": block.header.hash
+            })))
+        }
+        SyncOutcome::AlreadyKnown { .. } | SyncOutcome::BehindOrSibling { .. } => {
+            Ok(Json(serde_json::json!({
+                "status": "already_known",
+                "height": block.header.block_height
+            })))
+        }
+        SyncOutcome::GapAhead {
+            local_head,
+            candidate,
+        } => Err((
+            StatusCode::CONFLICT,
+            format!("gap: local={local_head} candidate={candidate}"),
+        )),
+        outcome => Err((
+            StatusCode::BAD_REQUEST,
+            format!("block rejected: {outcome:?}"),
+        )),
+    }
+}
+
 pub fn create_router(app_state: Arc<AppState>) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -3670,6 +3883,14 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         .route("/metrics/audit", get(get_audit_logs))
         .route("/chain/height", get(get_height))
         .route("/chain/state-root", get(get_state_root))
+        .route(
+            "/chain/private-commitment-root",
+            get(get_private_commitment_root),
+        )
+        .route(
+            "/chain/private-commitments/:commitment/proof",
+            get(get_private_commitment_proof),
+        )
         .route("/accounts/:address", get(get_account))
         .route("/accounts/:address/proof", get(get_account_proof))
         .route("/accounts/proof/verify", post(verify_account_proof))
@@ -3687,11 +3908,11 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
             get(get_block_private_tx_hashes_range),
         )
         .route("/private/tx", post(post_private_tx_body))
-        .route("/private/wallet/send-from-seed", post(send_from_seed))
         .route("/private/tx/:hash", get(get_private_tx_by_hash))
         .route("/blocks/range/:from/:to", get(get_blocks_range))
         .route("/blocks/range/:from/:to/raw", get(get_raw_blocks_range))
         .route("/transactions/:hash", get(get_transaction_by_hash))
+        .route("/sync/block", post(post_block_submit))
         .route("/admin/rollback", post(admin_rollback))
         .route("/admin/rollback-points", get(admin_rollback_points))
         .route("/transactions", post(submit_transaction))
@@ -4075,7 +4296,7 @@ pub async fn start_api_on_bind(
 /// Same as `start_api_on_bind` but accepts a broadcast channel sender that
 /// links the API into the fullnode main loop. Pass `Some(sender)` from a
 /// fullnode boot path so private transactions submitted via the HTTP API
-/// (e.g. `/private/wallet/send-from-seed`) reach the in-memory pool and
+/// (e.g. `/private/tx`) reach the in-memory pool and
 /// the libp2p gossip layer of the running node.
 pub async fn start_api_on_bind_with_broadcaster(
     state_manager: SharedState,
@@ -4129,6 +4350,76 @@ mod tests {
     use super::*;
     use crate::types::{Block, PublicKey, Signature};
     static PROFILE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn minimal_private_tx(
+        hash: &str,
+        nullifier: &str,
+        input_nullifiers: Vec<&str>,
+    ) -> crate::private_wallet::PrivateTransaction {
+        serde_json::from_value(serde_json::json!({
+            "tx_hash": hash,
+            "commitment": "commitment",
+            "nullifier": nullifier,
+            "input_nullifiers": input_nullifiers,
+            "zk_proof": null,
+            "timestamp": 1,
+            "status": "Verified"
+        }))
+        .unwrap()
+    }
+
+    fn test_app_state(test_dir: &str) -> AppState {
+        let storage = Arc::new(crate::storage::RocksDbStorage::new(test_dir).unwrap());
+        let state_manager = Arc::new(StateManager::new(storage));
+        AppState {
+            state_manager,
+            mempool: Arc::new(Mempool::new(1000)),
+            security: ApiSecurityConfig::default(),
+            rate_limiter: ApiRateLimiter::default(),
+            security_stats: Arc::new(ApiSecurityStats::default()),
+            ws_manager: WebSocketConnectionManager::new(),
+            pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
+            private_wallet_manager: None,
+            private_tx_broadcaster: None,
+        }
+    }
+
+    #[test]
+    fn test_private_tx_nullifier_tags_collects_primary_and_inputs() {
+        let tx = minimal_private_tx("tx-new", "primary", vec!["input-a", "", " input-b "]);
+        let tags = private_tx_nullifier_tags(&tx);
+
+        assert!(tags.contains("primary"));
+        assert!(tags.contains("input-a"));
+        assert!(tags.contains("input-b"));
+        assert_eq!(tags.len(), 3);
+    }
+
+    #[test]
+    fn test_find_pending_private_nullifier_conflict_detects_duplicate() {
+        let test_dir = ".zoka/test-suite/.test_api_pending_nullifier_conflict";
+        let _ = std::fs::remove_dir_all(test_dir);
+        let state = test_app_state(test_dir);
+        let pending = minimal_private_tx("tx-pending", "shared-nullifier", vec![]);
+        let pending_body = serde_json::to_vec(&pending).unwrap();
+        state
+            .state_manager
+            .save_private_transaction_bytes("tx-pending", &pending_body)
+            .unwrap();
+        state
+            .state_manager
+            .save_pending_private_transaction_hash("tx-pending")
+            .unwrap();
+
+        let new_tx = minimal_private_tx("tx-new", "other", vec!["shared-nullifier"]);
+        let conflict = find_pending_private_nullifier_conflict(&state, "tx-new", &new_tx)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(conflict.0, "tx-pending");
+        assert_eq!(conflict.1, "shared-nullifier");
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
 
     #[tokio::test]
     async fn test_create_router() {
