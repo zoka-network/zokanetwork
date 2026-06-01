@@ -4872,6 +4872,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "x25519-dalek",
  "zeroize",
 ]
 

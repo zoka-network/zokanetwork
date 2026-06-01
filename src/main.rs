@@ -2808,6 +2808,68 @@ fn import_sidecar_private_txs(db_path: &str, storage: &RocksDbStorage) -> usize 
     imported
 }
 
+/// Poll public RPC peers for their pending private transactions and stage any
+/// we don't already have into the sidecar queue, so the local mining loop can
+/// include them. Returns how many new bodies were staged. Best-effort: any RPC
+/// or parse failure is skipped silently so this never disrupts the main loop.
+///
+/// This is the NAT-friendly pull path that complements libp2p gossip: a miner
+/// that only opens outbound HTTP still receives private txs published to a
+/// public node.
+fn pull_pending_private_txs_from_rpc(db_path: &str, rpc_endpoints: &[String]) -> usize {
+    if rpc_endpoints.is_empty() {
+        return 0;
+    }
+    let sidecar = private_tx_sidecar_dir(db_path);
+
+    // Hashes we already hold locally (committed bodies or queued sidecar files)
+    // so we don't restage or refetch them every cycle.
+    let have_committed = |hash: &str| -> bool {
+        RocksDbStorage::new(db_path)
+            .ok()
+            .and_then(|s| s.get_private_transaction_bytes(hash).ok().flatten())
+            .is_some()
+    };
+    let sidecar_has = |hash: &str| -> bool { sidecar.join(format!("{hash}.privtx")).exists() };
+
+    let mut staged = 0usize;
+    for rpc in rpc_endpoints {
+        let value = match rpc_http_get_json(rpc, "/private/pending", 5) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let Some(list) = value.get("pending").and_then(|p| p.as_array()) else {
+            continue;
+        };
+        for tx in list {
+            let Some(hash) = tx.get("tx_hash").and_then(|h| h.as_str()) else {
+                continue;
+            };
+            let hash = hash.trim();
+            if hash.is_empty()
+                || hash.len() > 128
+                || !hash
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() || matches!(c, '-' | '_'))
+            {
+                continue;
+            }
+            if sidecar_has(hash) || have_committed(hash) {
+                continue;
+            }
+            let Ok(bytes) = serde_json::to_vec(tx) else {
+                continue;
+            };
+            if std::fs::create_dir_all(&sidecar).is_ok()
+                && std::fs::write(sidecar.join(format!("{hash}.privtx")), &bytes).is_ok()
+            {
+                staged += 1;
+            }
+        }
+    }
+    staged
+}
+
 fn clear_committed_local_private_txs(
     storage: &RocksDbStorage,
     hashes: &[String],
@@ -6967,6 +7029,11 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut next_seed_reconnect_at = tokio::time::Instant::now();
     let mut next_ibd_at = tokio::time::Instant::now();
     let mut next_miner_heartbeat_at = tokio::time::Instant::now();
+    // Periodic RPC pull of pending private txs from public peers. This is the
+    // NAT-friendly counterpart to libp2p gossip: a miner that can only open
+    // outbound HTTP pulls pending private txs into its own pool so it can mine
+    // them, even when inbound P2P gossip never reaches it.
+    let mut next_private_pull_at = tokio::time::Instant::now();
     let mut heartbeat_last_status_log = HashMap::<String, bool>::new();
     let mut heartbeat_recent_failures: VecDeque<(String, String)> = VecDeque::with_capacity(8);
     let mut last_runtime_mining_enabled = auto_mine;
@@ -7118,6 +7185,22 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 last_event = rebroadcast_event;
             }
             next_sync_state_at = tokio::time::Instant::now() + Duration::from_secs(3);
+        }
+
+        // Pull pending private txs from public RPC peers so a NAT'd miner can
+        // include txs that were published to a droplet but never gossiped to
+        // it. Bodies are dropped into the sidecar queue, which the mining loop
+        // already drains into the local pending pool — this avoids fighting the
+        // miner for the RocksDB write lock. Runs on every node with RPC
+        // endpoints; harmless on the droplets (they re-stage what they have).
+        if tokio::time::Instant::now() >= next_private_pull_at {
+            if let Some(path) = db_path.as_deref() {
+                let staged = pull_pending_private_txs_from_rpc(path, &rpc_sync_endpoints);
+                if staged > 0 {
+                    last_event = format!("Pulled {staged} pending private tx(s) from RPC peers");
+                }
+            }
+            next_private_pull_at = tokio::time::Instant::now() + Duration::from_secs(5);
         }
 
         if mining_task

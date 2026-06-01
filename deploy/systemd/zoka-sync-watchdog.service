@@ -1,0 +1,13 @@
+[Unit]
+Description=Zoka RPC sync catch-up watchdog
+After=network-online.target zoka-rpc.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/zoka-sync-watchdog.sh
+Environment=BOOT_RPC=http://159.223.119.216:3000
+Environment=LOCAL_RPC=http://127.0.0.1:3000
+Environment=GAP_THRESHOLD=2
+Environment=MAX_PUSH=64
+Environment=CURL_TIMEOUT=30

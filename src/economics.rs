@@ -26,12 +26,14 @@ pub const COINBASE_MATURITY_BLOCKS: u64 = 5;
 /// block must keep a bounded commitment list so validation remains predictable.
 pub const PRIVATE_TX_HASHES_PER_BLOCK_LIMIT: usize = 128;
 
-// TEMPORARY TEST VALUES: difficulty lowered to 8 bits for the genesis-reset
-// rehearsal so blocks solve quickly on a single CPU miner. RESTORE BOTH TO 12
-// before the real mainnet launch.
+// TEMPORARY TEST VALUES: difficulty pinned to 8 bits for the genesis-reset
+// rehearsal. MIN == INITIAL == MAX == 8 so the retarget clamp keeps it fixed
+// at 8 even when blocks solve in milliseconds on a single CPU (otherwise the
+// retarget escalates 8->13+ and freezes the chain). RESTORE to MIN 12 /
+// INITIAL 12 / MAX 30 before the real mainnet launch.
 pub const POW_MIN_DIFFICULTY_BITS: u32 = 8;
 pub const POW_INITIAL_DIFFICULTY_BITS: u32 = 8;
-pub const POW_MAX_DIFFICULTY_BITS: u32 = 30;
+pub const POW_MAX_DIFFICULTY_BITS: u32 = 8;
 pub const POW_KEY_EPOCH_BLOCKS: u64 = 2_048;
 
 /// Canonical public-network PoW algorithm. See `docs/protocol-overview.md`.

@@ -22,6 +22,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
+use zeroize::Zeroize;
 
 type SharedState = Arc<StateManager>;
 type SharedMempool = Arc<Mempool>;
@@ -471,6 +472,7 @@ impl RbacConfig {
         endpoint_permissions.insert("/transactions/:hash", ApiRole::Read);
         endpoint_permissions.insert("/mempool/metrics", ApiRole::Read);
         endpoint_permissions.insert("/network/runtime", ApiRole::Read);
+        endpoint_permissions.insert("/crypto/server-pubkey", ApiRole::Read);
 
         // Write endpoints
         endpoint_permissions.insert("/transactions", ApiRole::Write);
@@ -478,6 +480,7 @@ impl RbacConfig {
         endpoint_permissions.insert("/network/miners/heartbeat", ApiRole::Write);
         endpoint_permissions.insert("/local/mining/start", ApiRole::Write);
         endpoint_permissions.insert("/local/mining/stop", ApiRole::Write);
+        endpoint_permissions.insert("/private/wallet/send-from-seed", ApiRole::Write);
 
         // Admin endpoints
         endpoint_permissions.insert("/admin/rollback", ApiRole::Admin);
@@ -805,6 +808,7 @@ fn verify_transaction_request_signature(
 
 fn rate_limit_bucket(method: &str, path: &str) -> &'static str {
     if path.starts_with("/transactions")
+        || path == "/private/wallet/send-from-seed"
         || (!matches!(method, "GET" | "HEAD" | "OPTIONS") && path.starts_with("/private/tx"))
     {
         "transactions"
@@ -2345,6 +2349,56 @@ async fn get_private_tx_by_hash(
     })?))
 }
 
+/// List the node's still-pending (un-mined) private transactions, each with
+/// its full canonical body. This is the RPC-pull counterpart to libp2p gossip:
+/// a miner behind NAT — which can open outbound HTTP but receives no inbound
+/// P2P — polls this endpoint to pull pending private txs into its own pool so
+/// it can include them in the next block. Without it, a private tx published
+/// to a public node never reaches a NAT'd miner and is never mined.
+///
+/// Privacy: `PrivateTransaction` carries no clear sender/receiver/amount, so
+/// exposing the bodies here leaks nothing beyond what `/private/tx/:hash`
+/// already serves.
+async fn get_pending_private_txs(
+    State(app_state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let hashes = app_state
+        .state_manager
+        .iterate_pending_private_transaction_hashes()
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to list pending private txs: {e}"),
+            )
+        })?;
+
+    // Cap the response so a huge backlog can't blow up a single request; the
+    // miner polls repeatedly and will drain the rest on later passes.
+    const MAX_PENDING_RETURNED: usize = 64;
+    let mut txs = Vec::new();
+    for hash in hashes.into_iter().take(MAX_PENDING_RETURNED) {
+        // Skip anything already committed on-chain (pending index can lag).
+        if app_state
+            .state_manager
+            .has_private_transaction_hash(&hash)
+            .await
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if let Ok(Some(bytes)) = app_state.state_manager.get_private_transaction_bytes(&hash) {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                txs.push(value);
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "count": txs.len(),
+        "pending": txs,
+    })))
+}
+
 /// Archive a canonical private transaction body so future wallet restores can
 /// replay confirmed private history from a public RPC node.
 async fn post_private_tx_body(
@@ -2777,13 +2831,11 @@ async fn submit_transaction(
 
 // â”€â”€ /private/wallet/send-from-seed â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //
-// Legacy implementation intentionally kept unrouted during migration.
-// Mobile clients now publish only a canonical `/private/tx` body.
-//
 // Build, sign and broadcast a private transaction on behalf of a mobile
-// (or any seed-only) client. The client POSTs the BIP-39 entropy of its
-// recovery phrase together with recipient + amount; the node uses the
-// seed *ephemerally* in a sandboxed temp directory to:
+// (or any seed-only) client. The client encrypts the BIP-39 entropy with
+// the node's ephemeral server key and POSTs the sealed envelope together
+// with recipient + amount; the node uses the decrypted seed *ephemerally*
+// in a sandboxed temp directory to:
 //
 //   1. Restore the wallet keys (`wallet-restore-from-keys`)
 //   2. Sync UTXOs from the local chain DB (`balance` triggers it)
@@ -2792,8 +2844,8 @@ async fn submit_transaction(
 //      and submit to the mempool (`send`)
 //   4. Delete the temp directory unconditionally
 //
-// The seed never touches disk except inside the temp directory, which is
-// always removed on the response path (success or error). The node
+// The seed is encrypted in transit and never touches disk except inside
+// the temp directory, which is always removed on the response path. The node
 // operator can still inspect process memory, so this endpoint is a
 // usability/privacy tradeoff: clients who care about full custody should
 // point `Custom RPC` at their own node (see RpcSettings in zkapriv).
@@ -2805,13 +2857,14 @@ async fn submit_transaction(
 // CLI to reuse the battle-tested send pipeline instead of reimplementing
 // the cryptography in the HTTP handler.
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct SendFromSeedRequest {
-    /// Hex of the BIP-39 entropy (16 or 32 bytes). The scan key for
-    /// Zoka private wallets IS the recovery entropy; the spending key
-    /// is derived from it deterministically.
-    seed_hex: String,
+    /// X25519 ephemeral public key generated by the client for this request.
+    ephemeral_pubkey_hex: String,
+    /// AES-256-GCM nonce generated by the client for this request.
+    nonce_hex: String,
+    /// AES-256-GCM ciphertext and tag containing the 16 or 32 byte seed.
+    encrypted_seed_hex: String,
     /// Recipient zka1â€¦ address.
     to: String,
     /// Amount in ZKA atoms (1 ZKA = 1_000_000 atoms).
@@ -2821,11 +2874,115 @@ struct SendFromSeedRequest {
     fee_atoms: Option<u64>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 struct SendFromSeedResponse {
     hash: String,
     status: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ServerPubkeyResponse {
+    algorithm: &'static str,
+    public_key_hex: String,
+}
+
+struct ServerSeedKey {
+    secret: x25519_dalek::StaticSecret,
+    public: x25519_dalek::PublicKey,
+}
+
+fn server_seed_key() -> &'static ServerSeedKey {
+    use rand::RngCore;
+
+    static KEY: OnceLock<ServerSeedKey> = OnceLock::new();
+    KEY.get_or_init(|| {
+        let mut secret_bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut secret_bytes);
+        let secret = x25519_dalek::StaticSecret::from(secret_bytes);
+        secret_bytes.zeroize();
+        let public = x25519_dalek::PublicKey::from(&secret);
+        ServerSeedKey { secret, public }
+    })
+}
+
+async fn get_server_pubkey() -> Json<ServerPubkeyResponse> {
+    Json(ServerPubkeyResponse {
+        algorithm: "x25519-aes256gcm-v1",
+        public_key_hex: hex::encode(server_seed_key().public.as_bytes()),
+    })
+}
+
+fn decode_fixed_hex<const N: usize>(
+    value: &str,
+    field: &str,
+) -> Result<[u8; N], (StatusCode, String)> {
+    let decoded = hex::decode(value.trim())
+        .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid {field}")))?;
+    decoded.try_into().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("{field} must be {N} bytes"),
+        )
+    })
+}
+
+fn decrypt_seed(req: &SendFromSeedRequest) -> Result<Vec<u8>, (StatusCode, String)> {
+    use aes_gcm::aead::{Aead, Payload};
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+    use sha2::{Digest, Sha256};
+
+    let ephemeral_bytes =
+        decode_fixed_hex::<32>(&req.ephemeral_pubkey_hex, "ephemeral_pubkey_hex")?;
+    let nonce_bytes = decode_fixed_hex::<12>(&req.nonce_hex, "nonce_hex")?;
+    let ciphertext = hex::decode(req.encrypted_seed_hex.trim()).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "invalid encrypted_seed_hex".to_string(),
+        )
+    })?;
+    if ciphertext.len() < 16 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "encrypted_seed_hex must include an authentication tag".to_string(),
+        ));
+    }
+
+    let ephemeral_pubkey = x25519_dalek::PublicKey::from(ephemeral_bytes);
+    let server_key = server_seed_key();
+    let mut shared_secret = server_key
+        .secret
+        .diffie_hellman(&ephemeral_pubkey)
+        .to_bytes();
+    let mut hasher = Sha256::new();
+    hasher.update(b"zoka-seed-envelope-v1");
+    hasher.update(shared_secret);
+    hasher.update(ephemeral_bytes);
+    hasher.update(server_key.public.as_bytes());
+    let mut aes_key = hasher.finalize();
+    shared_secret.zeroize();
+
+    let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to initialize seed envelope cipher".to_string(),
+        )
+    })?;
+    let result = cipher
+        .decrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: &ciphertext,
+                aad: b"zoka-seed-envelope-v1",
+            },
+        )
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "encrypted seed authentication failed".to_string(),
+            )
+        });
+    aes_key.zeroize();
+    result
 }
 
 fn private_tx_nullifier_tags(tx: &crate::private_wallet::PrivateTransaction) -> HashSet<String> {
@@ -2894,7 +3051,6 @@ fn find_pending_private_nullifier_conflict(
     Ok(None)
 }
 
-#[allow(dead_code)]
 async fn send_from_seed(
     State(app_state): State<Arc<AppState>>,
     Json(req): Json<SendFromSeedRequest>,
@@ -2908,8 +3064,7 @@ async fn send_from_seed(
             "amount_atoms must be greater than zero".to_string(),
         ));
     }
-    let seed_bytes = hex::decode(req.seed_hex.trim())
-        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid seed_hex".to_string()))?;
+    let mut seed_bytes = decrypt_seed(&req)?;
     if seed_bytes.len() != 32 && seed_bytes.len() != 16 {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -2929,9 +3084,11 @@ async fn send_from_seed(
     hasher.update(b"zoka-private-wallet-spend-v1");
     hasher.update([0x1f]);
     hasher.update(&seed_bytes);
-    let spending_key = hasher.finalize();
-    let spending_key_hex = hex::encode(spending_key);
-    let scan_key_hex = hex::encode(&seed_bytes);
+    let mut spending_key = hasher.finalize();
+    let mut spending_key_hex = hex::encode(&spending_key);
+    let mut scan_key_hex = hex::encode(&seed_bytes);
+    spending_key.zeroize();
+    seed_bytes.zeroize();
 
     // â”€â”€ Sandbox the wallet file under a unique temp dir â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     let nanos = SystemTime::now()
@@ -2971,7 +3128,7 @@ async fn send_from_seed(
     });
 
     // â”€â”€ Step 1: restore the wallet from the seed-derived keys â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    let restore_out = tokio::process::Command::new(&zoka_bin)
+    let restore_result = tokio::process::Command::new(&zoka_bin)
         .current_dir(&tmp_dir)
         .args([
             "wallet-restore-from-keys",
@@ -2987,13 +3144,15 @@ async fn send_from_seed(
             "mainnet",
         ])
         .output()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to spawn wallet-restore-from-keys: {e}"),
-            )
-        })?;
+        .await;
+    scan_key_hex.zeroize();
+    spending_key_hex.zeroize();
+    let restore_out = restore_result.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to spawn wallet-restore-from-keys: {e}"),
+        )
+    })?;
 
     if !restore_out.status.success() {
         let stderr = String::from_utf8_lossy(&restore_out.stderr);
@@ -3879,6 +4038,7 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         .route("/local/mining/start", post(post_local_mining_start))
         .route("/local/mining/stop", post(post_local_mining_stop))
         .route("/health", get(health))
+        .route("/crypto/server-pubkey", get(get_server_pubkey))
         .route("/metrics/security", get(get_security_metrics))
         .route("/metrics/audit", get(get_audit_logs))
         .route("/chain/height", get(get_height))
@@ -3908,6 +4068,8 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
             get(get_block_private_tx_hashes_range),
         )
         .route("/private/tx", post(post_private_tx_body))
+        .route("/private/wallet/send-from-seed", post(send_from_seed))
+        .route("/private/pending", get(get_pending_private_txs))
         .route("/private/tx/:hash", get(get_private_tx_by_hash))
         .route("/blocks/range/:from/:to", get(get_blocks_range))
         .route("/blocks/range/:from/:to/raw", get(get_raw_blocks_range))
@@ -4748,6 +4910,10 @@ mod tests {
             "transactions"
         );
         assert_eq!(rate_limit_bucket("POST", "/private/tx"), "transactions");
+        assert_eq!(
+            rate_limit_bucket("POST", "/private/wallet/send-from-seed"),
+            "transactions"
+        );
         assert_eq!(rate_limit_bucket("GET", "/private/tx/hash"), "default");
         assert_eq!(rate_limit_bucket("GET", "/chain/height"), "default");
     }
@@ -4763,9 +4929,55 @@ mod tests {
             ApiRole::Write
         );
         assert_eq!(
+            required_role_for_request("POST", "/private/wallet/send-from-seed"),
+            ApiRole::Write
+        );
+        assert_eq!(
             required_role_for_request("GET", "/metrics/security"),
             ApiRole::Admin
         );
+    }
+
+    #[test]
+    fn test_seed_envelope_decrypts_and_rejects_tampering() {
+        use aes_gcm::aead::{Aead, Payload};
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+        use sha2::{Digest, Sha256};
+
+        let server_key = server_seed_key();
+        let ephemeral_secret = x25519_dalek::StaticSecret::from([7u8; 32]);
+        let ephemeral_pubkey = x25519_dalek::PublicKey::from(&ephemeral_secret);
+        let shared_secret = ephemeral_secret.diffie_hellman(&server_key.public);
+        let mut hasher = Sha256::new();
+        hasher.update(b"zoka-seed-envelope-v1");
+        hasher.update(shared_secret.as_bytes());
+        hasher.update(ephemeral_pubkey.as_bytes());
+        hasher.update(server_key.public.as_bytes());
+        let aes_key = hasher.finalize();
+        let nonce = [9u8; 12];
+        let cipher = Aes256Gcm::new_from_slice(&aes_key).unwrap();
+        let seed = [3u8; 32];
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &seed,
+                    aad: b"zoka-seed-envelope-v1",
+                },
+            )
+            .unwrap();
+        let mut request = SendFromSeedRequest {
+            ephemeral_pubkey_hex: hex::encode(ephemeral_pubkey.as_bytes()),
+            nonce_hex: hex::encode(nonce),
+            encrypted_seed_hex: hex::encode(ciphertext),
+            to: "zka1test".to_string(),
+            amount_atoms: 1,
+            fee_atoms: None,
+        };
+
+        assert_eq!(decrypt_seed(&request).unwrap(), seed);
+        request.encrypted_seed_hex.replace_range(0..2, "ff");
+        assert!(decrypt_seed(&request).is_err());
     }
 
     #[test]
