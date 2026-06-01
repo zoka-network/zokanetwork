@@ -469,6 +469,7 @@ mod tests {
             },
             transactions: vec![coinbase],
             private_tx_hashes: Vec::new(),
+            private_nullifiers: Vec::new(),
             private_fee_claims: Vec::new(),
             private_coinbase: Some(dummy_private_coinbase(height, miner)),
         };

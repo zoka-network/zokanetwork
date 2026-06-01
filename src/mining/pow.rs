@@ -310,8 +310,10 @@ mod randomx_backend {
                     let flags = base | RandomXFlag::FLAG_FULL_MEM;
                     let mut vms = Vec::with_capacity(lanes.max(1));
                     for _ in 0..lanes.max(1) {
-                        let vm = RandomXVM::new(flags, None, Some(dataset.clone()))
-                            .map_err(|e| PowError::Runtime(format!("randomx vm init failed: {e:?}")))?;
+                        let vm =
+                            RandomXVM::new(flags, None, Some(dataset.clone())).map_err(|e| {
+                                PowError::Runtime(format!("randomx vm init failed: {e:?}"))
+                            })?;
                         vms.push(Self { vm: Mutex::new(vm) });
                     }
                     (flags, vms)
@@ -321,10 +323,12 @@ mod randomx_backend {
                     let flags = base;
                     let mut vms = Vec::with_capacity(lanes.max(1));
                     for _ in 0..lanes.max(1) {
-                        let rx_cache = RandomXCache::new(flags, &seed)
-                            .map_err(|e| PowError::Runtime(format!("randomx cache init failed: {e:?}")))?;
-                        let vm = RandomXVM::new(flags, Some(rx_cache), None)
-                            .map_err(|e| PowError::Runtime(format!("randomx vm init failed: {e:?}")))?;
+                        let rx_cache = RandomXCache::new(flags, &seed).map_err(|e| {
+                            PowError::Runtime(format!("randomx cache init failed: {e:?}"))
+                        })?;
+                        let vm = RandomXVM::new(flags, Some(rx_cache), None).map_err(|e| {
+                            PowError::Runtime(format!("randomx vm init failed: {e:?}"))
+                        })?;
                         vms.push(Self { vm: Mutex::new(vm) });
                     }
                     (flags, vms)

@@ -103,6 +103,7 @@ impl UserMiner {
             },
             transactions: txs.clone(),
             private_tx_hashes: Vec::new(),
+            private_nullifiers: Vec::new(),
             private_fee_claims: Vec::new(),
             private_coinbase: None,
         };

@@ -8,7 +8,7 @@
     "initial_block_reward_zka": 12,
     "halving_interval_blocks": 1051200,
     "target_block_time_secs": 120,
-    "coinbase_maturity_blocks": 60
+    "coinbase_maturity_blocks": 5
   },
   "validators": [],
   "pre_mine": [],

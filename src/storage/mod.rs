@@ -7,6 +7,11 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 const PENDING_PRIVATE_TX_PREFIX: &str = "mempool:private:pending:";
 const PENDING_PRIVATE_TX_COUNT_KEY: &str = "mempool:private:count";
+/// Global on-chain index of spent private-tx nullifiers. One key per
+/// nullifier (`nullifier:spent:<hex>` -> block height), so a spent check is
+/// an O(1) point lookup. This is the canonical double-spend guard consulted
+/// during block application.
+const SPENT_NULLIFIER_PREFIX: &str = "nullifier:spent:";
 
 /// Storage trait defining the interface for blockchain persistence
 pub trait StorageBackend: Send + Sync {
@@ -372,6 +377,66 @@ impl RocksDbStorage {
     fn refresh_pending_private_transaction_count(&self) -> Result<(), StorageError> {
         let count = self.iterate_pending_private_transaction_hashes()?.len() as u64;
         self.put_raw(PENDING_PRIVATE_TX_COUNT_KEY, count.to_string().into_bytes())
+    }
+
+    /// Record a private-tx nullifier as spent at `height`. Idempotent: a
+    /// later height overwrites an earlier one, which is harmless because the
+    /// index only answers "spent or not".
+    pub fn save_spent_nullifier(&self, nullifier: &str, height: u64) -> Result<(), StorageError> {
+        let nullifier = nullifier.trim();
+        if nullifier.is_empty() {
+            return Err(StorageError::SerializationError(
+                "spent nullifier cannot be empty".to_string(),
+            ));
+        }
+        let key = format!("{SPENT_NULLIFIER_PREFIX}{nullifier}");
+        self.put_raw(&key, height.to_le_bytes().to_vec())
+    }
+
+    /// Return true if `nullifier` was already committed in a prior block.
+    pub fn is_nullifier_spent(&self, nullifier: &str) -> Result<bool, StorageError> {
+        let nullifier = nullifier.trim();
+        if nullifier.is_empty() {
+            return Ok(false);
+        }
+        let key = format!("{SPENT_NULLIFIER_PREFIX}{nullifier}");
+        Ok(self.get_raw(&key)?.is_some())
+    }
+
+    /// Remove a nullifier from the spent index. Used when a block is rolled
+    /// back / a side branch is reorged out so the note can be respent on the
+    /// new canonical chain.
+    pub fn delete_spent_nullifier(&self, nullifier: &str) -> Result<(), StorageError> {
+        let key = format!("{SPENT_NULLIFIER_PREFIX}{}", nullifier.trim());
+        self.db
+            .delete(key.as_bytes())
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))
+    }
+
+    /// Iterate `(nullifier, height)` pairs in the spent index, for
+    /// diagnostics and rebuilds.
+    pub fn iterate_spent_nullifiers(&self) -> Result<Vec<(String, u64)>, StorageError> {
+        let prefix = SPENT_NULLIFIER_PREFIX.as_bytes();
+        let mut out = Vec::new();
+        for item in self
+            .db
+            .iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward))
+        {
+            let (key, value) = item.map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let nullifier = String::from_utf8(key[prefix.len()..].to_vec()).map_err(|_| {
+                StorageError::SerializationError("Invalid UTF-8 in spent nullifier key".to_string())
+            })?;
+            let height = if value.len() == 8 {
+                u64::from_le_bytes(value.as_ref().try_into().unwrap_or_default())
+            } else {
+                0
+            };
+            out.push((nullifier, height));
+        }
+        Ok(out)
     }
 
     /// Retrieve a transaction by hash

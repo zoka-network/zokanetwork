@@ -145,12 +145,15 @@ mod tests {
 
     #[test]
     fn retarget_steps_down_when_parent_solve_time_is_too_slow() {
+        // Start one bit above the floor so the step-down is observable even
+        // when INITIAL == MIN (as in the lowered test config).
+        let start = economics::POW_INITIAL_DIFFICULTY_BITS + 1;
         let new_bits = retarget_from_solve_time(
-            economics::POW_INITIAL_DIFFICULTY_BITS,
+            start,
             economics::TARGET_BLOCK_TIME_SECS * 3,
             economics::TARGET_BLOCK_TIME_SECS,
         );
-        assert_eq!(new_bits, economics::POW_INITIAL_DIFFICULTY_BITS - 1);
+        assert_eq!(new_bits, start - 1);
     }
 
     #[test]
@@ -209,6 +212,7 @@ mod tests {
             },
             transactions: Vec::new(),
             private_tx_hashes: Vec::new(),
+            private_nullifiers: Vec::new(),
             private_fee_claims: Vec::new(),
             private_coinbase: None,
         };

@@ -518,6 +518,7 @@ mod tests {
             },
             transactions: vec![],
             private_tx_hashes: vec![],
+            private_nullifiers: vec![],
             private_fee_claims: vec![],
             private_coinbase: None,
         }
@@ -567,6 +568,7 @@ mod tests {
             },
             transactions: vec![coinbase],
             private_tx_hashes: vec![],
+            private_nullifiers: vec![],
             private_fee_claims: vec![],
             private_coinbase: Some(dummy_private_coinbase(height, miner_address)),
         };
@@ -1024,6 +1026,7 @@ mod tests {
             },
             transactions: vec![coinbase],
             private_tx_hashes: vec![],
+            private_nullifiers: vec![],
             private_fee_claims: vec![],
             private_coinbase: Some(dummy_private_coinbase(1, "zka1miner")),
         };

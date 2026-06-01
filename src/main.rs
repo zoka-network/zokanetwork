@@ -2683,6 +2683,14 @@ fn select_non_conflicting_pending_private_tx_hashes(
         if tags.is_empty() || tags.iter().any(|tag| seen_spend_tags.contains(tag)) {
             continue;
         }
+        // Skip any tx whose nullifier is already committed on-chain — it is
+        // a double-spend and `apply_block_inner` would reject the block.
+        if tags
+            .iter()
+            .any(|tag| storage.is_nullifier_spent(tag).unwrap_or(false))
+        {
+            continue;
+        }
         seen_spend_tags.extend(tags);
         selected.push(hash);
     }
@@ -3422,6 +3430,33 @@ fn collect_private_tx_bodies_from_storage(
         .iter()
         .filter_map(|hash| storage.get_private_transaction_bytes(hash).ok().flatten())
         .collect()
+}
+
+/// Derive the sorted, de-duplicated set of spent nullifiers (primary +
+/// input nullifiers) for the private txs selected for a block, reading each
+/// body from `priv_tx:<hash>` storage. This is committed in the block's
+/// Merkle root so every node can enforce the no-double-spend rule without
+/// needing the tx bodies. Hashes whose body is missing locally are skipped
+/// (the miner only includes txs whose bodies it holds, so this should not
+/// happen for the local mining path).
+fn collect_private_nullifiers_for_hashes(
+    storage: &RocksDbStorage,
+    hashes: &[String],
+) -> Vec<String> {
+    let mut nullifiers = Vec::new();
+    for hash in hashes {
+        let Some(body) = storage.get_private_transaction_bytes(hash).ok().flatten() else {
+            continue;
+        };
+        let Ok(tx) = serde_json::from_slice::<zoka::private_wallet::PrivateTransaction>(&body)
+        else {
+            continue;
+        };
+        nullifiers.extend(private_tx_spend_tags(&tx));
+    }
+    nullifiers.sort();
+    nullifiers.dedup();
+    nullifiers
 }
 
 /// Same as `collect_private_tx_bodies_from_storage` but opens the DB at
@@ -4714,6 +4749,18 @@ fn run_mining_batch_with_progress(
             Some(path) => local_pending_private_tx_hashes(path, LOCAL_PRIVATE_TXS_PER_BLOCK_LIMIT)?,
             None => Vec::new(),
         };
+        // Derive the spent-nullifier set committed in this block from the
+        // selected tx bodies, so every node enforces no-double-spend from
+        // the block alone (the bodies are not guaranteed to propagate).
+        let private_nullifiers_for_block = match config.chain_db_path.as_deref() {
+            Some(path) if !private_tx_hashes_for_block.is_empty() => match open_storage(path) {
+                Ok(storage) => {
+                    collect_private_nullifiers_for_hashes(&storage, &private_tx_hashes_for_block)
+                }
+                Err(_) => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
         let private_fee_claims_for_block = private_manager
             .create_local_private_fee_claims_for_block(
                 &private_tx_hashes_for_block,
@@ -4746,6 +4793,7 @@ fn run_mining_batch_with_progress(
             },
             transactions: vec![coinbase_tx],
             private_tx_hashes: private_tx_hashes_for_block.clone(),
+            private_nullifiers: private_nullifiers_for_block.clone(),
             private_fee_claims: private_fee_claims_for_block.clone(),
             private_coinbase: Some(private_coinbase.clone()),
         };
@@ -4771,6 +4819,7 @@ fn run_mining_batch_with_progress(
             },
             transactions: Vec::new(),
             private_tx_hashes: Vec::new(),
+            private_nullifiers: Vec::new(),
             private_fee_claims: Vec::new(),
             private_coinbase: None,
         };

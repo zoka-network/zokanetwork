@@ -260,6 +260,13 @@ pub struct Block {
     /// to empty for backwards compatibility with pre-split blocks.
     #[serde(default)]
     pub private_tx_hashes: Vec<String>,
+    /// Spent nullifiers (primary + input nullifiers) of every private tx
+    /// committed in this block, sorted and de-duplicated. Committed in the
+    /// Merkle root so every node — even one that never received the tx
+    /// bodies — can enforce the no-double-spend consensus rule from the
+    /// block alone. Defaults to empty for backwards compatibility.
+    #[serde(default)]
+    pub private_nullifiers: Vec<String>,
     /// Encrypted fee-opening envelopes for private txs included in this
     /// block. These are committed by Merkle root but hide the fee amount.
     #[serde(default)]
@@ -294,6 +301,7 @@ impl Block {
             },
             transactions,
             private_tx_hashes: Vec::new(),
+            private_nullifiers: Vec::new(),
             private_fee_claims: Vec::new(),
             private_coinbase: None,
         };
@@ -330,11 +338,26 @@ impl Block {
         self
     }
 
+    /// Attach the spent-nullifier set for the private txs in this block.
+    /// The list is sorted and de-duplicated so the commitment is canonical.
+    /// Recomputes the Merkle root and block hash, so call this before
+    /// finalizing PoW/signature.
+    pub fn with_private_nullifiers(mut self, private_nullifiers: Vec<String>) -> Self {
+        let mut nullifiers = private_nullifiers;
+        nullifiers.sort();
+        nullifiers.dedup();
+        self.private_nullifiers = nullifiers;
+        self.header.merkle_root = self.compute_merkle_root();
+        self.header.hash = self.compute_hash();
+        self
+    }
+
     pub fn compute_merkle_root(&self) -> String {
         use sha2::{Digest, Sha256};
 
         if self.transactions.is_empty()
             && self.private_tx_hashes.is_empty()
+            && self.private_nullifiers.is_empty()
             && self.private_fee_claims.is_empty()
             && self.private_coinbase.is_none()
         {
@@ -355,6 +378,14 @@ impl Block {
                 let mut hasher = Sha256::new();
                 hasher.update(b"private:");
                 hasher.update(hash.as_bytes());
+                hasher.finalize().to_vec()
+            }))
+            .chain(self.private_nullifiers.iter().map(|nullifier| {
+                // Commit each spent nullifier so the no-double-spend rule is
+                // anchored by PoW and verifiable from the block alone.
+                let mut hasher = Sha256::new();
+                hasher.update(b"private-nullifier:");
+                hasher.update(nullifier.as_bytes());
                 hasher.finalize().to_vec()
             }))
             .chain(self.private_fee_claims.iter().map(|claim| {

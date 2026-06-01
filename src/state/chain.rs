@@ -87,6 +87,12 @@ pub enum ChainError {
         candidate_work: u128,
         head_work: u128,
     },
+
+    #[error("private double-spend: nullifier {nullifier} already committed on-chain")]
+    PrivateNullifierDoubleSpend { nullifier: String },
+
+    #[error("private double-spend: nullifier {nullifier} appears twice within the same block")]
+    DuplicatePrivateNullifierInBlock { nullifier: String },
 }
 
 impl From<StorageError> for ChainError {
@@ -139,6 +145,7 @@ pub fn genesis_parent_for(chain_id: &str) -> Block {
         },
         transactions: Vec::new(),
         private_tx_hashes: Vec::new(),
+        private_nullifiers: Vec::new(),
         private_fee_claims: Vec::new(),
         private_coinbase: None,
     }
@@ -317,8 +324,24 @@ fn promote_branch_to_canonical(
 ) -> Result<ChainHead, ChainError> {
     let old_height = storage.get_chain_height()?;
     let branch = collect_branch_to_common_ancestor(storage, candidate)?;
+    // Reorg: the blocks being displaced (from the branch point up to the old
+    // head) leave the canonical chain, so free their nullifiers; then the new
+    // canonical branch claims its own. Order matters — de-index the outgoing
+    // blocks before indexing the incoming branch so a nullifier reused across
+    // both branches ends up owned by the new chain.
+    if let Some(first) = branch.first() {
+        let branch_point = first.header.block_height;
+        for height in branch_point..=old_height {
+            if let Some(hash) = canonical_hash_at_height(storage, height)? {
+                if let Some(old_block) = storage.get_block(&hash)? {
+                    deindex_block_nullifiers(storage, &old_block)?;
+                }
+            }
+        }
+    }
     for block in &branch {
         storage.set_block_hash_at_height(block.header.block_height, &block.header.hash)?;
+        index_block_nullifiers(storage, block)?;
     }
     for height in meta.height.saturating_add(1)..=old_height {
         storage.delete_block_hash_at_height(height)?;
@@ -385,6 +408,74 @@ pub fn apply_block_with_expected_difficulty(
     apply_block_inner(storage, chain_id, candidate, expected_difficulty_bits, true)
 }
 
+/// Reject a block that double-spends a private note. Two checks:
+///   1. No nullifier may repeat within the block's own `private_nullifiers`.
+///   2. No nullifier may already be committed on-chain (the global spent
+///      index). This is the canonical no-double-spend consensus rule, and it
+///      works from the block alone — a node does not need the tx bodies,
+///      which are not guaranteed to propagate with the block.
+fn validate_private_nullifiers(
+    storage: &RocksDbStorage,
+    candidate: &Block,
+) -> Result<(), ChainError> {
+    if candidate.private_nullifiers.is_empty() {
+        return Ok(());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for nullifier in &candidate.private_nullifiers {
+        let nullifier = nullifier.trim();
+        if nullifier.is_empty() {
+            continue;
+        }
+        if !seen.insert(nullifier.to_string()) {
+            return Err(ChainError::DuplicatePrivateNullifierInBlock {
+                nullifier: nullifier.to_string(),
+            });
+        }
+        if storage
+            .is_nullifier_spent(nullifier)
+            .map_err(|e| ChainError::Storage(format!("{e:?}")))?
+        {
+            return Err(ChainError::PrivateNullifierDoubleSpend {
+                nullifier: nullifier.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Persist every nullifier committed in `block` into the global spent index,
+/// keyed at the block's height. Call this whenever a block becomes part of
+/// the canonical chain.
+fn index_block_nullifiers(storage: &RocksDbStorage, block: &Block) -> Result<(), ChainError> {
+    for nullifier in &block.private_nullifiers {
+        let nullifier = nullifier.trim();
+        if nullifier.is_empty() {
+            continue;
+        }
+        storage
+            .save_spent_nullifier(nullifier, block.header.block_height)
+            .map_err(|e| ChainError::Storage(format!("{e:?}")))?;
+    }
+    Ok(())
+}
+
+/// Remove every nullifier committed in `block` from the global spent index.
+/// Call this when a block leaves the canonical chain (reorg) so the note can
+/// be respent on the new canonical branch.
+fn deindex_block_nullifiers(storage: &RocksDbStorage, block: &Block) -> Result<(), ChainError> {
+    for nullifier in &block.private_nullifiers {
+        let nullifier = nullifier.trim();
+        if nullifier.is_empty() {
+            continue;
+        }
+        storage
+            .delete_spent_nullifier(nullifier)
+            .map_err(|e| ChainError::Storage(format!("{e:?}")))?;
+    }
+    Ok(())
+}
+
 fn apply_block_inner(
     storage: &RocksDbStorage,
     chain_id: &str,
@@ -446,6 +537,7 @@ fn apply_block_inner(
         expected_difficulty_bits: effective_expected_difficulty,
     };
     validate_pow_block(candidate, &ctx)?;
+    validate_private_nullifiers(storage, candidate)?;
 
     let coinbase_amount = candidate
         .transactions
@@ -469,6 +561,7 @@ fn apply_block_inner(
     if extends_head {
         storage.save_block(candidate)?;
         save_block_meta(storage, &candidate.header.hash, &new_meta)?;
+        index_block_nullifiers(storage, candidate)?;
         storage.set_chain_height(candidate.header.block_height)?;
         storage.set_last_block_hash(&candidate.header.hash)?;
         storage.set_total_supply_emitted(new_total_supply)?;
@@ -711,6 +804,7 @@ mod tests {
             },
             transactions: vec![coinbase],
             private_tx_hashes: Vec::new(),
+            private_nullifiers: Vec::new(),
             private_fee_claims: Vec::new(),
             private_coinbase: Some(dummy_private_coinbase(height, miner)),
         };
@@ -1100,6 +1194,7 @@ mod tests {
             },
             transactions: vec![coinbase],
             private_tx_hashes: Vec::new(),
+            private_nullifiers: Vec::new(),
             private_fee_claims: Vec::new(),
             private_coinbase: Some(dummy_private_coinbase(1, "zka1miner")),
         };
@@ -1270,5 +1365,159 @@ mod tests {
         for h in 13..=20u64 {
             assert!(storage.get_block_by_height(h).expect("query").is_some());
         }
+    }
+
+    /// Build a block carrying the given spent nullifiers (mined on top of the
+    /// supplied parent), recomputing merkle/hash so PoW stays valid.
+    fn mine_block_with_nullifiers(
+        chain_id: &str,
+        parent_hash: &str,
+        parent_height: u64,
+        parent_supply: u64,
+        miner: &Address,
+        difficulty_bits: u32,
+        timestamp: u64,
+        nullifiers: Vec<String>,
+    ) -> Block {
+        let mut block = mine_block(
+            chain_id,
+            parent_hash,
+            parent_height,
+            parent_supply,
+            miner,
+            difficulty_bits,
+            timestamp,
+        );
+        // Assign nullifiers raw (no sort/dedup) so tests can exercise the
+        // in-block duplicate guard; recompute merkle/hash and re-mine the nonce
+        // against the new header so PoW stays valid.
+        block.private_nullifiers = nullifiers;
+        block.header.merkle_root = block.compute_merkle_root();
+        let engine = pow::engine_for(chain_id, block.header.block_height).expect("engine");
+        let mut nonce = 0u64;
+        let (computed, found_nonce) = loop {
+            let preimage = pow::build_pow_input(
+                chain_id,
+                parent_hash,
+                miner,
+                block.header.block_height,
+                timestamp,
+                nonce,
+            );
+            let hash = engine.calculate_hash(&preimage).expect("hash");
+            if pow::hash_meets_difficulty(&hash, difficulty_bits) {
+                break (hash, nonce);
+            }
+            nonce = nonce.wrapping_add(1);
+        };
+        block.header.nonce = found_nonce;
+        block.header.seal = Signature(computed);
+        block.header.hash = block.compute_hash();
+        block
+    }
+
+    #[test]
+    fn spent_nullifier_index_roundtrips() {
+        let (storage, _dir) = open_temp_storage();
+        assert!(!storage.is_nullifier_spent("abc").expect("query"));
+        storage.save_spent_nullifier("abc", 7).expect("save");
+        assert!(storage.is_nullifier_spent("abc").expect("query"));
+        storage.delete_spent_nullifier("abc").expect("delete");
+        assert!(!storage.is_nullifier_spent("abc").expect("query"));
+    }
+
+    #[test]
+    fn block_with_duplicate_nullifier_is_rejected() {
+        let chain_id = "zoka-test-net";
+        let (storage, _dir) = open_temp_storage();
+        let genesis = genesis_parent_for(chain_id);
+        let miner = "zka1miner".to_string();
+        let block = mine_block_with_nullifiers(
+            chain_id,
+            &genesis.header.hash,
+            0,
+            0,
+            &miner,
+            economics::POW_MIN_DIFFICULTY_BITS,
+            1,
+            vec!["dup".to_string(), "dup".to_string()],
+        );
+        let err = apply_block(&storage, chain_id, &block).unwrap_err();
+        assert!(
+            matches!(err, ChainError::DuplicatePrivateNullifierInBlock { .. }),
+            "expected duplicate-nullifier rejection, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn double_spent_nullifier_across_blocks_is_rejected() {
+        let chain_id = "zoka-test-net";
+        let (storage, _dir) = open_temp_storage();
+        let genesis = genesis_parent_for(chain_id);
+        let miner = "zka1miner".to_string();
+
+        // Block 1 commits nullifier N — accepted and indexed.
+        let b1 = mine_block_with_nullifiers(
+            chain_id,
+            &genesis.header.hash,
+            0,
+            0,
+            &miner,
+            economics::POW_MIN_DIFFICULTY_BITS,
+            1,
+            vec!["N".to_string()],
+        );
+        let head1 = apply_block(&storage, chain_id, &b1).expect("apply b1");
+        assert!(storage.is_nullifier_spent("N").expect("query"));
+
+        // Block 2 tries to commit the same nullifier N — must be rejected.
+        let b2 = mine_block_with_nullifiers(
+            chain_id,
+            &head1.hash,
+            head1.height,
+            head1.total_supply_emitted,
+            &miner,
+            economics::POW_MIN_DIFFICULTY_BITS,
+            2,
+            vec!["N".to_string()],
+        );
+        let err = apply_block(&storage, chain_id, &b2).unwrap_err();
+        assert!(
+            matches!(err, ChainError::PrivateNullifierDoubleSpend { .. }),
+            "expected double-spend rejection, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn distinct_nullifiers_across_blocks_are_accepted() {
+        let chain_id = "zoka-test-net";
+        let (storage, _dir) = open_temp_storage();
+        let genesis = genesis_parent_for(chain_id);
+        let miner = "zka1miner".to_string();
+
+        let b1 = mine_block_with_nullifiers(
+            chain_id,
+            &genesis.header.hash,
+            0,
+            0,
+            &miner,
+            economics::POW_MIN_DIFFICULTY_BITS,
+            1,
+            vec!["N1".to_string()],
+        );
+        let head1 = apply_block(&storage, chain_id, &b1).expect("apply b1");
+        let b2 = mine_block_with_nullifiers(
+            chain_id,
+            &head1.hash,
+            head1.height,
+            head1.total_supply_emitted,
+            &miner,
+            economics::POW_MIN_DIFFICULTY_BITS,
+            2,
+            vec!["N2".to_string()],
+        );
+        apply_block(&storage, chain_id, &b2).expect("apply b2");
+        assert!(storage.is_nullifier_spent("N1").expect("query"));
+        assert!(storage.is_nullifier_spent("N2").expect("query"));
     }
 }
