@@ -154,10 +154,34 @@ impl Default for ApiSecurityConfig {
                     matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
                 })
                 .unwrap_or(false),
-            enable_remote_seed_endpoint: parse_bool_env(
-                "ZOKA_API_ENABLE_REMOTE_SEED_ENDPOINT",
-                false,
-            ),
+            enable_remote_seed_endpoint: {
+                // /private/wallet/send-from-seed receives the user's recovery
+                // seed (sealed in transit) and builds the proof server-side — a
+                // transitional convenience that breaks self-custody. It is OFF
+                // by default, and a RELEASE/mainnet build additionally refuses
+                // to enable it unless the operator ALSO opts into the insecure
+                // mode, so a single stray env var can never expose it in prod.
+                let requested =
+                    parse_bool_env("ZOKA_API_ENABLE_REMOTE_SEED_ENDPOINT", false);
+                let allow_insecure =
+                    parse_bool_env("ZOKA_API_ALLOW_INSECURE_REMOTE_SEED", false);
+                let enabled = requested && (cfg!(debug_assertions) || allow_insecure);
+                if requested && !enabled {
+                    eprintln!(
+                        "SECURITY: ZOKA_API_ENABLE_REMOTE_SEED_ENDPOINT is set but \
+                         ignored in this release build. Set \
+                         ZOKA_API_ALLOW_INSECURE_REMOTE_SEED=1 to force it (never on \
+                         mainnet — it breaks self-custody)."
+                    );
+                } else if enabled {
+                    eprintln!(
+                        "SECURITY: /private/wallet/send-from-seed is ENABLED. The node \
+                         receives recovery seeds and proves server-side — insecure for \
+                         mainnet; disable before launch."
+                    );
+                }
+                enabled
+            },
             write_clients: parse_csv_env("ZOKA_API_WRITE_CLIENTS"),
             admin_clients: parse_csv_env("ZOKA_API_ADMIN_CLIENTS"),
             ip_whitelist,
