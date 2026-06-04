@@ -9006,6 +9006,95 @@ fn cmd_private_send(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `zoka consolidate --from <addr> --yes [--db <path>] [--password ...]`
+///
+/// Merges a fragmented private wallet (e.g. thousands of small mining-coinbase
+/// notes) into far fewer, larger notes by sending the whole spendable balance
+/// to the wallet's OWN address. `cmd_private_send` auto-splits that self-send
+/// into chunks of up to PRIVATE_TX_MAX_INPUTS notes, so each chunk fuses ~96
+/// small notes into one. One run takes N notes down to ceil(N/96); re-run
+/// after the sweep is mined to consolidate further. Large ordinary sends that
+/// previously needed dozens of chained txs then need far fewer.
+fn cmd_private_consolidate(args: &[String]) -> Result<(), String> {
+    let network = NetworkProfile::from_args(args)?;
+    let from_raw = required_option_value(args, "--from")?;
+    let password = password_value(args)?;
+    let db_path =
+        option_value(args, "--db").or_else(|| Some(network.default_db_path().to_string()));
+    if !has_flag(args, "--yes") {
+        return Err(
+            "refusing to consolidate without explicit confirmation; add --yes".to_string(),
+        );
+    }
+
+    // Read the wallet's spendable balance + note count, then release the DB
+    // before the send reopens it.
+    let (own_address, balance, note_count) = {
+        let storage = wallet_storage_for_network(network)?;
+        let manager =
+            load_private_wallet_manager_for_network(&storage, password.as_deref(), network)?;
+        let (from_wallet, from_commitment) =
+            resolve_network_wallet_address_required(&manager, &storage, &from_raw, "--from")?;
+        let sender = manager
+            .get_private_wallet(&from_wallet)
+            .ok_or_else(|| format!("private wallet not found: {from_wallet}"))?;
+        if sender.view_only || sender.spending_key.is_empty() {
+            return Err("cannot consolidate a view-only private wallet".to_string());
+        }
+        let count = sender.private_notes.iter().filter(|n| !n.spent).count();
+        (
+            user_private_address_display(&from_commitment),
+            sender.private_balance,
+            count,
+        )
+    };
+
+    if balance == 0 {
+        return Err("nothing to consolidate: zero spendable balance".to_string());
+    }
+    if note_count <= 1 {
+        println!("Already consolidated: {note_count} spendable note(s).");
+        return Ok(());
+    }
+
+    let expected_after = (note_count + PRIVATE_TX_MAX_INPUTS - 1) / PRIVATE_TX_MAX_INPUTS;
+    println!(
+        "Consolidating {} across {} note(s) → ~{} note(s) ({} self-transfer chunk(s) of up to {} inputs).",
+        format_zka(balance),
+        note_count,
+        expected_after,
+        expected_after,
+        PRIVATE_TX_MAX_INPUTS
+    );
+
+    // Sweep: send the whole spendable balance back to our own address.
+    let mut send_args = vec![
+        "--from".to_string(),
+        own_address.clone(),
+        "--to".to_string(),
+        own_address,
+        "--amount".to_string(),
+        format_zka_amount(balance),
+        "--fee".to_string(),
+        "0".to_string(),
+        "--yes".to_string(),
+        "--network".to_string(),
+        network.label().to_string(),
+    ];
+    if let Some(pw) = password.as_deref() {
+        send_args.push("--password".to_string());
+        send_args.push(pw.to_string());
+    }
+    push_opt_arg(&mut send_args, "--db", db_path);
+
+    cmd_private_send(&send_args)?;
+    println!(
+        "Consolidation sweep broadcast. Once mined, re-run to merge the remaining \
+         ~{expected_after} note(s) further."
+    );
+    Ok(())
+}
+
 fn max_private_tx_total_for_wallet(wallet: &PrivateWallet) -> u64 {
     let mut amounts = wallet
         .private_notes
@@ -11199,6 +11288,10 @@ async fn run() -> Result<(), String> {
         "send" => {
             let args = normalize_positional_alias_args(tail, &["--from", "--to", "--amount"]);
             cmd_tx_send_unified(&args)
+        }
+        "consolidate" | "private-consolidate" => {
+            let args = normalize_positional_alias_args(tail, &["--from"]);
+            cmd_private_consolidate(&args)
         }
         "fee" => {
             let args = normalize_positional_alias_args(tail, &["--amount"]);
