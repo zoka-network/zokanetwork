@@ -2103,6 +2103,10 @@ fn block_metadata_json(
         "reward_zka_display": format_zka_amount(reward_atoms),
         "transactions_count": block.transactions.len(),
         "private_tx_count": block.private_tx_hashes.len(),
+        // Count only: nullifiers are anchored in the block's merkle root as a
+        // public double-spend proof and never reveal their owner, but the
+        // count is all the explorer needs for transparency.
+        "private_nullifier_count": block.private_nullifiers.len(),
         "private_coinbase": block.private_coinbase.is_some(),
     })
 }
