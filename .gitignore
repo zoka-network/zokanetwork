@@ -30,3 +30,9 @@ migration-*.log
 
 # Local CRS ceremony rehearsal and release-candidate outputs
 ceremony-output/
+zkapriv/
+benchmark-output/
+lab-trusted-setup-v2-i1/
+docs/artifacts/
+PLAN-*.md
+test_output_decrypt.py
