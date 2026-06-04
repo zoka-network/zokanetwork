@@ -219,6 +219,7 @@ mod tests {
             },
             transactions: Vec::new(),
             private_tx_hashes: Vec::new(),
+            private_tx_bodies: Vec::new(),
             private_nullifiers: Vec::new(),
             private_fee_claims: Vec::new(),
             private_coinbase: None,

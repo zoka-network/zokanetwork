@@ -62,6 +62,9 @@ pub struct ApiSecurityConfig {
     pub enable_replay_protection: bool,
     pub request_nonce_max_age_secs: u64,
     pub enforce_rbac: bool,
+    /// Transitional compatibility escape hatch. Keep disabled for public
+    /// nodes: this endpoint decrypts wallet seed material in node memory.
+    pub enable_remote_seed_endpoint: bool,
     pub write_clients: Vec<String>,
     pub admin_clients: Vec<String>,
     pub ip_whitelist: Vec<String>, // Empty = allow all
@@ -78,6 +81,16 @@ fn parse_csv_env(var: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn parse_bool_env(var: &str, default: bool) -> bool {
+    std::env::var(var)
+        .ok()
+        .map(|v| {
+            let normalized = v.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(default)
 }
 
 impl Default for ApiSecurityConfig {
@@ -141,6 +154,10 @@ impl Default for ApiSecurityConfig {
                     matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
                 })
                 .unwrap_or(false),
+            enable_remote_seed_endpoint: parse_bool_env(
+                "ZOKA_API_ENABLE_REMOTE_SEED_ENDPOINT",
+                false,
+            ),
             write_clients: parse_csv_env("ZOKA_API_WRITE_CLIENTS"),
             admin_clients: parse_csv_env("ZOKA_API_ADMIN_CLIENTS"),
             ip_whitelist,
@@ -3057,6 +3074,14 @@ async fn send_from_seed(
 ) -> Result<Json<SendFromSeedResponse>, (StatusCode, String)> {
     use sha2::{Digest, Sha256};
 
+    if !app_state.security.enable_remote_seed_endpoint {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "remote seed endpoint is disabled; submit a locally-built private transaction to POST /private/tx"
+                .to_string(),
+        ));
+    }
+
     // â”€â”€ Validate inputs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if req.amount_atoms == 0 {
         return Err((
@@ -4030,7 +4055,7 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
-    Router::new()
+    let mut router = Router::new()
         .route("/stats", get(get_stats))
         .route("/network/runtime", get(get_network_runtime))
         .route("/network/miners/heartbeat", post(post_miner_heartbeat))
@@ -4038,7 +4063,6 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         .route("/local/mining/start", post(post_local_mining_start))
         .route("/local/mining/stop", post(post_local_mining_stop))
         .route("/health", get(health))
-        .route("/crypto/server-pubkey", get(get_server_pubkey))
         .route("/metrics/security", get(get_security_metrics))
         .route("/metrics/audit", get(get_audit_logs))
         .route("/chain/height", get(get_height))
@@ -4068,7 +4092,6 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
             get(get_block_private_tx_hashes_range),
         )
         .route("/private/tx", post(post_private_tx_body))
-        .route("/private/wallet/send-from-seed", post(send_from_seed))
         .route("/private/pending", get(get_pending_private_txs))
         .route("/private/tx/:hash", get(get_private_tx_by_hash))
         .route("/blocks/range/:from/:to", get(get_blocks_range))
@@ -4093,7 +4116,13 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         .route("/consensus/message", post(pbft_message))
         .route("/ws/subscribe", post(ws_subscribe))
         .route("/ws/unsubscribe", post(ws_unsubscribe))
-        .route("/ws/status", get(ws_status))
+        .route("/ws/status", get(ws_status));
+    if app_state.security.enable_remote_seed_endpoint {
+        router = router
+            .route("/crypto/server-pubkey", get(get_server_pubkey))
+            .route("/private/wallet/send-from-seed", post(send_from_seed));
+    }
+    router
         .layer(DefaultBodyLimit::max(
             app_state.security.max_request_body_bytes,
         ))
@@ -4978,6 +5007,32 @@ mod tests {
         assert_eq!(decrypt_seed(&request).unwrap(), seed);
         request.encrypted_seed_hex.replace_range(0..2, "ff");
         assert!(decrypt_seed(&request).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_from_seed_disabled_before_decrypting_envelope() {
+        let test_dir = ".zoka/test-suite/.test_send_from_seed_disabled";
+        let _ = std::fs::remove_dir_all(test_dir);
+        let mut state = test_app_state(test_dir);
+        state.security.enable_remote_seed_endpoint = false;
+        let state = Arc::new(state);
+        let request = SendFromSeedRequest {
+            ephemeral_pubkey_hex: "not-hex".to_string(),
+            nonce_hex: "not-hex".to_string(),
+            encrypted_seed_hex: "not-hex".to_string(),
+            to: "not-an-address".to_string(),
+            amount_atoms: 0,
+            fee_atoms: None,
+        };
+
+        let err = send_from_seed(State(state.clone()), Json(request))
+            .await
+            .expect_err("disabled endpoint must reject before reading the envelope");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert!(err.1.contains("remote seed endpoint is disabled"));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(test_dir);
     }
 
     #[test]

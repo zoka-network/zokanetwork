@@ -14,7 +14,7 @@ use super::circuits::{MerkleProofCircuit, NullifierCircuit, TransactionBalanceCi
 use super::groth16_backend::{
     self as g16, BALANCE_CIRCUIT, BALANCE_PRIVATE_INPUT_WORDS, BALANCE_PUBLIC_INPUT_WORDS,
     MERKLE_CIRCUIT, MERKLE_PUBLIC_INPUT_WORDS, NULLIFIER_CIRCUIT, NULLIFIER_PRIVATE_INPUT_WORDS,
-    NULLIFIER_PUBLIC_INPUT_WORDS, PRIVATE_TX_CIRCUIT,
+    NULLIFIER_PUBLIC_INPUT_WORDS, PRIVATE_TX_CIRCUIT, PRIVATE_TX_V2_I1_LAB_CIRCUIT,
 };
 
 const MERKLE_MAX_DEPTH: usize = 16;
@@ -96,7 +96,9 @@ impl Prover {
             BALANCE_CIRCUIT => self.prove_balance_circuit(private_inputs, public_inputs),
             MERKLE_CIRCUIT => self.prove_merkle_circuit(private_inputs, public_inputs),
             NULLIFIER_CIRCUIT => self.prove_nullifier_circuit(private_inputs, public_inputs),
-            PRIVATE_TX_CIRCUIT => self.prove_private_tx_circuit(private_inputs, public_inputs),
+            PRIVATE_TX_CIRCUIT | PRIVATE_TX_V2_I1_LAB_CIRCUIT => {
+                self.prove_private_tx_circuit(private_inputs, public_inputs)
+            }
             _ => self.prove_placeholder(private_inputs, public_inputs),
         }
     }
@@ -348,7 +350,7 @@ impl Prover {
         public_inputs: &[u8],
     ) -> Result<ZKProof, BlockError> {
         let (proof_bytes, public_inputs_serialized) =
-            g16::prove_private_tx(private_inputs, public_inputs)?;
+            g16::prove_private_tx_for_circuit(&self.circuit_name, private_inputs, public_inputs)?;
         Ok(ZKProof::new(
             proof_bytes,
             self.circuit_name.clone(),

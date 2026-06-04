@@ -31,6 +31,14 @@ default = ["randomx"]
 #   - Windows x86_64: Visual Studio Build Tools (MSVC v143+) and cmake on PATH
 # See docs/protocol-overview.md for the network summary.
 randomx = ["dep:randomx-rs"]
+# Enabled by the Android native crate (zkapriv/native). It marks the build as
+# the on-device prover so trusted-setup params are read WITHOUT the per-point
+# subgroup-membership check: on mobile the params come from the app's own APK
+# assets and their SHA digest is already verified against the canonical CRS
+# before loading, so re-checking the subgroup is redundant and just burns
+# minutes on a phone. Node/server builds never enable this, so they keep the
+# full check. See src/zk/setup_io.rs::read_circuit_params.
+mobile = []
 
 [dependencies]
 randomx-rs = { version = "1.3", optional = true }

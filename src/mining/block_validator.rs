@@ -133,6 +133,18 @@ pub enum BlockValidationError {
     #[error("too many private transaction hashes in block: {actual} > {max}")]
     TooManyPrivateTxHashes { actual: usize, max: usize },
 
+    #[error("canonical private transaction bodies are not active at height {0}")]
+    CanonicalPrivateTxBodiesBeforeActivation(u64),
+
+    #[error("canonical private body count mismatch: hashes={hashes}, bodies={bodies}")]
+    CanonicalPrivateTxBodyCountMismatch { hashes: usize, bodies: usize },
+
+    #[error("canonical private transaction body is too large: {actual} > {max}")]
+    CanonicalPrivateTxBodyTooLarge { actual: usize, max: usize },
+
+    #[error("canonical private transaction bundle is too large: {actual} > {max}")]
+    CanonicalPrivateTxBundleTooLarge { actual: usize, max: usize },
+
     #[error("private fee claim references tx not committed in this block: {0}")]
     FeeClaimForMissingPrivateTx(String),
 
@@ -198,11 +210,61 @@ pub fn validate_pow_block(
 ) -> Result<(), BlockValidationError> {
     validate_coinbase_shape(candidate)?;
     validate_private_fee_claims(candidate)?;
+    validate_canonical_private_tx_bodies(candidate)?;
     validate_coinbase_amount(candidate, ctx)?;
     validate_chain_link(candidate, ctx)?;
     validate_private_coinbase(candidate)?;
     validate_header_self_consistency(candidate)?;
     validate_pow(candidate, ctx)?;
+    Ok(())
+}
+
+fn validate_canonical_private_tx_bodies(block: &Block) -> Result<(), BlockValidationError> {
+    validate_canonical_private_tx_bodies_at(
+        block,
+        economics::private_tx_canonical_bundle_activation_height(),
+    )
+}
+
+fn validate_canonical_private_tx_bodies_at(
+    block: &Block,
+    activation_height: Option<u64>,
+) -> Result<(), BlockValidationError> {
+    if !economics::private_tx_canonical_bundle_required_at(
+        block.header.block_height,
+        activation_height,
+    ) {
+        return if block.private_tx_bodies.is_empty() {
+            Ok(())
+        } else {
+            Err(CanonicalPrivateTxBodiesBeforeActivation(
+                block.header.block_height,
+            ))
+        };
+    }
+
+    if block.private_tx_bodies.len() != block.private_tx_hashes.len() {
+        return Err(CanonicalPrivateTxBodyCountMismatch {
+            hashes: block.private_tx_hashes.len(),
+            bodies: block.private_tx_bodies.len(),
+        });
+    }
+    let mut total_bytes = 0usize;
+    for body in &block.private_tx_bodies {
+        if body.len() > economics::PRIVATE_TX_CANONICAL_BODY_BYTES_LIMIT {
+            return Err(CanonicalPrivateTxBodyTooLarge {
+                actual: body.len(),
+                max: economics::PRIVATE_TX_CANONICAL_BODY_BYTES_LIMIT,
+            });
+        }
+        total_bytes = total_bytes.saturating_add(body.len());
+    }
+    if total_bytes > economics::PRIVATE_TX_CANONICAL_BUNDLE_BYTES_LIMIT {
+        return Err(CanonicalPrivateTxBundleTooLarge {
+            actual: total_bytes,
+            max: economics::PRIVATE_TX_CANONICAL_BUNDLE_BYTES_LIMIT,
+        });
+    }
     Ok(())
 }
 
@@ -518,6 +580,7 @@ mod tests {
             },
             transactions: vec![],
             private_tx_hashes: vec![],
+            private_tx_bodies: vec![],
             private_nullifiers: vec![],
             private_fee_claims: vec![],
             private_coinbase: None,
@@ -568,6 +631,7 @@ mod tests {
             },
             transactions: vec![coinbase],
             private_tx_hashes: vec![],
+            private_tx_bodies: vec![],
             private_nullifiers: vec![],
             private_fee_claims: vec![],
             private_coinbase: Some(dummy_private_coinbase(height, miner_address)),
@@ -708,6 +772,67 @@ mod tests {
 
         let err = validate_pow_block(&block, &ctx_for(chain_id, &parent, 4)).unwrap_err();
         assert!(matches!(err, TooManyPrivateTxHashes { .. }));
+    }
+
+    #[test]
+    fn canonical_private_bodies_are_rejected_before_activation() {
+        let mut block = build_genesis_parent("zoka-test-net");
+        block.header.block_height = 10;
+        block.private_tx_bodies = vec![b"private-body".to_vec()];
+
+        let err = validate_canonical_private_tx_bodies_at(&block, None).unwrap_err();
+
+        assert!(matches!(err, CanonicalPrivateTxBodiesBeforeActivation(10)));
+    }
+
+    #[test]
+    fn activated_canonical_private_bodies_require_matching_count() {
+        let mut block = build_genesis_parent("zoka-test-net");
+        block.header.block_height = 10;
+        block.private_tx_hashes = vec!["private-tx-1".to_string()];
+
+        let err = validate_canonical_private_tx_bodies_at(&block, Some(10)).unwrap_err();
+
+        assert!(matches!(
+            err,
+            CanonicalPrivateTxBodyCountMismatch {
+                hashes: 1,
+                bodies: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn activated_canonical_private_bodies_are_size_bounded() {
+        let mut block = build_genesis_parent("zoka-test-net");
+        block.header.block_height = 10;
+        block.private_tx_hashes = vec!["private-tx-1".to_string()];
+        block.private_tx_bodies = vec![vec![
+            0;
+            economics::PRIVATE_TX_CANONICAL_BODY_BYTES_LIMIT + 1
+        ]];
+
+        let err = validate_canonical_private_tx_bodies_at(&block, Some(10)).unwrap_err();
+
+        assert!(matches!(err, CanonicalPrivateTxBodyTooLarge { .. }));
+    }
+
+    #[test]
+    fn activated_canonical_private_bundle_is_size_bounded() {
+        let body_count = economics::PRIVATE_TX_CANONICAL_BUNDLE_BYTES_LIMIT
+            / economics::PRIVATE_TX_CANONICAL_BODY_BYTES_LIMIT
+            + 1;
+        let mut block = build_genesis_parent("zoka-test-net");
+        block.header.block_height = 10;
+        block.private_tx_hashes = (0..body_count)
+            .map(|idx| format!("private-tx-{idx}"))
+            .collect();
+        block.private_tx_bodies =
+            vec![vec![0; economics::PRIVATE_TX_CANONICAL_BODY_BYTES_LIMIT]; body_count];
+
+        let err = validate_canonical_private_tx_bodies_at(&block, Some(10)).unwrap_err();
+
+        assert!(matches!(err, CanonicalPrivateTxBundleTooLarge { .. }));
     }
 
     #[test]
@@ -1026,6 +1151,7 @@ mod tests {
             },
             transactions: vec![coinbase],
             private_tx_hashes: vec![],
+            private_tx_bodies: vec![],
             private_nullifiers: vec![],
             private_fee_claims: vec![],
             private_coinbase: Some(dummy_private_coinbase(1, "zka1miner")),

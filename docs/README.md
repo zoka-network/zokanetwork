@@ -11,6 +11,14 @@ These are the public docs for joining and operating the ZOKA testnet.
 | [protocol-overview.md](protocol-overview.md) | High-level network architecture |
 | [troubleshooting.md](troubleshooting.md) | Common fixes |
 
+## Release Engineering
+
+| Document | Purpose |
+|---|---|
+| [zkapriv-v2-i1-focused-review-checklist.md](zkapriv-v2-i1-focused-review-checklist.md) | Freeze and review the exact compact mobile circuit snapshot before ceremony |
+| [zkapriv-v2-i1-ceremony-runbook.md](zkapriv-v2-i1-ceremony-runbook.md) | Assemble, sign and independently verify the compact mobile CRS bundle |
+| [zkapriv-v2-i1-staging-checklist.md](zkapriv-v2-i1-staging-checklist.md) | Coordinate BOOT, VPS2, PC miner and APK staging before activation |
+
 ## Network Artifacts
 
 | File | Purpose |

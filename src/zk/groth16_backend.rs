@@ -44,6 +44,10 @@ pub const BALANCE_CIRCUIT: &str = "balance_circuit";
 pub const MERKLE_CIRCUIT: &str = "merkle_circuit";
 pub const NULLIFIER_CIRCUIT: &str = "nullifier_circuit";
 pub const PRIVATE_TX_CIRCUIT: &str = "private_tx";
+/// Benchmark-only compact profile. It is deliberately excluded from node
+/// verification and the canonical trusted-setup bundle until dual-stack
+/// activation is implemented and audited.
+pub const PRIVATE_TX_V2_I1_LAB_CIRCUIT: &str = "private_tx_v2_i1";
 
 pub const BALANCE_PRIVATE_INPUT_WORDS: usize = 4;
 pub const BALANCE_PUBLIC_INPUT_WORDS: usize = 2;
@@ -72,6 +76,51 @@ pub const PRIVATE_TX_PUBLIC_INPUT_WORDS: usize = 2
     + PRIVATE_TX_ROOT_WORDS; // header + padded input key images + proven input flags + proven input commitment words + root anchor
 pub const PRIVATE_TX_RANGE_BITS: usize = 64;
 
+#[derive(Clone, Copy)]
+struct PrivateTxCircuitProfile {
+    circuit_name: &'static str,
+    max_inputs: usize,
+    merkle_proven_inputs: usize,
+}
+
+impl PrivateTxCircuitProfile {
+    fn private_input_words(self) -> usize {
+        10 + (self.max_inputs * 3)
+            + (self.merkle_proven_inputs * PRIVATE_TX_MERKLE_MAX_DEPTH * PRIVATE_TX_ROOT_WORDS)
+            + (self.merkle_proven_inputs * PRIVATE_TX_MERKLE_MAX_DEPTH)
+    }
+
+    fn public_input_words(self) -> usize {
+        2 + self.max_inputs
+            + self.merkle_proven_inputs
+            + (self.merkle_proven_inputs * PRIVATE_TREE_SCALAR_WORDS)
+            + PRIVATE_TX_ROOT_WORDS
+    }
+}
+
+const PRIVATE_TX_V1_PROFILE: PrivateTxCircuitProfile = PrivateTxCircuitProfile {
+    circuit_name: PRIVATE_TX_CIRCUIT,
+    max_inputs: PRIVATE_TX_MAX_INPUTS,
+    merkle_proven_inputs: PRIVATE_TX_MERKLE_PROVEN_INPUTS,
+};
+
+const PRIVATE_TX_V2_I1_LAB_PROFILE: PrivateTxCircuitProfile = PrivateTxCircuitProfile {
+    circuit_name: PRIVATE_TX_V2_I1_LAB_CIRCUIT,
+    max_inputs: 1,
+    merkle_proven_inputs: 1,
+};
+
+fn private_tx_profile_for_circuit(circuit: &str) -> Result<PrivateTxCircuitProfile, BlockError> {
+    match circuit {
+        PRIVATE_TX_CIRCUIT => Ok(PRIVATE_TX_V1_PROFILE),
+        PRIVATE_TX_V2_I1_LAB_CIRCUIT => Ok(PRIVATE_TX_V2_I1_LAB_PROFILE),
+        _ => Err(BlockError::TransactionValidationFailed(format!(
+            "unsupported private transaction Groth16 circuit: {}",
+            circuit
+        ))),
+    }
+}
+
 const MERKLE_DEPTH: usize = 16;
 
 struct SetupBundle {
@@ -83,6 +132,8 @@ struct SetupBundle {
     nullifier_pvk: PreparedVerifyingKey<Bls12>,
     private_tx_params: Parameters<Bls12>,
     private_tx_pvk: PreparedVerifyingKey<Bls12>,
+    private_tx_v2_i1_params: Option<Parameters<Bls12>>,
+    private_tx_v2_i1_pvk: Option<PreparedVerifyingKey<Bls12>>,
 }
 
 /// WARNING: only for development and tests. τ is derivable from the seed, so
@@ -100,11 +151,15 @@ fn build_bundle_from_params(
     merkle_params: Parameters<Bls12>,
     nullifier_params: Parameters<Bls12>,
     private_tx_params: Parameters<Bls12>,
+    private_tx_v2_i1_params: Option<Parameters<Bls12>>,
 ) -> SetupBundle {
     let balance_pvk = prepare_verifying_key(&balance_params.vk);
     let merkle_pvk = prepare_verifying_key(&merkle_params.vk);
     let nullifier_pvk = prepare_verifying_key(&nullifier_params.vk);
     let private_tx_pvk = prepare_verifying_key(&private_tx_params.vk);
+    let private_tx_v2_i1_pvk = private_tx_v2_i1_params
+        .as_ref()
+        .map(|params| prepare_verifying_key(&params.vk));
     SetupBundle {
         balance_params,
         balance_pvk,
@@ -114,6 +169,8 @@ fn build_bundle_from_params(
         nullifier_pvk,
         private_tx_params,
         private_tx_pvk,
+        private_tx_v2_i1_params,
+        private_tx_v2_i1_pvk,
     }
 }
 
@@ -147,6 +204,14 @@ pub fn generate_circuit_params_with_osrng(circuit: &str) -> Result<Parameters<Bl
         }
         other => Err(format!("unknown circuit: {other}")),
     }
+}
+
+pub fn generate_private_tx_v2_i1_lab_params_with_osrng() -> Result<Parameters<Bls12>, String> {
+    generate_random_parameters::<Bls12, _, _>(
+        GrothPrivateTxCircuit::blank_for_profile(1, 1),
+        &mut OsRng,
+    )
+    .map_err(|e| format!("setup for {PRIVATE_TX_V2_I1_LAB_CIRCUIT}: {e}"))
 }
 
 pub fn generate_setup_bundle_with_osrng() -> (
@@ -203,6 +268,7 @@ fn build_setup_bundle_seeded() -> SetupBundle {
         merkle_params,
         nullifier_params,
         private_tx_params,
+        None,
     )
 }
 
@@ -245,11 +311,22 @@ fn load_setup_bundle_from_disk(dir: &std::path::Path) -> Result<SetupBundle, Str
         setup_io::read_circuit_params(dir, NULLIFIER_CIRCUIT).map_err(|e| e.to_string())?;
     let private_tx_params =
         setup_io::read_circuit_params(dir, PRIVATE_TX_CIRCUIT).map_err(|e| e.to_string())?;
+    let private_tx_v2_i1_path = dir
+        .join(setup_io::params_filename(PRIVATE_TX_V2_I1_LAB_CIRCUIT).map_err(|e| e.to_string())?);
+    let private_tx_v2_i1_params = if private_tx_v2_i1_path.exists() {
+        Some(
+            setup_io::read_circuit_params(dir, PRIVATE_TX_V2_I1_LAB_CIRCUIT)
+                .map_err(|e| e.to_string())?,
+        )
+    } else {
+        None
+    };
     Ok(build_bundle_from_params(
         balance_params,
         merkle_params,
         nullifier_params,
         private_tx_params,
+        private_tx_v2_i1_params,
     ))
 }
 
@@ -314,6 +391,12 @@ fn parameters_for(circuit: &str) -> Result<&'static Parameters<Bls12>, BlockErro
         MERKLE_CIRCUIT => Ok(&setup.merkle_params),
         NULLIFIER_CIRCUIT => Ok(&setup.nullifier_params),
         PRIVATE_TX_CIRCUIT => Ok(&setup.private_tx_params),
+        PRIVATE_TX_V2_I1_LAB_CIRCUIT => setup.private_tx_v2_i1_params.as_ref().ok_or_else(|| {
+            BlockError::TransactionValidationFailed(format!(
+                "{} parameters are unavailable in the authenticated trusted setup bundle",
+                PRIVATE_TX_V2_I1_LAB_CIRCUIT
+            ))
+        }),
         _ => Err(BlockError::TransactionValidationFailed(format!(
             "unsupported Groth16 circuit: {}",
             circuit
@@ -328,6 +411,12 @@ fn pvk_for(circuit: &str) -> Result<&'static PreparedVerifyingKey<Bls12>, String
         MERKLE_CIRCUIT => Ok(&setup.merkle_pvk),
         NULLIFIER_CIRCUIT => Ok(&setup.nullifier_pvk),
         PRIVATE_TX_CIRCUIT => Ok(&setup.private_tx_pvk),
+        PRIVATE_TX_V2_I1_LAB_CIRCUIT => setup.private_tx_v2_i1_pvk.as_ref().ok_or_else(|| {
+            format!(
+                "{} verification key is unavailable in the authenticated trusted setup bundle",
+                PRIVATE_TX_V2_I1_LAB_CIRCUIT
+            )
+        }),
         _ => Err(format!("unsupported Groth16 circuit: {}", circuit)),
     }
 }
@@ -417,7 +506,11 @@ fn decode_public_input_words(
 pub fn is_groth16_circuit(circuit: &str) -> bool {
     matches!(
         circuit,
-        BALANCE_CIRCUIT | MERKLE_CIRCUIT | NULLIFIER_CIRCUIT | PRIVATE_TX_CIRCUIT
+        BALANCE_CIRCUIT
+            | MERKLE_CIRCUIT
+            | NULLIFIER_CIRCUIT
+            | PRIVATE_TX_CIRCUIT
+            | PRIVATE_TX_V2_I1_LAB_CIRCUIT
     )
 }
 
@@ -427,12 +520,156 @@ pub fn expected_public_input_count(circuit: &str) -> Option<usize> {
         MERKLE_CIRCUIT => Some(MERKLE_PUBLIC_INPUT_WORDS),
         NULLIFIER_CIRCUIT => Some(NULLIFIER_PUBLIC_INPUT_WORDS),
         PRIVATE_TX_CIRCUIT => Some(PRIVATE_TX_PUBLIC_INPUT_WORDS),
+        PRIVATE_TX_V2_I1_LAB_CIRCUIT => Some(PRIVATE_TX_V2_I1_LAB_PROFILE.public_input_words()),
         _ => None,
     }
 }
 
 pub fn ensure_trusted_setup() {
     let _ = setup_bundle();
+}
+
+struct PrivateTxV2I1LabSetup {
+    trusted_setup_dir: PathBuf,
+    params: Parameters<Bls12>,
+    pvk: PreparedVerifyingKey<Bls12>,
+}
+
+fn private_tx_v2_i1_lab_setup(
+    trusted_setup_dir: &std::path::Path,
+) -> Result<&'static PrivateTxV2I1LabSetup, String> {
+    let requested_dir = trusted_setup_dir
+        .canonicalize()
+        .map_err(|e| format!("canonicalizing {}: {e}", trusted_setup_dir.display()))?;
+    static LAB_SETUP: OnceLock<Result<PrivateTxV2I1LabSetup, String>> = OnceLock::new();
+    match LAB_SETUP.get_or_init(|| {
+        let params =
+            setup_io::read_circuit_params(&requested_dir, PRIVATE_TX_V2_I1_LAB_CIRCUIT)
+                .map_err(|e| e.to_string())?;
+        let pvk = prepare_verifying_key(&params.vk);
+        Ok(PrivateTxV2I1LabSetup {
+            trusted_setup_dir: requested_dir.clone(),
+            params,
+            pvk,
+        })
+    }) {
+        Ok(setup) if setup.trusted_setup_dir == requested_dir => Ok(setup),
+        Ok(setup) => Err(format!(
+            "{PRIVATE_TX_V2_I1_LAB_CIRCUIT} lab setup is already loaded from {}; refusing to switch to {} in the same process",
+            setup.trusted_setup_dir.display(),
+            requested_dir.display()
+        )),
+        Err(err) => Err(err.clone()),
+    }
+}
+
+pub fn preload_private_tx_v2_i1_lab_params(
+    trusted_setup_dir: &std::path::Path,
+) -> Result<(), String> {
+    let _ = private_tx_v2_i1_lab_setup(trusted_setup_dir)?;
+    Ok(())
+}
+
+pub struct PrivateTxV2I1LabBenchmark {
+    pub params_bytes: u64,
+    pub params_load_ms: u64,
+    pub prove_ms: u64,
+    pub verify_ms: u64,
+    pub proof_bytes: usize,
+    pub public_input_count: usize,
+}
+
+fn encode_u64_words(words: &[u64]) -> Vec<u8> {
+    words.iter().flat_map(|word| word.to_le_bytes()).collect()
+}
+
+fn synthetic_inactive_private_tx_v2_i1_inputs() -> (Vec<u8>, Vec<u8>) {
+    let mut private_words = vec![
+        0, // amount
+        0, // blind
+        0, // secret
+        0, // index
+        0, // input sum
+        0, // output sum
+        0, // fee
+        0, // primary key image
+        1, // input asset tag
+        1, // output asset tag
+        0, // padded input amount
+        0, // padded input key image
+        0, // padded input asset tag
+    ];
+    private_words.extend(vec![0; PRIVATE_TX_MERKLE_MAX_DEPTH * PRIVATE_TX_ROOT_WORDS]);
+    private_words.extend(vec![0; PRIVATE_TX_MERKLE_MAX_DEPTH]);
+    debug_assert_eq!(
+        private_words.len(),
+        PRIVATE_TX_V2_I1_LAB_PROFILE.private_input_words()
+    );
+
+    let public_words = vec![0; PRIVATE_TX_V2_I1_LAB_PROFILE.public_input_words()];
+    (
+        encode_u64_words(&private_words),
+        encode_u64_words(&public_words),
+    )
+}
+
+pub fn benchmark_private_tx_v2_i1_lab(
+    trusted_setup_dir: &std::path::Path,
+) -> Result<PrivateTxV2I1LabBenchmark, String> {
+    let params_path = trusted_setup_dir
+        .join(setup_io::params_filename(PRIVATE_TX_V2_I1_LAB_CIRCUIT).map_err(|e| e.to_string())?);
+    let params_bytes = std::fs::metadata(&params_path)
+        .map_err(|e| format!("reading {} metadata: {e}", params_path.display()))?
+        .len();
+
+    let load_started = std::time::Instant::now();
+    let setup = private_tx_v2_i1_lab_setup(trusted_setup_dir)?;
+    let params_load_ms = load_started
+        .elapsed()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+
+    let (private_inputs, public_inputs) = synthetic_inactive_private_tx_v2_i1_inputs();
+    let prove_started = std::time::Instant::now();
+    let (proof_bytes, encoded_public_inputs) = prove_private_tx_for_profile(
+        &private_inputs,
+        &public_inputs,
+        PRIVATE_TX_V2_I1_LAB_PROFILE,
+        &setup.params,
+    )
+    .map_err(|e| e.to_string())?;
+    let prove_ms = prove_started
+        .elapsed()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+
+    let verify_started = std::time::Instant::now();
+    if !verify_private_tx_for_profile(
+        &proof_bytes,
+        &encoded_public_inputs,
+        PRIVATE_TX_V2_I1_LAB_PROFILE,
+        &setup.pvk,
+    )? {
+        return Err(format!(
+            "Groth16 verification for {PRIVATE_TX_V2_I1_LAB_CIRCUIT} failed"
+        ));
+    }
+    let verify_ms = verify_started
+        .elapsed()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+
+    Ok(PrivateTxV2I1LabBenchmark {
+        params_bytes,
+        params_load_ms,
+        prove_ms,
+        verify_ms,
+        proof_bytes: proof_bytes.len(),
+        public_input_count: encoded_public_inputs.len(),
+    })
 }
 
 pub fn verification_key_bytes(circuit: &str) -> Result<Vec<u8>, BlockError> {
@@ -607,14 +844,33 @@ pub fn prove_private_tx(
     private_inputs: &[u8],
     public_inputs: &[u8],
 ) -> Result<(Vec<u8>, Vec<Vec<u8>>), BlockError> {
+    prove_private_tx_for_circuit(PRIVATE_TX_CIRCUIT, private_inputs, public_inputs)
+}
+
+pub fn prove_private_tx_for_circuit(
+    circuit: &str,
+    private_inputs: &[u8],
+    public_inputs: &[u8],
+) -> Result<(Vec<u8>, Vec<Vec<u8>>), BlockError> {
+    let profile = private_tx_profile_for_circuit(circuit)?;
+    let params = parameters_for(circuit)?;
+    prove_private_tx_for_profile(private_inputs, public_inputs, profile, params)
+}
+
+fn prove_private_tx_for_profile(
+    private_inputs: &[u8],
+    public_inputs: &[u8],
+    profile: PrivateTxCircuitProfile,
+    params: &Parameters<Bls12>,
+) -> Result<(Vec<u8>, Vec<Vec<u8>>), BlockError> {
     let private_values = parse_u64_words(
         private_inputs,
-        PRIVATE_TX_PRIVATE_INPUT_WORDS,
+        profile.private_input_words(),
         "private_tx private inputs",
     )?;
     let public_values = parse_u64_words(
         public_inputs,
-        PRIVATE_TX_PUBLIC_INPUT_WORDS,
+        profile.public_input_words(),
         "private_tx public inputs",
     )?;
 
@@ -628,26 +884,25 @@ pub fn prove_private_tx(
     let key_image = private_values[7];
     let input_asset_tag = private_values[8];
     let output_asset_tag = private_values[9];
-    let input_amounts = private_values[10..(10 + PRIVATE_TX_MAX_INPUTS)].to_vec();
+    let input_amounts = private_values[10..(10 + profile.max_inputs)].to_vec();
     let input_key_images =
-        private_values[(10 + PRIVATE_TX_MAX_INPUTS)..(10 + (PRIVATE_TX_MAX_INPUTS * 2))].to_vec();
-    let input_asset_tags = private_values
-        [(10 + (PRIVATE_TX_MAX_INPUTS * 2))..(10 + (PRIVATE_TX_MAX_INPUTS * 3))]
-        .to_vec();
-    let sibling_words_start = 10 + (PRIVATE_TX_MAX_INPUTS * 3);
+        private_values[(10 + profile.max_inputs)..(10 + (profile.max_inputs * 2))].to_vec();
+    let input_asset_tags =
+        private_values[(10 + (profile.max_inputs * 2))..(10 + (profile.max_inputs * 3))].to_vec();
+    let sibling_words_start = 10 + (profile.max_inputs * 3);
     let sibling_words_end = sibling_words_start
-        + (PRIVATE_TX_MERKLE_PROVEN_INPUTS * PRIVATE_TX_MERKLE_MAX_DEPTH * PRIVATE_TX_ROOT_WORDS);
+        + (profile.merkle_proven_inputs * PRIVATE_TX_MERKLE_MAX_DEPTH * PRIVATE_TX_ROOT_WORDS);
     let path_sibling_words = private_values[sibling_words_start..sibling_words_end].to_vec();
     let path_direction_values = private_values[sibling_words_end..].to_vec();
     let commitment = public_values[0];
     let nullifier = public_values[1];
-    let public_input_key_images = public_values[2..(2 + PRIVATE_TX_MAX_INPUTS)].to_vec();
-    let public_membership_flags = public_values[(2 + PRIVATE_TX_MAX_INPUTS)
-        ..(2 + PRIVATE_TX_MAX_INPUTS + PRIVATE_TX_MERKLE_PROVEN_INPUTS)]
+    let public_input_key_images = public_values[2..(2 + profile.max_inputs)].to_vec();
+    let public_membership_flags = public_values
+        [(2 + profile.max_inputs)..(2 + profile.max_inputs + profile.merkle_proven_inputs)]
         .to_vec();
-    let public_commitment_words_start = 2 + PRIVATE_TX_MAX_INPUTS + PRIVATE_TX_MERKLE_PROVEN_INPUTS;
-    let public_commitment_words_end = public_commitment_words_start
-        + (PRIVATE_TX_MERKLE_PROVEN_INPUTS * PRIVATE_TREE_SCALAR_WORDS);
+    let public_commitment_words_start = 2 + profile.max_inputs + profile.merkle_proven_inputs;
+    let public_commitment_words_end =
+        public_commitment_words_start + (profile.merkle_proven_inputs * PRIVATE_TREE_SCALAR_WORDS);
     let public_proven_commitment_words =
         public_values[public_commitment_words_start..public_commitment_words_end].to_vec();
     let public_root_words = public_values[public_commitment_words_end..].to_vec();
@@ -687,7 +942,7 @@ pub fn prove_private_tx(
             "private_tx input/output asset tags do not match".to_string(),
         ));
     }
-    for idx in 0..PRIVATE_TX_MAX_INPUTS {
+    for idx in 0..profile.max_inputs {
         let amount = input_amounts[idx];
         let asset_tag = input_asset_tags[idx];
         if amount > 0 && asset_tag != input_asset_tag {
@@ -728,9 +983,7 @@ pub fn prove_private_tx(
         ));
     }
 
-    if path_direction_values.len()
-        != (PRIVATE_TX_MERKLE_PROVEN_INPUTS * PRIVATE_TX_MERKLE_MAX_DEPTH)
-    {
+    if path_direction_values.len() != (profile.merkle_proven_inputs * PRIVATE_TX_MERKLE_MAX_DEPTH) {
         return Err(BlockError::TransactionValidationFailed(
             "private_tx proven path directions are incomplete".to_string(),
         ));
@@ -740,7 +993,7 @@ pub fn prove_private_tx(
             "private_tx proven path directions must be boolean".to_string(),
         ));
     }
-    if public_membership_flags.len() != PRIVATE_TX_MERKLE_PROVEN_INPUTS
+    if public_membership_flags.len() != profile.merkle_proven_inputs
         || public_membership_flags.iter().any(|value| *value > 1)
     {
         return Err(BlockError::TransactionValidationFailed(
@@ -749,11 +1002,11 @@ pub fn prove_private_tx(
     }
     let public_root_scalar = scalar_from_public_words(&public_root_words, "private_tx root")?;
 
-    let mut proven_membership_flags = Vec::with_capacity(PRIVATE_TX_MERKLE_PROVEN_INPUTS);
-    let mut proven_commitment_words = Vec::with_capacity(PRIVATE_TX_MERKLE_PROVEN_INPUTS);
-    let mut path_siblings = Vec::with_capacity(PRIVATE_TX_MERKLE_PROVEN_INPUTS);
-    let mut path_directions = Vec::with_capacity(PRIVATE_TX_MERKLE_PROVEN_INPUTS);
-    for proven_idx in 0..PRIVATE_TX_MERKLE_PROVEN_INPUTS {
+    let mut proven_membership_flags = Vec::with_capacity(profile.merkle_proven_inputs);
+    let mut proven_commitment_words = Vec::with_capacity(profile.merkle_proven_inputs);
+    let mut path_siblings = Vec::with_capacity(profile.merkle_proven_inputs);
+    let mut path_directions = Vec::with_capacity(profile.merkle_proven_inputs);
+    for proven_idx in 0..profile.merkle_proven_inputs {
         let is_active = public_membership_flags[proven_idx] == 1;
         proven_membership_flags.push(is_active);
 
@@ -842,7 +1095,7 @@ pub fn prove_private_tx(
     }
 
     let mut amount_bits = Vec::with_capacity(PRIVATE_TX_RANGE_BITS);
-    let mut input_amount_bits = Vec::with_capacity(PRIVATE_TX_MAX_INPUTS);
+    let mut input_amount_bits = Vec::with_capacity(profile.max_inputs);
     let mut input_sum_bits = Vec::with_capacity(PRIVATE_TX_RANGE_BITS);
     let mut output_sum_bits = Vec::with_capacity(PRIVATE_TX_RANGE_BITS);
     let mut fee_bits = Vec::with_capacity(PRIVATE_TX_RANGE_BITS);
@@ -907,15 +1160,73 @@ pub fn prove_private_tx(
         fee_bits,
     };
 
-    let params = parameters_for(PRIVATE_TX_CIRCUIT)?;
     let proof = create_random_proof(circuit, params, &mut OsRng).map_err(|e| {
-        BlockError::TransactionValidationFailed(format!("Groth16 proving failed: {}", e))
+        BlockError::TransactionValidationFailed(format!(
+            "Groth16 proving for {} failed: {}",
+            profile.circuit_name, e
+        ))
     })?;
 
     Ok((
         serialize_proof(&proof)?,
         encode_public_input_words(public_inputs),
     ))
+}
+
+/// Offline-only proving route for the compact `i1` candidate. Callers must
+/// provide an explicit lab setup directory; this profile is intentionally not
+/// registered with node verification or the canonical setup bundle yet.
+pub fn prove_private_tx_v2_i1_candidate(
+    trusted_setup_dir: &std::path::Path,
+    private_inputs: &[u8],
+    public_inputs: &[u8],
+) -> Result<(Vec<u8>, Vec<Vec<u8>>), BlockError> {
+    let setup = private_tx_v2_i1_lab_setup(trusted_setup_dir).map_err(|e| {
+        BlockError::TransactionValidationFailed(format!(
+            "{PRIVATE_TX_V2_I1_LAB_CIRCUIT} setup is unavailable: {e}"
+        ))
+    })?;
+    prove_private_tx_for_profile(
+        private_inputs,
+        public_inputs,
+        PRIVATE_TX_V2_I1_LAB_PROFILE,
+        &setup.params,
+    )
+}
+
+/// Offline-only verification route paired with
+/// `prove_private_tx_v2_i1_candidate`.
+pub fn verify_private_tx_v2_i1_candidate(
+    trusted_setup_dir: &std::path::Path,
+    proof_bytes: &[u8],
+    public_inputs: &[Vec<u8>],
+) -> Result<bool, String> {
+    let setup = private_tx_v2_i1_lab_setup(trusted_setup_dir)?;
+    verify_private_tx_for_profile(
+        proof_bytes,
+        public_inputs,
+        PRIVATE_TX_V2_I1_LAB_PROFILE,
+        &setup.pvk,
+    )
+}
+
+fn verify_private_tx_for_profile(
+    proof_bytes: &[u8],
+    public_inputs: &[Vec<u8>],
+    profile: PrivateTxCircuitProfile,
+    pvk: &PreparedVerifyingKey<Bls12>,
+) -> Result<bool, String> {
+    let public_words = decode_public_input_words(public_inputs, profile.public_input_words())?;
+    let public_scalars: Vec<Scalar> = public_words.into_iter().map(Scalar::from).collect();
+
+    let mut cursor = Cursor::new(proof_bytes);
+    let proof = Proof::<Bls12>::read(&mut cursor)
+        .map_err(|e| format!("failed to deserialize Groth16 proof: {}", e))?;
+
+    match verify_proof(pvk, &proof, &public_scalars) {
+        Ok(()) => Ok(true),
+        Err(_) => Ok(false),
+    }
 }
 
 pub fn verify(
@@ -1176,6 +1487,13 @@ struct GrothPrivateTxCircuit {
 
 impl GrothPrivateTxCircuit {
     fn blank() -> Self {
+        Self::blank_for_profile(PRIVATE_TX_MAX_INPUTS, PRIVATE_TX_MERKLE_PROVEN_INPUTS)
+    }
+
+    fn blank_for_profile(max_inputs: usize, merkle_proven_inputs: usize) -> Self {
+        assert!(max_inputs > 0);
+        assert!(merkle_proven_inputs > 0);
+        assert!(merkle_proven_inputs <= max_inputs);
         Self {
             commitment: Some(Scalar::from(0u64)),
             nullifier: Some(Scalar::from(0u64)),
@@ -1189,28 +1507,25 @@ impl GrothPrivateTxCircuit {
             index: Some(Scalar::from(0u64)),
             input_asset_tag: Some(Scalar::from(0u64)),
             output_asset_tag: Some(Scalar::from(0u64)),
-            input_amounts: vec![Scalar::from(0u64); PRIVATE_TX_MAX_INPUTS],
-            input_key_images: vec![Scalar::from(0u64); PRIVATE_TX_MAX_INPUTS],
-            input_asset_tags: vec![Scalar::from(0u64); PRIVATE_TX_MAX_INPUTS],
-            proven_input_flags: vec![false; PRIVATE_TX_MERKLE_PROVEN_INPUTS],
+            input_amounts: vec![Scalar::from(0u64); max_inputs],
+            input_key_images: vec![Scalar::from(0u64); max_inputs],
+            input_asset_tags: vec![Scalar::from(0u64); max_inputs],
+            proven_input_flags: vec![false; merkle_proven_inputs],
             proven_input_commitment_words: vec![
                 vec![Scalar::from(0u64); PRIVATE_TREE_SCALAR_WORDS];
-                PRIVATE_TX_MERKLE_PROVEN_INPUTS
+                merkle_proven_inputs
             ],
             path_sibling_words: vec![
                 vec![
                     Scalar::from(0u64);
                     PRIVATE_TX_MERKLE_MAX_DEPTH * PRIVATE_TX_ROOT_WORDS
                 ];
-                PRIVATE_TX_MERKLE_PROVEN_INPUTS
+                merkle_proven_inputs
             ],
-            path_directions: vec![
-                vec![false; PRIVATE_TX_MERKLE_MAX_DEPTH];
-                PRIVATE_TX_MERKLE_PROVEN_INPUTS
-            ],
+            path_directions: vec![vec![false; PRIVATE_TX_MERKLE_MAX_DEPTH]; merkle_proven_inputs],
             private_root_words: vec![Scalar::from(0u64); PRIVATE_TX_ROOT_WORDS],
             amount_bits: vec![false; PRIVATE_TX_RANGE_BITS],
-            input_amount_bits: vec![vec![false; PRIVATE_TX_RANGE_BITS]; PRIVATE_TX_MAX_INPUTS],
+            input_amount_bits: vec![vec![false; PRIVATE_TX_RANGE_BITS]; max_inputs],
             input_sum_bits: vec![false; PRIVATE_TX_RANGE_BITS],
             output_sum_bits: vec![false; PRIVATE_TX_RANGE_BITS],
             fee_bits: vec![false; PRIVATE_TX_RANGE_BITS],
@@ -1379,7 +1694,7 @@ impl Circuit<Scalar> for GrothPrivateTxCircuit {
             |lc| lc + CS::one(),
             |lc| lc + input_sum,
         );
-        for idx in 0..PRIVATE_TX_MAX_INPUTS {
+        for idx in 0..self.input_amounts.len() {
             cs.enforce(
                 || format!("input_key_image_public_anchor_{}", idx),
                 |lc| lc + input_key_image_vars[idx],
@@ -1608,7 +1923,7 @@ impl Circuit<Scalar> for GrothPrivateTxCircuit {
             reconstructed_root_value,
         )?;
 
-        for proven_idx in 0..PRIVATE_TX_MERKLE_PROVEN_INPUTS {
+        for proven_idx in 0..self.proven_input_flags.len() {
             let flag_value = if self.proven_input_flags[proven_idx] {
                 Scalar::from(1u64)
             } else {
@@ -1719,7 +2034,7 @@ impl Circuit<Scalar> for GrothPrivateTxCircuit {
                 (current_state, state_value)
             };
 
-            for depth in 0..PRIVATE_TX_MERKLE_MAX_DEPTH {
+            for depth in 0..self.path_directions[proven_idx].len() {
                 let sibling_word_vars = (0..PRIVATE_TX_ROOT_WORDS)
                     .map(|word_idx| {
                         let flat_idx = depth * PRIVATE_TX_ROOT_WORDS + word_idx;
@@ -1870,6 +2185,207 @@ impl Circuit<Scalar> for GrothPrivateTxCircuit {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod private_tx_v2_i1_lab_tests {
+    use super::*;
+    use bellman::gadgets::test::TestConstraintSystem;
+
+    const LAB_SETUP_DIR_ENV: &str = "ZOKA_PRIVATE_TX_V2_I1_LAB_DIR";
+
+    #[test]
+    fn v1_shape_remains_96_inputs_and_8_merkle_paths() {
+        let circuit = GrothPrivateTxCircuit::blank();
+        assert_eq!(circuit.input_amounts.len(), PRIVATE_TX_MAX_INPUTS);
+        assert_eq!(
+            circuit.proven_input_flags.len(),
+            PRIVATE_TX_MERKLE_PROVEN_INPUTS
+        );
+        assert_eq!(
+            PRIVATE_TX_V1_PROFILE.private_input_words(),
+            PRIVATE_TX_PRIVATE_INPUT_WORDS
+        );
+        assert_eq!(
+            PRIVATE_TX_V1_PROFILE.public_input_words(),
+            PRIVATE_TX_PUBLIC_INPUT_WORDS
+        );
+
+        let mut cs = TestConstraintSystem::new();
+        circuit.synthesize(&mut cs).expect("v1 synthesis");
+        assert!(
+            cs.is_satisfied(),
+            "v1 blank circuit must remain satisfiable"
+        );
+    }
+
+    #[test]
+    fn v2_i1_lab_shape_uses_one_input_and_one_merkle_path() {
+        let circuit = GrothPrivateTxCircuit::blank_for_profile(1, 1);
+        assert_eq!(circuit.input_amounts.len(), 1);
+        assert_eq!(circuit.proven_input_flags.len(), 1);
+
+        let mut cs = TestConstraintSystem::new();
+        circuit.synthesize(&mut cs).expect("v2 i1 synthesis");
+        assert!(cs.is_satisfied(), "v2 i1 blank circuit must be satisfiable");
+    }
+
+    #[test]
+    fn v2_i1_candidate_rejects_tampering_and_malformed_public_inputs() {
+        let params = generate_private_tx_v2_i1_lab_params_with_osrng().expect("generate params");
+        let pvk = prepare_verifying_key(&params.vk);
+        let (private_inputs, public_inputs) = synthetic_inactive_private_tx_v2_i1_inputs();
+        let (proof_bytes, encoded_public_inputs) = prove_private_tx_for_profile(
+            &private_inputs,
+            &public_inputs,
+            PRIVATE_TX_V2_I1_LAB_PROFILE,
+            &params,
+        )
+        .expect("prove satisfiable i1 candidate");
+
+        assert_eq!(proof_bytes.len(), 192);
+        assert!(verify_private_tx_for_profile(
+            &proof_bytes,
+            &encoded_public_inputs,
+            PRIVATE_TX_V2_I1_LAB_PROFILE,
+            &pvk,
+        )
+        .expect("verify satisfiable i1 candidate"));
+
+        let mut tampered_public_inputs = encoded_public_inputs.clone();
+        tampered_public_inputs[0][0] ^= 1;
+        assert!(!verify_private_tx_for_profile(
+            &proof_bytes,
+            &tampered_public_inputs,
+            PRIVATE_TX_V2_I1_LAB_PROFILE,
+            &pvk,
+        )
+        .expect("tampered public inputs must parse"));
+
+        let malformed_public_inputs =
+            &encoded_public_inputs[..encoded_public_inputs.len().saturating_sub(1)];
+        let err = verify_private_tx_for_profile(
+            &proof_bytes,
+            malformed_public_inputs,
+            PRIVATE_TX_V2_I1_LAB_PROFILE,
+            &pvk,
+        )
+        .expect_err("missing public input must be rejected");
+        assert!(err.contains("invalid public input count"));
+
+        let mut tampered_proof = proof_bytes;
+        tampered_proof[0] ^= 1;
+        assert!(!matches!(
+            verify_private_tx_for_profile(
+                &tampered_proof,
+                &encoded_public_inputs,
+                PRIVATE_TX_V2_I1_LAB_PROFILE,
+                &pvk,
+            ),
+            Ok(true)
+        ));
+    }
+
+    #[test]
+    #[ignore = "manual generation of temporary benchmark-only Groth16 parameters"]
+    fn generate_v2_i1_lab_params() {
+        let out_dir = std::path::PathBuf::from(
+            std::env::var(LAB_SETUP_DIR_ENV).expect("set ZOKA_PRIVATE_TX_V2_I1_LAB_DIR"),
+        );
+        std::fs::create_dir_all(&out_dir).expect("create lab setup directory");
+
+        let started = std::time::Instant::now();
+        let params = generate_private_tx_v2_i1_lab_params_with_osrng().expect("generate params");
+        setup_io::write_circuit_params(&out_dir, PRIVATE_TX_V2_I1_LAB_CIRCUIT, &params)
+            .expect("write params");
+        let path = out_dir.join(
+            setup_io::params_filename(PRIVATE_TX_V2_I1_LAB_CIRCUIT).expect("params filename"),
+        );
+        println!(
+            "{}",
+            serde_json::json!({
+                "profile": PRIVATE_TX_V2_I1_LAB_CIRCUIT,
+                "params_path": path,
+                "params_bytes": std::fs::metadata(path).expect("params metadata").len(),
+                "generate_ms": started.elapsed().as_millis(),
+            })
+        );
+    }
+
+    #[test]
+    #[ignore = "manual host benchmark for temporary v2 i1 parameters"]
+    fn benchmark_v2_i1_lab_profile_on_host() {
+        let setup_dir = std::path::PathBuf::from(
+            std::env::var(LAB_SETUP_DIR_ENV).expect("set ZOKA_PRIVATE_TX_V2_I1_LAB_DIR"),
+        );
+        let result = benchmark_private_tx_v2_i1_lab(&setup_dir).expect("benchmark");
+        println!(
+            "{}",
+            serde_json::json!({
+                "profile": PRIVATE_TX_V2_I1_LAB_CIRCUIT,
+                "params_bytes": result.params_bytes,
+                "params_load_ms": result.params_load_ms,
+                "prove_ms": result.prove_ms,
+                "verify_ms": result.verify_ms,
+                "proof_bytes": result.proof_bytes,
+                "public_input_count": result.public_input_count,
+            })
+        );
+    }
+
+    #[test]
+    #[ignore = "manual runtime wiring check with temporary v2 i1 parameters"]
+    fn runtime_v2_i1_authenticated_bundle_route() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let release_setup_dir = manifest_dir.join("trusted-setup");
+        let lab_setup_dir = std::path::PathBuf::from(
+            std::env::var(LAB_SETUP_DIR_ENV).expect("set ZOKA_PRIVATE_TX_V2_I1_LAB_DIR"),
+        );
+        let runtime_bundle = tempfile::TempDir::new().expect("runtime bundle tmpdir");
+
+        for circuit in setup_io::REQUIRED_CIRCUITS {
+            let filename = setup_io::params_filename(circuit).expect("required params filename");
+            std::fs::copy(
+                release_setup_dir.join(filename),
+                runtime_bundle.path().join(filename),
+            )
+            .expect("copy required release params");
+        }
+        let i1_filename =
+            setup_io::params_filename(PRIVATE_TX_V2_I1_LAB_CIRCUIT).expect("i1 params filename");
+        std::fs::copy(
+            lab_setup_dir.join(i1_filename),
+            runtime_bundle.path().join(i1_filename),
+        )
+        .expect("copy temporary i1 params");
+        let digest =
+            setup_io::compute_directory_digest(runtime_bundle.path()).expect("runtime digest");
+        setup_io::write_digest(runtime_bundle.path(), &digest).expect("write runtime digest");
+
+        std::env::set_var(TRUSTED_SETUP_ENV, runtime_bundle.path());
+        let (private_inputs, public_inputs) = synthetic_inactive_private_tx_v2_i1_inputs();
+        let (proof_bytes, encoded_public_inputs) = prove_private_tx_for_circuit(
+            PRIVATE_TX_V2_I1_LAB_CIRCUIT,
+            &private_inputs,
+            &public_inputs,
+        )
+        .expect("runtime i1 proving route");
+        assert!(verify(
+            PRIVATE_TX_V2_I1_LAB_CIRCUIT,
+            &proof_bytes,
+            &encoded_public_inputs
+        )
+        .expect("runtime i1 verification route"));
+        println!(
+            "{}",
+            serde_json::json!({
+                "profile": PRIVATE_TX_V2_I1_LAB_CIRCUIT,
+                "digest": hex::encode(digest),
+                "proof_bytes": proof_bytes.len(),
+                "public_input_count": encoded_public_inputs.len(),
+            })
+        );
     }
 }
 

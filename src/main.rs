@@ -2628,18 +2628,32 @@ fn network_pending_private_txs(db_path: Option<&str>) -> u64 {
 }
 
 fn local_pending_private_tx_hashes(db_path: &str, limit: usize) -> Result<Vec<String>, String> {
+    local_pending_private_tx_hashes_at(db_path, limit, None)
+}
+
+fn local_pending_private_tx_hashes_at(
+    db_path: &str,
+    limit: usize,
+    target_block_height: Option<u64>,
+) -> Result<Vec<String>, String> {
     let storage = match open_storage(db_path) {
         Ok(storage) => storage,
-        Err(e) if is_storage_lock_error(&e) => {
-            return Ok(sidecar_pending_private_tx_hashes(db_path, limit));
-        }
+        // Sidecar files are only candidates after they have been imported,
+        // decoded, and validated. Mining file names directly could commit a
+        // tx hash without its spent-nullifier set while RocksDB is locked.
+        Err(e) if is_storage_lock_error(&e) => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
     let hashes = storage
         .iterate_pending_private_transaction_hashes()
         .map_err(|e| format!("failed to read pending private txs: {e}"))?;
+    let target_block_height = target_block_height
+        .unwrap_or_else(|| storage.get_chain_height().unwrap_or(0).saturating_add(1));
     Ok(select_non_conflicting_pending_private_tx_hashes(
-        &storage, hashes, limit,
+        &storage,
+        hashes,
+        limit,
+        target_block_height,
     ))
 }
 
@@ -2660,10 +2674,47 @@ fn private_tx_spend_tags(tx: &zoka::private_wallet::PrivateTransaction) -> Vec<S
     tags
 }
 
+fn validate_private_tx_for_pending_pool(tx: &PrivateTransaction) -> Result<(), String> {
+    let mut validator = PrivateWalletManager::new();
+    validator
+        .validate_inbound_private_transaction(tx)
+        .map_err(|e| format!("private transaction validation failed: {e}"))
+}
+
+fn validate_private_tx_for_block_candidate(
+    tx: &PrivateTransaction,
+    target_block_height: u64,
+) -> Result<(), String> {
+    validate_private_tx_for_block_candidate_at(
+        tx,
+        target_block_height,
+        economics::private_tx_v2_i1_activation_height(),
+        economics::private_tx_canonical_bundle_activation_height(),
+    )
+}
+
+fn validate_private_tx_for_block_candidate_at(
+    tx: &PrivateTransaction,
+    target_block_height: u64,
+    v2_i1_activation_height: Option<u64>,
+    canonical_bundle_activation_height: Option<u64>,
+) -> Result<(), String> {
+    let mut validator = PrivateWalletManager::new();
+    validator
+        .validate_inbound_private_transaction_at(
+            tx,
+            target_block_height,
+            v2_i1_activation_height,
+            canonical_bundle_activation_height,
+        )
+        .map_err(|e| format!("private transaction validation failed: {e}"))
+}
+
 fn select_non_conflicting_pending_private_tx_hashes(
     storage: &RocksDbStorage,
     hashes: Vec<String>,
     limit: usize,
+    target_block_height: u64,
 ) -> Vec<String> {
     let mut selected = Vec::new();
     let mut seen_spend_tags = HashSet::new();
@@ -2679,6 +2730,9 @@ fn select_non_conflicting_pending_private_tx_hashes(
         else {
             continue;
         };
+        if validate_private_tx_for_block_candidate(&tx, target_block_height).is_err() {
+            continue;
+        }
         let tags = private_tx_spend_tags(&tx);
         if tags.is_empty() || tags.iter().any(|tag| seen_spend_tags.contains(tag)) {
             continue;
@@ -2708,34 +2762,12 @@ fn private_tx_sidecar_dir(db_path: &str) -> std::path::PathBuf {
     base.join("pending_private_queue")
 }
 
-fn sidecar_pending_private_tx_hashes(db_path: &str, limit: usize) -> Vec<String> {
-    let sidecar = private_tx_sidecar_dir(db_path);
-    let entries = match std::fs::read_dir(&sidecar) {
-        Ok(entries) => entries,
-        Err(_) => return Vec::new(),
-    };
-    let mut hashes: Vec<String> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("privtx") {
-                return None;
-            }
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_string())
-        })
-        .collect();
-    hashes.sort();
-    hashes.truncate(limit);
-    hashes
-}
-
 fn persist_local_private_tx_for_node(
     db_path: &str,
     tx_hash: &str,
     tx: &zoka::private_wallet::PrivateTransaction,
 ) -> Result<(), String> {
+    validate_private_tx_for_pending_pool(tx)?;
     let body = serde_json::to_vec(tx)
         .map_err(|e| format!("failed to serialize private transaction: {e}"))?;
 
@@ -2794,6 +2826,13 @@ fn import_sidecar_private_txs(db_path: &str, storage: &RocksDbStorage) -> usize 
             Some(h) => h,
             None => continue,
         };
+        let tx = match serde_json::from_slice::<PrivateTransaction>(&bytes) {
+            Ok(tx) if tx.tx_hash == tx_hash => tx,
+            _ => continue,
+        };
+        if validate_private_tx_for_pending_pool(&tx).is_err() {
+            continue;
+        }
         if storage
             .save_private_transaction_bytes(&tx_hash, &bytes)
             .is_ok()
@@ -3484,6 +3523,9 @@ fn collect_private_tx_bodies_from_storage(
     storage: &RocksDbStorage,
     block: &zoka::types::Block,
 ) -> Vec<Vec<u8>> {
+    if !block.private_tx_bodies.is_empty() {
+        return block.private_tx_bodies.clone();
+    }
     if block.private_tx_hashes.is_empty() {
         return Vec::new();
     }
@@ -3491,6 +3533,19 @@ fn collect_private_tx_bodies_from_storage(
         .private_tx_hashes
         .iter()
         .filter_map(|hash| storage.get_private_transaction_bytes(hash).ok().flatten())
+        .collect()
+}
+
+/// Collect every body selected for a future canonical private bundle.
+/// Unlike P2P attachments, this is all-or-nothing: a miner must never
+/// produce a post-activation block whose committed body list is partial.
+fn collect_canonical_private_tx_bodies_for_hashes(
+    storage: &RocksDbStorage,
+    hashes: &[String],
+) -> Option<Vec<Vec<u8>>> {
+    hashes
+        .iter()
+        .map(|hash| storage.get_private_transaction_bytes(hash).ok().flatten())
         .collect()
 }
 
@@ -4807,9 +4862,35 @@ fn run_mining_batch_with_progress(
                 import_sidecar_private_txs(path, &storage);
             }
         }
-        let private_tx_hashes_for_block = match config.chain_db_path.as_deref() {
-            Some(path) => local_pending_private_tx_hashes(path, LOCAL_PRIVATE_TXS_PER_BLOCK_LIMIT)?,
+        let mut private_tx_hashes_for_block = match config.chain_db_path.as_deref() {
+            Some(path) => local_pending_private_tx_hashes_at(
+                path,
+                LOCAL_PRIVATE_TXS_PER_BLOCK_LIMIT,
+                Some(height),
+            )?,
             None => Vec::new(),
+        };
+        let private_tx_bodies_for_block = if economics::private_tx_canonical_bundle_required(height)
+        {
+            match config.chain_db_path.as_deref() {
+                Some(path) if !private_tx_hashes_for_block.is_empty() => {
+                    match open_storage(path).ok().and_then(|storage| {
+                        collect_canonical_private_tx_bodies_for_hashes(
+                            &storage,
+                            &private_tx_hashes_for_block,
+                        )
+                    }) {
+                        Some(bodies) => bodies,
+                        None => {
+                            private_tx_hashes_for_block.clear();
+                            Vec::new()
+                        }
+                    }
+                }
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
         };
         // Derive the spent-nullifier set committed in this block from the
         // selected tx bodies, so every node enforces no-double-spend from
@@ -4819,7 +4900,10 @@ fn run_mining_batch_with_progress(
                 Ok(storage) => {
                     collect_private_nullifiers_for_hashes(&storage, &private_tx_hashes_for_block)
                 }
-                Err(_) => Vec::new(),
+                Err(_) => {
+                    private_tx_hashes_for_block.clear();
+                    Vec::new()
+                }
             },
             _ => Vec::new(),
         };
@@ -4855,6 +4939,7 @@ fn run_mining_batch_with_progress(
             },
             transactions: vec![coinbase_tx],
             private_tx_hashes: private_tx_hashes_for_block.clone(),
+            private_tx_bodies: private_tx_bodies_for_block.clone(),
             private_nullifiers: private_nullifiers_for_block.clone(),
             private_fee_claims: private_fee_claims_for_block.clone(),
             private_coinbase: Some(private_coinbase.clone()),
@@ -4881,6 +4966,7 @@ fn run_mining_batch_with_progress(
             },
             transactions: Vec::new(),
             private_tx_hashes: Vec::new(),
+            private_tx_bodies: Vec::new(),
             private_nullifiers: Vec::new(),
             private_fee_claims: Vec::new(),
             private_coinbase: None,
@@ -5280,6 +5366,12 @@ fn handle_fullnode_network_message(
             if matches!(storage.get_private_transaction_bytes(hash), Ok(Some(_))) {
                 return Some(format!(
                     "Gossiped private tx {} already on disk; ignoring duplicate.",
+                    truncate_dashboard_text(hash, 16)
+                ));
+            }
+            if let Err(err) = validate_private_tx_for_pending_pool(&tx) {
+                return Some(format!(
+                    "Ignored gossiped private tx {}: {err}",
                     truncate_dashboard_text(hash, 16)
                 ));
             }
@@ -6612,8 +6704,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         let api_mempool = Arc::new(zoka::mempool::Mempool::new(10_000));
         let api_bind_addr = configured_api_bind_addr(args, network)?;
         let api_public_url = format!("http://{api_bind_addr}");
-        // Channel for the API's /private/wallet/send-from-seed handler to
-        // hand freshly built PrivateTransactions back to the fullnode
+        // Channel for API private-tx submission handlers to hand freshly
+        // built PrivateTransactions back to the fullnode
         // main loop. The main loop drains the receiver below, inserts
         // each tx into the in-memory private pool, AND gossips it via
         // libp2p so any connected mining peer can include it in their
@@ -12090,6 +12182,120 @@ mod tests {
             current_known_height_for_network(Some(&db), NetworkProfile::Mainnet),
             7
         );
+    }
+
+    fn private_tx_with_unknown_proof_profile() -> PrivateTransaction {
+        serde_json::from_value(serde_json::json!({
+            "tx_hash": "unknown-proof-profile",
+            "commitment": "commitment",
+            "private_proof_version": 2,
+            "private_proof_profile": "private_tx_v2_i1",
+            "nullifier": "nullifier",
+            "zk_proof": null,
+            "timestamp": 1,
+            "status": "Pending"
+        }))
+        .expect("deserialize private tx fixture")
+    }
+
+    #[test]
+    fn pending_private_tx_selection_rejects_unknown_proof_profile() {
+        let (_tmp, db) = temp_db_arg();
+        let storage = RocksDbStorage::new(&db).expect("temp rocksdb");
+        let tx = private_tx_with_unknown_proof_profile();
+        let body = serde_json::to_vec(&tx).expect("serialize private tx fixture");
+        storage
+            .save_private_transaction_bytes(&tx.tx_hash, &body)
+            .expect("save private tx body");
+        storage
+            .save_pending_private_transaction_hash(&tx.tx_hash)
+            .expect("save pending hash");
+
+        assert!(
+            select_non_conflicting_pending_private_tx_hashes(&storage, vec![tx.tx_hash], 1, 1,)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mining_candidate_validation_uses_exact_v2_activation_height() {
+        let tx = private_tx_with_unknown_proof_profile();
+        let err = validate_private_tx_for_block_candidate_at(&tx, 9, Some(10), Some(10))
+            .expect_err("v2 i1 must remain excluded before activation");
+        assert!(err.contains("not active at height 9"));
+
+        let err = validate_private_tx_for_block_candidate_at(&tx, 10, Some(10), Some(10))
+            .expect_err("deliberately incomplete fixture remains invalid after activation");
+        assert!(err.contains("hash does not match body"));
+        assert!(!err.contains("not active"));
+    }
+
+    #[test]
+    fn canonical_private_tx_body_collection_is_all_or_nothing() {
+        let (_tmp, db) = temp_db_arg();
+        let storage = RocksDbStorage::new(&db).expect("temp rocksdb");
+        storage
+            .save_private_transaction_bytes("private-tx-a", b"body-a")
+            .expect("save first private body");
+        let hashes = vec!["private-tx-a".to_string(), "private-tx-b".to_string()];
+
+        assert_eq!(
+            collect_canonical_private_tx_bodies_for_hashes(&storage, &hashes),
+            None
+        );
+
+        storage
+            .save_private_transaction_bytes("private-tx-b", b"body-b")
+            .expect("save second private body");
+        assert_eq!(
+            collect_canonical_private_tx_bodies_for_hashes(&storage, &hashes),
+            Some(vec![b"body-a".to_vec(), b"body-b".to_vec()])
+        );
+    }
+
+    #[test]
+    fn block_response_prefers_embedded_canonical_private_bodies() {
+        let (_tmp, db) = temp_db_arg();
+        let storage = RocksDbStorage::new(&db).expect("temp rocksdb");
+        storage
+            .save_private_transaction_bytes("private-tx-a", b"sidecar-body")
+            .expect("save sidecar private body");
+        let block = zoka::types::Block::new(
+            "prev".to_string(),
+            1,
+            0,
+            1,
+            Vec::new(),
+            zoka::types::PublicKey(Vec::new()),
+            zoka::types::Signature(Vec::new()),
+        )
+        .with_private_tx_hashes(vec!["private-tx-a".to_string()])
+        .with_private_tx_bodies(vec![b"canonical-body".to_vec()]);
+
+        assert_eq!(
+            collect_private_tx_bodies_from_storage(&storage, &block),
+            vec![b"canonical-body".to_vec()]
+        );
+    }
+
+    #[test]
+    fn sidecar_import_rejects_unknown_proof_profile() {
+        let (_tmp, db) = temp_db_arg();
+        let storage = RocksDbStorage::new(&db).expect("temp rocksdb");
+        let tx = private_tx_with_unknown_proof_profile();
+        let sidecar = private_tx_sidecar_dir(&db);
+        std::fs::create_dir_all(&sidecar).expect("create sidecar dir");
+        std::fs::write(
+            sidecar.join(format!("{}.privtx", tx.tx_hash)),
+            serde_json::to_vec(&tx).expect("serialize private tx fixture"),
+        )
+        .expect("write sidecar fixture");
+
+        assert_eq!(import_sidecar_private_txs(&db, &storage), 0);
+        assert!(storage
+            .get_private_transaction_bytes(&tx.tx_hash)
+            .expect("read stored body")
+            .is_none());
     }
 
     #[test]

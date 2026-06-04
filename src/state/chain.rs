@@ -93,6 +93,9 @@ pub enum ChainError {
 
     #[error("private double-spend: nullifier {nullifier} appears twice within the same block")]
     DuplicatePrivateNullifierInBlock { nullifier: String },
+
+    #[error("invalid canonical private transaction bundle: {0}")]
+    InvalidPrivateTxBundle(String),
 }
 
 impl From<StorageError> for ChainError {
@@ -145,6 +148,7 @@ pub fn genesis_parent_for(chain_id: &str) -> Block {
         },
         transactions: Vec::new(),
         private_tx_hashes: Vec::new(),
+        private_tx_bodies: Vec::new(),
         private_nullifiers: Vec::new(),
         private_fee_claims: Vec::new(),
         private_coinbase: None,
@@ -537,6 +541,8 @@ fn apply_block_inner(
         expected_difficulty_bits: effective_expected_difficulty,
     };
     validate_pow_block(candidate, &ctx)?;
+    crate::state::sync::validate_private_tx_bundle_policy_for_block(candidate)
+        .map_err(ChainError::InvalidPrivateTxBundle)?;
     validate_private_nullifiers(storage, candidate)?;
 
     let coinbase_amount = candidate
@@ -804,6 +810,7 @@ mod tests {
             },
             transactions: vec![coinbase],
             private_tx_hashes: Vec::new(),
+            private_tx_bodies: Vec::new(),
             private_nullifiers: Vec::new(),
             private_fee_claims: Vec::new(),
             private_coinbase: Some(dummy_private_coinbase(height, miner)),
@@ -1028,12 +1035,10 @@ mod tests {
         );
         let canonical_head = apply_block(&storage, chain_id, &canonical).expect("apply canonical");
 
-        let stronger_bits = (canonical_head.cumulative_work as u32)
-            .saturating_add(1)
-            .clamp(
-                economics::POW_INITIAL_DIFFICULTY_BITS,
-                economics::POW_MAX_DIFFICULTY_BITS,
-            );
+        // Mine a seal with strictly more observed work than the canonical
+        // block. Do not clamp this fixture to the temporary rehearsal max:
+        // a valid block may exceed the minimum target by chance.
+        let stronger_bits = (canonical_head.cumulative_work as u32).saturating_add(1);
         let side_branch = mine_block(
             chain_id,
             &genesis.header.hash,
@@ -1072,12 +1077,7 @@ mod tests {
         );
         let canonical_head = apply_block(&storage, chain_id, &canonical).expect("apply canonical");
 
-        let stronger_bits = (canonical_head.cumulative_work as u32)
-            .saturating_add(1)
-            .clamp(
-                economics::POW_INITIAL_DIFFICULTY_BITS,
-                economics::POW_MAX_DIFFICULTY_BITS,
-            );
+        let stronger_bits = (canonical_head.cumulative_work as u32).saturating_add(1);
         let side_branch = mine_block(
             chain_id,
             &genesis.header.hash,
@@ -1194,6 +1194,7 @@ mod tests {
             },
             transactions: vec![coinbase],
             private_tx_hashes: Vec::new(),
+            private_tx_bodies: Vec::new(),
             private_nullifiers: Vec::new(),
             private_fee_claims: Vec::new(),
             private_coinbase: Some(dummy_private_coinbase(1, "zka1miner")),

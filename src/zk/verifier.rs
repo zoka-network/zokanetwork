@@ -9,6 +9,7 @@ use crate::types::BlockError;
 
 use super::groth16_backend::{
     self as g16, BALANCE_CIRCUIT, MERKLE_CIRCUIT, NULLIFIER_CIRCUIT, PRIVATE_TX_CIRCUIT,
+    PRIVATE_TX_V2_I1_LAB_CIRCUIT,
 };
 use super::prover::ZKProof;
 
@@ -293,7 +294,11 @@ impl Verifier {
 
         // Phase 2: real Groth16 verification for trusted-setup circuits.
         let is_valid = match proof.circuit_type.as_str() {
-            BALANCE_CIRCUIT | MERKLE_CIRCUIT | NULLIFIER_CIRCUIT | PRIVATE_TX_CIRCUIT => {
+            BALANCE_CIRCUIT
+            | MERKLE_CIRCUIT
+            | NULLIFIER_CIRCUIT
+            | PRIVATE_TX_CIRCUIT
+            | PRIVATE_TX_V2_I1_LAB_CIRCUIT => {
                 match g16::verify(
                     &proof.circuit_type,
                     &proof.proof_bytes,

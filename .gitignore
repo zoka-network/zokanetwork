@@ -27,3 +27,6 @@ zokaweb/
 # Local snapshots / migration artifacts
 zoka-local-*.snapshot.json
 migration-*.log
+
+# Local CRS ceremony rehearsal and release-candidate outputs
+ceremony-output/
