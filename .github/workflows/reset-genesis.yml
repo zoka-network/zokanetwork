@@ -1,0 +1,71 @@
+name: Reset Genesis (DESTRUCTIVE)
+
+# Wipes the chain DB on a droplet and restarts the service so it re-initialises
+# from the genesis block. Use after a consensus/block-format change that hard-
+# forks the chain. Requires typing RESET to confirm.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Node to reset'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - bootstrap
+          - rpc
+      confirm:
+        description: 'Type RESET to confirm the DB wipe'
+        required: true
+        default: ''
+
+env:
+  BOOTSTRAP_IP: "159.223.119.216"
+  RPC_IP: "157.230.5.103"
+
+jobs:
+  reset-bootstrap:
+    name: Reset bootstrap node
+    runs-on: ubuntu-22.04
+    if: ${{ (inputs.target == 'both' || inputs.target == 'bootstrap') && inputs.confirm == 'RESET' }}
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DO_SSH_PRIVATE_KEY }}" > ~/.ssh/zoka_do
+          chmod 600 ~/.ssh/zoka_do
+          ssh-keyscan -H ${{ env.BOOTSTRAP_IP }} >> ~/.ssh/known_hosts
+      - name: Wipe DB and restart
+        run: |
+          ssh -i ~/.ssh/zoka_do root@${{ env.BOOTSTRAP_IP }} bash -s <<'REMOTE'
+          set -e
+          systemctl stop zoka-bootstrap || true
+          rm -rf /data/zoka/blockchain.db /data/zoka/blockchain.db-* /data/zoka/blockchain.db.* || true
+          systemctl start zoka-bootstrap
+          sleep 8
+          echo "height after reset:"; curl -fsS http://127.0.0.1:3000/chain/height || true
+          REMOTE
+
+  reset-rpc:
+    name: Reset RPC node
+    runs-on: ubuntu-22.04
+    if: ${{ (inputs.target == 'both' || inputs.target == 'rpc') && inputs.confirm == 'RESET' }}
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DO_SSH_PRIVATE_KEY }}" > ~/.ssh/zoka_do
+          chmod 600 ~/.ssh/zoka_do
+          ssh-keyscan -H ${{ env.RPC_IP }} >> ~/.ssh/known_hosts
+      - name: Wipe DB and restart
+        run: |
+          ssh -i ~/.ssh/zoka_do root@${{ env.RPC_IP }} bash -s <<'REMOTE'
+          set -e
+          systemctl stop zoka-rpc || true
+          rm -rf /data/zoka/blockchain.db /data/zoka/blockchain.db-* /data/zoka/blockchain.db.* || true
+          systemctl start zoka-rpc
+          sleep 8
+          echo "height after reset:"; curl -fsS http://127.0.0.1:3000/chain/height || true
+          REMOTE
