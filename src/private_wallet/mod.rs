@@ -250,6 +250,16 @@ pub fn derive_spending_key_from_recovery_seed(seed_entropy: &[u8]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
+pub fn payment_address_from_scan_key(scan_key: &[u8]) -> Result<String, BlockError> {
+    if scan_key.len() != 16 && scan_key.len() != 32 {
+        return Err(BlockError::TransactionValidationFailed(
+            "scan private key must be 16 or 32 bytes".to_string(),
+        ));
+    }
+    let spending_key = derive_spending_key_from_recovery_seed(scan_key);
+    Ok(payment_address_from_keys(scan_key, &spending_key))
+}
+
 fn parse_payment_address(payment_address: &str) -> Option<(RistrettoPoint, RistrettoPoint)> {
     let parts = payment_address.split(':').collect::<Vec<_>>();
     if parts.len() != 3 || parts[0] != "zpriv" {
@@ -5345,6 +5355,31 @@ mod tests {
         assert!(wrong_key
             .to_string()
             .contains("scan private key does not match"));
+    }
+
+    #[test]
+    fn test_private_view_scan_derives_address_from_scan_key() {
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        let bob_address = manager.create_private_wallet("bob").unwrap();
+        let bob_scan_key = manager.get_private_wallet("bob").unwrap().scan_key.clone();
+        manager.deposit_to_private_wallet("alice", 100).unwrap();
+
+        let tx_hash = manager
+            .send_private_transaction("alice", bob_address.clone(), 25)
+            .unwrap();
+        let tx = manager
+            .get_private_transaction(&tx_hash)
+            .expect("tx should exist");
+
+        let derived_address = payment_address_from_scan_key(&bob_scan_key).unwrap();
+        assert_eq!(derived_address, bob_address);
+
+        let matches =
+            scan_private_transaction_with_view_key(&bob_scan_key, &derived_address, &tx).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].amount, 25);
+        assert_eq!(matches[0].tx_hash, tx_hash);
     }
 
     #[test]
