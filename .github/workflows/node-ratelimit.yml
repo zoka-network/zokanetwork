@@ -1,0 +1,58 @@
+name: Node Rate Limit
+
+# Raises the API rate limits on a droplet so the HTTP API stays responsive
+# under autopush + sync + explorer load (the bootstrap unit otherwise uses the
+# low default and returns 429). Idempotent.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Node'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - bootstrap
+          - rpc
+      limit:
+        description: 'Requests/min'
+        required: true
+        default: '20000'
+
+env:
+  BOOTSTRAP_IP: "159.223.119.216"
+  RPC_IP: "157.230.5.103"
+
+jobs:
+  apply:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DO_SSH_PRIVATE_KEY }}" > ~/.ssh/zoka_do
+          chmod 600 ~/.ssh/zoka_do
+      - name: Apply rate limits
+        run: |
+          set -e
+          do_node () {
+            local IP="$1" SVC="$2"
+            ssh-keyscan -H "$IP" >> ~/.ssh/known_hosts
+            ssh -i ~/.ssh/zoka_do root@"$IP" "LIMIT='${{ inputs.limit }}' SVC=$SVC bash -s" <<'REMOTE'
+          set -e
+          UNIT="/etc/systemd/system/$SVC.service"
+          # remove any prior rate-limit lines, then add fresh ones after the API bind line
+          sed -i "/Environment=ZOKA_API_RATE_LIMIT=/d;/Environment=ZOKA_API_TX_RATE_LIMIT=/d" "$UNIT"
+          sed -i "/Environment=ZOKA_API_BIND=/a Environment=ZOKA_API_TX_RATE_LIMIT=$LIMIT" "$UNIT"
+          sed -i "/Environment=ZOKA_API_BIND=/a Environment=ZOKA_API_RATE_LIMIT=$LIMIT" "$UNIT"
+          grep -nE 'RATE_LIMIT|API_BIND' "$UNIT" || true
+          systemctl daemon-reload
+          systemctl restart "$SVC"
+          sleep 8
+          echo "height:"; curl -fsS http://127.0.0.1:3000/chain/height || true
+          REMOTE
+          }
+          if [ "${{ inputs.target }}" = "both" ] || [ "${{ inputs.target }}" = "bootstrap" ]; then do_node "${{ env.BOOTSTRAP_IP }}" zoka-bootstrap; fi
+          if [ "${{ inputs.target }}" = "both" ] || [ "${{ inputs.target }}" = "rpc" ]; then do_node "${{ env.RPC_IP }}" zoka-rpc; fi
