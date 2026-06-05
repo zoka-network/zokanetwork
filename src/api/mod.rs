@@ -2,7 +2,10 @@
 use crate::cli::{CliConfig, MultiProfileConfig};
 use crate::consensus::pbft::PbftConsensus;
 use crate::mempool::Mempool;
-use crate::private_wallet::{PrivateTransaction, PrivateWalletManager};
+use crate::private_wallet::{
+    scan_private_transaction_with_view_key, validate_view_scan_key_for_address, PrivateTransaction,
+    PrivateViewScanMatch, PrivateWalletManager,
+};
 use crate::state::{AccountInclusionProof, StateManager};
 use crate::types::{StateError, TransactionRequest, TransactionResponse};
 use axum::{
@@ -161,10 +164,8 @@ impl Default for ApiSecurityConfig {
                 // by default, and a RELEASE/mainnet build additionally refuses
                 // to enable it unless the operator ALSO opts into the insecure
                 // mode, so a single stray env var can never expose it in prod.
-                let requested =
-                    parse_bool_env("ZOKA_API_ENABLE_REMOTE_SEED_ENDPOINT", false);
-                let allow_insecure =
-                    parse_bool_env("ZOKA_API_ALLOW_INSECURE_REMOTE_SEED", false);
+                let requested = parse_bool_env("ZOKA_API_ENABLE_REMOTE_SEED_ENDPOINT", false);
+                let allow_insecure = parse_bool_env("ZOKA_API_ALLOW_INSECURE_REMOTE_SEED", false);
                 let enabled = requested && (cfg!(debug_assertions) || allow_insecure);
                 if requested && !enabled {
                     eprintln!(
@@ -521,6 +522,7 @@ impl RbacConfig {
         endpoint_permissions.insert("/network/miners/heartbeat", ApiRole::Write);
         endpoint_permissions.insert("/local/mining/start", ApiRole::Write);
         endpoint_permissions.insert("/local/mining/stop", ApiRole::Write);
+        endpoint_permissions.insert("/private/view-scan", ApiRole::Write);
         endpoint_permissions.insert("/private/wallet/send-from-seed", ApiRole::Write);
 
         // Admin endpoints
@@ -849,6 +851,7 @@ fn verify_transaction_request_signature(
 
 fn rate_limit_bucket(method: &str, path: &str) -> &'static str {
     if path.starts_with("/transactions")
+        || path == "/private/view-scan"
         || path == "/private/wallet/send-from-seed"
         || (!matches!(method, "GET" | "HEAD" | "OPTIONS") && path.starts_with("/private/tx"))
     {
@@ -2442,6 +2445,100 @@ async fn get_pending_private_txs(
         "count": txs.len(),
         "pending": txs,
     })))
+}
+
+#[derive(Debug, Deserialize)]
+struct PrivateViewScanRequest {
+    address: String,
+    scan_key_hex: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct PrivateViewScanResponse {
+    address: String,
+    scanned_transactions: usize,
+    matching_outputs: usize,
+    total_amount_atoms: u64,
+    matches: Vec<PrivateViewScanMatch>,
+}
+
+async fn post_private_view_scan(
+    State(app_state): State<Arc<AppState>>,
+    Json(mut req): Json<PrivateViewScanRequest>,
+) -> Result<Json<PrivateViewScanResponse>, (StatusCode, String)> {
+    req.address = req.address.trim().to_string();
+    req.scan_key_hex = req.scan_key_hex.trim().trim_start_matches("0x").to_string();
+    if req.address.len() > 180 || !req.address.starts_with("zpriv:") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "address must be a zpriv payment address".to_string(),
+        ));
+    }
+    if req.scan_key_hex.len() != 32 && req.scan_key_hex.len() != 64 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "scan_key_hex must encode 16 or 32 bytes".to_string(),
+        ));
+    }
+    if !req.scan_key_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "scan_key_hex must be hexadecimal".to_string(),
+        ));
+    }
+
+    let mut scan_key = hex::decode(&req.scan_key_hex).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "scan_key_hex must be valid hexadecimal".to_string(),
+        )
+    })?;
+    validate_view_scan_key_for_address(&scan_key, &req.address)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("view scan failed: {e}")))?;
+
+    let archived = app_state
+        .state_manager
+        .iterate_private_transactions()
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to list private transactions: {e}"),
+            )
+        })?;
+
+    let max_returned = req.limit.unwrap_or(100).clamp(1, 500);
+    let scanned_transactions = archived.len();
+    let mut matches = Vec::new();
+    for (_hash, body) in archived {
+        let tx = match serde_json::from_slice::<PrivateTransaction>(&body) {
+            Ok(tx) => tx,
+            Err(_) => continue,
+        };
+        let mut tx_matches =
+            scan_private_transaction_with_view_key(&scan_key, &req.address, &tx)
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("view scan failed: {e}")))?;
+        matches.append(&mut tx_matches);
+        if matches.len() >= max_returned {
+            matches.truncate(max_returned);
+            break;
+        }
+    }
+    scan_key.zeroize();
+    req.scan_key_hex.zeroize();
+
+    let total_amount_atoms = matches
+        .iter()
+        .fold(0u64, |total, item| total.saturating_add(item.amount));
+
+    Ok(Json(PrivateViewScanResponse {
+        address: req.address,
+        scanned_transactions,
+        matching_outputs: matches.len(),
+        total_amount_atoms,
+        matches,
+    }))
 }
 
 /// Archive a canonical private transaction body so future wallet restores can
@@ -4120,6 +4217,7 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
             get(get_block_private_tx_hashes_range),
         )
         .route("/private/tx", post(post_private_tx_body))
+        .route("/private/view-scan", post(post_private_view_scan))
         .route("/private/pending", get(get_pending_private_txs))
         .route("/private/tx/:hash", get(get_private_tx_by_hash))
         .route("/blocks/range/:from/:to", get(get_blocks_range))

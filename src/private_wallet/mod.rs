@@ -992,6 +992,20 @@ pub struct PrivateFeeClaimOutcome {
     pub skipped_tx_hashes: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PrivateViewScanMatch {
+    pub tx_hash: String,
+    pub output_id: String,
+    pub output_index: usize,
+    pub asset_tag: String,
+    pub amount: u64,
+    pub commitment: String,
+    pub stealth_address: String,
+    pub one_time_public_key: String,
+    pub is_change: bool,
+    pub timestamp: u64,
+}
+
 fn legacy_output_from_tx(tx: &PrivateTransaction) -> Option<PrivateOutput> {
     if tx.commitment.is_empty() {
         return None;
@@ -3135,6 +3149,125 @@ fn decrypt_private_output_for_wallet(
     Ok(Some((local_output, amount)))
 }
 
+pub fn validate_view_scan_key_for_address(
+    scan_key: &[u8],
+    payment_address: &str,
+) -> Result<(RistrettoPoint, RistrettoPoint), BlockError> {
+    let (scan_public, spend_public) = parse_payment_address(payment_address).ok_or_else(|| {
+        BlockError::TransactionValidationFailed(
+            "payment address is not a valid zpriv address".to_string(),
+        )
+    })?;
+    let derived_scan_public = scalar_from_secret_bytes(scan_key) * RISTRETTO_BASEPOINT_POINT;
+    if derived_scan_public != scan_public {
+        return Err(BlockError::TransactionValidationFailed(
+            "scan private key does not match this address".to_string(),
+        ));
+    }
+    Ok((scan_public, spend_public))
+}
+
+pub fn scan_private_transaction_with_view_key(
+    scan_key: &[u8],
+    payment_address: &str,
+    tx: &PrivateTransaction,
+) -> Result<Vec<PrivateViewScanMatch>, BlockError> {
+    let (_, spend_public) = validate_view_scan_key_for_address(scan_key, payment_address)?;
+    let mut matches = Vec::new();
+    for (output_index, output) in tx_outputs(tx).into_iter().enumerate() {
+        let Some(amount_blind) = derive_output_amount_blind_from_note(scan_key, &output) else {
+            continue;
+        };
+        let Some(ephemeral_public) = output
+            .ephemeral_pubkey
+            .as_slice()
+            .try_into()
+            .ok()
+            .and_then(|bytes: [u8; 32]| CompressedRistretto(bytes).decompress())
+        else {
+            continue;
+        };
+        let shared_point = scalar_from_secret_bytes(scan_key) * ephemeral_public;
+        let derived_scalar = hash_to_scalar(&[
+            b"zoka-output-key",
+            shared_point.compress().as_bytes(),
+            output.commitment.as_bytes(),
+        ]);
+        let derived_public =
+            point_to_hex(&(spend_public + derived_scalar * RISTRETTO_BASEPOINT_POINT));
+        if !constant_time_eq_str(&derived_public, &output.one_time_public_key) {
+            continue;
+        }
+
+        let (amount, commitment_blind) =
+            if output.encrypted_amount.len() == PRIVATE_NOTE_PAYLOAD_V2_LEN {
+                decrypt_private_note_payload_v2(
+                    &output.encrypted_amount,
+                    amount_blind,
+                    &output.commitment,
+                    &tx.nullifier,
+                )?
+            } else {
+                let recipient_commitment = if output.recipient_commitment.is_empty() {
+                    payment_address
+                } else {
+                    output.recipient_commitment.as_str()
+                };
+                if output.commitment_blind.is_empty() {
+                    return Err(BlockError::TransactionValidationFailed(
+                        "Legacy private output is missing commitment blind".to_string(),
+                    ));
+                }
+                (
+                    decode_amount_from_payload(
+                        &output.encrypted_amount,
+                        &output.commitment_blind,
+                        recipient_commitment,
+                        &tx.nullifier,
+                    )?,
+                    output.commitment_blind.clone(),
+                )
+            };
+
+        let expected_commitment = Commitment::new_blinded(&amount.to_le_bytes(), &commitment_blind);
+        if !constant_time_eq_str(&expected_commitment.to_hex(), &output.commitment) {
+            return Err(BlockError::TransactionValidationFailed(
+                "Commitment mismatch while scanning private amount".to_string(),
+            ));
+        }
+
+        let expected_amount_commitment = amount_commitment_hex(amount, amount_blind);
+        if !output.amount_commitment.is_empty()
+            && !constant_time_eq_str(&expected_amount_commitment, &output.amount_commitment)
+        {
+            return Err(BlockError::TransactionValidationFailed(
+                "Amount commitment mismatch while scanning private amount".to_string(),
+            ));
+        }
+        if !output.range_proof.is_empty()
+            && !verify_output_range(&output.amount_commitment, &output.range_proof)?
+        {
+            return Err(BlockError::TransactionValidationFailed(
+                "Range proof mismatch while scanning private amount".to_string(),
+            ));
+        }
+
+        matches.push(PrivateViewScanMatch {
+            tx_hash: tx.tx_hash.clone(),
+            output_id: output.output_id.clone(),
+            output_index,
+            asset_tag: output.asset_tag.clone(),
+            amount,
+            commitment: output.commitment.clone(),
+            stealth_address: output.stealth_address.clone(),
+            one_time_public_key: output.one_time_public_key.clone(),
+            is_change: output.is_change,
+            timestamp: tx.timestamp,
+        });
+    }
+    Ok(matches)
+}
+
 /// Privacy-enabled wallet manager
 pub struct PrivateWalletManager {
     private_wallets: HashMap<String, PrivateWallet>,
@@ -5179,6 +5312,39 @@ mod tests {
             .decrypt_private_amount_for_wallet("alice", &tx)
             .expect("alice should decrypt change");
         assert_eq!(alice_change, 60);
+    }
+
+    #[test]
+    fn test_private_view_scan_matches_without_spend_private_key() {
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        let bob_address = manager.create_private_wallet("bob").unwrap();
+        let bob_scan_key = manager.get_private_wallet("bob").unwrap().scan_key.clone();
+        let alice_scan_key = manager
+            .get_private_wallet("alice")
+            .unwrap()
+            .scan_key
+            .clone();
+        manager.deposit_to_private_wallet("alice", 100).unwrap();
+
+        let tx_hash = manager
+            .send_private_transaction("alice", bob_address.clone(), 40)
+            .unwrap();
+        let tx = manager
+            .get_private_transaction(&tx_hash)
+            .expect("tx should exist");
+
+        let matches =
+            scan_private_transaction_with_view_key(&bob_scan_key, &bob_address, &tx).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].amount, 40);
+        assert_eq!(matches[0].tx_hash, tx_hash);
+
+        let wrong_key = scan_private_transaction_with_view_key(&alice_scan_key, &bob_address, &tx)
+            .expect_err("wrong scan key should not match bob address");
+        assert!(wrong_key
+            .to_string()
+            .contains("scan private key does not match"));
     }
 
     #[test]

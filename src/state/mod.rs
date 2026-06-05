@@ -521,6 +521,13 @@ impl StateManager {
             .map_err(|e| StateError::StorageError(e.to_string()))
     }
 
+    /// Return every locally archived private transaction body.
+    pub fn iterate_private_transactions(&self) -> Result<Vec<(String, Vec<u8>)>, StateError> {
+        self.storage
+            .iterate_private_transactions()
+            .map_err(|e| StateError::StorageError(e.to_string()))
+    }
+
     /// Persist the encrypted/canonical private transaction body by hash.
     pub fn save_private_transaction_bytes(
         &self,
