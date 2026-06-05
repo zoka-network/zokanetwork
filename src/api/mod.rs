@@ -57,6 +57,7 @@ const MINER_HEARTBEAT_TTL_SECS: u64 = 90;
 pub struct ApiSecurityConfig {
     pub api_token: Option<String>,
     pub rate_limit_per_minute: usize,
+    pub read_rate_limit_per_minute: usize,
     pub transaction_rate_limit_per_minute: usize,
     pub max_client_id_len: usize,
     pub max_request_body_bytes: usize,
@@ -109,6 +110,11 @@ impl Default for ApiSecurityConfig {
                 .and_then(|raw| raw.parse::<usize>().ok())
                 .filter(|value| *value > 0)
                 .unwrap_or(120),
+            read_rate_limit_per_minute: std::env::var("ZOKA_API_READ_RATE_LIMIT")
+                .ok()
+                .and_then(|raw| raw.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(1200),
             transaction_rate_limit_per_minute: std::env::var("ZOKA_API_TX_RATE_LIMIT")
                 .ok()
                 .and_then(|raw| raw.parse::<usize>().ok())
@@ -859,8 +865,26 @@ fn rate_limit_bucket(method: &str, path: &str) -> &'static str {
         || (!matches!(method, "GET" | "HEAD" | "OPTIONS") && path.starts_with("/private/tx"))
     {
         "transactions"
+    } else if matches!(method, "GET" | "HEAD")
+        && (path == "/chain/height"
+            || path == "/stats"
+            || path == "/network/runtime"
+            || path.starts_with("/blocks")
+            || path.starts_with("/mempool")
+            || path == "/private/pending"
+            || path.starts_with("/private/tx/"))
+    {
+        "public-read"
     } else {
         "default"
+    }
+}
+
+fn rate_limit_key(client_ip: &str, client_id: &str, bucket: &str) -> String {
+    if client_id == "anonymous" {
+        format!("ip:{client_ip}:{bucket}")
+    } else {
+        format!("client:{client_id}:ip:{client_ip}:{bucket}")
     }
 }
 
@@ -1864,10 +1888,12 @@ async fn auth_and_rate_limit(
     let bucket = rate_limit_bucket(&method, &path);
     let limit = if bucket == "transactions" {
         app_state.security.transaction_rate_limit_per_minute
+    } else if bucket == "public-read" {
+        app_state.security.read_rate_limit_per_minute
     } else {
         app_state.security.rate_limit_per_minute
     };
-    let key = format!("{}:{}", client_id, bucket);
+    let key = rate_limit_key(&client_ip, &client_id, bucket);
 
     let allowed = app_state.rate_limiter.allow_request(&key, limit).await;
     if !allowed {
@@ -5149,8 +5175,31 @@ mod tests {
             rate_limit_bucket("POST", "/private/wallet/send-from-seed"),
             "transactions"
         );
-        assert_eq!(rate_limit_bucket("GET", "/private/tx/hash"), "default");
-        assert_eq!(rate_limit_bucket("GET", "/chain/height"), "default");
+        assert_eq!(rate_limit_bucket("GET", "/private/tx/hash"), "public-read");
+        assert_eq!(rate_limit_bucket("GET", "/chain/height"), "public-read");
+        assert_eq!(rate_limit_bucket("GET", "/stats"), "public-read");
+        assert_eq!(rate_limit_bucket("GET", "/mempool/metrics"), "public-read");
+        assert_eq!(
+            rate_limit_bucket("GET", "/blocks/range/1/10"),
+            "public-read"
+        );
+        assert_eq!(rate_limit_bucket("GET", "/private/pending"), "public-read");
+    }
+
+    #[test]
+    fn test_rate_limit_key_separates_anonymous_clients_by_ip() {
+        assert_ne!(
+            rate_limit_key("203.0.113.10", "anonymous", "public-read"),
+            rate_limit_key("203.0.113.11", "anonymous", "public-read")
+        );
+        assert_eq!(
+            rate_limit_key("203.0.113.10", "anonymous", "public-read"),
+            "ip:203.0.113.10:public-read"
+        );
+        assert_eq!(
+            rate_limit_key("203.0.113.10", "explorer", "public-read"),
+            "client:explorer:ip:203.0.113.10:public-read"
+        );
     }
 
     #[test]
