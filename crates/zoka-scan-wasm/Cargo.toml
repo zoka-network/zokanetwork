@@ -1,0 +1,23 @@
+# Client-side (in-browser) private scan for the explorer. Mirrors the exact
+# crypto in src/private_wallet/mod.rs so the scan key NEVER leaves the browser:
+# the explorer fetches public encrypted data and matches/derives locally via
+# this WASM module. Standalone (not part of the main `zoka` package) so it can
+# target wasm32 without the node's heavy deps (rocksdb/libp2p/bellman).
+[package]
+name = "zoka-scan-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+curve25519-dalek = "4.1"
+sha2 = "0.10"
+hex = "0.4"
+
+[profile.release]
+opt-level = "s"
+lto = true
