@@ -7356,6 +7356,19 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     publish_failures = publish_failures.saturating_add(1);
                 }
             }
+            // Autopush: also POST each mined block to the configured public RPC
+            // endpoints (/sync/block). P2P gossip alone is unreliable for a
+            // NAT'd local miner, so this HTTP push delivers the block straight
+            // to the cloud nodes for efficient sync.
+            if !rpc_sync_endpoints.is_empty() {
+                for block in &batch.produced_blocks {
+                    if let Ok(body) = serde_json::to_value(block) {
+                        for rpc in &rpc_sync_endpoints {
+                            let _ = rpc_http_post_json(rpc, "/sync/block", &body, 5);
+                        }
+                    }
+                }
+            }
             last_event = if publish_failures == 0 {
                 format!(
                     "Auto-mined {} block(s), broadcast to peers, scheduled {} for maturity, next difficulty {} bits.",
