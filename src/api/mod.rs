@@ -70,6 +70,11 @@ pub struct ApiSecurityConfig {
     /// Transitional compatibility escape hatch. Keep disabled for public
     /// nodes: this endpoint decrypts wallet seed material in node memory.
     pub enable_remote_seed_endpoint: bool,
+    /// Enables POST /mining/start|stop|control so a local controller (e.g. the
+    /// ZSilent desktop app) can toggle the node's in-process miner at runtime
+    /// without restarting the node. OFF by default so public nodes can't be
+    /// toggled by anyone.
+    pub enable_mining_control_endpoint: bool,
     pub write_clients: Vec<String>,
     pub admin_clients: Vec<String>,
     pub ip_whitelist: Vec<String>, // Empty = allow all
@@ -190,6 +195,10 @@ impl Default for ApiSecurityConfig {
                 }
                 enabled
             },
+            enable_mining_control_endpoint: parse_bool_env(
+                "ZOKA_API_ENABLE_MINING_CONTROL",
+                false,
+            ),
             write_clients: parse_csv_env("ZOKA_API_WRITE_CLIENTS"),
             admin_clients: parse_csv_env("ZOKA_API_ADMIN_CLIENTS"),
             ip_whitelist,
@@ -4259,6 +4268,41 @@ pub async fn ws_status(
 /// Accepts the same Block JSON returned by `GET /blocks/:height/raw`.
 /// Uses the same code path as `zoka rpc-sync` (try_apply_synced_block_payload)
 /// so validation is identical to the normal block sync flow.
+#[derive(serde::Deserialize, Default)]
+struct MiningControlRequest {
+    threads: Option<u64>,
+}
+
+/// Start the node's in-process miner at runtime (no restart). Gated by
+/// ZOKA_API_ENABLE_MINING_CONTROL so only a local controller can toggle it.
+async fn post_mining_start(body: Option<Json<MiningControlRequest>>) -> Json<serde_json::Value> {
+    let threads = body.and_then(|b| b.0.threads).unwrap_or(0).max(1);
+    let snap = global_local_mining_control().enable(threads);
+    Json(serde_json::json!({
+        "enabled": snap.enabled,
+        "threads": snap.threads,
+        "updated_at": snap.updated_at,
+    }))
+}
+
+/// Stop the node's in-process miner at runtime (the node keeps running + synced).
+async fn post_mining_stop() -> Json<serde_json::Value> {
+    let snap = global_local_mining_control().disable();
+    Json(serde_json::json!({
+        "enabled": snap.enabled,
+        "updated_at": snap.updated_at,
+    }))
+}
+
+async fn get_mining_control() -> Json<serde_json::Value> {
+    let snap = global_local_mining_control().snapshot();
+    Json(serde_json::json!({
+        "enabled": snap.enabled,
+        "threads": snap.threads,
+        "updated_at": snap.updated_at,
+    }))
+}
+
 async fn post_block_submit(
     State(app_state): State<Arc<AppState>>,
     Json(block): Json<crate::types::Block>,
@@ -4401,6 +4445,12 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         router = router
             .route("/crypto/server-pubkey", get(get_server_pubkey))
             .route("/private/wallet/send-from-seed", post(send_from_seed));
+    }
+    if app_state.security.enable_mining_control_endpoint {
+        router = router
+            .route("/mining/start", post(post_mining_start))
+            .route("/mining/stop", post(post_mining_stop))
+            .route("/mining/control", get(get_mining_control));
     }
     router
         .layer(DefaultBodyLimit::max(
