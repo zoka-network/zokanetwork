@@ -2861,6 +2861,53 @@ async fn get_block_transactions(
 }
 
 /// Get blocks in a range
+/// Per-block private-coinbase metadata for a range, so a wallet owner can match
+/// their mining rewards CLIENT-SIDE: the recipient_commitment is the miner's
+/// `zpriv:` address (already public on-chain) and the amount is the public block
+/// reward. The explorer derives the user's address from their scan key locally
+/// and compares — the scan key never leaves the browser.
+async fn get_private_coinbases_range(
+    State(app_state): State<Arc<AppState>>,
+    Path((from, to)): Path<(u64, u64)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if from > to {
+        return Err((StatusCode::BAD_REQUEST, "Invalid range: from > to".to_string()));
+    }
+    if to - from > 1000 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Range too large: maximum 1000 blocks".to_string(),
+        ));
+    }
+    match app_state.state_manager.get_blocks_in_range(from, to).await {
+        Ok(blocks) => {
+            let coinbases: Vec<serde_json::Value> = blocks
+                .iter()
+                .filter_map(|b| {
+                    let cb = b.private_coinbase.as_ref()?;
+                    let amount = b.transactions.first().map(|tx| tx.amount).unwrap_or(0);
+                    Some(serde_json::json!({
+                        "height": b.header.block_height,
+                        "recipient_commitment": cb.recipient_commitment,
+                        "amount_atoms": amount,
+                        "unlock_height": cb.unlock_height,
+                    }))
+                })
+                .collect();
+            Ok(Json(serde_json::json!({
+                "from_height": from,
+                "to_height": to,
+                "coinbases_count": coinbases.len(),
+                "coinbases": coinbases,
+            })))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to read blocks: {e}"),
+        )),
+    }
+}
+
 async fn get_blocks_range(
     State(app_state): State<Arc<AppState>>,
     Path((from, to)): Path<(u64, u64)>,
@@ -4327,6 +4374,7 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         .route("/private/pending", get(get_pending_private_txs))
         .route("/private/tx/:hash", get(get_private_tx_by_hash))
         .route("/blocks/range/:from/:to", get(get_blocks_range))
+        .route("/private/coinbases/range/:from/:to", get(get_private_coinbases_range))
         .route("/blocks/range/:from/:to/raw", get(get_raw_blocks_range))
         .route("/transactions/:hash", get(get_transaction_by_hash))
         .route("/sync/block", post(post_block_submit))
