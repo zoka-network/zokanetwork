@@ -2965,6 +2965,45 @@ fn collect_private_tx_hashes_in_height_range(
     hashes
 }
 
+fn missing_private_tx_body_hashes(storage: &RocksDbStorage, hashes: &[String]) -> Vec<String> {
+    hashes
+        .iter()
+        .filter_map(|hash| {
+            let hash = hash.trim();
+            if !valid_private_tx_hash_format(hash) {
+                return None;
+            }
+            if storage
+                .get_private_transaction_bytes(hash)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                return None;
+            }
+            Some(hash.to_string())
+        })
+        .collect()
+}
+
+fn should_advance_private_body_scan(
+    has_rpc_endpoints: bool,
+    initial_backfill: bool,
+    missing_count: usize,
+    fetched: usize,
+) -> bool {
+    if missing_count == 0 {
+        return true;
+    }
+    if !has_rpc_endpoints {
+        return false;
+    }
+    if initial_backfill && missing_count > 0 && fetched == 0 {
+        return false;
+    }
+    true
+}
+
 /// Best-effort body backfill for already-committed private tx hashes. This is
 /// deliberately outside consensus: failures only leave the local archive as-is.
 fn pull_missing_committed_private_tx_bodies(
@@ -7405,7 +7444,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     if last_private_body_scan_height > tip {
                         last_private_body_scan_height = 0;
                     }
-                    let from_height = if last_private_body_scan_height == 0 {
+                    let initial_backfill = last_private_body_scan_height == 0;
+                    let from_height = if initial_backfill {
                         tip.saturating_sub(PRIVATE_TX_BODY_BACKFILL_WINDOW_BLOCKS)
                             .saturating_add(1)
                             .max(1)
@@ -7415,18 +7455,38 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     if from_height <= tip {
                         let hashes =
                             collect_private_tx_hashes_in_height_range(storage, from_height, tip);
+                        let missing_hashes = missing_private_tx_body_hashes(storage, &hashes);
                         let fetched = pull_missing_committed_private_tx_bodies(
                             storage,
                             &rpc_sync_endpoints,
-                            &hashes,
+                            &missing_hashes,
                         );
                         if fetched > 0 {
                             last_event = format!(
                                 "Backfilled {fetched} committed private tx body(s) from RPC peers ({from_height}..{tip})"
                             );
                         }
+                        if should_advance_private_body_scan(
+                            !rpc_sync_endpoints.is_empty(),
+                            initial_backfill,
+                            missing_hashes.len(),
+                            fetched,
+                        ) {
+                            last_private_body_scan_height = tip;
+                        } else if rpc_sync_endpoints.is_empty() && !missing_hashes.is_empty() {
+                            last_event = format!(
+                                "Private tx body backfill waiting for RPC endpoints ({from_height}..{tip}, {} missing)",
+                                missing_hashes.len()
+                            );
+                        } else if initial_backfill && !missing_hashes.is_empty() {
+                            last_event = format!(
+                                "Private tx body backfill will retry ({from_height}..{tip}, {} missing)",
+                                missing_hashes.len()
+                            );
+                        }
+                    } else {
+                        last_private_body_scan_height = tip;
                     }
-                    last_private_body_scan_height = tip;
                 }
             }
             next_private_body_pull_at = tokio::time::Instant::now()
@@ -12626,6 +12686,50 @@ mod tests {
         assert_eq!(
             collect_private_tx_hashes_in_height_range(&storage, 1, 2),
             vec!["aaaa".to_string(), "bbbb".to_string(), "cccc".to_string()]
+        );
+    }
+
+    #[test]
+    fn missing_private_tx_body_hashes_skips_present_and_invalid_entries() {
+        let (_tmp, db) = temp_db_arg();
+        let storage = RocksDbStorage::new(&db).expect("temp rocksdb");
+        storage
+            .save_private_transaction_bytes("aaaa", b"body-a")
+            .expect("save existing body");
+        let hashes = vec![
+            "aaaa".to_string(),
+            "bbbb".to_string(),
+            "invalid hash".to_string(),
+            "cccc".to_string(),
+        ];
+
+        assert_eq!(
+            missing_private_tx_body_hashes(&storage, &hashes),
+            vec!["bbbb".to_string(), "cccc".to_string()]
+        );
+    }
+
+    #[test]
+    fn private_body_scan_advance_policy_retries_sticky_initial_backfill() {
+        assert!(
+            should_advance_private_body_scan(false, true, 0, 0),
+            "complete windows can advance even without RPC peers"
+        );
+        assert!(
+            !should_advance_private_body_scan(false, true, 2, 0),
+            "missing bodies should not be marked scanned when no RPC peers are configured"
+        );
+        assert!(
+            !should_advance_private_body_scan(true, true, 2, 0),
+            "initial backfill with unresolved missing bodies should be retried"
+        );
+        assert!(
+            should_advance_private_body_scan(true, true, 2, 1),
+            "a productive initial backfill can advance"
+        );
+        assert!(
+            should_advance_private_body_scan(true, false, 2, 0),
+            "steady-state scans advance so they do not pin the live loop forever"
         );
     }
 
