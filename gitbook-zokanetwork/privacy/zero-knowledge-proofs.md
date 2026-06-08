@@ -20,3 +20,9 @@ Zero-knowledge proofs protect transaction data. They do not hide every network
 metadata signal. Timing, IP-level behavior, public RPC usage, and address reuse
 can still matter operationally.
 
+## Release Awareness
+
+Proof systems depend on the active circuit, verification keys, and activation
+rules for the release. Documentation and integrations should track the current
+release branch instead of assuming that every development profile is active on
+public nodes.

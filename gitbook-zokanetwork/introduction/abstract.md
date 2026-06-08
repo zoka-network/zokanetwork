@@ -14,3 +14,7 @@ The network is designed so that:
 ZOKA is not a centralized privacy service. Public RPC nodes provide chain data;
 they are not custodians and do not need wallet secrets.
 
+The practical model is local-first: wallet applications use local secret
+material to scan chain data and prepare private transfer flows. Public
+infrastructure exists to synchronize, validate, mine, and observe network state,
+not to hold or reveal user balances.

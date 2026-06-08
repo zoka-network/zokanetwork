@@ -22,3 +22,18 @@ Public network binaries should be built with RandomX enabled:
 ```sh
 cargo build --release --features randomx --bin zoka --bin zokahd
 ```
+
+In the current Rust package, RandomX is also part of the default feature set so
+a normal release build is intended to include the public PoW backend. The
+explicit `--features randomx` form remains useful for release verification and
+operator instructions.
+
+## Practical Notes
+
+RandomX mining is CPU and memory intensive by design. Operators should monitor
+system load, temperature, node sync state, and peer connectivity. A miner that
+is not synced to the public chain risks wasting work on a local view that other
+nodes will reject.
+
+ZSilent Core exposes mining controls from the desktop app, while the CLI flow
+remains available for servers and automation.

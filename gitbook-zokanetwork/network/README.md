@@ -13,3 +13,9 @@ privacy-safe explorer.
 | Public RPC | Provides read-only chain data and accepts locally built transaction payloads where enabled. |
 | Explorer | Shows public consensus data without revealing private wallet state. |
 
+## Public and Local Roles
+
+Public services help the network stay reachable, but they should not become
+custody services. Wallets own recovery, scanning, and spend authorization.
+Nodes own validation and chain state. Miners own block production. The explorer
+owns public visibility into consensus data.

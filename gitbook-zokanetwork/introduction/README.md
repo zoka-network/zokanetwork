@@ -17,3 +17,7 @@ only the data needed for consensus, synchronization, and verification.
 - **Open participation** for nodes and miners.
 - **Practical clients** across desktop and Android.
 
+ZOKA's public surfaces should explain what is verifiable without exposing what
+is personal. The explorer, website, and docs can show network status, blocks,
+mining, supply, and downloads, while wallets remain the place where private
+account history and recovery material live.

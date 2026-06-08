@@ -30,3 +30,6 @@ The chain must still expose consensus data:
 
 Use wallets for private history. Use the explorer for public chain state.
 
+If a website, explorer, support form, or chat asks for a recovery phrase, scan
+key, spend key, or wallet password, it is outside the safe public-data boundary.
+Those values belong in the wallet flow only.
