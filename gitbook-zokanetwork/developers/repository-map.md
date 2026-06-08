@@ -16,5 +16,6 @@ This GitBook source lives in the core repository under:
 gitbook-zokanetwork/
 ```
 
-GitBook can import that subdirectory from the `main` branch.
-
+GitBook can import that subdirectory from the release branch selected for the
+current documentation update. After review, the same source can be merged into
+`main`.
