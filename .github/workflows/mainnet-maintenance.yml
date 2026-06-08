@@ -104,6 +104,12 @@ jobs:
               ts="$(date -u +%Y%m%d-%H%M%S)"
               mkdir -p "/data/zoka/reset-backups/$ts"
               mv /data/zoka/blockchain.db "/data/zoka/reset-backups/$ts/" 2>/dev/null || true
+              mv /data/zoka/pending_private_queue "/data/zoka/reset-backups/$ts/" 2>/dev/null || true
+              mv /data/zoka/user_mining_state.json "/data/zoka/reset-backups/$ts/" 2>/dev/null || true
+              mv /data/zoka/mining_diagnostic.log "/data/zoka/reset-backups/$ts/" 2>/dev/null || true
+              mv /data/zoka/.zoka/mainnet/pending_private_queue "/data/zoka/reset-backups/$ts/pending_private_queue.zoka-home" 2>/dev/null || true
+              mv /data/zoka/.zoka/mainnet/user_mining_state.json "/data/zoka/reset-backups/$ts/user_mining_state.zoka-home.json" 2>/dev/null || true
+              mv /data/zoka/.zoka/mainnet/mining_diagnostic.log "/data/zoka/reset-backups/$ts/mining_diagnostic.zoka-home.log" 2>/dev/null || true
               rm -rf /data/zoka/blockchain.db-* /data/zoka/blockchain.db.* || true
               systemctl start "$SVC"
               sleep 10
