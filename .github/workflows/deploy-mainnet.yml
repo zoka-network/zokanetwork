@@ -103,6 +103,7 @@ jobs:
             --no-network-config \
             --db /data/zoka/blockchain.db \
             --listen /ip4/0.0.0.0/tcp/28080 \
+            --no-mine \
             --mine-interval-secs 30 \
             --mine-blocks 1 \
             --min-mine-peers 0 \
@@ -114,6 +115,9 @@ jobs:
           Environment=ZOKA_HOME=/data/zoka
           Environment=ZOKA_TRUSTED_SETUP_DIR=/opt/zoka/trusted-setup
           Environment=ZOKA_API_BIND=0.0.0.0:3000
+          Environment=ZOKA_API_RATE_LIMIT=20000
+          Environment=ZOKA_API_READ_RATE_LIMIT=20000
+          Environment=ZOKA_API_TX_RATE_LIMIT=20000
           Environment=ZOKA_MINER_ADDRESS=zka1a6n1R8noF6T5vR4YGGv8ibUKpUESu8y5ESdb8BUNx6wGengyZ9mXGJA7u9dpwUh5rxk3gSFXEhBZacXgHUNjb5ET3cJn9
           Environment=ZOKA_NODE_PASSWORD=${{ secrets.ZOKA_NODE_PASSWORD }}
           Restart=on-failure
