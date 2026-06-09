@@ -19,6 +19,17 @@
       "role": "seed",
       "status": "active",
       "note": "Primary bootstrap - peer discovery entry point for new nodes"
+    },
+    {
+      "label": "do-nyc-rpc-1",
+      "operator": "zoka-core",
+      "region": "nyc",
+      "multiaddr": "/ip4/157.230.5.103/tcp/28080",
+      "onion": null,
+      "i2p": null,
+      "role": "seed",
+      "status": "active",
+      "note": "Secondary bootstrap - fallback peer discovery if primary is unreachable"
     }
   ],
   "public_rpc": [
@@ -39,7 +50,7 @@
       "url": "http://157.230.5.103:3000",
       "onion": null,
       "i2p": null,
-      "status": "fallback",
+      "status": "active",
       "logging_policy": "no-wallet-secrets-no-private-keys"
     }
   ],
