@@ -7404,16 +7404,22 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 tokio::time::Instant::now() + Duration::from_secs(reconnect_delay_secs);
         }
 
-        if !mining_active && tokio::time::Instant::now() >= next_sync_state_at {
+        if tokio::time::Instant::now() >= next_sync_state_at {
+            // Always broadcast local height so peers behind us can discover
+            // they need to catch up — even while this node is actively mining.
             if let Some(sync_event) = publish_local_sync_state(&mut node, db_path.as_deref())? {
                 last_event = sync_event;
             }
-            if let Some(rebroadcast_event) = publish_recent_chain_blocks(
-                &mut node,
-                db_path.as_deref(),
-                sync_rebroadcast_recent_blocks,
-            )? {
-                last_event = rebroadcast_event;
+            // Block rebroadcast is skipped during mining to avoid flooding
+            // the network with redundant payloads the miner just produced.
+            if !mining_active {
+                if let Some(rebroadcast_event) = publish_recent_chain_blocks(
+                    &mut node,
+                    db_path.as_deref(),
+                    sync_rebroadcast_recent_blocks,
+                )? {
+                    last_event = rebroadcast_event;
+                }
             }
             next_sync_state_at = tokio::time::Instant::now() + Duration::from_secs(3);
         }
