@@ -16,6 +16,7 @@ on:
 env:
   BOOTSTRAP_IP: "159.223.119.216"
   RPC_IP: "157.230.5.103"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
