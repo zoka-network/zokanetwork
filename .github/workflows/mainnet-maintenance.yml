@@ -1,0 +1,131 @@
+name: Mainnet Maintenance
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Node target'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - bootstrap
+          - rpc
+      action:
+        description: 'Maintenance action'
+        required: true
+        default: 'diagnostics'
+        type: choice
+        options:
+          - diagnostics
+          - restart
+          - sync-rpc
+          - reset-db
+      confirm:
+        description: 'Type RESET only for reset-db'
+        required: false
+        default: ''
+
+env:
+  BOOTSTRAP_IP: "159.223.119.216"
+  RPC_IP: "157.230.5.103"
+
+jobs:
+  maintenance:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DO_SSH_PRIVATE_KEY }}" > ~/.ssh/zoka_do
+          chmod 600 ~/.ssh/zoka_do
+
+      - name: Run maintenance
+        run: |
+          set -euo pipefail
+
+          run_node() {
+            local name="$1"
+            local ip="$2"
+            local svc="$3"
+            ssh-keyscan -H "$ip" >> ~/.ssh/known_hosts
+            ssh -i ~/.ssh/zoka_do root@"$ip" \
+              "NODE_NAME='$name' ACTION='${{ inputs.action }}' CONFIRM='${{ inputs.confirm }}' SVC='$svc' BOOT_RPC='http://${{ env.BOOTSTRAP_IP }}:3000' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          echo "=== $NODE_NAME :: action=$ACTION service=$SVC ==="
+          date -u
+          hostname
+          systemctl --no-pager status "$SVC" | head -20 || true
+          echo "--- unit ---"
+          sed -n '1,120p' "/etc/systemd/system/$SVC.service" || true
+          echo "--- binary ---"
+          sha256sum /usr/local/bin/zoka 2>/dev/null || true
+          /usr/local/bin/zoka mine-status --network mainnet --db /data/zoka/blockchain.db --json 2>/dev/null || true
+          echo "--- local api ---"
+          curl -fsS http://127.0.0.1:3000/health || true; echo
+          curl -fsS http://127.0.0.1:3000/chain/height || true; echo
+          curl -fsS http://127.0.0.1:3000/blocks/latest || true; echo
+          echo "--- journal tail ---"
+          journalctl -u "$SVC" -n 120 --no-pager || true
+
+          case "$ACTION" in
+            diagnostics)
+              ;;
+            restart)
+              systemctl restart "$SVC"
+              sleep 10
+              curl -fsS http://127.0.0.1:3000/chain/height || true; echo
+              ;;
+            sync-rpc)
+              if [ "$SVC" != "zoka-rpc" ]; then
+                echo "sync-rpc only applies to zoka-rpc; skipping $SVC"
+                exit 0
+              fi
+              systemctl stop "$SVC" || true
+              /usr/local/bin/zoka rpc-sync \
+                --network mainnet \
+                --rpc "$BOOT_RPC" \
+                --db /data/zoka/blockchain.db \
+                --limit 512 \
+                --json || true
+              systemctl start "$SVC"
+              sleep 10
+              curl -fsS http://127.0.0.1:3000/chain/height || true; echo
+              curl -fsS http://127.0.0.1:3000/blocks/latest || true; echo
+              ;;
+            reset-db)
+              if [ "$CONFIRM" != "RESET" ]; then
+                echo "reset-db requires confirm=RESET"
+                exit 2
+              fi
+              systemctl stop "$SVC" || true
+              ts="$(date -u +%Y%m%d-%H%M%S)"
+              mkdir -p "/data/zoka/reset-backups/$ts"
+              mv /data/zoka/blockchain.db "/data/zoka/reset-backups/$ts/" 2>/dev/null || true
+              mv /data/zoka/pending_private_queue "/data/zoka/reset-backups/$ts/" 2>/dev/null || true
+              mv /data/zoka/user_mining_state.json "/data/zoka/reset-backups/$ts/" 2>/dev/null || true
+              mv /data/zoka/mining_diagnostic.log "/data/zoka/reset-backups/$ts/" 2>/dev/null || true
+              mv /data/zoka/.zoka/mainnet/pending_private_queue "/data/zoka/reset-backups/$ts/pending_private_queue.zoka-home" 2>/dev/null || true
+              mv /data/zoka/.zoka/mainnet/user_mining_state.json "/data/zoka/reset-backups/$ts/user_mining_state.zoka-home.json" 2>/dev/null || true
+              mv /data/zoka/.zoka/mainnet/mining_diagnostic.log "/data/zoka/reset-backups/$ts/mining_diagnostic.zoka-home.log" 2>/dev/null || true
+              rm -rf /data/zoka/blockchain.db-* /data/zoka/blockchain.db.* || true
+              systemctl start "$SVC"
+              sleep 10
+              curl -fsS http://127.0.0.1:3000/chain/height || true; echo
+              ;;
+            *)
+              echo "unknown action: $ACTION"
+              exit 2
+              ;;
+          esac
+          REMOTE
+          }
+
+          if [ "${{ inputs.target }}" = "both" ] || [ "${{ inputs.target }}" = "bootstrap" ]; then
+            run_node bootstrap "${{ env.BOOTSTRAP_IP }}" zoka-bootstrap
+          fi
+          if [ "${{ inputs.target }}" = "both" ] || [ "${{ inputs.target }}" = "rpc" ]; then
+            run_node rpc "${{ env.RPC_IP }}" zoka-rpc
+          fi
