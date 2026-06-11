@@ -10,8 +10,8 @@ use crate::transaction::commitment::Commitment;
 use crate::transaction::nullifier::{Nullifier, NullifierSet};
 use crate::types::BlockError;
 use crate::zk::groth16_backend::{
-    PRIVATE_TX_MAX_INPUTS, PRIVATE_TX_MERKLE_MAX_DEPTH, PRIVATE_TX_MERKLE_PROVEN_INPUTS,
-    PRIVATE_TX_ROOT_WORDS,
+    PRIVATE_TX_CIRCUIT, PRIVATE_TX_MAX_INPUTS, PRIVATE_TX_MERKLE_MAX_DEPTH,
+    PRIVATE_TX_MERKLE_PROVEN_INPUTS, PRIVATE_TX_ROOT_WORDS, PRIVATE_TX_V2_I1_LAB_CIRCUIT,
 };
 use crate::zk::prover::Prover;
 use crate::zk::range_proofs::{
@@ -103,7 +103,10 @@ fn pad_u64s(values: &[u64], width: usize) -> Result<Vec<u64>, BlockError> {
     Ok(padded)
 }
 
-fn proof_public_inputs_for_tx(tx: &PrivateTransaction) -> Result<Vec<Vec<u8>>, BlockError> {
+fn proof_public_inputs_for_tx_with_profile(
+    tx: &PrivateTransaction,
+    profile: PrivateProofProfileSpec,
+) -> Result<Vec<Vec<u8>>, BlockError> {
     if tx.proof_commitment == 0 && tx.proof_nullifier == 0 {
         return Ok(vec![]);
     }
@@ -113,19 +116,16 @@ fn proof_public_inputs_for_tx(tx: &PrivateTransaction) -> Result<Vec<Vec<u8>>, B
             .iter()
             .map(|image| first_u64_from_hex(image))
             .collect::<Vec<_>>(),
-        PRIVATE_TX_MAX_INPUTS,
+        profile.max_inputs,
     )?;
 
     let mut words = vec![tx.proof_commitment, tx.proof_nullifier];
     words.extend_from_slice(&padded_key_images);
-    let active_proven_inputs = tx
-        .input_commitments
-        .len()
-        .min(PRIVATE_TX_MERKLE_PROVEN_INPUTS);
-    let mut proven_flags = vec![0u64; PRIVATE_TX_MERKLE_PROVEN_INPUTS];
+    let active_proven_inputs = tx.input_commitments.len().min(profile.merkle_proven_inputs);
+    let mut proven_flags = vec![0u64; profile.merkle_proven_inputs];
     let mut proven_commitment_words =
-        Vec::with_capacity(PRIVATE_TX_MERKLE_PROVEN_INPUTS * PRIVATE_TX_ROOT_WORDS);
-    for proven_idx in 0..PRIVATE_TX_MERKLE_PROVEN_INPUTS {
+        Vec::with_capacity(profile.merkle_proven_inputs * PRIVATE_TX_ROOT_WORDS);
+    for proven_idx in 0..profile.merkle_proven_inputs {
         if proven_idx < active_proven_inputs {
             proven_flags[proven_idx] = 1;
             proven_commitment_words.extend_from_slice(&private_tree_commitment_words(
@@ -248,6 +248,16 @@ pub fn derive_spending_key_from_recovery_seed(seed_entropy: &[u8]) -> Vec<u8> {
     hasher.update([0x1f]);
     hasher.update(seed_entropy);
     hasher.finalize().to_vec()
+}
+
+pub fn payment_address_from_scan_key(scan_key: &[u8]) -> Result<String, BlockError> {
+    if scan_key.len() != 16 && scan_key.len() != 32 {
+        return Err(BlockError::TransactionValidationFailed(
+            "scan private key must be 16 or 32 bytes".to_string(),
+        ));
+    }
+    let spending_key = derive_spending_key_from_recovery_seed(scan_key);
+    Ok(payment_address_from_keys(scan_key, &spending_key))
 }
 
 fn parse_payment_address(payment_address: &str) -> Option<(RistrettoPoint, RistrettoPoint)> {
@@ -992,6 +1002,20 @@ pub struct PrivateFeeClaimOutcome {
     pub skipped_tx_hashes: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PrivateViewScanMatch {
+    pub tx_hash: String,
+    pub output_id: String,
+    pub output_index: usize,
+    pub asset_tag: String,
+    pub amount: u64,
+    pub commitment: String,
+    pub stealth_address: String,
+    pub one_time_public_key: String,
+    pub is_change: bool,
+    pub timestamp: u64,
+}
+
 fn legacy_output_from_tx(tx: &PrivateTransaction) -> Option<PrivateOutput> {
     if tx.commitment.is_empty() {
         return None;
@@ -1032,6 +1056,51 @@ fn tx_outputs(tx: &PrivateTransaction) -> Vec<PrivateOutput> {
     }
 }
 
+fn expected_private_tx_hash(tx: &PrivateTransaction) -> String {
+    let body_hash = private_tx_hash(
+        &tx.input_nullifiers,
+        &tx.input_commitments,
+        &tx.input_asset_tags,
+        &tx.private_commitment_root,
+        &tx.input_public_keys,
+        &tx.input_key_images,
+        &tx.input_amount_commitments,
+        &tx.amount_balance_commitment,
+        &tx.fee_asset_tag,
+        &tx.asset_balance_commitments,
+        &tx.fee_commitment,
+        &tx_outputs(tx),
+    );
+    private_tx_hash_for_profile(
+        tx.private_proof_version,
+        &tx.private_proof_profile,
+        &body_hash,
+    )
+}
+
+fn private_tx_hash_for_profile(
+    private_proof_version: u8,
+    private_proof_profile: &str,
+    body_hash: &str,
+) -> String {
+    if private_proof_version == PRIVATE_PROOF_VERSION_V1
+        && private_proof_profile == PRIVATE_PROOF_PROFILE_V1
+    {
+        return body_hash.to_string();
+    }
+
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"zoka-private-tx-profile-v1");
+    hasher.update([0x1f]);
+    hasher.update([private_proof_version]);
+    hasher.update([0x1f]);
+    hasher.update(private_proof_profile.as_bytes());
+    hasher.update([0x1f]);
+    hasher.update(body_hash.as_bytes());
+    hex::encode(&hasher.finalize()[..16])
+}
+
 fn tx_input_nullifiers(tx: &PrivateTransaction) -> Vec<String> {
     if tx.input_nullifiers.is_empty() {
         if tx.nullifier.is_empty() {
@@ -1063,6 +1132,110 @@ fn default_asset_tag() -> String {
     "ZOKA".to_string()
 }
 
+pub const PRIVATE_PROOF_VERSION_V1: u8 = 1;
+pub const PRIVATE_PROOF_PROFILE_V1: &str = PRIVATE_TX_CIRCUIT;
+pub const PRIVATE_PROOF_VERSION_V2: u8 = 2;
+pub const PRIVATE_PROOF_PROFILE_V2_I1: &str = PRIVATE_TX_V2_I1_LAB_CIRCUIT;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrivateProofProfileSpec {
+    pub version: u8,
+    pub profile: &'static str,
+    pub circuit: &'static str,
+    pub max_inputs: usize,
+    pub merkle_proven_inputs: usize,
+}
+
+pub const PRIVATE_PROOF_SPEC_V1: PrivateProofProfileSpec = PrivateProofProfileSpec {
+    version: PRIVATE_PROOF_VERSION_V1,
+    profile: PRIVATE_PROOF_PROFILE_V1,
+    circuit: PRIVATE_TX_CIRCUIT,
+    max_inputs: PRIVATE_TX_MAX_INPUTS,
+    merkle_proven_inputs: PRIVATE_TX_MERKLE_PROVEN_INPUTS,
+};
+
+pub const PRIVATE_PROOF_SPEC_V2_I1: PrivateProofProfileSpec = PrivateProofProfileSpec {
+    version: PRIVATE_PROOF_VERSION_V2,
+    profile: PRIVATE_PROOF_PROFILE_V2_I1,
+    circuit: PRIVATE_TX_V2_I1_LAB_CIRCUIT,
+    max_inputs: 1,
+    merkle_proven_inputs: 1,
+};
+
+fn default_private_proof_version() -> u8 {
+    PRIVATE_PROOF_VERSION_V1
+}
+
+fn default_private_proof_profile() -> String {
+    PRIVATE_PROOF_PROFILE_V1.to_string()
+}
+
+pub fn private_proof_profile_spec(
+    private_proof_version: u8,
+    private_proof_profile: &str,
+) -> Result<PrivateProofProfileSpec, BlockError> {
+    match (private_proof_version, private_proof_profile) {
+        (PRIVATE_PROOF_VERSION_V1, PRIVATE_PROOF_PROFILE_V1) => Ok(PRIVATE_PROOF_SPEC_V1),
+        (PRIVATE_PROOF_VERSION_V2, PRIVATE_PROOF_PROFILE_V2_I1) => Ok(PRIVATE_PROOF_SPEC_V2_I1),
+        _ => Err(BlockError::TransactionValidationFailed(format!(
+            "Unsupported private proof profile: version {}, profile {}",
+            private_proof_version, private_proof_profile
+        ))),
+    }
+}
+
+pub fn private_proof_profile_spec_for_relay(
+    private_proof_version: u8,
+    private_proof_profile: &str,
+    v2_i1_activation_height: Option<u64>,
+    canonical_bundle_activation_height: Option<u64>,
+) -> Result<PrivateProofProfileSpec, BlockError> {
+    let profile = private_proof_profile_spec(private_proof_version, private_proof_profile)?;
+    if profile == PRIVATE_PROOF_SPEC_V2_I1
+        && (v2_i1_activation_height.is_none() || canonical_bundle_activation_height.is_none())
+    {
+        return Err(BlockError::TransactionValidationFailed(
+            "Private proof profile private_tx_v2_i1 is dormant".to_string(),
+        ));
+    }
+    Ok(profile)
+}
+
+pub fn private_proof_profile_spec_at(
+    private_proof_version: u8,
+    private_proof_profile: &str,
+    height: u64,
+    v2_i1_activation_height: Option<u64>,
+    canonical_bundle_activation_height: Option<u64>,
+) -> Result<PrivateProofProfileSpec, BlockError> {
+    let profile = private_proof_profile_spec(private_proof_version, private_proof_profile)?;
+    if profile == PRIVATE_PROOF_SPEC_V2_I1
+        && !crate::economics::private_tx_v2_i1_active_at(
+            height,
+            v2_i1_activation_height,
+            canonical_bundle_activation_height,
+        )
+    {
+        return Err(BlockError::TransactionValidationFailed(format!(
+            "Private proof profile private_tx_v2_i1 is not active at height {} \
+             (v2i1_act={:?}, canonical_act={:?})",
+            height, v2_i1_activation_height, canonical_bundle_activation_height
+        )));
+    }
+    Ok(profile)
+}
+
+fn private_proof_profile_spec_for_tx(
+    tx: &PrivateTransaction,
+) -> Result<PrivateProofProfileSpec, BlockError> {
+    private_proof_profile_spec_for_relay(
+        tx.private_proof_version,
+        &tx.private_proof_profile,
+        crate::economics::private_tx_v2_i1_activation_height(),
+        crate::economics::private_tx_canonical_bundle_activation_height(),
+    )
+}
+
 fn asset_tag_commitment_hex(asset_tag: &str) -> String {
     point_to_hex(&hash_to_point(&[
         b"zoka-asset-tag-commitment",
@@ -1075,6 +1248,10 @@ fn asset_tag_commitment_hex(asset_tag: &str) -> String {
 pub struct PrivateTransaction {
     pub tx_hash: String,
     pub commitment: String, // Pedersen commitment of amount
+    #[serde(default = "default_private_proof_version")]
+    pub private_proof_version: u8,
+    #[serde(default = "default_private_proof_profile")]
+    pub private_proof_profile: String,
     #[serde(default)]
     pub recipient_commitment: String, // Receiver commitment identifier
     #[serde(default)]
@@ -1193,6 +1370,7 @@ pub struct PrivateTransactionBuilder {
     input_inclusion_proofs: Vec<PrivateCommitmentInclusionProof>,
     input_secret_keys: Vec<Scalar>,
     input_amount_blinds: Vec<Scalar>,
+    proof_profile: PrivateProofProfileSpec,
     prover: Prover,
     nullifier_set: Arc<Mutex<NullifierSet>>,
 }
@@ -1415,7 +1593,8 @@ impl PrivateTransactionBuilder {
             input_inclusion_proofs: Vec::new(),
             input_secret_keys: Vec::new(),
             input_amount_blinds: Vec::new(),
-            prover: Prover::new("private_tx".to_string()),
+            proof_profile: PRIVATE_PROOF_SPEC_V1,
+            prover: Prover::new(PRIVATE_PROOF_PROFILE_V1.to_string()),
             nullifier_set,
         }
     }
@@ -1470,6 +1649,12 @@ impl PrivateTransactionBuilder {
         self
     }
 
+    pub fn with_private_proof_profile(mut self, proof_profile: PrivateProofProfileSpec) -> Self {
+        self.prover = Prover::new(proof_profile.circuit.to_string());
+        self.proof_profile = proof_profile;
+        self
+    }
+
     pub fn with_private_commitment_root(mut self, private_commitment_root: String) -> Self {
         self.private_commitment_root = private_commitment_root;
         self
@@ -1512,6 +1697,7 @@ impl PrivateTransactionBuilder {
     pub fn build(self) -> Result<PrivateTransaction, BlockError> {
         use rand::RngCore;
 
+        let proof_profile = self.proof_profile;
         let recipient_commitment = self.recipient_commitment.ok_or_else(|| {
             BlockError::TransactionValidationFailed("Recipient commitment required".to_string())
         })?;
@@ -1624,10 +1810,10 @@ impl PrivateTransactionBuilder {
                 "private input amount blinds/amounts cardinality mismatch".to_string(),
             ));
         }
-        if input_amounts.len() > PRIVATE_TX_MAX_INPUTS {
+        if input_amounts.len() > proof_profile.max_inputs {
             return Err(BlockError::TransactionValidationFailed(format!(
                 "private transaction exceeds Groth16 input bound ({})",
-                PRIVATE_TX_MAX_INPUTS
+                proof_profile.max_inputs
             )));
         }
         if input_asset_tags.iter().any(|tag| *tag == 0) {
@@ -1772,21 +1958,23 @@ impl PrivateTransactionBuilder {
             .first()
             .map(|image| first_u64_from_hex(image))
             .unwrap_or(0);
-        let proven_input_count = input_commitments.len().min(PRIVATE_TX_MERKLE_PROVEN_INPUTS);
+        let proven_input_count = input_commitments
+            .len()
+            .min(proof_profile.merkle_proven_inputs);
         let proof_private_root_words =
             fixed_u64_words_from_hex(&private_commitment_root, PRIVATE_TX_ROOT_WORDS);
-        let mut proven_input_flags = vec![0u64; PRIVATE_TX_MERKLE_PROVEN_INPUTS];
+        let mut proven_input_flags = vec![0u64; proof_profile.merkle_proven_inputs];
         let mut proven_commitment_words =
-            Vec::with_capacity(PRIVATE_TX_MERKLE_PROVEN_INPUTS * PRIVATE_TX_ROOT_WORDS);
-        let padded_input_amounts = pad_u64s(&input_amounts, PRIVATE_TX_MAX_INPUTS)?;
+            Vec::with_capacity(proof_profile.merkle_proven_inputs * PRIVATE_TX_ROOT_WORDS);
+        let padded_input_amounts = pad_u64s(&input_amounts, proof_profile.max_inputs)?;
         let padded_input_key_images = pad_u64s(
             &input_key_images
                 .iter()
                 .map(|image| first_u64_from_hex(image))
                 .collect::<Vec<_>>(),
-            PRIVATE_TX_MAX_INPUTS,
+            proof_profile.max_inputs,
         )?;
-        let padded_input_asset_tags = pad_u64s(&input_asset_tags, PRIVATE_TX_MAX_INPUTS)?;
+        let padded_input_asset_tags = pad_u64s(&input_asset_tags, proof_profile.max_inputs)?;
         let input_asset_tag = *input_asset_tags.first().ok_or_else(|| {
             BlockError::TransactionValidationFailed(
                 "private transaction requires at least one input asset tag".to_string(),
@@ -1794,11 +1982,13 @@ impl PrivateTransactionBuilder {
         })?;
         let output_asset_tag = input_asset_tag;
         let mut proven_path_sibling_words = Vec::with_capacity(
-            PRIVATE_TX_MERKLE_PROVEN_INPUTS * PRIVATE_TX_MERKLE_MAX_DEPTH * PRIVATE_TX_ROOT_WORDS,
+            proof_profile.merkle_proven_inputs
+                * PRIVATE_TX_MERKLE_MAX_DEPTH
+                * PRIVATE_TX_ROOT_WORDS,
         );
         let mut proven_path_directions =
-            Vec::with_capacity(PRIVATE_TX_MERKLE_PROVEN_INPUTS * PRIVATE_TX_MERKLE_MAX_DEPTH);
-        for proven_idx in 0..PRIVATE_TX_MERKLE_PROVEN_INPUTS {
+            Vec::with_capacity(proof_profile.merkle_proven_inputs * PRIVATE_TX_MERKLE_MAX_DEPTH);
+        for proven_idx in 0..proof_profile.merkle_proven_inputs {
             if proven_idx < proven_input_count {
                 let proof = input_inclusion_proofs.get(proven_idx).ok_or_else(|| {
                     BlockError::TransactionValidationFailed(format!(
@@ -1963,7 +2153,7 @@ impl PrivateTransactionBuilder {
             balance_commitment: amount_balance_commitment.clone(),
         }];
 
-        let tx_hash = private_tx_hash(
+        let body_hash = private_tx_hash(
             &input_nullifiers,
             &input_commitments,
             &input_asset_tag_labels,
@@ -1977,6 +2167,8 @@ impl PrivateTransactionBuilder {
             &fee_commitment,
             &outputs,
         );
+        let tx_hash =
+            private_tx_hash_for_profile(proof_profile.version, proof_profile.profile, &body_hash);
         for (ordinal, output) in outputs.iter_mut().enumerate() {
             output.output_id = derive_output_id(
                 &tx_hash,
@@ -2074,6 +2266,8 @@ impl PrivateTransactionBuilder {
         Ok(PrivateTransaction {
             tx_hash,
             commitment: commitment_hex,
+            private_proof_version: proof_profile.version,
+            private_proof_profile: proof_profile.profile.to_string(),
             recipient_commitment: String::new(),
             stealth_address,
             ephemeral_pubkey,
@@ -2176,7 +2370,24 @@ impl PrivateTransactionPool {
         &mut self,
         tx: PrivateTransaction,
     ) -> Result<String, BlockError> {
+        let proof_profile = private_proof_profile_spec_for_tx(&tx)?;
+        self.submit_private_transaction_with_profile(tx, proof_profile)
+    }
+
+    fn submit_private_transaction_with_profile(
+        &mut self,
+        tx: PrivateTransaction,
+        proof_profile: PrivateProofProfileSpec,
+    ) -> Result<String, BlockError> {
         let tx_hash = tx.tx_hash.clone();
+        let declared_profile =
+            private_proof_profile_spec(tx.private_proof_version, &tx.private_proof_profile)?;
+        if declared_profile != proof_profile {
+            return Err(BlockError::TransactionValidationFailed(
+                "Private transaction proof profile does not match authorized profile".to_string(),
+            ));
+        }
+        let proof_circuit = proof_profile.circuit;
 
         // Reject immediately if any input nullifier is already spent.
         {
@@ -2198,10 +2409,10 @@ impl PrivateTransactionPool {
         // Verify ZK proof if present
         if let Some(proof_bytes) = &tx.zk_proof {
             let verifier = Verifier::new();
-            let public_inputs = proof_public_inputs_for_tx(&tx)?;
+            let public_inputs = proof_public_inputs_for_tx_with_profile(&tx, proof_profile)?;
             let temp_proof = crate::zk::prover::ZKProof::new(
                 proof_bytes.clone(),
-                "private_tx".to_string(),
+                proof_circuit.to_string(),
                 public_inputs,
                 current_timestamp(),
             );
@@ -2513,7 +2724,11 @@ impl PrivateWallet {
         });
     }
 
-    fn select_spendable_note_indices(&self, amount: u64) -> Result<Vec<usize>, BlockError> {
+    fn select_spendable_note_indices_with_bound(
+        &self,
+        amount: u64,
+        max_inputs: usize,
+    ) -> Result<Vec<usize>, BlockError> {
         let mut candidates = self
             .private_notes
             .iter()
@@ -2534,12 +2749,12 @@ impl PrivateWallet {
 
         let max_single_tx_total = candidates
             .iter()
-            .take(PRIVATE_TX_MAX_INPUTS)
+            .take(max_inputs)
             .fold(0u64, |total, (_, amount)| total.saturating_add(*amount));
         if max_single_tx_total < amount {
             return Err(BlockError::TransactionValidationFailed(format!(
                 "amount requires more than {} private inputs. Max spendable in one transaction right now is {} ZKA; send a smaller amount or split it into multiple transfers.",
-                PRIVATE_TX_MAX_INPUTS,
+                max_inputs,
                 crate::economics::format_zka_amount(max_single_tx_total)
             )));
         }
@@ -2560,8 +2775,17 @@ impl PrivateWallet {
         &mut self,
         total_required: u64,
     ) -> Result<(Vec<usize>, Vec<PrivateNote>), BlockError> {
+        self.prepare_selected_notes_with_bound(total_required, PRIVATE_TX_MAX_INPUTS)
+    }
+
+    fn prepare_selected_notes_with_bound(
+        &mut self,
+        total_required: u64,
+        max_inputs: usize,
+    ) -> Result<(Vec<usize>, Vec<PrivateNote>), BlockError> {
         self.materialize_legacy_balance_note();
-        let selected_note_indices = self.select_spendable_note_indices(total_required)?;
+        let selected_note_indices =
+            self.select_spendable_note_indices_with_bound(total_required, max_inputs)?;
         let selected_notes = selected_note_indices
             .iter()
             .map(|idx| self.private_notes[*idx].clone())
@@ -2604,16 +2828,41 @@ impl PrivateWallet {
         input_inclusion_proofs: Vec<PrivateCommitmentInclusionProof>,
         ring_backend: RingSignatureBackend,
     ) -> Result<PrivateTransaction, BlockError> {
+        self.create_private_transaction_with_profile(
+            amount,
+            fee,
+            recipient_commitment,
+            nullifier_set,
+            ring_members,
+            private_commitment_root,
+            input_inclusion_proofs,
+            ring_backend,
+            PRIVATE_PROOF_SPEC_V1,
+        )
+    }
+
+    fn create_private_transaction_with_profile(
+        &mut self,
+        amount: u64,
+        fee: u64,
+        recipient_commitment: String,
+        nullifier_set: Arc<Mutex<NullifierSet>>,
+        ring_members: Vec<String>,
+        private_commitment_root: String,
+        input_inclusion_proofs: Vec<PrivateCommitmentInclusionProof>,
+        ring_backend: RingSignatureBackend,
+        proof_profile: PrivateProofProfileSpec,
+    ) -> Result<PrivateTransaction, BlockError> {
         let total_required = amount.checked_add(fee).ok_or_else(|| {
             BlockError::TransactionValidationFailed("private amount + fee overflow".to_string())
         })?;
         let (selected_note_indices, selected_notes) =
-            self.prepare_selected_notes(total_required)?;
-        if selected_notes.len() > PRIVATE_TX_MAX_INPUTS {
+            self.prepare_selected_notes_with_bound(total_required, proof_profile.max_inputs)?;
+        if selected_notes.len() > proof_profile.max_inputs {
             return Err(BlockError::TransactionValidationFailed(format!(
                 "private transaction selected {} inputs, exceeding Groth16 bound {}",
                 selected_notes.len(),
-                PRIVATE_TX_MAX_INPUTS
+                proof_profile.max_inputs
             )));
         }
         let total_input = selected_notes.iter().map(|note| note.amount).sum::<u64>();
@@ -2728,6 +2977,7 @@ impl PrivateWallet {
                 .with_input_secret_keys(input_secret_scalars)
                 .with_input_amount_blinds(input_amount_blinds)
                 .with_ring_backend(ring_backend)
+                .with_private_proof_profile(proof_profile)
                 .with_fee(fee);
         if change_amount > 0 {
             builder = builder.with_change_output(self.commitment_key.clone(), change_amount);
@@ -2907,6 +3157,125 @@ fn decrypt_private_output_for_wallet(
     local_output.recipient_commitment = wallet.commitment_key.clone();
     local_output.commitment_blind = commitment_blind;
     Ok(Some((local_output, amount)))
+}
+
+pub fn validate_view_scan_key_for_address(
+    scan_key: &[u8],
+    payment_address: &str,
+) -> Result<(RistrettoPoint, RistrettoPoint), BlockError> {
+    let (scan_public, spend_public) = parse_payment_address(payment_address).ok_or_else(|| {
+        BlockError::TransactionValidationFailed(
+            "payment address is not a valid zpriv address".to_string(),
+        )
+    })?;
+    let derived_scan_public = scalar_from_secret_bytes(scan_key) * RISTRETTO_BASEPOINT_POINT;
+    if derived_scan_public != scan_public {
+        return Err(BlockError::TransactionValidationFailed(
+            "scan private key does not match this address".to_string(),
+        ));
+    }
+    Ok((scan_public, spend_public))
+}
+
+pub fn scan_private_transaction_with_view_key(
+    scan_key: &[u8],
+    payment_address: &str,
+    tx: &PrivateTransaction,
+) -> Result<Vec<PrivateViewScanMatch>, BlockError> {
+    let (_, spend_public) = validate_view_scan_key_for_address(scan_key, payment_address)?;
+    let mut matches = Vec::new();
+    for (output_index, output) in tx_outputs(tx).into_iter().enumerate() {
+        let Some(amount_blind) = derive_output_amount_blind_from_note(scan_key, &output) else {
+            continue;
+        };
+        let Some(ephemeral_public) = output
+            .ephemeral_pubkey
+            .as_slice()
+            .try_into()
+            .ok()
+            .and_then(|bytes: [u8; 32]| CompressedRistretto(bytes).decompress())
+        else {
+            continue;
+        };
+        let shared_point = scalar_from_secret_bytes(scan_key) * ephemeral_public;
+        let derived_scalar = hash_to_scalar(&[
+            b"zoka-output-key",
+            shared_point.compress().as_bytes(),
+            output.commitment.as_bytes(),
+        ]);
+        let derived_public =
+            point_to_hex(&(spend_public + derived_scalar * RISTRETTO_BASEPOINT_POINT));
+        if !constant_time_eq_str(&derived_public, &output.one_time_public_key) {
+            continue;
+        }
+
+        let (amount, commitment_blind) =
+            if output.encrypted_amount.len() == PRIVATE_NOTE_PAYLOAD_V2_LEN {
+                decrypt_private_note_payload_v2(
+                    &output.encrypted_amount,
+                    amount_blind,
+                    &output.commitment,
+                    &tx.nullifier,
+                )?
+            } else {
+                let recipient_commitment = if output.recipient_commitment.is_empty() {
+                    payment_address
+                } else {
+                    output.recipient_commitment.as_str()
+                };
+                if output.commitment_blind.is_empty() {
+                    return Err(BlockError::TransactionValidationFailed(
+                        "Legacy private output is missing commitment blind".to_string(),
+                    ));
+                }
+                (
+                    decode_amount_from_payload(
+                        &output.encrypted_amount,
+                        &output.commitment_blind,
+                        recipient_commitment,
+                        &tx.nullifier,
+                    )?,
+                    output.commitment_blind.clone(),
+                )
+            };
+
+        let expected_commitment = Commitment::new_blinded(&amount.to_le_bytes(), &commitment_blind);
+        if !constant_time_eq_str(&expected_commitment.to_hex(), &output.commitment) {
+            return Err(BlockError::TransactionValidationFailed(
+                "Commitment mismatch while scanning private amount".to_string(),
+            ));
+        }
+
+        let expected_amount_commitment = amount_commitment_hex(amount, amount_blind);
+        if !output.amount_commitment.is_empty()
+            && !constant_time_eq_str(&expected_amount_commitment, &output.amount_commitment)
+        {
+            return Err(BlockError::TransactionValidationFailed(
+                "Amount commitment mismatch while scanning private amount".to_string(),
+            ));
+        }
+        if !output.range_proof.is_empty()
+            && !verify_output_range(&output.amount_commitment, &output.range_proof)?
+        {
+            return Err(BlockError::TransactionValidationFailed(
+                "Range proof mismatch while scanning private amount".to_string(),
+            ));
+        }
+
+        matches.push(PrivateViewScanMatch {
+            tx_hash: tx.tx_hash.clone(),
+            output_id: output.output_id.clone(),
+            output_index,
+            asset_tag: output.asset_tag.clone(),
+            amount,
+            commitment: output.commitment.clone(),
+            stealth_address: output.stealth_address.clone(),
+            one_time_public_key: output.one_time_public_key.clone(),
+            is_change: output.is_change,
+            timestamp: tx.timestamp,
+        });
+    }
+    Ok(matches)
 }
 
 /// Privacy-enabled wallet manager
@@ -3168,13 +3537,66 @@ impl PrivateWalletManager {
         private_commitment_root: String,
         input_inclusion_proofs: Vec<PrivateCommitmentInclusionProof>,
     ) -> Result<String, BlockError> {
+        self.send_private_transaction_with_fee_and_membership_profile(
+            from_wallet,
+            to_commitment,
+            amount,
+            fee,
+            private_commitment_root,
+            input_inclusion_proofs,
+            PRIVATE_PROOF_SPEC_V1,
+        )
+    }
+
+    pub fn send_private_transaction_with_fee_and_membership_profile_at(
+        &mut self,
+        from_wallet: &str,
+        to_commitment: String,
+        amount: u64,
+        fee: u64,
+        private_commitment_root: String,
+        input_inclusion_proofs: Vec<PrivateCommitmentInclusionProof>,
+        private_proof_version: u8,
+        private_proof_profile: &str,
+        height: u64,
+        v2_i1_activation_height: Option<u64>,
+        canonical_bundle_activation_height: Option<u64>,
+    ) -> Result<String, BlockError> {
+        let proof_profile = private_proof_profile_spec_at(
+            private_proof_version,
+            private_proof_profile,
+            height,
+            v2_i1_activation_height,
+            canonical_bundle_activation_height,
+        )?;
+        self.send_private_transaction_with_fee_and_membership_profile(
+            from_wallet,
+            to_commitment,
+            amount,
+            fee,
+            private_commitment_root,
+            input_inclusion_proofs,
+            proof_profile,
+        )
+    }
+
+    fn send_private_transaction_with_fee_and_membership_profile(
+        &mut self,
+        from_wallet: &str,
+        to_commitment: String,
+        amount: u64,
+        fee: u64,
+        private_commitment_root: String,
+        input_inclusion_proofs: Vec<PrivateCommitmentInclusionProof>,
+        proof_profile: PrivateProofProfileSpec,
+    ) -> Result<String, BlockError> {
         let ring_members = self.build_sender_ring_members(from_wallet, &to_commitment, amount);
         let wallet = self.private_wallets.get_mut(from_wallet).ok_or_else(|| {
             BlockError::TransactionValidationFailed("Wallet not found".to_string())
         })?;
 
         let nullifier_set = self.private_pool.nullifier_set();
-        let tx = wallet.create_private_transaction(
+        let tx = wallet.create_private_transaction_with_profile(
             amount,
             fee,
             to_commitment,
@@ -3183,10 +3605,14 @@ impl PrivateWalletManager {
             private_commitment_root,
             input_inclusion_proofs,
             self.ring_backend,
+            proof_profile,
         )?;
 
         let tx_hash = tx.tx_hash.clone();
-        if let Err(e) = self.private_pool.submit_private_transaction(tx) {
+        if let Err(e) = self
+            .private_pool
+            .submit_private_transaction_with_profile(tx, proof_profile)
+        {
             // Pool rejected the TX — release the notes so they are spendable again.
             if let Some(wallet) = self.private_wallets.get_mut(from_wallet) {
                 wallet.release_reserved_notes(&tx_hash);
@@ -3929,6 +4355,39 @@ impl PrivateWalletManager {
         &mut self,
         tx: &PrivateTransaction,
     ) -> Result<(), BlockError> {
+        let proof_profile = private_proof_profile_spec_for_tx(tx)?;
+        self.validate_inbound_private_transaction_with_profile(tx, proof_profile)
+    }
+
+    pub fn validate_inbound_private_transaction_at(
+        &mut self,
+        tx: &PrivateTransaction,
+        height: u64,
+        v2_i1_activation_height: Option<u64>,
+        canonical_bundle_activation_height: Option<u64>,
+    ) -> Result<(), BlockError> {
+        let proof_profile = private_proof_profile_spec_at(
+            tx.private_proof_version,
+            &tx.private_proof_profile,
+            height,
+            v2_i1_activation_height,
+            canonical_bundle_activation_height,
+        )?;
+        self.validate_inbound_private_transaction_with_profile(tx, proof_profile)
+    }
+
+    fn validate_inbound_private_transaction_with_profile(
+        &mut self,
+        tx: &PrivateTransaction,
+        proof_profile: PrivateProofProfileSpec,
+    ) -> Result<(), BlockError> {
+        let proof_circuit = proof_profile.circuit;
+        let expected_tx_hash = expected_private_tx_hash(tx);
+        if !constant_time_eq_str(&tx.tx_hash, &expected_tx_hash) {
+            return Err(BlockError::TransactionValidationFailed(
+                "Private transaction hash does not match body".to_string(),
+            ));
+        }
         let input_nullifiers = tx_input_nullifiers(tx);
         if input_nullifiers.is_empty() {
             return Err(BlockError::TransactionValidationFailed(
@@ -4031,10 +4490,10 @@ impl PrivateWalletManager {
                 "Input amount commitment count does not match spent note count".to_string(),
             ));
         }
-        if tx.input_key_images.len() > PRIVATE_TX_MAX_INPUTS {
+        if tx.input_key_images.len() > proof_profile.max_inputs {
             return Err(BlockError::TransactionValidationFailed(format!(
                 "Private transaction exceeds Groth16 input bound ({})",
-                PRIVATE_TX_MAX_INPUTS
+                proof_profile.max_inputs
             )));
         }
 
@@ -4408,10 +4867,10 @@ impl PrivateWalletManager {
 
         if let Some(proof_bytes) = &tx.zk_proof {
             let verifier = Verifier::new();
-            let public_inputs = proof_public_inputs_for_tx(tx)?;
+            let public_inputs = proof_public_inputs_for_tx_with_profile(tx, proof_profile)?;
             let proof = crate::zk::prover::ZKProof::new(
                 proof_bytes.clone(),
-                "private_tx".to_string(),
+                proof_circuit.to_string(),
                 public_inputs,
                 current_timestamp(),
             );
@@ -4451,6 +4910,263 @@ mod tests {
     use super::*;
     use crate::identity::HDWallet;
     use proptest::prelude::*;
+
+    fn legacy_private_tx_without_profile_metadata() -> PrivateTransaction {
+        serde_json::from_value(serde_json::json!({
+            "tx_hash": "legacy-private-tx",
+            "commitment": "legacy-commitment",
+            "nullifier": "legacy-nullifier",
+            "zk_proof": null,
+            "timestamp": 1,
+            "status": "Pending"
+        }))
+        .expect("deserialize legacy private tx")
+    }
+
+    #[test]
+    fn test_legacy_private_transaction_defaults_to_v1_proof_profile() {
+        let tx = legacy_private_tx_without_profile_metadata();
+
+        assert_eq!(tx.private_proof_version, PRIVATE_PROOF_VERSION_V1);
+        assert_eq!(tx.private_proof_profile, PRIVATE_PROOF_PROFILE_V1);
+        assert_eq!(
+            private_proof_profile_spec_for_tx(&tx)
+                .expect("legacy v1 profile")
+                .circuit,
+            PRIVATE_TX_CIRCUIT
+        );
+    }
+
+    #[test]
+    fn test_private_pool_rejects_dormant_v2_i1_profile_before_enqueue() {
+        let mut tx = legacy_private_tx_without_profile_metadata();
+        tx.private_proof_version = PRIVATE_PROOF_VERSION_V2;
+        tx.private_proof_profile = PRIVATE_PROOF_PROFILE_V2_I1.to_string();
+
+        let mut pool = PrivateTransactionPool::new();
+        let err = pool
+            .submit_private_transaction(tx)
+            .expect_err("dormant private proof profile must be rejected");
+
+        assert!(err.to_string().contains("private_tx_v2_i1 is dormant"));
+        assert_eq!(pool.get_private_pool_stats(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_v2_i1_profile_activation_is_height_gated() {
+        let profile = private_proof_profile_spec_at(
+            PRIVATE_PROOF_VERSION_V2,
+            PRIVATE_PROOF_PROFILE_V2_I1,
+            100,
+            Some(100),
+            Some(100),
+        )
+        .expect("v2 i1 activates at configured height");
+        assert_eq!(profile.max_inputs, 1);
+        assert_eq!(profile.merkle_proven_inputs, 1);
+        assert_eq!(profile.circuit, PRIVATE_TX_V2_I1_LAB_CIRCUIT);
+
+        let err = private_proof_profile_spec_at(
+            PRIVATE_PROOF_VERSION_V2,
+            PRIVATE_PROOF_PROFILE_V2_I1,
+            99,
+            Some(100),
+            Some(100),
+        )
+        .expect_err("v2 i1 must remain rejected before configured height");
+        assert!(err.to_string().contains("not active at height 99"));
+
+        let err = private_proof_profile_spec_at(
+            PRIVATE_PROOF_VERSION_V2,
+            PRIVATE_PROOF_PROFILE_V2_I1,
+            100,
+            Some(100),
+            None,
+        )
+        .expect_err("v2 i1 must remain rejected without canonical bodies");
+        assert!(err.to_string().contains("not active at height 100"));
+    }
+
+    #[test]
+    fn test_unknown_private_proof_profile_remains_rejected() {
+        let err = private_proof_profile_spec(PRIVATE_PROOF_VERSION_V2, "private_tx_v2_unknown")
+            .expect_err("unknown v2 profile must be rejected");
+        assert!(err
+            .to_string()
+            .contains("Unsupported private proof profile"));
+    }
+
+    #[test]
+    fn test_v2_i1_builder_rejects_generation_before_activation() {
+        let mut manager = PrivateWalletManager::new();
+        let err = manager
+            .send_private_transaction_with_fee_and_membership_profile_at(
+                "unused",
+                "unused".to_string(),
+                1,
+                0,
+                String::new(),
+                Vec::new(),
+                PRIVATE_PROOF_VERSION_V2,
+                PRIVATE_PROOF_PROFILE_V2_I1,
+                99,
+                Some(100),
+                Some(100),
+            )
+            .expect_err("v2 i1 generation must remain disabled before activation");
+        assert!(err.to_string().contains("not active at height 99"));
+    }
+
+    #[test]
+    fn test_v2_i1_builder_applies_single_note_bound_before_proving() {
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        let bob = manager.create_private_wallet("bob").unwrap();
+        manager.deposit_to_private_wallet("alice", 30).unwrap();
+        manager.deposit_to_private_wallet("alice", 20).unwrap();
+
+        let err = manager
+            .send_private_transaction_with_fee_and_membership_profile_at(
+                "alice",
+                bob,
+                40,
+                0,
+                String::new(),
+                Vec::new(),
+                PRIVATE_PROOF_VERSION_V2,
+                PRIVATE_PROOF_PROFILE_V2_I1,
+                100,
+                Some(100),
+                Some(100),
+            )
+            .expect_err("v2 i1 must reject a payment that needs two notes");
+        assert!(err.to_string().contains("more than 1 private inputs"));
+    }
+
+    #[test]
+    #[ignore = "manual full v2 i1 transaction route with temporary authenticated parameters"]
+    fn test_v2_i1_full_transaction_runtime_route_rejects_preactivation_and_tampering() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let release_setup_dir = manifest_dir.join("trusted-setup");
+        let lab_setup_dir = std::path::PathBuf::from(
+            std::env::var("ZOKA_PRIVATE_TX_V2_I1_LAB_DIR")
+                .expect("set ZOKA_PRIVATE_TX_V2_I1_LAB_DIR"),
+        );
+        let runtime_bundle = tempfile::TempDir::new().expect("runtime bundle tmpdir");
+
+        for circuit in crate::zk::setup_io::REQUIRED_CIRCUITS {
+            let filename =
+                crate::zk::setup_io::params_filename(circuit).expect("required params filename");
+            std::fs::copy(
+                release_setup_dir.join(filename),
+                runtime_bundle.path().join(filename),
+            )
+            .expect("copy required release params");
+        }
+        let i1_filename = crate::zk::setup_io::params_filename(PRIVATE_TX_V2_I1_LAB_CIRCUIT)
+            .expect("i1 params filename");
+        std::fs::copy(
+            lab_setup_dir.join(i1_filename),
+            runtime_bundle.path().join(i1_filename),
+        )
+        .expect("copy temporary i1 params");
+        let digest = crate::zk::setup_io::compute_directory_digest(runtime_bundle.path())
+            .expect("runtime digest");
+        crate::zk::setup_io::write_digest(runtime_bundle.path(), &digest)
+            .expect("write runtime digest");
+        std::env::set_var(
+            crate::zk::groth16_backend::TRUSTED_SETUP_ENV,
+            runtime_bundle.path(),
+        );
+
+        let mut manager = PrivateWalletManager::new();
+        manager
+            .create_private_wallet("alice")
+            .expect("alice wallet");
+        let bob = manager.create_private_wallet("bob").expect("bob wallet");
+        manager
+            .deposit_to_private_wallet("alice", 30)
+            .expect("fund alice");
+
+        let err = manager
+            .send_private_transaction_with_fee_and_membership_profile_at(
+                "alice",
+                bob.clone(),
+                10,
+                0,
+                String::new(),
+                Vec::new(),
+                PRIVATE_PROOF_VERSION_V2,
+                PRIVATE_PROOF_PROFILE_V2_I1,
+                9,
+                Some(10),
+                Some(10),
+            )
+            .expect_err("v2 i1 construction must fail before activation");
+        assert!(err.to_string().contains("not active at height 9"));
+
+        let tx_hash = manager
+            .send_private_transaction_with_fee_and_membership_profile_at(
+                "alice",
+                bob,
+                10,
+                0,
+                String::new(),
+                Vec::new(),
+                PRIVATE_PROOF_VERSION_V2,
+                PRIVATE_PROOF_PROFILE_V2_I1,
+                10,
+                Some(10),
+                Some(10),
+            )
+            .expect("build active v2 i1 transaction");
+        let tx = manager
+            .get_private_transaction(&tx_hash)
+            .expect("read active v2 i1 transaction");
+        assert_eq!(tx.private_proof_version, PRIVATE_PROOF_VERSION_V2);
+        assert_eq!(tx.private_proof_profile, PRIVATE_PROOF_PROFILE_V2_I1);
+        assert_eq!(tx.input_nullifiers.len(), 1);
+        assert_eq!(tx.zk_proof.as_ref().map(Vec::len), Some(192));
+
+        let mut before_activation = PrivateWalletManager::new();
+        let err = before_activation
+            .validate_inbound_private_transaction_at(&tx, 9, Some(10), Some(10))
+            .expect_err("full v2 i1 transaction must fail before activation");
+        assert!(err.to_string().contains("not active at height 9"));
+
+        let mut active = PrivateWalletManager::new();
+        active
+            .validate_inbound_private_transaction_at(&tx, 10, Some(10), Some(10))
+            .expect("full v2 i1 transaction validates at activation");
+
+        let mut tampered = tx.clone();
+        tampered.zk_proof.as_mut().expect("v2 i1 proof bytes")[0] ^= 1;
+        let mut tampered_validator = PrivateWalletManager::new();
+        assert!(tampered_validator
+            .validate_inbound_private_transaction_at(&tampered, 10, Some(10), Some(10))
+            .is_err());
+
+        let mut false_root = tx.clone();
+        false_root.proof_private_root_words[0] ^= 1;
+        let mut false_root_validator = PrivateWalletManager::new();
+        let err = false_root_validator
+            .validate_inbound_private_transaction_at(&false_root, 10, Some(10), Some(10))
+            .expect_err("v2 i1 transaction with false proof root must fail");
+        assert!(err
+            .to_string()
+            .contains("proof root anchor does not match commitment root"));
+
+        let mut downgraded = tx;
+        downgraded.private_proof_version = PRIVATE_PROOF_VERSION_V1;
+        downgraded.private_proof_profile = PRIVATE_PROOF_PROFILE_V1.to_string();
+        let mut downgrade_validator = PrivateWalletManager::new();
+        let err = downgrade_validator
+            .validate_inbound_private_transaction_at(&downgraded, 10, Some(10), Some(10))
+            .expect_err("v2 i1 transaction metadata downgrade must fail");
+        assert!(err
+            .to_string()
+            .contains("Private transaction hash does not match body"));
+    }
 
     #[test]
     fn test_private_wallet_creation() {
@@ -4606,6 +5322,64 @@ mod tests {
             .decrypt_private_amount_for_wallet("alice", &tx)
             .expect("alice should decrypt change");
         assert_eq!(alice_change, 60);
+    }
+
+    #[test]
+    fn test_private_view_scan_matches_without_spend_private_key() {
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        let bob_address = manager.create_private_wallet("bob").unwrap();
+        let bob_scan_key = manager.get_private_wallet("bob").unwrap().scan_key.clone();
+        let alice_scan_key = manager
+            .get_private_wallet("alice")
+            .unwrap()
+            .scan_key
+            .clone();
+        manager.deposit_to_private_wallet("alice", 100).unwrap();
+
+        let tx_hash = manager
+            .send_private_transaction("alice", bob_address.clone(), 40)
+            .unwrap();
+        let tx = manager
+            .get_private_transaction(&tx_hash)
+            .expect("tx should exist");
+
+        let matches =
+            scan_private_transaction_with_view_key(&bob_scan_key, &bob_address, &tx).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].amount, 40);
+        assert_eq!(matches[0].tx_hash, tx_hash);
+
+        let wrong_key = scan_private_transaction_with_view_key(&alice_scan_key, &bob_address, &tx)
+            .expect_err("wrong scan key should not match bob address");
+        assert!(wrong_key
+            .to_string()
+            .contains("scan private key does not match"));
+    }
+
+    #[test]
+    fn test_private_view_scan_derives_address_from_scan_key() {
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        let bob_address = manager.create_private_wallet("bob").unwrap();
+        let bob_scan_key = manager.get_private_wallet("bob").unwrap().scan_key.clone();
+        manager.deposit_to_private_wallet("alice", 100).unwrap();
+
+        let tx_hash = manager
+            .send_private_transaction("alice", bob_address.clone(), 25)
+            .unwrap();
+        let tx = manager
+            .get_private_transaction(&tx_hash)
+            .expect("tx should exist");
+
+        let derived_address = payment_address_from_scan_key(&bob_scan_key).unwrap();
+        assert_eq!(derived_address, bob_address);
+
+        let matches =
+            scan_private_transaction_with_view_key(&bob_scan_key, &derived_address, &tx).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].amount, 25);
+        assert_eq!(matches[0].tx_hash, tx_hash);
     }
 
     #[test]
@@ -4781,6 +5555,27 @@ mod tests {
         let mut tx = manager.get_private_transaction(&tx_hash).unwrap();
         tx.ring_signature[0] ^= 0x01;
         assert!(manager.validate_inbound_private_transaction(&tx).is_err());
+    }
+
+    #[test]
+    fn test_private_transaction_rejects_body_hash_drift() {
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        let bob_commitment = manager.create_private_wallet("bob").unwrap();
+        manager.deposit_to_private_wallet("alice", 100).unwrap();
+
+        let tx_hash = manager
+            .send_private_transaction("alice", bob_commitment, 25)
+            .unwrap();
+        let mut tx = manager.get_private_transaction(&tx_hash).unwrap();
+        tx.outputs[0].encrypted_amount[0] ^= 0x01;
+
+        let err = manager
+            .validate_inbound_private_transaction(&tx)
+            .expect_err("body drift must invalidate private tx hash");
+        assert!(err
+            .to_string()
+            .contains("Private transaction hash does not match body"));
     }
 
     #[test]
@@ -5466,6 +6261,27 @@ mod tests {
         let result = manager.claim_private_coinbase_output("miner", "block-hash", &output, 11, 67);
         assert!(result.is_err());
         assert_eq!(manager.get_private_balance("miner"), Some(0));
+    }
+
+    #[test]
+    fn test_v2_i1_hash_domain_wraps_body_without_changing_v1_history() {
+        let body_hash = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            private_tx_hash_for_profile(
+                PRIVATE_PROOF_VERSION_V1,
+                PRIVATE_PROOF_PROFILE_V1,
+                body_hash
+            ),
+            body_hash
+        );
+        assert_ne!(
+            private_tx_hash_for_profile(
+                PRIVATE_PROOF_VERSION_V2,
+                PRIVATE_PROOF_PROFILE_V2_I1,
+                body_hash,
+            ),
+            body_hash
+        );
     }
 
     #[test]

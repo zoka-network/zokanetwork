@@ -13,7 +13,9 @@
 //!   merkle.params         (Parameters<Bls12> for merkle_circuit)
 //!   nullifier.params      (Parameters<Bls12> for nullifier_circuit)
 //!   private_tx.params     (Parameters<Bls12> for private_tx)
-//!   DIGEST                (hex-encoded SHA-256 over the four files, newline-terminated)
+//!   private_tx_v2_i1.params (optional future compact private_tx profile)
+//!   DIGEST                (hex-encoded SHA-256 over required files plus any
+//!                          present optional profiles, newline-terminated)
 //! ```
 //!
 //! `DIGEST` lets a node be bound at compile time (or via a constant) to a
@@ -29,6 +31,7 @@ use sha2::{Digest, Sha256};
 
 use super::groth16_backend::{
     BALANCE_CIRCUIT, MERKLE_CIRCUIT, NULLIFIER_CIRCUIT, PRIVATE_TX_CIRCUIT,
+    PRIVATE_TX_V2_I1_LAB_CIRCUIT,
 };
 
 pub const DIGEST_FILENAME: &str = "DIGEST";
@@ -40,6 +43,10 @@ pub const REQUIRED_CIRCUITS: [&str; 4] = [
     NULLIFIER_CIRCUIT,
     PRIVATE_TX_CIRCUIT,
 ];
+/// Optional future profiles are hash-bound whenever present, but remain
+/// absent from the release bundle until their ceremony and activation are
+/// explicitly completed.
+pub const OPTIONAL_CIRCUITS: [&str; 1] = [PRIVATE_TX_V2_I1_LAB_CIRCUIT];
 
 #[derive(Debug)]
 pub enum SetupIoError {
@@ -78,6 +85,7 @@ pub fn params_filename(circuit: &str) -> Result<&'static str, SetupIoError> {
         MERKLE_CIRCUIT => Ok("merkle.params"),
         NULLIFIER_CIRCUIT => Ok("nullifier.params"),
         PRIVATE_TX_CIRCUIT => Ok("private_tx.params"),
+        PRIVATE_TX_V2_I1_LAB_CIRCUIT => Ok("private_tx_v2_i1.params"),
         other => Err(SetupIoError::Serialization(format!(
             "unknown circuit for setup IO: {}",
             other
@@ -125,9 +133,21 @@ pub fn read_circuit_params(dir: &Path, circuit: &str) -> Result<Parameters<Bls12
     let file = File::open(&path)
         .map_err(|e| SetupIoError::Io(format!("opening {}: {}", path.display(), e)))?;
     let mut reader = BufReader::new(file);
-    // `Parameters::read` with `checked = true` validates subgroup membership; slow but
-    // exactly the work you want on a piece of infrastructure you must fully trust.
-    Parameters::<Bls12>::read(&mut reader, true)
+    // `Parameters::read` with `checked = true` validates subgroup membership on
+    // EVERY point — one full multiplication per point. That is exactly the work
+    // you want on infrastructure you must fully trust (node/server: a one-time
+    // startup cost), but on a phone it dominates the whole send (minutes to
+    // subgroup-check the ~14 MB bundle).
+    //
+    // On mobile we read the params from the app's OWN bundled APK assets, and
+    // `verify_directory_digest` has already hashed them and matched the digest
+    // against the expected canonical CRS BEFORE we get here. A matching digest
+    // means these bytes are identical to the known-good ceremony output, so the
+    // points are valid by construction and re-checking the subgroup buys
+    // nothing. Skip it only under the `mobile` feature; every other build keeps
+    // the full check.
+    let checked = !cfg!(feature = "mobile");
+    Parameters::<Bls12>::read(&mut reader, checked)
         .map_err(|e| SetupIoError::Serialization(format!("reading {}: {}", circuit, e)))
 }
 
@@ -148,8 +168,8 @@ fn file_sha256(path: &Path) -> Result<[u8; 32], SetupIoError> {
     Ok(hasher.finalize().into())
 }
 
-/// Compute a SHA-256 digest over every required circuit file, in canonical order
-/// (`balance`, `merkle`, `nullifier`, `private_tx`).
+/// Compute a SHA-256 digest over every required circuit file and each present
+/// optional profile, in canonical order.
 ///
 /// The digest binds every node to a single, specific CRS snapshot.
 pub fn compute_directory_digest(dir: &Path) -> Result<[u8; 32], SetupIoError> {
@@ -158,6 +178,17 @@ pub fn compute_directory_digest(dir: &Path) -> Result<[u8; 32], SetupIoError> {
         let path = params_path(dir, circuit)?;
         if !path.exists() {
             return Err(SetupIoError::MissingFile(path));
+        }
+        let file_hash = file_sha256(&path)?;
+        hasher.update(circuit.as_bytes());
+        hasher.update([0x1f]);
+        hasher.update(file_hash);
+        hasher.update([0x1e]);
+    }
+    for circuit in OPTIONAL_CIRCUITS {
+        let path = params_path(dir, circuit)?;
+        if !path.exists() {
+            continue;
         }
         let file_hash = file_sha256(&path)?;
         hasher.update(circuit.as_bytes());
@@ -271,5 +302,22 @@ mod tests {
             Err(SetupIoError::DigestMismatch { .. }) => {}
             other => panic!("expected digest mismatch, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn digest_binds_present_optional_profiles() {
+        let dir = TempDir::new().expect("tmpdir");
+        for circuit in REQUIRED_CIRCUITS {
+            let params = generate_random_parameters::<Bls12, _, _>(Trivial, &mut OsRng).unwrap();
+            write_circuit_params(dir.path(), circuit, &params).expect("write");
+        }
+        let required_only = compute_directory_digest(dir.path()).expect("required-only digest");
+
+        let optional = generate_random_parameters::<Bls12, _, _>(Trivial, &mut OsRng).unwrap();
+        write_circuit_params(dir.path(), PRIVATE_TX_V2_I1_LAB_CIRCUIT, &optional)
+            .expect("write optional profile");
+        let with_optional = compute_directory_digest(dir.path()).expect("optional profile digest");
+
+        assert_ne!(required_only, with_optional);
     }
 }

@@ -16,21 +16,106 @@ pub const MAX_SUPPLY_ATOMS: u64 = MAX_SUPPLY_ZKA * ATOMS_PER_ZKA;
 pub const INITIAL_BLOCK_REWARD_ATOMS: u64 = INITIAL_BLOCK_REWARD_ZKA * ATOMS_PER_ZKA;
 pub const HALVING_INTERVAL_BLOCKS: u64 = 1_051_200;
 pub const TARGET_BLOCK_TIME_SECS: u64 = 120;
-/// TEMPORARY TEST VALUE: lowered for the genesis-reset rehearsal so coinbase
-/// outputs mature fast. RESTORE TO 60 before the real mainnet launch.
-/// (Mainnet value: coinbase outputs require 60 confirmations before spend.)
-pub const COINBASE_MATURITY_BLOCKS: u64 = 5;
+/// Coinbase outputs require 60 confirmations before they can be spent.
+/// At 120s/block this is ~2 hours, protecting the network against short reorgs
+/// invalidating reward payments.
+pub const COINBASE_MATURITY_BLOCKS: u64 = 60;
 
 /// Consensus cap for private transaction hash commitments in one block.
 /// Wallets can split large sends across multiple private transactions, but a
 /// block must keep a bounded commitment list so validation remains predictable.
 pub const PRIVATE_TX_HASHES_PER_BLOCK_LIMIT: usize = 128;
+/// Canonical private bodies remain disabled until a reviewed fork height is
+/// fixed in release binaries. `None` keeps the historical hash-only format.
+///
+/// The on-device prover build (`mobile` feature) activates from genesis so the
+/// staging app can exercise the compact v2-i1 profile against the test nodes
+/// (which already run with these activations enabled). This ONLY affects the
+/// phone's local gate — node/server binaries never enable `mobile`, so their
+/// consensus default stays `None`/env-controlled and is untouched.
+#[cfg(not(feature = "mobile"))]
+pub const PRIVATE_TX_CANONICAL_BUNDLE_ACTIVATION_HEIGHT: Option<u64> = None;
+#[cfg(feature = "mobile")]
+pub const PRIVATE_TX_CANONICAL_BUNDLE_ACTIVATION_HEIGHT: Option<u64> = Some(0);
+/// Compact mobile Groth16 profile remains disabled until the final i1 CRS,
+/// adversarial vectors and coordinated rollout height are fixed.
+#[cfg(not(feature = "mobile"))]
+pub const PRIVATE_TX_V2_I1_ACTIVATION_HEIGHT: Option<u64> = None;
+#[cfg(feature = "mobile")]
+pub const PRIVATE_TX_V2_I1_ACTIVATION_HEIGHT: Option<u64> = Some(0);
+/// Defense-in-depth limits for the future canonical private body bundle.
+pub const PRIVATE_TX_CANONICAL_BODY_BYTES_LIMIT: usize = 1024 * 1024;
+pub const PRIVATE_TX_CANONICAL_BUNDLE_BYTES_LIMIT: usize = 8 * 1024 * 1024;
 
-// TEMPORARY TEST VALUES: difficulty lowered to 8 bits for the genesis-reset
-// rehearsal so blocks solve quickly on a single CPU miner. RESTORE BOTH TO 12
-// before the real mainnet launch.
-pub const POW_MIN_DIFFICULTY_BITS: u32 = 8;
-pub const POW_INITIAL_DIFFICULTY_BITS: u32 = 8;
+pub fn private_tx_canonical_bundle_activation_height() -> Option<u64> {
+    activation_height_from_env(
+        "ZOKA_PRIVATE_TX_CANONICAL_BUNDLE_ACTIVATION_HEIGHT",
+        PRIVATE_TX_CANONICAL_BUNDLE_ACTIVATION_HEIGHT,
+    )
+}
+
+pub fn private_tx_v2_i1_activation_height() -> Option<u64> {
+    activation_height_from_env(
+        "ZOKA_PRIVATE_TX_V2_I1_ACTIVATION_HEIGHT",
+        PRIVATE_TX_V2_I1_ACTIVATION_HEIGHT,
+    )
+}
+
+fn activation_height_from_env(var: &str, default: Option<u64>) -> Option<u64> {
+    let Ok(raw) = std::env::var(var) else {
+        return default;
+    };
+    let raw = raw.trim();
+    if raw.is_empty()
+        || raw.eq_ignore_ascii_case("none")
+        || raw.eq_ignore_ascii_case("null")
+        || raw.eq_ignore_ascii_case("off")
+    {
+        return None;
+    }
+    Some(
+        raw.parse::<u64>()
+            .unwrap_or_else(|_| panic!("{var} must be an unsigned block height or 'none'")),
+    )
+}
+
+pub fn private_tx_canonical_bundle_required(height: u64) -> bool {
+    private_tx_canonical_bundle_required_at(height, private_tx_canonical_bundle_activation_height())
+}
+
+pub fn private_tx_canonical_bundle_required_at(
+    height: u64,
+    activation_height: Option<u64>,
+) -> bool {
+    activation_height.is_some_and(|activation| height >= activation)
+}
+
+pub fn private_tx_v2_i1_active(height: u64) -> bool {
+    private_tx_v2_i1_active_at(
+        height,
+        private_tx_v2_i1_activation_height(),
+        private_tx_canonical_bundle_activation_height(),
+    )
+}
+
+pub fn private_tx_v2_i1_active_at(
+    height: u64,
+    activation_height: Option<u64>,
+    canonical_bundle_activation_height: Option<u64>,
+) -> bool {
+    activation_height.is_some_and(|activation| height >= activation)
+        && private_tx_canonical_bundle_required_at(height, canonical_bundle_activation_height)
+}
+
+/// Minimum difficulty the per-block retarget can fall to. Keeps the chain
+/// viable even with a single low-end miner.
+pub const POW_MIN_DIFFICULTY_BITS: u32 = 12;
+/// Starting difficulty for the first two blocks (warmup band before two
+/// committed timestamps are available for retarget).
+pub const POW_INITIAL_DIFFICULTY_BITS: u32 = 12;
+/// Hard ceiling for the per-block retarget. 30 bits at RandomX is
+/// comfortably achievable by GPU/ASIC-resistant CPUs without freezing
+/// the chain.
 pub const POW_MAX_DIFFICULTY_BITS: u32 = 30;
 pub const POW_KEY_EPOCH_BLOCKS: u64 = 2_048;
 
@@ -188,8 +273,44 @@ mod tests {
         assert_eq!(INITIAL_BLOCK_REWARD_ATOMS, 12_000_000);
         assert_eq!(HALVING_INTERVAL_BLOCKS, 1_051_200);
         assert_eq!(TARGET_BLOCK_TIME_SECS, 120);
-        // TEST VALUE — restore to 60 with the constant before mainnet launch.
-        assert_eq!(COINBASE_MATURITY_BLOCKS, 5);
+        assert_eq!(COINBASE_MATURITY_BLOCKS, 60);
+    }
+
+    #[test]
+    fn canonical_private_bundle_stays_dormant_until_height_is_fixed() {
+        assert_eq!(PRIVATE_TX_CANONICAL_BUNDLE_ACTIVATION_HEIGHT, None);
+        assert!(!private_tx_canonical_bundle_required(0));
+        assert!(!private_tx_canonical_bundle_required(u64::MAX));
+        assert!(!private_tx_canonical_bundle_required_at(9, Some(10)));
+        assert!(private_tx_canonical_bundle_required_at(10, Some(10)));
+        assert!(private_tx_canonical_bundle_required_at(11, Some(10)));
+    }
+
+    #[test]
+    fn compact_private_tx_profile_stays_dormant_until_height_is_fixed() {
+        assert_eq!(PRIVATE_TX_V2_I1_ACTIVATION_HEIGHT, None);
+        assert!(!private_tx_v2_i1_active(0));
+        assert!(!private_tx_v2_i1_active(u64::MAX));
+        assert!(!private_tx_v2_i1_active_at(9, Some(10), Some(10)));
+        assert!(private_tx_v2_i1_active_at(10, Some(10), Some(10)));
+        assert!(private_tx_v2_i1_active_at(11, Some(10), Some(10)));
+        assert!(!private_tx_v2_i1_active_at(10, Some(10), None));
+    }
+
+    #[test]
+    fn activation_height_env_override_is_explicit() {
+        const VAR: &str = "ZOKA_TEST_ONLY_PRIVATE_TX_ACTIVATION_HEIGHT";
+        std::env::remove_var(VAR);
+        assert_eq!(activation_height_from_env(VAR, None), None);
+        assert_eq!(activation_height_from_env(VAR, Some(12)), Some(12));
+
+        std::env::set_var(VAR, "42");
+        assert_eq!(activation_height_from_env(VAR, None), Some(42));
+
+        std::env::set_var(VAR, "none");
+        assert_eq!(activation_height_from_env(VAR, Some(42)), None);
+
+        std::env::remove_var(VAR);
     }
 
     #[test]
@@ -249,7 +370,6 @@ mod tests {
         );
         assert_eq!(MAX_SUPPLY_ZKA, 23_000_000);
         assert_eq!(INITIAL_BLOCK_REWARD_ATOMS, 12_000_000);
-        // TEST VALUE — restore to 60 with the constant before mainnet launch.
-        assert_eq!(COINBASE_MATURITY_BLOCKS, 5);
+        assert_eq!(COINBASE_MATURITY_BLOCKS, 60);
     }
 }

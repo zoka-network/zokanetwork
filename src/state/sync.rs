@@ -19,11 +19,12 @@
 //! function so the consensus rules can be exercised without a libp2p
 //! swarm.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde::Deserialize;
 
 use crate::network::message::BlockResponseMessage;
+use crate::private_wallet::{PrivateTransaction, PrivateWalletManager};
 use crate::state::chain::{
     apply_block, apply_block_with_expected_difficulty, read_chain_head, ChainError, ChainHead,
 };
@@ -384,14 +385,14 @@ fn try_apply_synced_block_payload_inner(
     };
     match applied {
         Ok(head) => {
-            persist_attached_private_tx_bodies(storage, &block, &response.private_tx_bodies);
+            persist_available_private_tx_bodies(storage, &block, &response.private_tx_bodies);
             SyncOutcome::Applied(head)
         }
         Err(ChainError::BlockAlreadyKnown(hash)) => {
             // Persist bodies even when block is already known — this lets a
             // node that synced the block header earlier (without bodies)
             // backfill bodies the next time the same block re-circulates.
-            persist_attached_private_tx_bodies(storage, &block, &response.private_tx_bodies);
+            persist_available_private_tx_bodies(storage, &block, &response.private_tx_bodies);
             SyncOutcome::AlreadyKnown {
                 height: candidate_height,
                 hash,
@@ -455,6 +456,161 @@ pub(crate) fn parse_block_payload(bytes: &[u8]) -> Result<Block, String> {
     Block::deserialize(&mut de).map_err(|e| e.to_string())
 }
 
+fn strict_private_tx_spend_tags(tx: &PrivateTransaction) -> Result<Vec<String>, String> {
+    let primary = tx.nullifier.trim();
+    if primary.is_empty() || primary != tx.nullifier.as_str() {
+        return Err("private transaction has a missing or non-canonical primary nullifier".into());
+    }
+    if tx.input_nullifiers.is_empty() {
+        return Ok(vec![primary.to_string()]);
+    }
+
+    let mut tags = Vec::with_capacity(tx.input_nullifiers.len());
+    for tag in &tx.input_nullifiers {
+        let trimmed = tag.trim();
+        if trimmed.is_empty() || trimmed != tag {
+            return Err(
+                "private transaction has a missing or non-canonical input nullifier".into(),
+            );
+        }
+        tags.push(trimmed.to_string());
+    }
+    if tags.first().map(String::as_str) != Some(primary) {
+        return Err("private transaction primary nullifier does not match its first input".into());
+    }
+    Ok(tags)
+}
+
+/// Strict private bundle validation for the future height-gated block format.
+///
+/// Current blocks commit hashes and nullifiers but only carry bodies as
+/// best-effort attachments. The height-gated policy calls this before applying
+/// any future block whose bodies are canonical data.
+#[allow(dead_code)]
+pub(crate) fn validate_private_tx_bundle_for_block(
+    block: &Block,
+    bodies: &[Vec<u8>],
+) -> Result<(), String> {
+    validate_private_tx_bundle_for_block_at(
+        block,
+        bodies,
+        crate::economics::private_tx_v2_i1_activation_height(),
+        crate::economics::private_tx_canonical_bundle_activation_height(),
+    )
+}
+
+fn validate_private_tx_bundle_for_block_at(
+    block: &Block,
+    bodies: &[Vec<u8>],
+    v2_i1_activation_height: Option<u64>,
+    canonical_bundle_activation_height: Option<u64>,
+) -> Result<(), String> {
+    let mut committed_hashes = HashSet::new();
+    for hash in &block.private_tx_hashes {
+        let trimmed = hash.trim();
+        if trimmed.is_empty() || trimmed != hash {
+            return Err("block has a missing or non-canonical private transaction hash".into());
+        }
+        if !committed_hashes.insert(trimmed.to_string()) {
+            return Err(format!("block repeats private transaction hash {trimmed}"));
+        }
+    }
+    if bodies.len() != committed_hashes.len() {
+        return Err(format!(
+            "private transaction body count mismatch: committed {}, received {}",
+            committed_hashes.len(),
+            bodies.len()
+        ));
+    }
+
+    let mut committed_nullifiers = BTreeSet::new();
+    for nullifier in &block.private_nullifiers {
+        let trimmed = nullifier.trim();
+        if trimmed.is_empty() || trimmed != nullifier {
+            return Err("block has a missing or non-canonical private nullifier".into());
+        }
+        if !committed_nullifiers.insert(trimmed.to_string()) {
+            return Err(format!("block repeats private nullifier {trimmed}"));
+        }
+    }
+
+    let mut represented_hashes = HashSet::new();
+    let mut derived_nullifiers = BTreeSet::new();
+    let mut validator = PrivateWalletManager::new();
+    for (expected_hash, body_bytes) in block.private_tx_hashes.iter().zip(bodies) {
+        let tx: PrivateTransaction = serde_json::from_slice(body_bytes)
+            .map_err(|err| format!("private transaction body deserialize failed: {err}"))?;
+        let hash = tx.tx_hash.trim();
+        if hash.is_empty() || hash != tx.tx_hash {
+            return Err("private transaction body has a missing or non-canonical hash".into());
+        }
+        if hash != expected_hash {
+            return Err(format!(
+                "private transaction body hash {hash} does not match committed position {expected_hash}"
+            ));
+        }
+        if !represented_hashes.insert(hash.to_string()) {
+            return Err(format!(
+                "private transaction hash {hash} has more than one body"
+            ));
+        }
+
+        validator
+            .validate_inbound_private_transaction_at(
+                &tx,
+                block.header.block_height,
+                v2_i1_activation_height,
+                canonical_bundle_activation_height,
+            )
+            .map_err(|err| format!("private transaction {hash} failed validation: {err}"))?;
+        for nullifier in strict_private_tx_spend_tags(&tx)? {
+            if !derived_nullifiers.insert(nullifier.clone()) {
+                return Err(format!(
+                    "private transaction bundle repeats nullifier {nullifier}"
+                ));
+            }
+        }
+    }
+
+    if represented_hashes != committed_hashes {
+        return Err("not every committed private transaction hash has exactly one body".into());
+    }
+    if derived_nullifiers != committed_nullifiers {
+        return Err(format!(
+            "private nullifier set mismatch: derived {}, committed {}",
+            derived_nullifiers.len(),
+            committed_nullifiers.len()
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_private_tx_bundle_policy_for_block(block: &Block) -> Result<(), String> {
+    validate_private_tx_bundle_policy_for_block_at(
+        block,
+        crate::economics::private_tx_canonical_bundle_activation_height(),
+    )
+}
+
+fn validate_private_tx_bundle_policy_for_block_at(
+    block: &Block,
+    activation_height: Option<u64>,
+) -> Result<(), String> {
+    if crate::economics::private_tx_canonical_bundle_required_at(
+        block.header.block_height,
+        activation_height,
+    ) {
+        validate_private_tx_bundle_for_block(block, &block.private_tx_bodies)
+    } else if block.private_tx_bodies.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "canonical private transaction bodies are not active at height {}",
+            block.header.block_height
+        ))
+    }
+}
+
 /// Persist private transaction bodies that arrived attached to a block
 /// payload. Each body's `tx_hash` is cross-checked against the block's
 /// `private_tx_hashes` list — bodies that don't correspond to a committed
@@ -496,6 +652,37 @@ fn persist_attached_private_tx_bodies(storage: &RocksDbStorage, block: &Block, b
             tracing::warn!("failed to persist attached private tx body {hash}: {err}");
         }
     }
+}
+
+fn persist_available_private_tx_bodies(
+    storage: &RocksDbStorage,
+    block: &Block,
+    attached_bodies: &[Vec<u8>],
+) {
+    persist_available_private_tx_bodies_at(
+        storage,
+        block,
+        attached_bodies,
+        crate::economics::private_tx_canonical_bundle_activation_height(),
+    );
+}
+
+fn persist_available_private_tx_bodies_at(
+    storage: &RocksDbStorage,
+    block: &Block,
+    attached_bodies: &[Vec<u8>],
+    activation_height: Option<u64>,
+) {
+    if !block.private_tx_bodies.is_empty() {
+        match validate_private_tx_bundle_policy_for_block_at(block, activation_height) {
+            Ok(()) => persist_attached_private_tx_bodies(storage, block, &block.private_tx_bodies),
+            Err(err) => tracing::warn!(
+                "refusing to persist invalid canonical private tx bodies for block {}: {err}",
+                block.header.hash
+            ),
+        }
+    }
+    persist_attached_private_tx_bodies(storage, block, attached_bodies);
 }
 
 #[cfg(test)]
@@ -570,6 +757,7 @@ mod tests {
             },
             transactions: vec![coinbase],
             private_tx_hashes: Vec::new(),
+            private_tx_bodies: Vec::new(),
             private_nullifiers: Vec::new(),
             private_fee_claims: Vec::new(),
             private_coinbase: Some(dummy_private_coinbase(height, miner)),
@@ -588,6 +776,223 @@ mod tests {
             private_tx_bodies: Vec::new(),
             timestamp: block.header.timestamp,
         }
+    }
+
+    fn block_with_private_bundle(
+        private_tx_hashes: Vec<String>,
+        private_nullifiers: Vec<String>,
+    ) -> Block {
+        let chain_id = "zoka-test-net";
+        let mut block = mine_test_block(
+            chain_id,
+            &genesis_parent_for(chain_id).header.hash,
+            0,
+            0,
+            &"zka1miner".to_string(),
+            4,
+            1_700_000_000,
+        );
+        block.private_tx_hashes = private_tx_hashes;
+        block.private_nullifiers = private_nullifiers;
+        block.header.merkle_root = block.compute_merkle_root();
+        block.header.hash = block.compute_hash();
+        block
+    }
+
+    #[test]
+    fn strict_private_bundle_rejects_missing_body() {
+        let block = block_with_private_bundle(
+            vec!["committed-private-tx".to_string()],
+            vec!["committed-nullifier".to_string()],
+        );
+
+        let err = validate_private_tx_bundle_for_block(&block, &[])
+            .expect_err("strict bundle must require one body per committed hash");
+
+        assert!(err.contains("body count mismatch"));
+    }
+
+    #[test]
+    fn strict_private_bundle_rejects_duplicate_committed_hash() {
+        let block = block_with_private_bundle(
+            vec![
+                "committed-private-tx".to_string(),
+                "committed-private-tx".to_string(),
+            ],
+            Vec::new(),
+        );
+
+        let err = validate_private_tx_bundle_for_block(&block, &[])
+            .expect_err("strict bundle must reject duplicate committed hashes");
+
+        assert!(err.contains("repeats private transaction hash"));
+    }
+
+    #[test]
+    fn strict_private_bundle_rejects_duplicate_committed_nullifier() {
+        let block = block_with_private_bundle(
+            Vec::new(),
+            vec![
+                "committed-nullifier".to_string(),
+                "committed-nullifier".to_string(),
+            ],
+        );
+
+        let err = validate_private_tx_bundle_for_block(&block, &[])
+            .expect_err("strict bundle must reject duplicate committed nullifiers");
+
+        assert!(err.contains("repeats private nullifier"));
+    }
+
+    #[test]
+    fn strict_private_bundle_rejects_dormant_v2_i1_profile() {
+        let block = block_with_private_bundle(
+            vec!["private-v2-disabled".to_string()],
+            vec!["nullifier-v2-disabled".to_string()],
+        );
+        let body = serde_json::to_vec(&serde_json::json!({
+            "tx_hash": "private-v2-disabled",
+            "commitment": "commitment-v2-disabled",
+            "private_proof_version": 2,
+            "private_proof_profile": "private_tx_v2_i1",
+            "nullifier": "nullifier-v2-disabled",
+            "zk_proof": null,
+            "timestamp": 1,
+            "status": "Pending"
+        }))
+        .expect("serialize private tx fixture");
+
+        let err = validate_private_tx_bundle_for_block(&block, &[body])
+            .expect_err("strict bundle must reject profiles before activation");
+
+        assert!(err.contains("not active at height"));
+    }
+
+    #[test]
+    fn strict_private_bundle_uses_block_height_for_configured_v2_i1_profile() {
+        let block = block_with_private_bundle(
+            vec!["private-v2-configured".to_string()],
+            vec!["nullifier-v2-configured".to_string()],
+        );
+        let body = serde_json::to_vec(&serde_json::json!({
+            "tx_hash": "private-v2-configured",
+            "commitment": "commitment-v2-configured",
+            "private_proof_version": 2,
+            "private_proof_profile": "private_tx_v2_i1",
+            "nullifier": "nullifier-v2-configured",
+            "zk_proof": null,
+            "timestamp": 1,
+            "status": "Pending"
+        }))
+        .expect("serialize private tx fixture");
+
+        let err = validate_private_tx_bundle_for_block_at(&block, &[body], Some(0), Some(0))
+            .expect_err("fixture remains invalid after profile activation");
+
+        assert!(err.contains("hash does not match body"));
+        assert!(!err.contains("not active"));
+    }
+
+    #[test]
+    fn strict_private_bundle_rejects_body_order_mismatch() {
+        let block = block_with_private_bundle(
+            vec!["private-tx-a".to_string(), "private-tx-b".to_string()],
+            vec!["nullifier-a".to_string(), "nullifier-b".to_string()],
+        );
+        let body_a = serde_json::to_vec(&serde_json::json!({
+            "tx_hash": "private-tx-a",
+            "commitment": "commitment-a",
+            "nullifier": "nullifier-a",
+            "zk_proof": null,
+            "timestamp": 1,
+            "status": "Pending"
+        }))
+        .expect("serialize private tx fixture");
+        let body_b = serde_json::to_vec(&serde_json::json!({
+            "tx_hash": "private-tx-b",
+            "commitment": "commitment-b",
+            "nullifier": "nullifier-b",
+            "zk_proof": null,
+            "timestamp": 1,
+            "status": "Pending"
+        }))
+        .expect("serialize private tx fixture");
+
+        let err = validate_private_tx_bundle_for_block(&block, &[body_b, body_a])
+            .expect_err("strict bundle must preserve hash/body order");
+
+        assert!(err.contains("does not match committed position"));
+    }
+
+    #[test]
+    fn canonical_private_bundle_policy_rejects_bodies_before_activation() {
+        let mut block = block_with_private_bundle(Vec::new(), Vec::new());
+        block.private_tx_bodies = vec![b"unexpected-body".to_vec()];
+
+        let err = validate_private_tx_bundle_policy_for_block_at(&block, None)
+            .expect_err("dormant policy must reject canonical bodies");
+
+        assert!(err.contains("not active"));
+    }
+
+    #[test]
+    fn strict_private_bundle_accepts_valid_tx_and_rejects_nullifier_mismatch() {
+        let mut manager = PrivateWalletManager::new();
+        manager
+            .create_private_wallet("alice")
+            .expect("alice wallet");
+        let bob = manager.create_private_wallet("bob").expect("bob wallet");
+        manager
+            .deposit_to_private_wallet("alice", 30)
+            .expect("fund alice");
+        let tx_hash = manager
+            .send_private_transaction("alice", bob, 10)
+            .expect("build private tx");
+        let tx = manager
+            .get_private_transaction(&tx_hash)
+            .expect("private tx");
+        let nullifiers = strict_private_tx_spend_tags(&tx).expect("derived nullifiers");
+        let body = serde_json::to_vec(&tx).expect("serialize private tx");
+        let block = block_with_private_bundle(vec![tx_hash], nullifiers);
+
+        validate_private_tx_bundle_for_block(&block, std::slice::from_ref(&body))
+            .expect("valid strict private bundle");
+
+        let mut canonical = block.clone();
+        canonical.private_tx_bodies = vec![body.clone()];
+        validate_private_tx_bundle_policy_for_block_at(
+            &canonical,
+            Some(canonical.header.block_height),
+        )
+        .expect("activated policy accepts valid canonical private bundle");
+        let (storage, _dir) = open_temp_storage();
+        persist_available_private_tx_bodies_at(
+            &storage,
+            &canonical,
+            &[],
+            Some(canonical.header.block_height),
+        );
+        assert_eq!(
+            storage
+                .get_private_transaction_bytes(&canonical.private_tx_hashes[0])
+                .expect("read persisted canonical body"),
+            Some(body.clone())
+        );
+
+        let mut mismatched = block.clone();
+        mismatched.private_nullifiers = vec!["different-nullifier".to_string()];
+        let err = validate_private_tx_bundle_for_block(&mismatched, &[body])
+            .expect_err("strict bundle must derive the committed nullifier set");
+
+        assert!(err.contains("private nullifier set mismatch"));
+
+        let mut tampered_tx = tx;
+        tampered_tx.outputs[0].encrypted_amount[0] ^= 1;
+        let tampered_body = serde_json::to_vec(&tampered_tx).expect("serialize tampered tx");
+        let err = validate_private_tx_bundle_for_block(&block, &[tampered_body])
+            .expect_err("strict bundle must reject body drift");
+
+        assert!(err.contains("hash does not match body"));
     }
 
     #[test]

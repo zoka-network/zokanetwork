@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Zoka RPC sync catch-up watchdog every 30 seconds
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

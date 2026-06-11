@@ -3,6 +3,7 @@
 //! Define los tipos de mensajes que viajan por la red P2P
 
 use crate::consensus::{PbftMessage, PbftNewView, PbftViewChange};
+use crate::private_wallet::{PRIVATE_PROOF_PROFILE_V1, PRIVATE_PROOF_VERSION_V1};
 use crate::state::PrivateCommitmentInclusionProof;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -13,6 +14,14 @@ fn default_user_query_found() -> bool {
 
 fn default_ring_version() -> u8 {
     1
+}
+
+fn default_private_proof_version() -> u8 {
+    PRIVATE_PROOF_VERSION_V1
+}
+
+fn default_private_proof_profile() -> String {
+    PRIVATE_PROOF_PROFILE_V1.to_string()
 }
 
 fn default_asset_tag() -> String {
@@ -111,6 +120,10 @@ pub struct PrivateTransactionMessage {
     pub tx_hash: String,
     /// Commitment (cantidad oculta)
     pub commitment: String,
+    #[serde(default = "default_private_proof_version")]
+    pub private_proof_version: u8,
+    #[serde(default = "default_private_proof_profile")]
+    pub private_proof_profile: String,
     #[serde(default)]
     pub stealth_address: String,
     #[serde(default)]
@@ -393,6 +406,8 @@ mod tests {
         let private_tx = PrivateTransactionMessage {
             tx_hash: "0xpriv".to_string(),
             commitment: "commitment".to_string(),
+            private_proof_version: PRIVATE_PROOF_VERSION_V1,
+            private_proof_profile: PRIVATE_PROOF_PROFILE_V1.to_string(),
             stealth_address: "stlth_abc".to_string(),
             ephemeral_pubkey: vec![1, 2, 3],
             nullifier: "nullifier".to_string(),
@@ -454,6 +469,8 @@ mod tests {
         match restored {
             ZokaMessage::PrivateTransaction(restored) => {
                 assert_eq!(restored.ring_id, "ring-id");
+                assert_eq!(restored.private_proof_version, PRIVATE_PROOF_VERSION_V1);
+                assert_eq!(restored.private_proof_profile, PRIVATE_PROOF_PROFILE_V1);
                 assert_eq!(restored.ring_members.len(), 2);
                 assert_eq!(restored.ring_signature.len(), 128);
                 assert_eq!(restored.proof_commitment, 11);
@@ -475,6 +492,8 @@ mod tests {
             private_tx: PrivateTransactionMessage {
                 tx_hash: "0xpriv".to_string(),
                 commitment: "commitment".to_string(),
+                private_proof_version: PRIVATE_PROOF_VERSION_V1,
+                private_proof_profile: PRIVATE_PROOF_PROFILE_V1.to_string(),
                 stealth_address: "stlth_abc".to_string(),
                 ephemeral_pubkey: vec![1, 2, 3],
                 nullifier: "nullifier".to_string(),
@@ -552,6 +571,8 @@ mod tests {
             txs: vec![PrivateTransactionMessage {
                 tx_hash: "0xpriv".to_string(),
                 commitment: "commitment".to_string(),
+                private_proof_version: PRIVATE_PROOF_VERSION_V1,
+                private_proof_profile: PRIVATE_PROOF_PROFILE_V1.to_string(),
                 stealth_address: "stlth_abc".to_string(),
                 ephemeral_pubkey: vec![1, 2, 3],
                 nullifier: "nullifier".to_string(),
@@ -640,6 +661,8 @@ mod tests {
         match restored {
             ZokaMessage::PrivateTransaction(tx) => {
                 assert_eq!(tx.ring_version, 1);
+                assert_eq!(tx.private_proof_version, PRIVATE_PROOF_VERSION_V1);
+                assert_eq!(tx.private_proof_profile, PRIVATE_PROOF_PROFILE_V1);
             }
             other => panic!("unexpected variant: {:?}", other),
         }

@@ -2628,18 +2628,32 @@ fn network_pending_private_txs(db_path: Option<&str>) -> u64 {
 }
 
 fn local_pending_private_tx_hashes(db_path: &str, limit: usize) -> Result<Vec<String>, String> {
+    local_pending_private_tx_hashes_at(db_path, limit, None)
+}
+
+fn local_pending_private_tx_hashes_at(
+    db_path: &str,
+    limit: usize,
+    target_block_height: Option<u64>,
+) -> Result<Vec<String>, String> {
     let storage = match open_storage(db_path) {
         Ok(storage) => storage,
-        Err(e) if is_storage_lock_error(&e) => {
-            return Ok(sidecar_pending_private_tx_hashes(db_path, limit));
-        }
+        // Sidecar files are only candidates after they have been imported,
+        // decoded, and validated. Mining file names directly could commit a
+        // tx hash without its spent-nullifier set while RocksDB is locked.
+        Err(e) if is_storage_lock_error(&e) => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
     let hashes = storage
         .iterate_pending_private_transaction_hashes()
         .map_err(|e| format!("failed to read pending private txs: {e}"))?;
+    let target_block_height = target_block_height
+        .unwrap_or_else(|| storage.get_chain_height().unwrap_or(0).saturating_add(1));
     Ok(select_non_conflicting_pending_private_tx_hashes(
-        &storage, hashes, limit,
+        &storage,
+        hashes,
+        limit,
+        target_block_height,
     ))
 }
 
@@ -2660,10 +2674,80 @@ fn private_tx_spend_tags(tx: &zoka::private_wallet::PrivateTransaction) -> Vec<S
     tags
 }
 
+fn validate_private_tx_for_pending_pool(tx: &PrivateTransaction) -> Result<(), String> {
+    let mut validator = PrivateWalletManager::new();
+    validator
+        .validate_inbound_private_transaction(tx)
+        .map_err(|e| format!("private transaction validation failed: {e}"))
+}
+
+fn valid_private_tx_hash_format(hash: &str) -> bool {
+    !hash.is_empty()
+        && hash.len() <= 128
+        && hash
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || matches!(c, '-' | '_'))
+}
+
+fn archive_committed_private_tx_body_json(
+    storage: &RocksDbStorage,
+    requested_hash: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let requested_hash = requested_hash.trim();
+    if !valid_private_tx_hash_format(requested_hash) {
+        return Err("private transaction hash format is invalid".to_string());
+    }
+    let tx: PrivateTransaction = serde_json::from_value(value.clone())
+        .map_err(|e| format!("failed to parse private tx body: {e}"))?;
+    if tx.tx_hash.trim() != requested_hash {
+        return Err(format!(
+            "private transaction body hash mismatch: requested {requested_hash}, got {}",
+            tx.tx_hash
+        ));
+    }
+    validate_private_tx_for_pending_pool(&tx)?;
+    let body =
+        serde_json::to_vec(&tx).map_err(|e| format!("failed to serialize private tx: {e}"))?;
+    storage
+        .save_private_transaction_bytes(requested_hash, &body)
+        .map_err(|e| format!("failed to archive private tx: {e}"))
+}
+
+fn validate_private_tx_for_block_candidate(
+    tx: &PrivateTransaction,
+    target_block_height: u64,
+) -> Result<(), String> {
+    validate_private_tx_for_block_candidate_at(
+        tx,
+        target_block_height,
+        economics::private_tx_v2_i1_activation_height(),
+        economics::private_tx_canonical_bundle_activation_height(),
+    )
+}
+
+fn validate_private_tx_for_block_candidate_at(
+    tx: &PrivateTransaction,
+    target_block_height: u64,
+    v2_i1_activation_height: Option<u64>,
+    canonical_bundle_activation_height: Option<u64>,
+) -> Result<(), String> {
+    let mut validator = PrivateWalletManager::new();
+    validator
+        .validate_inbound_private_transaction_at(
+            tx,
+            target_block_height,
+            v2_i1_activation_height,
+            canonical_bundle_activation_height,
+        )
+        .map_err(|e| format!("private transaction validation failed: {e}"))
+}
+
 fn select_non_conflicting_pending_private_tx_hashes(
     storage: &RocksDbStorage,
     hashes: Vec<String>,
     limit: usize,
+    target_block_height: u64,
 ) -> Vec<String> {
     let mut selected = Vec::new();
     let mut seen_spend_tags = HashSet::new();
@@ -2679,6 +2763,9 @@ fn select_non_conflicting_pending_private_tx_hashes(
         else {
             continue;
         };
+        if validate_private_tx_for_block_candidate(&tx, target_block_height).is_err() {
+            continue;
+        }
         let tags = private_tx_spend_tags(&tx);
         if tags.is_empty() || tags.iter().any(|tag| seen_spend_tags.contains(tag)) {
             continue;
@@ -2708,34 +2795,12 @@ fn private_tx_sidecar_dir(db_path: &str) -> std::path::PathBuf {
     base.join("pending_private_queue")
 }
 
-fn sidecar_pending_private_tx_hashes(db_path: &str, limit: usize) -> Vec<String> {
-    let sidecar = private_tx_sidecar_dir(db_path);
-    let entries = match std::fs::read_dir(&sidecar) {
-        Ok(entries) => entries,
-        Err(_) => return Vec::new(),
-    };
-    let mut hashes: Vec<String> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("privtx") {
-                return None;
-            }
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_string())
-        })
-        .collect();
-    hashes.sort();
-    hashes.truncate(limit);
-    hashes
-}
-
 fn persist_local_private_tx_for_node(
     db_path: &str,
     tx_hash: &str,
     tx: &zoka::private_wallet::PrivateTransaction,
 ) -> Result<(), String> {
+    validate_private_tx_for_pending_pool(tx)?;
     let body = serde_json::to_vec(tx)
         .map_err(|e| format!("failed to serialize private transaction: {e}"))?;
 
@@ -2794,6 +2859,13 @@ fn import_sidecar_private_txs(db_path: &str, storage: &RocksDbStorage) -> usize 
             Some(h) => h,
             None => continue,
         };
+        let tx = match serde_json::from_slice::<PrivateTransaction>(&bytes) {
+            Ok(tx) if tx.tx_hash == tx_hash => tx,
+            _ => continue,
+        };
+        if validate_private_tx_for_pending_pool(&tx).is_err() {
+            continue;
+        }
         if storage
             .save_private_transaction_bytes(&tx_hash, &bytes)
             .is_ok()
@@ -2806,6 +2878,170 @@ fn import_sidecar_private_txs(db_path: &str, storage: &RocksDbStorage) -> usize 
         }
     }
     imported
+}
+
+/// Poll public RPC peers for their pending private transactions and stage any
+/// we don't already have into the sidecar queue, so the local mining loop can
+/// include them. Returns how many new bodies were staged. Best-effort: any RPC
+/// or parse failure is skipped silently so this never disrupts the main loop.
+///
+/// This is the NAT-friendly pull path that complements libp2p gossip: a miner
+/// that only opens outbound HTTP still receives private txs published to a
+/// public node.
+fn pull_pending_private_txs_from_rpc(db_path: &str, rpc_endpoints: &[String]) -> usize {
+    if rpc_endpoints.is_empty() {
+        return 0;
+    }
+    let sidecar = private_tx_sidecar_dir(db_path);
+
+    // Hashes we already hold locally (committed bodies or queued sidecar files)
+    // so we don't restage or refetch them every cycle.
+    let have_committed = |hash: &str| -> bool {
+        RocksDbStorage::new(db_path)
+            .ok()
+            .and_then(|s| s.get_private_transaction_bytes(hash).ok().flatten())
+            .is_some()
+    };
+    let sidecar_has = |hash: &str| -> bool { sidecar.join(format!("{hash}.privtx")).exists() };
+
+    let mut staged = 0usize;
+    for rpc in rpc_endpoints {
+        let value = match rpc_http_get_json(rpc, "/private/pending", 5) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let Some(list) = value.get("pending").and_then(|p| p.as_array()) else {
+            continue;
+        };
+        for tx in list {
+            let Some(hash) = tx.get("tx_hash").and_then(|h| h.as_str()) else {
+                continue;
+            };
+            let hash = hash.trim();
+            if !valid_private_tx_hash_format(hash) {
+                continue;
+            }
+            if sidecar_has(hash) || have_committed(hash) {
+                continue;
+            }
+            let Ok(bytes) = serde_json::to_vec(tx) else {
+                continue;
+            };
+            if std::fs::create_dir_all(&sidecar).is_ok()
+                && std::fs::write(sidecar.join(format!("{hash}.privtx")), &bytes).is_ok()
+            {
+                staged += 1;
+            }
+        }
+    }
+    staged
+}
+
+const PRIVATE_TX_BODY_BACKFILL_WINDOW_BLOCKS: u64 = 5_000;
+const PRIVATE_TX_BODY_PULL_INTERVAL_SECS: u64 = 12;
+
+fn collect_private_tx_hashes_in_height_range(
+    storage: &RocksDbStorage,
+    from_height: u64,
+    to_height: u64,
+) -> Vec<String> {
+    if from_height == 0 || from_height > to_height {
+        return Vec::new();
+    }
+
+    let mut hashes = Vec::new();
+    let mut seen = HashSet::new();
+    for height in from_height..=to_height {
+        let Ok(Some(block)) = storage.get_block_by_height(height) else {
+            continue;
+        };
+        for hash in block.private_tx_hashes {
+            let hash = hash.trim();
+            if valid_private_tx_hash_format(hash) && seen.insert(hash.to_string()) {
+                hashes.push(hash.to_string());
+            }
+        }
+    }
+    hashes
+}
+
+fn missing_private_tx_body_hashes(storage: &RocksDbStorage, hashes: &[String]) -> Vec<String> {
+    hashes
+        .iter()
+        .filter_map(|hash| {
+            let hash = hash.trim();
+            if !valid_private_tx_hash_format(hash) {
+                return None;
+            }
+            if storage
+                .get_private_transaction_bytes(hash)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                return None;
+            }
+            Some(hash.to_string())
+        })
+        .collect()
+}
+
+fn should_advance_private_body_scan(
+    has_rpc_endpoints: bool,
+    initial_backfill: bool,
+    missing_count: usize,
+    fetched: usize,
+) -> bool {
+    if missing_count == 0 {
+        return true;
+    }
+    if !has_rpc_endpoints {
+        return false;
+    }
+    if initial_backfill && missing_count > 0 && fetched == 0 {
+        return false;
+    }
+    true
+}
+
+/// Best-effort body backfill for already-committed private tx hashes. This is
+/// deliberately outside consensus: failures only leave the local archive as-is.
+fn pull_missing_committed_private_tx_bodies(
+    storage: &RocksDbStorage,
+    rpc_endpoints: &[String],
+    hashes: &[String],
+) -> usize {
+    if rpc_endpoints.is_empty() || hashes.is_empty() {
+        return 0;
+    }
+
+    let mut fetched = 0usize;
+    for hash in hashes {
+        let hash = hash.trim();
+        if !valid_private_tx_hash_format(hash) {
+            continue;
+        }
+        if storage
+            .get_private_transaction_bytes(hash)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            continue;
+        }
+
+        for rpc in rpc_endpoints {
+            let value = match rpc_http_get_json(rpc, &format!("/private/tx/{hash}"), 5) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            if archive_committed_private_tx_body_json(storage, hash, &value).is_ok() {
+                fetched += 1;
+                break;
+            }
+        }
+    }
+    fetched
 }
 
 fn clear_committed_local_private_txs(
@@ -3422,6 +3658,9 @@ fn collect_private_tx_bodies_from_storage(
     storage: &RocksDbStorage,
     block: &zoka::types::Block,
 ) -> Vec<Vec<u8>> {
+    if !block.private_tx_bodies.is_empty() {
+        return block.private_tx_bodies.clone();
+    }
     if block.private_tx_hashes.is_empty() {
         return Vec::new();
     }
@@ -3429,6 +3668,19 @@ fn collect_private_tx_bodies_from_storage(
         .private_tx_hashes
         .iter()
         .filter_map(|hash| storage.get_private_transaction_bytes(hash).ok().flatten())
+        .collect()
+}
+
+/// Collect every body selected for a future canonical private bundle.
+/// Unlike P2P attachments, this is all-or-nothing: a miner must never
+/// produce a post-activation block whose committed body list is partial.
+fn collect_canonical_private_tx_bodies_for_hashes(
+    storage: &RocksDbStorage,
+    hashes: &[String],
+) -> Option<Vec<Vec<u8>>> {
+    hashes
+        .iter()
+        .map(|hash| storage.get_private_transaction_bytes(hash).ok().flatten())
         .collect()
 }
 
@@ -4745,9 +4997,35 @@ fn run_mining_batch_with_progress(
                 import_sidecar_private_txs(path, &storage);
             }
         }
-        let private_tx_hashes_for_block = match config.chain_db_path.as_deref() {
-            Some(path) => local_pending_private_tx_hashes(path, LOCAL_PRIVATE_TXS_PER_BLOCK_LIMIT)?,
+        let mut private_tx_hashes_for_block = match config.chain_db_path.as_deref() {
+            Some(path) => local_pending_private_tx_hashes_at(
+                path,
+                LOCAL_PRIVATE_TXS_PER_BLOCK_LIMIT,
+                Some(height),
+            )?,
             None => Vec::new(),
+        };
+        let private_tx_bodies_for_block = if economics::private_tx_canonical_bundle_required(height)
+        {
+            match config.chain_db_path.as_deref() {
+                Some(path) if !private_tx_hashes_for_block.is_empty() => {
+                    match open_storage(path).ok().and_then(|storage| {
+                        collect_canonical_private_tx_bodies_for_hashes(
+                            &storage,
+                            &private_tx_hashes_for_block,
+                        )
+                    }) {
+                        Some(bodies) => bodies,
+                        None => {
+                            private_tx_hashes_for_block.clear();
+                            Vec::new()
+                        }
+                    }
+                }
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
         };
         // Derive the spent-nullifier set committed in this block from the
         // selected tx bodies, so every node enforces no-double-spend from
@@ -4757,7 +5035,10 @@ fn run_mining_batch_with_progress(
                 Ok(storage) => {
                     collect_private_nullifiers_for_hashes(&storage, &private_tx_hashes_for_block)
                 }
-                Err(_) => Vec::new(),
+                Err(_) => {
+                    private_tx_hashes_for_block.clear();
+                    Vec::new()
+                }
             },
             _ => Vec::new(),
         };
@@ -4793,6 +5074,7 @@ fn run_mining_batch_with_progress(
             },
             transactions: vec![coinbase_tx],
             private_tx_hashes: private_tx_hashes_for_block.clone(),
+            private_tx_bodies: private_tx_bodies_for_block.clone(),
             private_nullifiers: private_nullifiers_for_block.clone(),
             private_fee_claims: private_fee_claims_for_block.clone(),
             private_coinbase: Some(private_coinbase.clone()),
@@ -4819,6 +5101,7 @@ fn run_mining_batch_with_progress(
             },
             transactions: Vec::new(),
             private_tx_hashes: Vec::new(),
+            private_tx_bodies: Vec::new(),
             private_nullifiers: Vec::new(),
             private_fee_claims: Vec::new(),
             private_coinbase: None,
@@ -5218,6 +5501,12 @@ fn handle_fullnode_network_message(
             if matches!(storage.get_private_transaction_bytes(hash), Ok(Some(_))) {
                 return Some(format!(
                     "Gossiped private tx {} already on disk; ignoring duplicate.",
+                    truncate_dashboard_text(hash, 16)
+                ));
+            }
+            if let Err(err) = validate_private_tx_for_pending_pool(&tx) {
+                return Some(format!(
+                    "Ignored gossiped private tx {}: {err}",
                     truncate_dashboard_text(hash, 16)
                 ));
             }
@@ -6515,6 +6804,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut private_tx_recv_outer: Option<
         tokio::sync::mpsc::UnboundedReceiver<zoka::private_wallet::PrivateTransaction>,
     > = None;
+    let mut chain_storage_outer: Option<Arc<RocksDbStorage>> = None;
 
     if let Some(db) = db_path.as_ref() {
         if let Some(genesis_file) = genesis_path.as_ref() {
@@ -6524,6 +6814,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             }
         }
         let manager = open_state_manager(db).await?;
+        chain_storage_outer = Some(manager.raw_storage());
         let state = manager.get_state().await;
         startup_notes.push(format!(
             "State ready from {}: height={}, state_root={}, accounts={}",
@@ -6550,8 +6841,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         let api_mempool = Arc::new(zoka::mempool::Mempool::new(10_000));
         let api_bind_addr = configured_api_bind_addr(args, network)?;
         let api_public_url = format!("http://{api_bind_addr}");
-        // Channel for the API's /private/wallet/send-from-seed handler to
-        // hand freshly built PrivateTransactions back to the fullnode
+        // Channel for API private-tx submission handlers to hand freshly
+        // built PrivateTransactions back to the fullnode
         // main loop. The main loop drains the receiver below, inserts
         // each tx into the in-memory private pool, AND gossips it via
         // libp2p so any connected mining peer can include it in their
@@ -6967,6 +7258,13 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut next_seed_reconnect_at = tokio::time::Instant::now();
     let mut next_ibd_at = tokio::time::Instant::now();
     let mut next_miner_heartbeat_at = tokio::time::Instant::now();
+    // Periodic RPC pull of pending private txs from public peers. This is the
+    // NAT-friendly counterpart to libp2p gossip: a miner that can only open
+    // outbound HTTP pulls pending private txs into its own pool so it can mine
+    // them, even when inbound P2P gossip never reaches it.
+    let mut next_private_pull_at = tokio::time::Instant::now();
+    let mut next_private_body_pull_at = tokio::time::Instant::now();
+    let mut last_private_body_scan_height = 0u64;
     let mut heartbeat_last_status_log = HashMap::<String, bool>::new();
     let mut heartbeat_recent_failures: VecDeque<(String, String)> = VecDeque::with_capacity(8);
     let mut last_runtime_mining_enabled = auto_mine;
@@ -7106,18 +7404,99 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 tokio::time::Instant::now() + Duration::from_secs(reconnect_delay_secs);
         }
 
-        if !mining_active && tokio::time::Instant::now() >= next_sync_state_at {
+        if tokio::time::Instant::now() >= next_sync_state_at {
+            // Always broadcast local height so peers behind us can discover
+            // they need to catch up — even while this node is actively mining.
             if let Some(sync_event) = publish_local_sync_state(&mut node, db_path.as_deref())? {
                 last_event = sync_event;
             }
-            if let Some(rebroadcast_event) = publish_recent_chain_blocks(
-                &mut node,
-                db_path.as_deref(),
-                sync_rebroadcast_recent_blocks,
-            )? {
-                last_event = rebroadcast_event;
+            // Block rebroadcast is skipped during mining to avoid flooding
+            // the network with redundant payloads the miner just produced.
+            if !mining_active {
+                if let Some(rebroadcast_event) = publish_recent_chain_blocks(
+                    &mut node,
+                    db_path.as_deref(),
+                    sync_rebroadcast_recent_blocks,
+                )? {
+                    last_event = rebroadcast_event;
+                }
             }
             next_sync_state_at = tokio::time::Instant::now() + Duration::from_secs(3);
+        }
+
+        // Pull pending private txs from public RPC peers so a NAT'd miner can
+        // include txs that were published to a droplet but never gossiped to
+        // it. Bodies are dropped into the sidecar queue, which the mining loop
+        // already drains into the local pending pool — this avoids fighting the
+        // miner for the RocksDB write lock. Runs on every node with RPC
+        // endpoints; harmless on the droplets (they re-stage what they have).
+        if tokio::time::Instant::now() >= next_private_pull_at {
+            if let Some(path) = db_path.as_deref() {
+                let staged = pull_pending_private_txs_from_rpc(path, &rpc_sync_endpoints);
+                if staged > 0 {
+                    last_event = format!("Pulled {staged} pending private tx(s) from RPC peers");
+                }
+            }
+            next_private_pull_at = tokio::time::Instant::now() + Duration::from_secs(5);
+        }
+
+        // Backfill private transaction bodies for hashes that are already
+        // committed in canonical blocks. This repairs peers that synced a
+        // block before ever seeing the private tx in their pending pool.
+        if tokio::time::Instant::now() >= next_private_body_pull_at {
+            if let Some(storage) = chain_storage_outer.as_deref() {
+                let tip = storage.get_chain_height().unwrap_or(0);
+                if tip > 0 {
+                    if last_private_body_scan_height > tip {
+                        last_private_body_scan_height = 0;
+                    }
+                    let initial_backfill = last_private_body_scan_height == 0;
+                    let from_height = if initial_backfill {
+                        tip.saturating_sub(PRIVATE_TX_BODY_BACKFILL_WINDOW_BLOCKS)
+                            .saturating_add(1)
+                            .max(1)
+                    } else {
+                        last_private_body_scan_height.saturating_add(1)
+                    };
+                    if from_height <= tip {
+                        let hashes =
+                            collect_private_tx_hashes_in_height_range(storage, from_height, tip);
+                        let missing_hashes = missing_private_tx_body_hashes(storage, &hashes);
+                        let fetched = pull_missing_committed_private_tx_bodies(
+                            storage,
+                            &rpc_sync_endpoints,
+                            &missing_hashes,
+                        );
+                        if fetched > 0 {
+                            last_event = format!(
+                                "Backfilled {fetched} committed private tx body(s) from RPC peers ({from_height}..{tip})"
+                            );
+                        }
+                        if should_advance_private_body_scan(
+                            !rpc_sync_endpoints.is_empty(),
+                            initial_backfill,
+                            missing_hashes.len(),
+                            fetched,
+                        ) {
+                            last_private_body_scan_height = tip;
+                        } else if rpc_sync_endpoints.is_empty() && !missing_hashes.is_empty() {
+                            last_event = format!(
+                                "Private tx body backfill waiting for RPC endpoints ({from_height}..{tip}, {} missing)",
+                                missing_hashes.len()
+                            );
+                        } else if initial_backfill && !missing_hashes.is_empty() {
+                            last_event = format!(
+                                "Private tx body backfill will retry ({from_height}..{tip}, {} missing)",
+                                missing_hashes.len()
+                            );
+                        }
+                    } else {
+                        last_private_body_scan_height = tip;
+                    }
+                }
+            }
+            next_private_body_pull_at = tokio::time::Instant::now()
+                + Duration::from_secs(PRIVATE_TX_BODY_PULL_INTERVAL_SECS);
         }
 
         if mining_task
@@ -7179,6 +7558,19 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     bodies,
                 ) {
                     publish_failures = publish_failures.saturating_add(1);
+                }
+            }
+            // Autopush: also POST each mined block to the configured public RPC
+            // endpoints (/sync/block). P2P gossip alone is unreliable for a
+            // NAT'd local miner, so this HTTP push delivers the block straight
+            // to the cloud nodes for efficient sync.
+            if !rpc_sync_endpoints.is_empty() {
+                for block in &batch.produced_blocks {
+                    if let Ok(body) = serde_json::to_value(block) {
+                        for rpc in &rpc_sync_endpoints {
+                            let _ = rpc_http_post_json(rpc, "/sync/block", &body, 5);
+                        }
+                    }
                 }
             }
             last_event = if publish_failures == 0 {
@@ -8828,6 +9220,93 @@ fn cmd_private_send(args: &[String]) -> Result<(), String> {
     } else if !archive_errors.is_empty() {
         println!("Archived private tx bodies: 0 (run private-tx-publish after RPC is reachable)");
     }
+    Ok(())
+}
+
+/// `zoka consolidate --from <addr> --yes [--db <path>] [--password ...]`
+///
+/// Merges a fragmented private wallet (e.g. thousands of small mining-coinbase
+/// notes) into far fewer, larger notes by sending the whole spendable balance
+/// to the wallet's OWN address. `cmd_private_send` auto-splits that self-send
+/// into chunks of up to PRIVATE_TX_MAX_INPUTS notes, so each chunk fuses ~96
+/// small notes into one. One run takes N notes down to ceil(N/96); re-run
+/// after the sweep is mined to consolidate further. Large ordinary sends that
+/// previously needed dozens of chained txs then need far fewer.
+fn cmd_private_consolidate(args: &[String]) -> Result<(), String> {
+    let network = NetworkProfile::from_args(args)?;
+    let from_raw = required_option_value(args, "--from")?;
+    let password = password_value(args)?;
+    let db_path =
+        option_value(args, "--db").or_else(|| Some(network.default_db_path().to_string()));
+    if !has_flag(args, "--yes") {
+        return Err("refusing to consolidate without explicit confirmation; add --yes".to_string());
+    }
+
+    // Read the wallet's spendable balance + note count, then release the DB
+    // before the send reopens it.
+    let (own_address, balance, note_count) = {
+        let storage = wallet_storage_for_network(network)?;
+        let manager =
+            load_private_wallet_manager_for_network(&storage, password.as_deref(), network)?;
+        let (from_wallet, from_commitment) =
+            resolve_network_wallet_address_required(&manager, &storage, &from_raw, "--from")?;
+        let sender = manager
+            .get_private_wallet(&from_wallet)
+            .ok_or_else(|| format!("private wallet not found: {from_wallet}"))?;
+        if sender.view_only || sender.spending_key.is_empty() {
+            return Err("cannot consolidate a view-only private wallet".to_string());
+        }
+        let count = sender.private_notes.iter().filter(|n| !n.spent).count();
+        (
+            user_private_address_display(&from_commitment),
+            sender.private_balance,
+            count,
+        )
+    };
+
+    if balance == 0 {
+        return Err("nothing to consolidate: zero spendable balance".to_string());
+    }
+    if note_count <= 1 {
+        println!("Already consolidated: {note_count} spendable note(s).");
+        return Ok(());
+    }
+
+    let expected_after = (note_count + PRIVATE_TX_MAX_INPUTS - 1) / PRIVATE_TX_MAX_INPUTS;
+    println!(
+        "Consolidating {} across {} note(s) → ~{} note(s) ({} self-transfer chunk(s) of up to {} inputs).",
+        format_zka(balance),
+        note_count,
+        expected_after,
+        expected_after,
+        PRIVATE_TX_MAX_INPUTS
+    );
+
+    // Sweep: send the whole spendable balance back to our own address.
+    let mut send_args = vec![
+        "--from".to_string(),
+        own_address.clone(),
+        "--to".to_string(),
+        own_address,
+        "--amount".to_string(),
+        format_zka_amount(balance),
+        "--fee".to_string(),
+        "0".to_string(),
+        "--yes".to_string(),
+        "--network".to_string(),
+        network.label().to_string(),
+    ];
+    if let Some(pw) = password.as_deref() {
+        send_args.push("--password".to_string());
+        send_args.push(pw.to_string());
+    }
+    push_opt_arg(&mut send_args, "--db", db_path);
+
+    cmd_private_send(&send_args)?;
+    println!(
+        "Consolidation sweep broadcast. Once mined, re-run to merge the remaining \
+         ~{expected_after} note(s) further."
+    );
     Ok(())
 }
 
@@ -11025,6 +11504,10 @@ async fn run() -> Result<(), String> {
             let args = normalize_positional_alias_args(tail, &["--from", "--to", "--amount"]);
             cmd_tx_send_unified(&args)
         }
+        "consolidate" | "private-consolidate" => {
+            let args = normalize_positional_alias_args(tail, &["--from"]);
+            cmd_private_consolidate(&args)
+        }
         "fee" => {
             let args = normalize_positional_alias_args(tail, &["--amount"]);
             cmd_estimate_fee(&args)
@@ -12006,6 +12489,253 @@ mod tests {
         assert_eq!(
             current_known_height_for_network(Some(&db), NetworkProfile::Mainnet),
             7
+        );
+    }
+
+    fn private_tx_with_unknown_proof_profile() -> PrivateTransaction {
+        serde_json::from_value(serde_json::json!({
+            "tx_hash": "unknown-proof-profile",
+            "commitment": "commitment",
+            "private_proof_version": 2,
+            "private_proof_profile": "private_tx_v2_i1",
+            "nullifier": "nullifier",
+            "zk_proof": null,
+            "timestamp": 1,
+            "status": "Pending"
+        }))
+        .expect("deserialize private tx fixture")
+    }
+
+    #[test]
+    fn pending_private_tx_selection_rejects_unknown_proof_profile() {
+        let (_tmp, db) = temp_db_arg();
+        let storage = RocksDbStorage::new(&db).expect("temp rocksdb");
+        let tx = private_tx_with_unknown_proof_profile();
+        let body = serde_json::to_vec(&tx).expect("serialize private tx fixture");
+        storage
+            .save_private_transaction_bytes(&tx.tx_hash, &body)
+            .expect("save private tx body");
+        storage
+            .save_pending_private_transaction_hash(&tx.tx_hash)
+            .expect("save pending hash");
+
+        assert!(
+            select_non_conflicting_pending_private_tx_hashes(&storage, vec![tx.tx_hash], 1, 1,)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mining_candidate_validation_uses_exact_v2_activation_height() {
+        let tx = private_tx_with_unknown_proof_profile();
+        let err = validate_private_tx_for_block_candidate_at(&tx, 9, Some(10), Some(10))
+            .expect_err("v2 i1 must remain excluded before activation");
+        assert!(err.contains("not active at height 9"));
+
+        let err = validate_private_tx_for_block_candidate_at(&tx, 10, Some(10), Some(10))
+            .expect_err("deliberately incomplete fixture remains invalid after activation");
+        assert!(err.contains("hash does not match body"));
+        assert!(!err.contains("not active"));
+    }
+
+    #[test]
+    fn canonical_private_tx_body_collection_is_all_or_nothing() {
+        let (_tmp, db) = temp_db_arg();
+        let storage = RocksDbStorage::new(&db).expect("temp rocksdb");
+        storage
+            .save_private_transaction_bytes("private-tx-a", b"body-a")
+            .expect("save first private body");
+        let hashes = vec!["private-tx-a".to_string(), "private-tx-b".to_string()];
+
+        assert_eq!(
+            collect_canonical_private_tx_bodies_for_hashes(&storage, &hashes),
+            None
+        );
+
+        storage
+            .save_private_transaction_bytes("private-tx-b", b"body-b")
+            .expect("save second private body");
+        assert_eq!(
+            collect_canonical_private_tx_bodies_for_hashes(&storage, &hashes),
+            Some(vec![b"body-a".to_vec(), b"body-b".to_vec()])
+        );
+    }
+
+    #[test]
+    fn block_response_prefers_embedded_canonical_private_bodies() {
+        let (_tmp, db) = temp_db_arg();
+        let storage = RocksDbStorage::new(&db).expect("temp rocksdb");
+        storage
+            .save_private_transaction_bytes("private-tx-a", b"sidecar-body")
+            .expect("save sidecar private body");
+        let block = zoka::types::Block::new(
+            "prev".to_string(),
+            1,
+            0,
+            1,
+            Vec::new(),
+            zoka::types::PublicKey(Vec::new()),
+            zoka::types::Signature(Vec::new()),
+        )
+        .with_private_tx_hashes(vec!["private-tx-a".to_string()])
+        .with_private_tx_bodies(vec![b"canonical-body".to_vec()]);
+
+        assert_eq!(
+            collect_private_tx_bodies_from_storage(&storage, &block),
+            vec![b"canonical-body".to_vec()]
+        );
+    }
+
+    #[test]
+    fn sidecar_import_rejects_unknown_proof_profile() {
+        let (_tmp, db) = temp_db_arg();
+        let storage = RocksDbStorage::new(&db).expect("temp rocksdb");
+        let tx = private_tx_with_unknown_proof_profile();
+        let sidecar = private_tx_sidecar_dir(&db);
+        std::fs::create_dir_all(&sidecar).expect("create sidecar dir");
+        std::fs::write(
+            sidecar.join(format!("{}.privtx", tx.tx_hash)),
+            serde_json::to_vec(&tx).expect("serialize private tx fixture"),
+        )
+        .expect("write sidecar fixture");
+
+        assert_eq!(import_sidecar_private_txs(&db, &storage), 0);
+        assert!(storage
+            .get_private_transaction_bytes(&tx.tx_hash)
+            .expect("read stored body")
+            .is_none());
+    }
+
+    #[test]
+    fn committed_private_tx_body_archive_rejects_hash_mismatch() {
+        let (_tmp, db) = temp_db_arg();
+        let storage = RocksDbStorage::new(&db).expect("temp rocksdb");
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        let bob = manager.create_private_wallet("bob").unwrap();
+        manager.deposit_to_private_wallet("alice", 10).unwrap();
+        let tx_hash = manager
+            .send_private_transaction("alice", bob, 1)
+            .expect("create private tx");
+        let tx = manager
+            .get_private_transaction(&tx_hash)
+            .expect("created tx");
+        let value = serde_json::to_value(tx).expect("serialize private tx value");
+
+        let err = archive_committed_private_tx_body_json(&storage, "deadbeef", &value)
+            .expect_err("mismatched archive must fail");
+        assert!(err.contains("hash mismatch"));
+        assert!(storage
+            .get_private_transaction_bytes("deadbeef")
+            .expect("read mismatched slot")
+            .is_none());
+    }
+
+    #[test]
+    fn committed_private_tx_body_archive_stores_valid_body() {
+        let (_tmp, db) = temp_db_arg();
+        let storage = RocksDbStorage::new(&db).expect("temp rocksdb");
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        let bob = manager.create_private_wallet("bob").unwrap();
+        manager.deposit_to_private_wallet("alice", 10).unwrap();
+        let tx_hash = manager
+            .send_private_transaction("alice", bob, 1)
+            .expect("create private tx");
+        let tx = manager
+            .get_private_transaction(&tx_hash)
+            .expect("created tx");
+        let value = serde_json::to_value(tx).expect("serialize private tx value");
+
+        archive_committed_private_tx_body_json(&storage, &tx_hash, &value)
+            .expect("valid archive should store body");
+        let stored = storage
+            .get_private_transaction_bytes(&tx_hash)
+            .expect("read archived body")
+            .expect("body stored");
+        let stored_tx: PrivateTransaction =
+            serde_json::from_slice(&stored).expect("parse archived body");
+        assert_eq!(stored_tx.tx_hash, tx_hash);
+    }
+
+    #[test]
+    fn private_tx_hash_range_collection_deduplicates_canonical_hashes() {
+        let (_tmp, db) = temp_db_arg();
+        let storage = RocksDbStorage::new(&db).expect("temp rocksdb");
+        let block_one = zoka::types::Block::new(
+            "prev".to_string(),
+            1,
+            0,
+            1,
+            Vec::new(),
+            zoka::types::PublicKey(Vec::new()),
+            zoka::types::Signature(Vec::new()),
+        )
+        .with_private_tx_hashes(vec!["aaaa".to_string(), "bbbb".to_string()]);
+        storage.save_block(&block_one).expect("save block one");
+        let block_two = zoka::types::Block::new(
+            block_one.header.hash.clone(),
+            2,
+            0,
+            2,
+            Vec::new(),
+            zoka::types::PublicKey(Vec::new()),
+            zoka::types::Signature(Vec::new()),
+        )
+        .with_private_tx_hashes(vec![
+            "bbbb".to_string(),
+            "invalid hash".to_string(),
+            "cccc".to_string(),
+        ]);
+        storage.save_block(&block_two).expect("save block two");
+
+        assert_eq!(
+            collect_private_tx_hashes_in_height_range(&storage, 1, 2),
+            vec!["aaaa".to_string(), "bbbb".to_string(), "cccc".to_string()]
+        );
+    }
+
+    #[test]
+    fn missing_private_tx_body_hashes_skips_present_and_invalid_entries() {
+        let (_tmp, db) = temp_db_arg();
+        let storage = RocksDbStorage::new(&db).expect("temp rocksdb");
+        storage
+            .save_private_transaction_bytes("aaaa", b"body-a")
+            .expect("save existing body");
+        let hashes = vec![
+            "aaaa".to_string(),
+            "bbbb".to_string(),
+            "invalid hash".to_string(),
+            "cccc".to_string(),
+        ];
+
+        assert_eq!(
+            missing_private_tx_body_hashes(&storage, &hashes),
+            vec!["bbbb".to_string(), "cccc".to_string()]
+        );
+    }
+
+    #[test]
+    fn private_body_scan_advance_policy_retries_sticky_initial_backfill() {
+        assert!(
+            should_advance_private_body_scan(false, true, 0, 0),
+            "complete windows can advance even without RPC peers"
+        );
+        assert!(
+            !should_advance_private_body_scan(false, true, 2, 0),
+            "missing bodies should not be marked scanned when no RPC peers are configured"
+        );
+        assert!(
+            !should_advance_private_body_scan(true, true, 2, 0),
+            "initial backfill with unresolved missing bodies should be retried"
+        );
+        assert!(
+            should_advance_private_body_scan(true, true, 2, 1),
+            "a productive initial backfill can advance"
+        );
+        assert!(
+            should_advance_private_body_scan(true, false, 2, 0),
+            "steady-state scans advance so they do not pin the live loop forever"
         );
     }
 

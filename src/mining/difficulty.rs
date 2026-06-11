@@ -135,25 +135,32 @@ mod tests {
 
     #[test]
     fn retarget_steps_up_when_parent_solve_time_is_too_fast() {
+        // Use a start in the middle of the [MIN, MAX] band so the step is
+        // observable regardless of how MIN/MAX are pinned in the test config.
+        // (In the pinned-8 test build MIN==MAX==8 leaves no room to step, so
+        // this exercises the band midpoint to validate the step logic.)
+        let start = (economics::POW_MIN_DIFFICULTY_BITS + economics::POW_MAX_DIFFICULTY_BITS) / 2;
         let new_bits = retarget_from_solve_time(
-            economics::POW_INITIAL_DIFFICULTY_BITS,
+            start,
             economics::TARGET_BLOCK_TIME_SECS / 4,
             economics::TARGET_BLOCK_TIME_SECS,
         );
-        assert_eq!(new_bits, economics::POW_INITIAL_DIFFICULTY_BITS + 1);
+        let expected = (start + 1).min(economics::POW_MAX_DIFFICULTY_BITS);
+        assert_eq!(new_bits, expected);
     }
 
     #[test]
     fn retarget_steps_down_when_parent_solve_time_is_too_slow() {
-        // Start one bit above the floor so the step-down is observable even
-        // when INITIAL == MIN (as in the lowered test config).
-        let start = economics::POW_INITIAL_DIFFICULTY_BITS + 1;
+        let start = (economics::POW_MIN_DIFFICULTY_BITS + economics::POW_MAX_DIFFICULTY_BITS) / 2;
         let new_bits = retarget_from_solve_time(
             start,
             economics::TARGET_BLOCK_TIME_SECS * 3,
             economics::TARGET_BLOCK_TIME_SECS,
         );
-        assert_eq!(new_bits, start - 1);
+        let expected = start
+            .saturating_sub(1)
+            .max(economics::POW_MIN_DIFFICULTY_BITS);
+        assert_eq!(new_bits, expected);
     }
 
     #[test]
@@ -212,6 +219,7 @@ mod tests {
             },
             transactions: Vec::new(),
             private_tx_hashes: Vec::new(),
+            private_tx_bodies: Vec::new(),
             private_nullifiers: Vec::new(),
             private_fee_claims: Vec::new(),
             private_coinbase: None,

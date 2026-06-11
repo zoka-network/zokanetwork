@@ -245,13 +245,10 @@ pub struct PrivateCoinbaseOutput {
 
 /// Block body on the ledger.
 ///
-/// Public transactions live in `transactions`. Private transactions are
-/// referenced here by **hash only** (`private_tx_hashes`); the actual
-/// `PrivateTransaction` payloads live in `PrivateTransactionPool` on each
-/// node and are fetched on demand by peers that don't have them yet.
-/// That keeps `types::Block` free of a cyclic dependency on the private
-/// wallet crate while still anchoring each private tx to its position in
-/// the chain via the Merkle root.
+/// Public transactions live in `transactions`. Historical private
+/// transactions are referenced by hash only. A future height-gated format
+/// also carries their serialized bodies as bytes, keeping this type free of
+/// a cyclic dependency on the private wallet module.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Block {
     pub header: BlockHeader,
@@ -260,6 +257,10 @@ pub struct Block {
     /// to empty for backwards compatibility with pre-split blocks.
     #[serde(default)]
     pub private_tx_hashes: Vec<String>,
+    /// Canonical serialized private transaction bodies. This field remains
+    /// empty until the reviewed activation height is fixed in consensus.
+    #[serde(default)]
+    pub private_tx_bodies: Vec<Vec<u8>>,
     /// Spent nullifiers (primary + input nullifiers) of every private tx
     /// committed in this block, sorted and de-duplicated. Committed in the
     /// Merkle root so every node — even one that never received the tx
@@ -301,6 +302,7 @@ impl Block {
             },
             transactions,
             private_tx_hashes: Vec::new(),
+            private_tx_bodies: Vec::new(),
             private_nullifiers: Vec::new(),
             private_fee_claims: Vec::new(),
             private_coinbase: None,
@@ -315,6 +317,15 @@ impl Block {
     /// root and block hash, so call this *before* signing the block.
     pub fn with_private_tx_hashes(mut self, private_tx_hashes: Vec<String>) -> Self {
         self.private_tx_hashes = private_tx_hashes;
+        self.header.merkle_root = self.compute_merkle_root();
+        self.header.hash = self.compute_hash();
+        self
+    }
+
+    /// Attach canonical private transaction bodies for the future
+    /// height-gated format. Recomputes the Merkle root and block hash.
+    pub fn with_private_tx_bodies(mut self, private_tx_bodies: Vec<Vec<u8>>) -> Self {
+        self.private_tx_bodies = private_tx_bodies;
         self.header.merkle_root = self.compute_merkle_root();
         self.header.hash = self.compute_hash();
         self
@@ -357,6 +368,7 @@ impl Block {
 
         if self.transactions.is_empty()
             && self.private_tx_hashes.is_empty()
+            && self.private_tx_bodies.is_empty()
             && self.private_nullifiers.is_empty()
             && self.private_fee_claims.is_empty()
             && self.private_coinbase.is_none()
@@ -378,6 +390,12 @@ impl Block {
                 let mut hasher = Sha256::new();
                 hasher.update(b"private:");
                 hasher.update(hash.as_bytes());
+                hasher.finalize().to_vec()
+            }))
+            .chain(self.private_tx_bodies.iter().map(|body| {
+                let mut hasher = Sha256::new();
+                hasher.update(b"private-body-v1:");
+                hasher.update(body);
                 hasher.finalize().to_vec()
             }))
             .chain(self.private_nullifiers.iter().map(|nullifier| {
@@ -673,6 +691,7 @@ mod block_body_split_tests {
             dummy_seal(),
         );
         assert!(block.private_tx_hashes.is_empty());
+        assert!(block.private_tx_bodies.is_empty());
     }
 
     #[test]
@@ -697,6 +716,25 @@ mod block_body_split_tests {
             empty.header.hash, with_private.header.hash,
             "adding a private tx hash must change the block hash"
         );
+    }
+
+    #[test]
+    fn canonical_private_tx_bodies_change_merkle_root() {
+        let empty = Block::new(
+            "prev".to_string(),
+            0,
+            0,
+            0,
+            vec![],
+            dummy_validator(),
+            dummy_seal(),
+        );
+        let with_body = empty
+            .clone()
+            .with_private_tx_bodies(vec![b"private-body".to_vec()]);
+
+        assert_ne!(empty.header.merkle_root, with_body.header.merkle_root);
+        assert_ne!(empty.header.hash, with_body.header.hash);
     }
 
     #[test]

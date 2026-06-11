@@ -2,7 +2,11 @@
 use crate::cli::{CliConfig, MultiProfileConfig};
 use crate::consensus::pbft::PbftConsensus;
 use crate::mempool::Mempool;
-use crate::private_wallet::{PrivateTransaction, PrivateWalletManager};
+use crate::private_wallet::{
+    payment_address_from_scan_key, scan_private_transaction_with_view_key,
+    validate_view_scan_key_for_address, PrivateTransaction, PrivateViewScanMatch,
+    PrivateWalletManager,
+};
 use crate::state::{AccountInclusionProof, StateManager};
 use crate::types::{StateError, TransactionRequest, TransactionResponse};
 use axum::{
@@ -22,6 +26,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
+use zeroize::Zeroize;
 
 type SharedState = Arc<StateManager>;
 type SharedMempool = Arc<Mempool>;
@@ -52,6 +57,7 @@ const MINER_HEARTBEAT_TTL_SECS: u64 = 90;
 pub struct ApiSecurityConfig {
     pub api_token: Option<String>,
     pub rate_limit_per_minute: usize,
+    pub read_rate_limit_per_minute: usize,
     pub transaction_rate_limit_per_minute: usize,
     pub max_client_id_len: usize,
     pub max_request_body_bytes: usize,
@@ -61,6 +67,14 @@ pub struct ApiSecurityConfig {
     pub enable_replay_protection: bool,
     pub request_nonce_max_age_secs: u64,
     pub enforce_rbac: bool,
+    /// Transitional compatibility escape hatch. Keep disabled for public
+    /// nodes: this endpoint decrypts wallet seed material in node memory.
+    pub enable_remote_seed_endpoint: bool,
+    /// Enables POST /mining/start|stop|control so a local controller (e.g. the
+    /// ZSilent desktop app) can toggle the node's in-process miner at runtime
+    /// without restarting the node. OFF by default so public nodes can't be
+    /// toggled by anyone.
+    pub enable_mining_control_endpoint: bool,
     pub write_clients: Vec<String>,
     pub admin_clients: Vec<String>,
     pub ip_whitelist: Vec<String>, // Empty = allow all
@@ -79,6 +93,16 @@ fn parse_csv_env(var: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn parse_bool_env(var: &str, default: bool) -> bool {
+    std::env::var(var)
+        .ok()
+        .map(|v| {
+            let normalized = v.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(default)
+}
+
 impl Default for ApiSecurityConfig {
     fn default() -> Self {
         let ip_whitelist = parse_csv_env("ZOKA_API_IP_WHITELIST");
@@ -91,6 +115,11 @@ impl Default for ApiSecurityConfig {
                 .and_then(|raw| raw.parse::<usize>().ok())
                 .filter(|value| *value > 0)
                 .unwrap_or(120),
+            read_rate_limit_per_minute: std::env::var("ZOKA_API_READ_RATE_LIMIT")
+                .ok()
+                .and_then(|raw| raw.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(1200),
             transaction_rate_limit_per_minute: std::env::var("ZOKA_API_TX_RATE_LIMIT")
                 .ok()
                 .and_then(|raw| raw.parse::<usize>().ok())
@@ -140,6 +169,36 @@ impl Default for ApiSecurityConfig {
                     matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
                 })
                 .unwrap_or(false),
+            enable_remote_seed_endpoint: {
+                // /private/wallet/send-from-seed receives the user's recovery
+                // seed (sealed in transit) and builds the proof server-side — a
+                // transitional convenience that breaks self-custody. It is OFF
+                // by default, and a RELEASE/mainnet build additionally refuses
+                // to enable it unless the operator ALSO opts into the insecure
+                // mode, so a single stray env var can never expose it in prod.
+                let requested = parse_bool_env("ZOKA_API_ENABLE_REMOTE_SEED_ENDPOINT", false);
+                let allow_insecure = parse_bool_env("ZOKA_API_ALLOW_INSECURE_REMOTE_SEED", false);
+                let enabled = requested && (cfg!(debug_assertions) || allow_insecure);
+                if requested && !enabled {
+                    eprintln!(
+                        "SECURITY: ZOKA_API_ENABLE_REMOTE_SEED_ENDPOINT is set but \
+                         ignored in this release build. Set \
+                         ZOKA_API_ALLOW_INSECURE_REMOTE_SEED=1 to force it (never on \
+                         mainnet — it breaks self-custody)."
+                    );
+                } else if enabled {
+                    eprintln!(
+                        "SECURITY: /private/wallet/send-from-seed is ENABLED. The node \
+                         receives recovery seeds and proves server-side — insecure for \
+                         mainnet; disable before launch."
+                    );
+                }
+                enabled
+            },
+            enable_mining_control_endpoint: parse_bool_env(
+                "ZOKA_API_ENABLE_MINING_CONTROL",
+                false,
+            ),
             write_clients: parse_csv_env("ZOKA_API_WRITE_CLIENTS"),
             admin_clients: parse_csv_env("ZOKA_API_ADMIN_CLIENTS"),
             ip_whitelist,
@@ -471,6 +530,7 @@ impl RbacConfig {
         endpoint_permissions.insert("/transactions/:hash", ApiRole::Read);
         endpoint_permissions.insert("/mempool/metrics", ApiRole::Read);
         endpoint_permissions.insert("/network/runtime", ApiRole::Read);
+        endpoint_permissions.insert("/crypto/server-pubkey", ApiRole::Read);
 
         // Write endpoints
         endpoint_permissions.insert("/transactions", ApiRole::Write);
@@ -478,6 +538,9 @@ impl RbacConfig {
         endpoint_permissions.insert("/network/miners/heartbeat", ApiRole::Write);
         endpoint_permissions.insert("/local/mining/start", ApiRole::Write);
         endpoint_permissions.insert("/local/mining/stop", ApiRole::Write);
+        endpoint_permissions.insert("/private/view-scan", ApiRole::Write);
+        endpoint_permissions.insert("/private/view-scan-key", ApiRole::Write);
+        endpoint_permissions.insert("/private/wallet/send-from-seed", ApiRole::Write);
 
         // Admin endpoints
         endpoint_permissions.insert("/admin/rollback", ApiRole::Admin);
@@ -805,11 +868,32 @@ fn verify_transaction_request_signature(
 
 fn rate_limit_bucket(method: &str, path: &str) -> &'static str {
     if path.starts_with("/transactions")
+        || path == "/private/view-scan"
+        || path == "/private/view-scan-key"
+        || path == "/private/wallet/send-from-seed"
         || (!matches!(method, "GET" | "HEAD" | "OPTIONS") && path.starts_with("/private/tx"))
     {
         "transactions"
+    } else if matches!(method, "GET" | "HEAD")
+        && (path == "/chain/height"
+            || path == "/stats"
+            || path == "/network/runtime"
+            || path.starts_with("/blocks")
+            || path.starts_with("/mempool")
+            || path == "/private/pending"
+            || path.starts_with("/private/tx/"))
+    {
+        "public-read"
     } else {
         "default"
+    }
+}
+
+fn rate_limit_key(client_ip: &str, client_id: &str, bucket: &str) -> String {
+    if client_id == "anonymous" {
+        format!("ip:{client_ip}:{bucket}")
+    } else {
+        format!("client:{client_id}:ip:{client_ip}:{bucket}")
     }
 }
 
@@ -1813,10 +1897,12 @@ async fn auth_and_rate_limit(
     let bucket = rate_limit_bucket(&method, &path);
     let limit = if bucket == "transactions" {
         app_state.security.transaction_rate_limit_per_minute
+    } else if bucket == "public-read" {
+        app_state.security.read_rate_limit_per_minute
     } else {
         app_state.security.rate_limit_per_minute
     };
-    let key = format!("{}:{}", client_id, bucket);
+    let key = rate_limit_key(&client_ip, &client_id, bucket);
 
     let allowed = app_state.rate_limiter.allow_request(&key, limit).await;
     if !allowed {
@@ -2082,6 +2168,10 @@ fn block_metadata_json(
         "reward_zka_display": format_zka_amount(reward_atoms),
         "transactions_count": block.transactions.len(),
         "private_tx_count": block.private_tx_hashes.len(),
+        // Count only: nullifiers are anchored in the block's merkle root as a
+        // public double-spend proof and never reveal their owner, but the
+        // count is all the explorer needs for transparency.
+        "private_nullifier_count": block.private_nullifiers.len(),
         "private_coinbase": block.private_coinbase.is_some(),
     })
 }
@@ -2345,6 +2435,226 @@ async fn get_private_tx_by_hash(
     })?))
 }
 
+/// List the node's still-pending (un-mined) private transactions, each with
+/// its full canonical body. This is the RPC-pull counterpart to libp2p gossip:
+/// a miner behind NAT — which can open outbound HTTP but receives no inbound
+/// P2P — polls this endpoint to pull pending private txs into its own pool so
+/// it can include them in the next block. Without it, a private tx published
+/// to a public node never reaches a NAT'd miner and is never mined.
+///
+/// Privacy: `PrivateTransaction` carries no clear sender/receiver/amount, so
+/// exposing the bodies here leaks nothing beyond what `/private/tx/:hash`
+/// already serves.
+async fn get_pending_private_txs(
+    State(app_state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let hashes = app_state
+        .state_manager
+        .iterate_pending_private_transaction_hashes()
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to list pending private txs: {e}"),
+            )
+        })?;
+
+    // Cap the response so a huge backlog can't blow up a single request; the
+    // miner polls repeatedly and will drain the rest on later passes.
+    const MAX_PENDING_RETURNED: usize = 64;
+    let mut txs = Vec::new();
+    for hash in hashes.into_iter().take(MAX_PENDING_RETURNED) {
+        // Skip anything already committed on-chain (pending index can lag).
+        if app_state
+            .state_manager
+            .has_private_transaction_hash(&hash)
+            .await
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if let Ok(Some(bytes)) = app_state.state_manager.get_private_transaction_bytes(&hash) {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                txs.push(value);
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "count": txs.len(),
+        "pending": txs,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct PrivateViewScanRequest {
+    address: String,
+    scan_key_hex: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrivateViewScanKeyRequest {
+    scan_key_hex: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct PrivateViewScanResponse {
+    address: String,
+    scanned_transactions: usize,
+    matching_outputs: usize,
+    total_amount_atoms: u64,
+    matches: Vec<PrivateViewScanMatch>,
+}
+
+async fn post_private_view_scan(
+    State(app_state): State<Arc<AppState>>,
+    Json(mut req): Json<PrivateViewScanRequest>,
+) -> Result<Json<PrivateViewScanResponse>, (StatusCode, String)> {
+    req.address = req.address.trim().to_string();
+    req.scan_key_hex = req.scan_key_hex.trim().trim_start_matches("0x").to_string();
+    if req.address.len() > 180 || !req.address.starts_with("zpriv:") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "address must be a zpriv payment address".to_string(),
+        ));
+    }
+    if req.scan_key_hex.len() != 32 && req.scan_key_hex.len() != 64 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "scan_key_hex must encode 16 or 32 bytes".to_string(),
+        ));
+    }
+    if !req.scan_key_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "scan_key_hex must be hexadecimal".to_string(),
+        ));
+    }
+
+    let mut scan_key = hex::decode(&req.scan_key_hex).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "scan_key_hex must be valid hexadecimal".to_string(),
+        )
+    })?;
+    validate_view_scan_key_for_address(&scan_key, &req.address)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("view scan failed: {e}")))?;
+
+    let archived = app_state
+        .state_manager
+        .iterate_private_transactions()
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to list private transactions: {e}"),
+            )
+        })?;
+
+    let max_returned = req.limit.unwrap_or(100).clamp(1, 500);
+    let scanned_transactions = archived.len();
+    let mut matches = Vec::new();
+    for (_hash, body) in archived {
+        let tx = match serde_json::from_slice::<PrivateTransaction>(&body) {
+            Ok(tx) => tx,
+            Err(_) => continue,
+        };
+        let mut tx_matches =
+            scan_private_transaction_with_view_key(&scan_key, &req.address, &tx)
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("view scan failed: {e}")))?;
+        matches.append(&mut tx_matches);
+        if matches.len() >= max_returned {
+            matches.truncate(max_returned);
+            break;
+        }
+    }
+    scan_key.zeroize();
+    req.scan_key_hex.zeroize();
+
+    let total_amount_atoms = matches
+        .iter()
+        .fold(0u64, |total, item| total.saturating_add(item.amount));
+
+    Ok(Json(PrivateViewScanResponse {
+        address: req.address,
+        scanned_transactions,
+        matching_outputs: matches.len(),
+        total_amount_atoms,
+        matches,
+    }))
+}
+
+async fn post_private_view_scan_key(
+    State(app_state): State<Arc<AppState>>,
+    Json(mut req): Json<PrivateViewScanKeyRequest>,
+) -> Result<Json<PrivateViewScanResponse>, (StatusCode, String)> {
+    req.scan_key_hex = req.scan_key_hex.trim().trim_start_matches("0x").to_string();
+    if req.scan_key_hex.len() != 32 && req.scan_key_hex.len() != 64 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "scan_key_hex must encode 16 or 32 bytes".to_string(),
+        ));
+    }
+    if !req.scan_key_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "scan_key_hex must be hexadecimal".to_string(),
+        ));
+    }
+
+    let mut scan_key = hex::decode(&req.scan_key_hex).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "scan_key_hex must be valid hexadecimal".to_string(),
+        )
+    })?;
+    let address = payment_address_from_scan_key(&scan_key)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("view scan failed: {e}")))?;
+
+    let archived = app_state
+        .state_manager
+        .iterate_private_transactions()
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to list private transactions: {e}"),
+            )
+        })?;
+
+    let max_returned = req.limit.unwrap_or(100).clamp(1, 500);
+    let scanned_transactions = archived.len();
+    let mut matches = Vec::new();
+    for (_hash, body) in archived {
+        let tx = match serde_json::from_slice::<PrivateTransaction>(&body) {
+            Ok(tx) => tx,
+            Err(_) => continue,
+        };
+        let mut tx_matches = scan_private_transaction_with_view_key(&scan_key, &address, &tx)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("view scan failed: {e}")))?;
+        matches.append(&mut tx_matches);
+        if matches.len() >= max_returned {
+            matches.truncate(max_returned);
+            break;
+        }
+    }
+    scan_key.zeroize();
+    req.scan_key_hex.zeroize();
+
+    let total_amount_atoms = matches
+        .iter()
+        .fold(0u64, |total, item| total.saturating_add(item.amount));
+
+    Ok(Json(PrivateViewScanResponse {
+        address,
+        scanned_transactions,
+        matching_outputs: matches.len(),
+        total_amount_atoms,
+        matches,
+    }))
+}
+
 /// Archive a canonical private transaction body so future wallet restores can
 /// replay confirmed private history from a public RPC node.
 async fn post_private_tx_body(
@@ -2560,6 +2870,53 @@ async fn get_block_transactions(
 }
 
 /// Get blocks in a range
+/// Per-block private-coinbase metadata for a range, so a wallet owner can match
+/// their mining rewards CLIENT-SIDE: the recipient_commitment is the miner's
+/// `zpriv:` address (already public on-chain) and the amount is the public block
+/// reward. The explorer derives the user's address from their scan key locally
+/// and compares — the scan key never leaves the browser.
+async fn get_private_coinbases_range(
+    State(app_state): State<Arc<AppState>>,
+    Path((from, to)): Path<(u64, u64)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if from > to {
+        return Err((StatusCode::BAD_REQUEST, "Invalid range: from > to".to_string()));
+    }
+    if to - from > 1000 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Range too large: maximum 1000 blocks".to_string(),
+        ));
+    }
+    match app_state.state_manager.get_blocks_in_range(from, to).await {
+        Ok(blocks) => {
+            let coinbases: Vec<serde_json::Value> = blocks
+                .iter()
+                .filter_map(|b| {
+                    let cb = b.private_coinbase.as_ref()?;
+                    let amount = b.transactions.first().map(|tx| tx.amount).unwrap_or(0);
+                    Some(serde_json::json!({
+                        "height": b.header.block_height,
+                        "recipient_commitment": cb.recipient_commitment,
+                        "amount_atoms": amount,
+                        "unlock_height": cb.unlock_height,
+                    }))
+                })
+                .collect();
+            Ok(Json(serde_json::json!({
+                "from_height": from,
+                "to_height": to,
+                "coinbases_count": coinbases.len(),
+                "coinbases": coinbases,
+            })))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to read blocks: {e}"),
+        )),
+    }
+}
+
 async fn get_blocks_range(
     State(app_state): State<Arc<AppState>>,
     Path((from, to)): Path<(u64, u64)>,
@@ -2777,13 +3134,11 @@ async fn submit_transaction(
 
 // â”€â”€ /private/wallet/send-from-seed â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //
-// Legacy implementation intentionally kept unrouted during migration.
-// Mobile clients now publish only a canonical `/private/tx` body.
-//
 // Build, sign and broadcast a private transaction on behalf of a mobile
-// (or any seed-only) client. The client POSTs the BIP-39 entropy of its
-// recovery phrase together with recipient + amount; the node uses the
-// seed *ephemerally* in a sandboxed temp directory to:
+// (or any seed-only) client. The client encrypts the BIP-39 entropy with
+// the node's ephemeral server key and POSTs the sealed envelope together
+// with recipient + amount; the node uses the decrypted seed *ephemerally*
+// in a sandboxed temp directory to:
 //
 //   1. Restore the wallet keys (`wallet-restore-from-keys`)
 //   2. Sync UTXOs from the local chain DB (`balance` triggers it)
@@ -2792,8 +3147,8 @@ async fn submit_transaction(
 //      and submit to the mempool (`send`)
 //   4. Delete the temp directory unconditionally
 //
-// The seed never touches disk except inside the temp directory, which is
-// always removed on the response path (success or error). The node
+// The seed is encrypted in transit and never touches disk except inside
+// the temp directory, which is always removed on the response path. The node
 // operator can still inspect process memory, so this endpoint is a
 // usability/privacy tradeoff: clients who care about full custody should
 // point `Custom RPC` at their own node (see RpcSettings in zkapriv).
@@ -2805,13 +3160,14 @@ async fn submit_transaction(
 // CLI to reuse the battle-tested send pipeline instead of reimplementing
 // the cryptography in the HTTP handler.
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct SendFromSeedRequest {
-    /// Hex of the BIP-39 entropy (16 or 32 bytes). The scan key for
-    /// Zoka private wallets IS the recovery entropy; the spending key
-    /// is derived from it deterministically.
-    seed_hex: String,
+    /// X25519 ephemeral public key generated by the client for this request.
+    ephemeral_pubkey_hex: String,
+    /// AES-256-GCM nonce generated by the client for this request.
+    nonce_hex: String,
+    /// AES-256-GCM ciphertext and tag containing the 16 or 32 byte seed.
+    encrypted_seed_hex: String,
     /// Recipient zka1â€¦ address.
     to: String,
     /// Amount in ZKA atoms (1 ZKA = 1_000_000 atoms).
@@ -2821,11 +3177,115 @@ struct SendFromSeedRequest {
     fee_atoms: Option<u64>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 struct SendFromSeedResponse {
     hash: String,
     status: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ServerPubkeyResponse {
+    algorithm: &'static str,
+    public_key_hex: String,
+}
+
+struct ServerSeedKey {
+    secret: x25519_dalek::StaticSecret,
+    public: x25519_dalek::PublicKey,
+}
+
+fn server_seed_key() -> &'static ServerSeedKey {
+    use rand::RngCore;
+
+    static KEY: OnceLock<ServerSeedKey> = OnceLock::new();
+    KEY.get_or_init(|| {
+        let mut secret_bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut secret_bytes);
+        let secret = x25519_dalek::StaticSecret::from(secret_bytes);
+        secret_bytes.zeroize();
+        let public = x25519_dalek::PublicKey::from(&secret);
+        ServerSeedKey { secret, public }
+    })
+}
+
+async fn get_server_pubkey() -> Json<ServerPubkeyResponse> {
+    Json(ServerPubkeyResponse {
+        algorithm: "x25519-aes256gcm-v1",
+        public_key_hex: hex::encode(server_seed_key().public.as_bytes()),
+    })
+}
+
+fn decode_fixed_hex<const N: usize>(
+    value: &str,
+    field: &str,
+) -> Result<[u8; N], (StatusCode, String)> {
+    let decoded = hex::decode(value.trim())
+        .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid {field}")))?;
+    decoded.try_into().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("{field} must be {N} bytes"),
+        )
+    })
+}
+
+fn decrypt_seed(req: &SendFromSeedRequest) -> Result<Vec<u8>, (StatusCode, String)> {
+    use aes_gcm::aead::{Aead, Payload};
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+    use sha2::{Digest, Sha256};
+
+    let ephemeral_bytes =
+        decode_fixed_hex::<32>(&req.ephemeral_pubkey_hex, "ephemeral_pubkey_hex")?;
+    let nonce_bytes = decode_fixed_hex::<12>(&req.nonce_hex, "nonce_hex")?;
+    let ciphertext = hex::decode(req.encrypted_seed_hex.trim()).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "invalid encrypted_seed_hex".to_string(),
+        )
+    })?;
+    if ciphertext.len() < 16 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "encrypted_seed_hex must include an authentication tag".to_string(),
+        ));
+    }
+
+    let ephemeral_pubkey = x25519_dalek::PublicKey::from(ephemeral_bytes);
+    let server_key = server_seed_key();
+    let mut shared_secret = server_key
+        .secret
+        .diffie_hellman(&ephemeral_pubkey)
+        .to_bytes();
+    let mut hasher = Sha256::new();
+    hasher.update(b"zoka-seed-envelope-v1");
+    hasher.update(shared_secret);
+    hasher.update(ephemeral_bytes);
+    hasher.update(server_key.public.as_bytes());
+    let mut aes_key = hasher.finalize();
+    shared_secret.zeroize();
+
+    let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to initialize seed envelope cipher".to_string(),
+        )
+    })?;
+    let result = cipher
+        .decrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: &ciphertext,
+                aad: b"zoka-seed-envelope-v1",
+            },
+        )
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "encrypted seed authentication failed".to_string(),
+            )
+        });
+    aes_key.zeroize();
+    result
 }
 
 fn private_tx_nullifier_tags(tx: &crate::private_wallet::PrivateTransaction) -> HashSet<String> {
@@ -2894,12 +3354,19 @@ fn find_pending_private_nullifier_conflict(
     Ok(None)
 }
 
-#[allow(dead_code)]
 async fn send_from_seed(
     State(app_state): State<Arc<AppState>>,
     Json(req): Json<SendFromSeedRequest>,
 ) -> Result<Json<SendFromSeedResponse>, (StatusCode, String)> {
     use sha2::{Digest, Sha256};
+
+    if !app_state.security.enable_remote_seed_endpoint {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "remote seed endpoint is disabled; submit a locally-built private transaction to POST /private/tx"
+                .to_string(),
+        ));
+    }
 
     // â”€â”€ Validate inputs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if req.amount_atoms == 0 {
@@ -2908,8 +3375,7 @@ async fn send_from_seed(
             "amount_atoms must be greater than zero".to_string(),
         ));
     }
-    let seed_bytes = hex::decode(req.seed_hex.trim())
-        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid seed_hex".to_string()))?;
+    let mut seed_bytes = decrypt_seed(&req)?;
     if seed_bytes.len() != 32 && seed_bytes.len() != 16 {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -2929,9 +3395,11 @@ async fn send_from_seed(
     hasher.update(b"zoka-private-wallet-spend-v1");
     hasher.update([0x1f]);
     hasher.update(&seed_bytes);
-    let spending_key = hasher.finalize();
-    let spending_key_hex = hex::encode(spending_key);
-    let scan_key_hex = hex::encode(&seed_bytes);
+    let mut spending_key = hasher.finalize();
+    let mut spending_key_hex = hex::encode(&spending_key);
+    let mut scan_key_hex = hex::encode(&seed_bytes);
+    spending_key.zeroize();
+    seed_bytes.zeroize();
 
     // â”€â”€ Sandbox the wallet file under a unique temp dir â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     let nanos = SystemTime::now()
@@ -2971,7 +3439,7 @@ async fn send_from_seed(
     });
 
     // â”€â”€ Step 1: restore the wallet from the seed-derived keys â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    let restore_out = tokio::process::Command::new(&zoka_bin)
+    let restore_result = tokio::process::Command::new(&zoka_bin)
         .current_dir(&tmp_dir)
         .args([
             "wallet-restore-from-keys",
@@ -2987,13 +3455,15 @@ async fn send_from_seed(
             "mainnet",
         ])
         .output()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to spawn wallet-restore-from-keys: {e}"),
-            )
-        })?;
+        .await;
+    scan_key_hex.zeroize();
+    spending_key_hex.zeroize();
+    let restore_out = restore_result.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to spawn wallet-restore-from-keys: {e}"),
+        )
+    })?;
 
     if !restore_out.status.success() {
         let stderr = String::from_utf8_lossy(&restore_out.stderr);
@@ -3798,6 +4268,41 @@ pub async fn ws_status(
 /// Accepts the same Block JSON returned by `GET /blocks/:height/raw`.
 /// Uses the same code path as `zoka rpc-sync` (try_apply_synced_block_payload)
 /// so validation is identical to the normal block sync flow.
+#[derive(serde::Deserialize, Default)]
+struct MiningControlRequest {
+    threads: Option<u64>,
+}
+
+/// Start the node's in-process miner at runtime (no restart). Gated by
+/// ZOKA_API_ENABLE_MINING_CONTROL so only a local controller can toggle it.
+async fn post_mining_start(body: Option<Json<MiningControlRequest>>) -> Json<serde_json::Value> {
+    let threads = body.and_then(|b| b.0.threads).unwrap_or(0).max(1);
+    let snap = global_local_mining_control().enable(threads);
+    Json(serde_json::json!({
+        "enabled": snap.enabled,
+        "threads": snap.threads,
+        "updated_at": snap.updated_at,
+    }))
+}
+
+/// Stop the node's in-process miner at runtime (the node keeps running + synced).
+async fn post_mining_stop() -> Json<serde_json::Value> {
+    let snap = global_local_mining_control().disable();
+    Json(serde_json::json!({
+        "enabled": snap.enabled,
+        "updated_at": snap.updated_at,
+    }))
+}
+
+async fn get_mining_control() -> Json<serde_json::Value> {
+    let snap = global_local_mining_control().snapshot();
+    Json(serde_json::json!({
+        "enabled": snap.enabled,
+        "threads": snap.threads,
+        "updated_at": snap.updated_at,
+    }))
+}
+
 async fn post_block_submit(
     State(app_state): State<Arc<AppState>>,
     Json(block): Json<crate::types::Block>,
@@ -3871,7 +4376,7 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
-    Router::new()
+    let mut router = Router::new()
         .route("/stats", get(get_stats))
         .route("/network/runtime", get(get_network_runtime))
         .route("/network/miners/heartbeat", post(post_miner_heartbeat))
@@ -3908,8 +4413,12 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
             get(get_block_private_tx_hashes_range),
         )
         .route("/private/tx", post(post_private_tx_body))
+        .route("/private/view-scan", post(post_private_view_scan))
+        .route("/private/view-scan-key", post(post_private_view_scan_key))
+        .route("/private/pending", get(get_pending_private_txs))
         .route("/private/tx/:hash", get(get_private_tx_by_hash))
         .route("/blocks/range/:from/:to", get(get_blocks_range))
+        .route("/private/coinbases/range/:from/:to", get(get_private_coinbases_range))
         .route("/blocks/range/:from/:to/raw", get(get_raw_blocks_range))
         .route("/transactions/:hash", get(get_transaction_by_hash))
         .route("/sync/block", post(post_block_submit))
@@ -3931,7 +4440,19 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         .route("/consensus/message", post(pbft_message))
         .route("/ws/subscribe", post(ws_subscribe))
         .route("/ws/unsubscribe", post(ws_unsubscribe))
-        .route("/ws/status", get(ws_status))
+        .route("/ws/status", get(ws_status));
+    if app_state.security.enable_remote_seed_endpoint {
+        router = router
+            .route("/crypto/server-pubkey", get(get_server_pubkey))
+            .route("/private/wallet/send-from-seed", post(send_from_seed));
+    }
+    if app_state.security.enable_mining_control_endpoint {
+        router = router
+            .route("/mining/start", post(post_mining_start))
+            .route("/mining/stop", post(post_mining_stop))
+            .route("/mining/control", get(get_mining_control));
+    }
+    router
         .layer(DefaultBodyLimit::max(
             app_state.security.max_request_body_bytes,
         ))
@@ -4748,8 +5269,35 @@ mod tests {
             "transactions"
         );
         assert_eq!(rate_limit_bucket("POST", "/private/tx"), "transactions");
-        assert_eq!(rate_limit_bucket("GET", "/private/tx/hash"), "default");
-        assert_eq!(rate_limit_bucket("GET", "/chain/height"), "default");
+        assert_eq!(
+            rate_limit_bucket("POST", "/private/wallet/send-from-seed"),
+            "transactions"
+        );
+        assert_eq!(rate_limit_bucket("GET", "/private/tx/hash"), "public-read");
+        assert_eq!(rate_limit_bucket("GET", "/chain/height"), "public-read");
+        assert_eq!(rate_limit_bucket("GET", "/stats"), "public-read");
+        assert_eq!(rate_limit_bucket("GET", "/mempool/metrics"), "public-read");
+        assert_eq!(
+            rate_limit_bucket("GET", "/blocks/range/1/10"),
+            "public-read"
+        );
+        assert_eq!(rate_limit_bucket("GET", "/private/pending"), "public-read");
+    }
+
+    #[test]
+    fn test_rate_limit_key_separates_anonymous_clients_by_ip() {
+        assert_ne!(
+            rate_limit_key("203.0.113.10", "anonymous", "public-read"),
+            rate_limit_key("203.0.113.11", "anonymous", "public-read")
+        );
+        assert_eq!(
+            rate_limit_key("203.0.113.10", "anonymous", "public-read"),
+            "ip:203.0.113.10:public-read"
+        );
+        assert_eq!(
+            rate_limit_key("203.0.113.10", "explorer", "public-read"),
+            "client:explorer:ip:203.0.113.10:public-read"
+        );
     }
 
     #[test]
@@ -4763,9 +5311,81 @@ mod tests {
             ApiRole::Write
         );
         assert_eq!(
+            required_role_for_request("POST", "/private/wallet/send-from-seed"),
+            ApiRole::Write
+        );
+        assert_eq!(
             required_role_for_request("GET", "/metrics/security"),
             ApiRole::Admin
         );
+    }
+
+    #[test]
+    fn test_seed_envelope_decrypts_and_rejects_tampering() {
+        use aes_gcm::aead::{Aead, Payload};
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+        use sha2::{Digest, Sha256};
+
+        let server_key = server_seed_key();
+        let ephemeral_secret = x25519_dalek::StaticSecret::from([7u8; 32]);
+        let ephemeral_pubkey = x25519_dalek::PublicKey::from(&ephemeral_secret);
+        let shared_secret = ephemeral_secret.diffie_hellman(&server_key.public);
+        let mut hasher = Sha256::new();
+        hasher.update(b"zoka-seed-envelope-v1");
+        hasher.update(shared_secret.as_bytes());
+        hasher.update(ephemeral_pubkey.as_bytes());
+        hasher.update(server_key.public.as_bytes());
+        let aes_key = hasher.finalize();
+        let nonce = [9u8; 12];
+        let cipher = Aes256Gcm::new_from_slice(&aes_key).unwrap();
+        let seed = [3u8; 32];
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &seed,
+                    aad: b"zoka-seed-envelope-v1",
+                },
+            )
+            .unwrap();
+        let mut request = SendFromSeedRequest {
+            ephemeral_pubkey_hex: hex::encode(ephemeral_pubkey.as_bytes()),
+            nonce_hex: hex::encode(nonce),
+            encrypted_seed_hex: hex::encode(ciphertext),
+            to: "zka1test".to_string(),
+            amount_atoms: 1,
+            fee_atoms: None,
+        };
+
+        assert_eq!(decrypt_seed(&request).unwrap(), seed);
+        request.encrypted_seed_hex.replace_range(0..2, "ff");
+        assert!(decrypt_seed(&request).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_from_seed_disabled_before_decrypting_envelope() {
+        let test_dir = ".zoka/test-suite/.test_send_from_seed_disabled";
+        let _ = std::fs::remove_dir_all(test_dir);
+        let mut state = test_app_state(test_dir);
+        state.security.enable_remote_seed_endpoint = false;
+        let state = Arc::new(state);
+        let request = SendFromSeedRequest {
+            ephemeral_pubkey_hex: "not-hex".to_string(),
+            nonce_hex: "not-hex".to_string(),
+            encrypted_seed_hex: "not-hex".to_string(),
+            to: "not-an-address".to_string(),
+            amount_atoms: 0,
+            fee_atoms: None,
+        };
+
+        let err = send_from_seed(State(state.clone()), Json(request))
+            .await
+            .expect_err("disabled endpoint must reject before reading the envelope");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert!(err.1.contains("remote seed endpoint is disabled"));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(test_dir);
     }
 
     #[test]

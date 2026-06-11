@@ -602,17 +602,29 @@ impl Node {
         }
     }
 
-    fn is_private_tx_well_formed(tx: &PrivateTransactionMessage) -> bool {
+    fn is_private_tx_well_formed_at(
+        tx: &PrivateTransactionMessage,
+        v2_i1_activation_height: Option<u64>,
+        canonical_bundle_activation_height: Option<u64>,
+    ) -> bool {
         if tx.tx_hash.is_empty() || tx.commitment.is_empty() || tx.nullifier.is_empty() {
             return false;
         }
+        let Ok(profile) = crate::private_wallet::private_proof_profile_spec_for_relay(
+            tx.private_proof_version,
+            &tx.private_proof_profile,
+            v2_i1_activation_height,
+            canonical_bundle_activation_height,
+        ) else {
+            return false;
+        };
         if tx.ring_version != 1 {
             return false;
         }
         if tx.ring_members.len() < 3 {
             return false;
         }
-        if tx.input_key_images.len() > crate::zk::groth16_backend::PRIVATE_TX_MAX_INPUTS {
+        if tx.input_key_images.len() > profile.max_inputs {
             return false;
         }
         if !tx.input_key_images.is_empty() {
@@ -645,6 +657,14 @@ impl Node {
                 && !output.amount_commitment.is_empty()
                 && !output.recipient_commitment.is_empty()
         })
+    }
+
+    fn is_private_tx_well_formed(tx: &PrivateTransactionMessage) -> bool {
+        Self::is_private_tx_well_formed_at(
+            tx,
+            crate::economics::private_tx_v2_i1_activation_height(),
+            crate::economics::private_tx_canonical_bundle_activation_height(),
+        )
     }
 
     fn validate_mixer_batch(&self, batch: &MixerBatchMessage) -> bool {
@@ -1841,6 +1861,8 @@ mod tests {
         PrivateTransactionMessage {
             tx_hash: hash.to_string(),
             commitment: "commitment".to_string(),
+            private_proof_version: crate::private_wallet::PRIVATE_PROOF_VERSION_V1,
+            private_proof_profile: crate::private_wallet::PRIVATE_PROOF_PROFILE_V1.to_string(),
             stealth_address: "stealth".to_string(),
             ephemeral_pubkey: vec![1u8; 32],
             nullifier: format!("nullifier-{hash}"),
@@ -1954,6 +1976,43 @@ mod tests {
         assert!(node.validate_inbound_message(&message).is_err());
     }
 
+    #[tokio::test]
+    async fn test_protocol_freeze_rejects_unknown_private_proof_profile() {
+        let node = Node::new(0).await.expect("node");
+        let mut tx = sample_private_tx("tx-invalid-proof-profile");
+        tx.private_proof_version = 2;
+        tx.private_proof_profile = "private_tx_v2_i1".to_string();
+
+        assert!(node
+            .validate_inbound_message(&ZokaMessage::PrivateTransaction(tx))
+            .is_err());
+    }
+
+    #[test]
+    fn test_protocol_freeze_compact_profile_is_dormant_but_width_bounded_when_configured() {
+        let mut tx = sample_private_tx("tx-v2-i1");
+        tx.private_proof_version = crate::private_wallet::PRIVATE_PROOF_VERSION_V2;
+        tx.private_proof_profile = crate::private_wallet::PRIVATE_PROOF_PROFILE_V2_I1.to_string();
+        tx.ring_members.push("member-c".to_string());
+        tx.ring_signature = vec![3u8; 160];
+
+        assert!(!Node::is_private_tx_well_formed(&tx));
+        assert!(!Node::is_private_tx_well_formed_at(&tx, Some(100), None));
+        assert!(Node::is_private_tx_well_formed_at(
+            &tx,
+            Some(100),
+            Some(100)
+        ));
+
+        tx.input_key_images.push("key-image-2".to_string());
+        tx.ring_signature = vec![3u8; 320];
+        assert!(!Node::is_private_tx_well_formed_at(
+            &tx,
+            Some(100),
+            Some(100)
+        ));
+    }
+
     #[test]
     fn test_topic_routing() {
         let ping = ZokaMessage::Ping(PingMessage {
@@ -1970,6 +2029,8 @@ mod tests {
             private_tx: PrivateTransactionMessage {
                 tx_hash: "tx-1".to_string(),
                 commitment: "commitment".to_string(),
+                private_proof_version: crate::private_wallet::PRIVATE_PROOF_VERSION_V1,
+                private_proof_profile: crate::private_wallet::PRIVATE_PROOF_PROFILE_V1.to_string(),
                 stealth_address: "stealth".to_string(),
                 ephemeral_pubkey: vec![1u8; 32],
                 nullifier: "nullifier".to_string(),
@@ -2104,6 +2165,28 @@ mod tests {
         assert!(node.inbound_queue.is_empty());
     }
 
+    #[tokio::test]
+    async fn test_mixer_batch_rejects_unknown_private_proof_profile() {
+        let mut node = Node::new(0).await.expect("node");
+        node.set_privacy_config(NetworkPrivacyConfig {
+            mixer_max_batch: 8,
+            ..NetworkPrivacyConfig::default()
+        });
+
+        let mut invalid = sample_private_tx("tx-invalid-proof-profile");
+        invalid.private_proof_version = 2;
+        invalid.private_proof_profile = "private_tx_v2_i1".to_string();
+        let batch = MixerBatchMessage {
+            batch_id: "batch-invalid-proof-profile".to_string(),
+            txs: vec![invalid],
+            padding: vec![],
+            timestamp: 1,
+        };
+        node.maybe_intercept_mixer_message(PeerId::random(), batch)
+            .expect("intercept should not error");
+        assert!(node.inbound_queue.is_empty());
+    }
+
     #[test]
     fn test_compute_mixer_batch_id_is_order_independent() {
         let a = sample_private_tx("a");
@@ -2180,6 +2263,8 @@ mod tests {
         let tx = PrivateTransactionMessage {
             tx_hash: "tx-1".to_string(),
             commitment: "commitment".to_string(),
+            private_proof_version: crate::private_wallet::PRIVATE_PROOF_VERSION_V1,
+            private_proof_profile: crate::private_wallet::PRIVATE_PROOF_PROFILE_V1.to_string(),
             stealth_address: "stealth".to_string(),
             ephemeral_pubkey: vec![1u8; 32],
             nullifier: "nullifier".to_string(),
@@ -2251,6 +2336,8 @@ mod tests {
         let tx = PrivateTransactionMessage {
             tx_hash: "tx-1".to_string(),
             commitment: "commitment".to_string(),
+            private_proof_version: crate::private_wallet::PRIVATE_PROOF_VERSION_V1,
+            private_proof_profile: crate::private_wallet::PRIVATE_PROOF_PROFILE_V1.to_string(),
             stealth_address: "stealth".to_string(),
             ephemeral_pubkey: vec![1u8; 32],
             nullifier: "nullifier".to_string(),
@@ -2371,6 +2458,8 @@ mod tests {
         let tx = PrivateTransactionMessage {
             tx_hash: "tx-1".to_string(),
             commitment: "commitment".to_string(),
+            private_proof_version: crate::private_wallet::PRIVATE_PROOF_VERSION_V1,
+            private_proof_profile: crate::private_wallet::PRIVATE_PROOF_PROFILE_V1.to_string(),
             stealth_address: "stealth".to_string(),
             ephemeral_pubkey: vec![1u8; 32],
             nullifier: "nullifier".to_string(),
