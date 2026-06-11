@@ -16,10 +16,10 @@ pub const MAX_SUPPLY_ATOMS: u64 = MAX_SUPPLY_ZKA * ATOMS_PER_ZKA;
 pub const INITIAL_BLOCK_REWARD_ATOMS: u64 = INITIAL_BLOCK_REWARD_ZKA * ATOMS_PER_ZKA;
 pub const HALVING_INTERVAL_BLOCKS: u64 = 1_051_200;
 pub const TARGET_BLOCK_TIME_SECS: u64 = 120;
-/// TEMPORARY TEST VALUE: lowered for the genesis-reset rehearsal so coinbase
-/// outputs mature fast. RESTORE TO 60 before the real mainnet launch.
-/// (Mainnet value: coinbase outputs require 60 confirmations before spend.)
-pub const COINBASE_MATURITY_BLOCKS: u64 = 5;
+/// Coinbase outputs require 60 confirmations before they can be spent.
+/// At 120s/block this is ~2 hours, protecting the network against short reorgs
+/// invalidating reward payments.
+pub const COINBASE_MATURITY_BLOCKS: u64 = 60;
 
 /// Consensus cap for private transaction hash commitments in one block.
 /// Wallets can split large sends across multiple private transactions, but a
@@ -107,14 +107,16 @@ pub fn private_tx_v2_i1_active_at(
         && private_tx_canonical_bundle_required_at(height, canonical_bundle_activation_height)
 }
 
-// TEMPORARY TEST VALUES: difficulty pinned to 8 bits for the genesis-reset
-// rehearsal. MIN == INITIAL == MAX == 8 so the retarget clamp keeps it fixed
-// at 8 even when blocks solve in milliseconds on a single CPU (otherwise the
-// retarget escalates 8->13+ and freezes the chain). RESTORE to MIN 12 /
-// INITIAL 12 / MAX 30 before the real mainnet launch.
-pub const POW_MIN_DIFFICULTY_BITS: u32 = 8;
-pub const POW_INITIAL_DIFFICULTY_BITS: u32 = 8;
-pub const POW_MAX_DIFFICULTY_BITS: u32 = 8;
+/// Minimum difficulty the per-block retarget can fall to. Keeps the chain
+/// viable even with a single low-end miner.
+pub const POW_MIN_DIFFICULTY_BITS: u32 = 12;
+/// Starting difficulty for the first two blocks (warmup band before two
+/// committed timestamps are available for retarget).
+pub const POW_INITIAL_DIFFICULTY_BITS: u32 = 12;
+/// Hard ceiling for the per-block retarget. 30 bits at RandomX is
+/// comfortably achievable by GPU/ASIC-resistant CPUs without freezing
+/// the chain.
+pub const POW_MAX_DIFFICULTY_BITS: u32 = 30;
 pub const POW_KEY_EPOCH_BLOCKS: u64 = 2_048;
 
 /// Canonical public-network PoW algorithm. See `docs/protocol-overview.md`.
@@ -271,8 +273,7 @@ mod tests {
         assert_eq!(INITIAL_BLOCK_REWARD_ATOMS, 12_000_000);
         assert_eq!(HALVING_INTERVAL_BLOCKS, 1_051_200);
         assert_eq!(TARGET_BLOCK_TIME_SECS, 120);
-        // TEST VALUE — restore to 60 with the constant before mainnet launch.
-        assert_eq!(COINBASE_MATURITY_BLOCKS, 5);
+        assert_eq!(COINBASE_MATURITY_BLOCKS, 60);
     }
 
     #[test]
@@ -369,7 +370,6 @@ mod tests {
         );
         assert_eq!(MAX_SUPPLY_ZKA, 23_000_000);
         assert_eq!(INITIAL_BLOCK_REWARD_ATOMS, 12_000_000);
-        // TEST VALUE — restore to 60 with the constant before mainnet launch.
-        assert_eq!(COINBASE_MATURITY_BLOCKS, 5);
+        assert_eq!(COINBASE_MATURITY_BLOCKS, 60);
     }
 }

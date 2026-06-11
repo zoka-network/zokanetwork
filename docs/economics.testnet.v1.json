@@ -19,13 +19,13 @@
     "initial_block_reward_atoms": 12000000,
     "halving_interval_blocks": 1051200,
     "target_block_time_seconds": 120,
-    "coinbase_maturity_blocks": 5
+    "coinbase_maturity_blocks": 60
   },
   "pow": {
     "mode": "pow-testnet",
     "algorithm_v1": "zoka-randomx-v1",
-    "initial_difficulty_bits": 8,
-    "min_difficulty_bits": 8,
+    "initial_difficulty_bits": 12,
+    "min_difficulty_bits": 12,
     "max_difficulty_bits": 30,
     "key_epoch_blocks": 2048
   },
