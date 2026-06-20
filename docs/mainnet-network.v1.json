@@ -70,6 +70,41 @@
     "miner": "zoka fullnode --network mainnet --network-config mainnet-network.v1.json --mine-interval-secs 30 --mine-blocks 1 --min-mine-peers 1 --address <your-zka1-address> --password <your-password>",
     "note": "The node auto-discovers peers from the seed node. Block rewards go directly to your wallet by protocol - no pool or intermediary."
   },
+  "trusted_setup": {
+    "release": "https://github.com/ZokaNetwork/ZokaNetwork/releases/tag/trusted-setup-mainnet-v1",
+    "files": [
+      {
+        "name": "private_tx.params",
+        "url": "https://github.com/ZokaNetwork/ZokaNetwork/releases/download/trusted-setup-mainnet-v1/private_tx.params",
+        "sha256": "696d8fead7135313ce849f6712386bf2b283d11bf5565b6c1c2b1e37ce22f7a7",
+        "size_bytes": 11779072
+      },
+      {
+        "name": "balance.params",
+        "url": "https://github.com/ZokaNetwork/ZokaNetwork/releases/download/trusted-setup-mainnet-v1/balance.params",
+        "sha256": "5141f7d8cac2c856fda60a647dd59a90dff941df3ab00994913c90ed5fa1ac56",
+        "size_bytes": 3210
+      },
+      {
+        "name": "merkle.params",
+        "url": "https://github.com/ZokaNetwork/ZokaNetwork/releases/download/trusted-setup-mainnet-v1/merkle.params",
+        "sha256": "caad492d972a317ffc5efe3f8e2890340a189f5060f655771d634035784baf9f",
+        "size_bytes": 21811
+      },
+      {
+        "name": "nullifier.params",
+        "url": "https://github.com/ZokaNetwork/ZokaNetwork/releases/download/trusted-setup-mainnet-v1/nullifier.params",
+        "sha256": "11ecb6d4eef5a575b0a109999ddc411ed1225c7ef56aea9140562206dd9d7df7",
+        "size_bytes": 2752
+      },
+      {
+        "name": "DIGEST",
+        "url": "https://github.com/ZokaNetwork/ZokaNetwork/releases/download/trusted-setup-mainnet-v1/DIGEST",
+        "sha256": "120423b6e462667dd2a19bae810faffca1cf443b10245e2ba63cdfe9a85e4f53",
+        "size_bytes": 65
+      }
+    ]
+  },
   "snapshot_signers": [],
   "notes": [
     "Primary bootstrap for the Zoka mainnet (DigitalOcean infrastructure).",
