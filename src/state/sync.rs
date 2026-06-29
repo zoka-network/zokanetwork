@@ -63,8 +63,20 @@ pub struct PeerChainView {
 }
 
 impl PeerChainView {
-    pub fn observe(&mut self, height: u64) {
-        if height > self.perceived_max_height {
+    /// Record a peer-announced height, but only if it's within plausible
+    /// reach of `local_height`. A `BlockResponse.block_height` (or
+    /// `SyncState.last_height`) arrives unvalidated — straight from the
+    /// wire, before the payload is ever checked against consensus rules —
+    /// so a single malformed or dishonest announcement could otherwise
+    /// plant an unreachable height and park `mining_pause_target`/IBD on it
+    /// indefinitely. `MAX_PENDING_BLOCK_AHEAD` is the same ceiling
+    /// `remember_block_response` already uses to decide whether a
+    /// candidate is worth caching at all, so a height this implausible was
+    /// never going to be actionable anyway.
+    pub fn observe(&mut self, height: u64, local_height: u64) {
+        if height > self.perceived_max_height
+            && height <= local_height.saturating_add(MAX_PENDING_BLOCK_AHEAD)
+        {
             self.perceived_max_height = height;
             self.perceived_max_height_observed_at = Some(Instant::now());
         }
@@ -1044,10 +1056,10 @@ mod tests {
     #[test]
     fn peer_chain_view_keeps_max_observed_height() {
         let mut view = PeerChainView::default();
-        view.observe(5);
-        view.observe(3);
-        view.observe(12);
-        view.observe(11);
+        view.observe(5, 0);
+        view.observe(3, 0);
+        view.observe(12, 0);
+        view.observe(11, 0);
         assert_eq!(view.perceived_max_height, 12);
     }
 
@@ -1265,7 +1277,7 @@ mod tests {
     fn next_required_height_returns_local_plus_one_when_behind() {
         let (storage, _dir) = open_temp_storage();
         let mut view = PeerChainView::default();
-        view.observe(5);
+        view.observe(5, 0);
         let next = next_required_height(&storage, &view).expect("query");
         assert_eq!(next, Some(1));
     }
@@ -1274,7 +1286,7 @@ mod tests {
     fn next_required_height_prefers_branch_backfill() {
         let (storage, _dir) = open_temp_storage();
         let mut view = PeerChainView::default();
-        view.observe(20);
+        view.observe(20, 0);
         view.branch_backfill_height = Some(7);
         view.branch_backfill_ceiling = Some(12);
         view.branch_expected_hashes
@@ -1491,7 +1503,7 @@ mod tests {
         let mut view = PeerChainView::default();
         assert_eq!(view.mining_pause_target(3), None);
 
-        view.observe(8);
+        view.observe(8, 0);
         assert_eq!(view.mining_pause_target(3), Some(8));
         assert_eq!(view.mining_pause_target(8), None);
 
@@ -1507,7 +1519,7 @@ mod tests {
     #[test]
     fn peer_chain_view_continues_forward_side_branch_until_peer_tip() {
         let mut view = PeerChainView::default();
-        view.observe(6);
+        view.observe(6, 0);
         view.record_sync_outcome(&SyncOutcome::MissingParent {
             local_head: 1,
             candidate: 2,

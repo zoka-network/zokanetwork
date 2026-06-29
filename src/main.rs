@@ -5374,7 +5374,6 @@ fn handle_inbound_block_message(
     };
 
     let height = response.block_height;
-    peer_view.observe(height);
 
     let path = match chain_db_path {
         Some(p) => p,
@@ -5393,6 +5392,8 @@ fn handle_inbound_block_message(
             ));
         }
     };
+    let local_height = storage.get_chain_height().unwrap_or(0);
+    peer_view.observe(height, local_height);
 
     let outcome = match unsafe_rehearsal_difficulty_bits {
         Some(bits) => zoka::state::sync::try_apply_synced_block_payload_with_expected_difficulty(
@@ -5422,7 +5423,11 @@ fn handle_fullnode_network_message(
             unsafe_rehearsal_difficulty_bits,
         ),
         zoka::network::message::ZokaMessage::SyncState(sync) => {
-            peer_view.observe(sync.last_height);
+            let local_height = chain_db_path
+                .and_then(|path| RocksDbStorage::new(path).ok())
+                .and_then(|storage| storage.get_chain_height().ok())
+                .unwrap_or(0);
+            peer_view.observe(sync.last_height, local_height);
             Some(format!(
                 "Observed peer sync state at height {}.",
                 sync.last_height
@@ -5974,7 +5979,7 @@ fn run_rpc_sync_batch(
         let rpc = candidate.rpc.as_str();
         let remote_height = candidate.height;
 
-        peer_view.observe(remote_height);
+        peer_view.observe(remote_height, local_height);
         let mut applied = 0u64;
         let mut validated_side_branch = 0u64;
         let mut last_event = String::new();
