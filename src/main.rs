@@ -7698,6 +7698,12 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                             next_mine_at = tokio::time::Instant::now() + Duration::from_secs(1);
                             continue;
                         }
+                        // mining_pause_target returned None: either there was
+                        // never a pause, or a previously-announced height aged
+                        // out without anyone ever delivering it. Clear it now
+                        // so a stale value can't resurface on the next peer
+                        // announcement at the same height.
+                        peer_chain_view.clear_stale_perceived_height(local_height);
                     }
                     Err(err) if is_transient_storage_lock_error(&err.to_string()) => {
                         last_event = format!("Auto-mining paused: storage busy ({err})");

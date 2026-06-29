@@ -20,6 +20,7 @@
 //! swarm.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -36,11 +37,23 @@ const MAX_PENDING_BLOCKS_PER_HEIGHT: usize = 4;
 const MAX_PENDING_BLOCK_AHEAD: u64 = 512;
 const MAX_BRANCH_BACKFILL_REQUEST_FAILURES: u8 = 4;
 
+/// `observe()` records a peer-announced height (from an unvalidated
+/// `BlockResponse.block_height` or `SyncState.last_height`) before the
+/// payload is ever checked against consensus rules. A single malformed or
+/// stale announcement can therefore plant a height neither this node nor
+/// any honest peer can ever actually deliver, permanently blocking
+/// `mining_pause_target` below. Expire the observation instead of trusting
+/// it forever: if the chain hasn't caught up within this window, treat it
+/// as unreachable and stop waiting on it. Comfortably above the ~120s
+/// target block time so a genuine, merely-slow sync isn't cut short.
+const PERCEIVED_HEIGHT_STALE_AFTER: Duration = Duration::from_secs(300);
+
 /// Highest block height any peer has revealed since this node booted.
 /// Treat 0 as "no peer has announced a block yet" — IBD is then a no-op.
 #[derive(Debug, Default, Clone)]
 pub struct PeerChainView {
     pub perceived_max_height: u64,
+    perceived_max_height_observed_at: Option<Instant>,
     pub branch_backfill_height: Option<u64>,
     pub branch_backfill_ceiling: Option<u64>,
     pub branch_expected_hashes: BTreeMap<u64, String>,
@@ -52,6 +65,7 @@ impl PeerChainView {
     pub fn observe(&mut self, height: u64) {
         if height > self.perceived_max_height {
             self.perceived_max_height = height;
+            self.perceived_max_height_observed_at = Some(Instant::now());
         }
     }
 
@@ -180,9 +194,29 @@ impl PeerChainView {
             return self.branch_backfill_ceiling.or(self.branch_backfill_height);
         }
         if self.perceived_max_height > local_height {
-            return Some(self.perceived_max_height);
+            let stale = self
+                .perceived_max_height_observed_at
+                .is_some_and(|seen_at| seen_at.elapsed() >= PERCEIVED_HEIGHT_STALE_AFTER);
+            if !stale {
+                return Some(self.perceived_max_height);
+            }
         }
         None
+    }
+
+    /// Drop a perceived height neither this node nor any peer has been able
+    /// to actually deliver within [`PERCEIVED_HEIGHT_STALE_AFTER`], so a
+    /// single bad announcement can't pause mining indefinitely. Call this
+    /// once mining resumes after `mining_pause_target` reports the height
+    /// as stale, so the next bona fide announcement starts a fresh window.
+    pub fn clear_stale_perceived_height(&mut self, local_height: u64) {
+        let stale = self
+            .perceived_max_height_observed_at
+            .is_some_and(|seen_at| seen_at.elapsed() >= PERCEIVED_HEIGHT_STALE_AFTER);
+        if stale && self.perceived_max_height > local_height {
+            self.perceived_max_height = local_height;
+            self.perceived_max_height_observed_at = None;
+        }
     }
 
     pub fn record_branch_backfill_request_failure(&mut self) -> bool {
