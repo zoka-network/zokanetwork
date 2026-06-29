@@ -269,6 +269,8 @@ struct MainnetNetworkConfig {
     _mining: Option<serde_json::Value>,
     #[serde(default, rename = "joining")]
     _joining: Option<serde_json::Value>,
+    #[serde(default, rename = "trusted_setup")]
+    _trusted_setup: Option<serde_json::Value>,
     #[serde(default)]
     snapshot_signers: Vec<String>,
     #[serde(default)]
@@ -3542,9 +3544,38 @@ where
         }
     }
 
-    settle_synced_private_coinbase_rewards(
+    let settled = settle_synced_private_coinbase_rewards(
         storage, manager, password, network, &mut state, registered,
-    )
+    )?;
+
+    // Advance the wallet's scan checkpoint past every block this call covered
+    // so the next unlock only scans new blocks instead of re-reading the
+    // entire chain from height 1 every time. Coinbases are still
+    // de-duplicated by output_id/block_hash above, so this is purely a
+    // performance optimization, not a correctness dependency.
+    advance_private_wallet_restore_height(storage, manager, wallet_name, password, chain_height)?;
+
+    Ok(settled)
+}
+
+/// Bumps `wallet.restore_height` to `scanned_through + 1` so future coinbase
+/// syncs skip blocks already scanned for this wallet. No-op if the wallet is
+/// already past `scanned_through` (e.g. a concurrent sync advanced it).
+fn advance_private_wallet_restore_height(
+    storage: &WalletStorage,
+    manager: &mut PrivateWalletManager,
+    wallet_name: &str,
+    password: Option<&str>,
+    scanned_through: u64,
+) -> Result<(), String> {
+    let Some(wallet) = manager.get_private_wallet_mut(wallet_name) else {
+        return Ok(());
+    };
+    if scanned_through < wallet.restore_height {
+        return Ok(());
+    }
+    wallet.restore_height = scanned_through.saturating_add(1);
+    persist_private_wallet(storage, manager, wallet_name, password)
 }
 
 fn sync_private_coinbase_outputs_from_rpc(
@@ -3590,9 +3621,13 @@ fn sync_private_coinbase_outputs_from_rpc(
         from = to.saturating_add(1);
     }
 
-    settle_synced_private_coinbase_rewards(
+    let settled = settle_synced_private_coinbase_rewards(
         storage, manager, password, network, &mut state, registered,
-    )
+    )?;
+
+    advance_private_wallet_restore_height(storage, manager, wallet_name, password, chain_height)?;
+
+    Ok(settled)
 }
 
 fn push_unique_rpc_url(urls: &mut Vec<String>, url: String) {
@@ -3804,8 +3839,17 @@ fn sync_private_coinbase_outputs_from_chain_db(
             network,
         );
     }
+    // Only read blocks the wallet hasn't scanned yet. `restore_height` is
+    // advanced past `chain_height` after every successful sync (see
+    // `advance_private_wallet_restore_height`), so a wallet that is already
+    // caught up reads zero blocks here instead of replaying the whole chain
+    // on every unlock.
+    let scan_from = manager
+        .get_private_wallet(wallet_name)
+        .map(|wallet| wallet.restore_height.max(1))
+        .unwrap_or(1);
     let mut blocks = Vec::new();
-    for height in 1..=chain_height {
+    for height in scan_from..=chain_height {
         if let Some(block) = chain_storage
             .get_block_by_height(height)
             .map_err(|e| format!("failed to read block at height {height}: {e}"))?
@@ -8164,8 +8208,16 @@ fn cmd_private_wallet_list(args: &[String]) -> Result<(), String> {
     let password = password_value(args)?;
     let as_json = has_flag(args, "--json");
     let (network, storage) = wallet_storage_for_args(args)?;
-    let db_path =
-        option_value(args, "--db").or_else(|| Some(network.default_db_path().to_string()));
+    // --rpc-only: skip the local chain DB entirely and sync straight from a
+    // network RPC. Callers that also run their own fullnode pointed at the
+    // same local DB (e.g. ZSilent's embedded node) would otherwise hit a
+    // RocksDB lock conflict on every call, fall back to RPC anyway, and pay
+    // for a wasted local-open attempt first.
+    let db_path = if has_flag(args, "--rpc-only") {
+        None
+    } else {
+        option_value(args, "--db").or_else(|| Some(network.default_db_path().to_string()))
+    };
     let disk_wallets_raw = storage
         .load_all_private_wallet_metadata()
         .map_err(|e| format!("failed to read private wallet files: {e}"))?;
@@ -8323,8 +8375,11 @@ fn cmd_private_balance(args: &[String]) -> Result<(), String> {
     let (network, storage) = wallet_storage_for_args(args)?;
     let wallet_selector = required_wallet_selector(args)?;
     let password = password_value(args)?;
-    let db_path =
-        option_value(args, "--db").or_else(|| Some(network.default_db_path().to_string()));
+    let db_path = if has_flag(args, "--rpc-only") {
+        None
+    } else {
+        option_value(args, "--db").or_else(|| Some(network.default_db_path().to_string()))
+    };
     let as_json = has_flag(args, "--json");
     let mut manager =
         load_private_wallet_manager_for_network(&storage, password.as_deref(), network)?;
@@ -8413,8 +8468,11 @@ fn cmd_private_history(args: &[String]) -> Result<(), String> {
     let (network, storage) = wallet_storage_for_args(args)?;
     let wallet_selector = required_wallet_selector(args)?;
     let password = password_value(args)?;
-    let db_path =
-        option_value(args, "--db").or_else(|| Some(network.default_db_path().to_string()));
+    let db_path = if has_flag(args, "--rpc-only") {
+        None
+    } else {
+        option_value(args, "--db").or_else(|| Some(network.default_db_path().to_string()))
+    };
     let as_json = has_flag(args, "--json");
     let verbose = has_flag(args, "--verbose");
     let limit = parse_u64_arg(option_value(args, "--limit"), 20, "--limit")? as usize;
@@ -12356,6 +12414,62 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("temp db dir");
         let db = tmp.path().join("chain.db");
         (tmp, db.to_string_lossy().to_string())
+    }
+
+    #[test]
+    fn advance_private_wallet_restore_height_skips_already_scanned_blocks() {
+        let tmp = tempfile::TempDir::new().expect("temp wallet dir");
+        let storage = WalletStorage::from_base_dir(tmp.path()).expect("wallet storage");
+        let mut manager = PrivateWalletManager::new();
+        let wallet_name = "rescan-test";
+        manager
+            .create_private_wallet(wallet_name)
+            .expect("create private wallet");
+
+        // A brand-new wallet has restore_height 0; the first sync should not
+        // advance past a chain it hasn't actually scanned.
+        assert_eq!(
+            manager.get_private_wallet(wallet_name).unwrap().restore_height,
+            0
+        );
+
+        advance_private_wallet_restore_height(&storage, &mut manager, wallet_name, None, 100)
+            .expect("advance after first scan");
+        assert_eq!(
+            manager.get_private_wallet(wallet_name).unwrap().restore_height,
+            101
+        );
+
+        // A later sync that only covered up to height 150 should push the
+        // checkpoint forward again — the next unlock only rescans 101..=150.
+        advance_private_wallet_restore_height(&storage, &mut manager, wallet_name, None, 150)
+            .expect("advance after second scan");
+        assert_eq!(
+            manager.get_private_wallet(wallet_name).unwrap().restore_height,
+            151
+        );
+
+        // A stale/concurrent call reporting a lower height than the wallet's
+        // current checkpoint must never move the checkpoint backwards.
+        advance_private_wallet_restore_height(&storage, &mut manager, wallet_name, None, 120)
+            .expect("stale advance is a no-op");
+        assert_eq!(
+            manager.get_private_wallet(wallet_name).unwrap().restore_height,
+            151
+        );
+
+        // The checkpoint must survive a reload from disk, otherwise every
+        // unlock would still rescan from genesis.
+        let reloaded = load_private_wallet_manager_for_network(
+            &storage,
+            None,
+            NetworkProfile::Mainnet,
+        )
+        .expect("reload manager from disk");
+        assert_eq!(
+            reloaded.get_private_wallet(wallet_name).unwrap().restore_height,
+            151
+        );
     }
 
     fn make_valid_zka1() -> String {
