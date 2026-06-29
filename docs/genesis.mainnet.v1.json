@@ -2,7 +2,7 @@
   "schema": "zoka-genesis-v1",
   "chain_id": "zoka-mainnet-v1",
   "pow_algorithm": "zoka-randomx-v1",
-  "genesis_timestamp": 1782777600,
+  "genesis_timestamp": 1782745200,
   "economics": {
     "max_supply_zka": 23000000,
     "initial_block_reward_zka": 12,
