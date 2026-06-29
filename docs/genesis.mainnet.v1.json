@@ -1,6 +1,6 @@
 {
   "schema": "zoka-genesis-v1",
-  "chain_id": "zoka-mainnet-v1",
+  "chain_id": "zoka-mainnet-zenith-v1",
   "pow_algorithm": "zoka-randomx-v1",
   "genesis_timestamp": 1782745200,
   "economics": {

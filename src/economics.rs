@@ -5,7 +5,12 @@
 
 pub const ECONOMICS_VERSION: &str = "zoka-economics-v2-atoms";
 pub const TOKEN_SYMBOL: &str = "ZKA";
-pub const MAINNET_CHAIN_ID: &str = "zoka-mainnet-v1";
+// Bumped for the Zenith relaunch genesis reset: the synthetic genesis hash
+// (genesis_pow_hash_for_chain) is derived directly from this id, so a stale
+// pre-relaunch chain is cryptographically incompatible with the new one —
+// not just rejected by protocol version, but unable to even produce a
+// matching block-1 parent hash. Defense in depth alongside PROTOCOL_FREEZE_ID.
+pub const MAINNET_CHAIN_ID: &str = "zoka-mainnet-zenith-v1";
 pub const TESTNET_CHAIN_ID: &str = "zoka-testnet-v1";
 
 pub const ZKA_DECIMALS: u32 = 6;
