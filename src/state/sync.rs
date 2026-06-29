@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
+use tracing::info;
 
 use crate::network::message::BlockResponseMessage;
 use crate::private_wallet::{PrivateTransaction, PrivateWalletManager};
@@ -70,6 +71,17 @@ impl PeerChainView {
     }
 
     pub fn record_sync_outcome(&mut self, outcome: &SyncOutcome) {
+        // Diagnostic for an intermittent resync stall seen on follower
+        // (--seed configured) nodes: a growing height gap with no error in
+        // the dashboard log. Applied/AlreadyKnown are the normal steady
+        // state and are noisy at this volume, so only the non-trivial
+        // outcomes (a block that couldn't apply directly) are logged.
+        if !matches!(
+            outcome,
+            SyncOutcome::Applied(_) | SyncOutcome::AlreadyKnown { .. }
+        ) {
+            info!("sync: non-trivial outcome {:?}", outcome);
+        }
         match outcome {
             SyncOutcome::Applied(head) => {
                 if self.matches_or_learns_branch_hash(head.height, &head.hash) {

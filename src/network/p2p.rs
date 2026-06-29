@@ -1604,6 +1604,17 @@ impl Node {
                                 warn!("discarding invalid message: {}", err);
                                 continue;
                             }
+                            // Diagnostic for an intermittent resync stall on
+                            // follower nodes (--seed configured): confirms
+                            // whether a BlockResponse genuinely never arrives
+                            // over gossip versus arriving and being dropped
+                            // somewhere downstream after this point.
+                            if let ZokaMessage::BlockResponse(ref r) = msg {
+                                info!(
+                                    "gossip: received BlockResponse height={} hash={} from {}",
+                                    r.block_height, r.block_hash, propagation_source
+                                );
+                            }
                             return Ok(msg);
                         }
                         Err(err) => warn!("discarding malformed message: {}", err),
