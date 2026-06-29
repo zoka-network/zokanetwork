@@ -75,6 +75,12 @@ pub struct ApiSecurityConfig {
     /// without restarting the node. OFF by default so public nodes can't be
     /// toggled by anyone.
     pub enable_mining_control_endpoint: bool,
+    /// Enables POST /sync/block, which applies an externally-submitted block
+    /// straight to local chain state with no peer-protocol-version check
+    /// (unlike normal P2P gossip). OFF by default: a stale pre-relaunch chain
+    /// (or anyone else) could otherwise push blocks the libp2p protocol
+    /// freeze would have rejected.
+    pub enable_block_submit_endpoint: bool,
     pub write_clients: Vec<String>,
     pub admin_clients: Vec<String>,
     pub ip_whitelist: Vec<String>, // Empty = allow all
@@ -197,6 +203,10 @@ impl Default for ApiSecurityConfig {
             },
             enable_mining_control_endpoint: parse_bool_env(
                 "ZOKA_API_ENABLE_MINING_CONTROL",
+                false,
+            ),
+            enable_block_submit_endpoint: parse_bool_env(
+                "ZOKA_API_ENABLE_BLOCK_SUBMIT",
                 false,
             ),
             write_clients: parse_csv_env("ZOKA_API_WRITE_CLIENTS"),
@@ -4421,7 +4431,6 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         .route("/private/coinbases/range/:from/:to", get(get_private_coinbases_range))
         .route("/blocks/range/:from/:to/raw", get(get_raw_blocks_range))
         .route("/transactions/:hash", get(get_transaction_by_hash))
-        .route("/sync/block", post(post_block_submit))
         .route("/admin/rollback", post(admin_rollback))
         .route("/admin/rollback-points", get(admin_rollback_points))
         .route("/transactions", post(submit_transaction))
@@ -4451,6 +4460,9 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
             .route("/mining/start", post(post_mining_start))
             .route("/mining/stop", post(post_mining_stop))
             .route("/mining/control", get(get_mining_control));
+    }
+    if app_state.security.enable_block_submit_endpoint {
+        router = router.route("/sync/block", post(post_block_submit));
     }
     router
         .layer(DefaultBodyLimit::max(
