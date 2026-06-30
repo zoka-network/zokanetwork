@@ -275,6 +275,11 @@ struct MainnetNetworkConfig {
     snapshot_signers: Vec<String>,
     #[serde(default)]
     notes: Vec<String>,
+    /// Minimum desktop client version the network expects; enforced by
+    /// ZSilent, not by this binary. Accepted (not just ignored) so the
+    /// manifest's deny_unknown_fields doesn't reject the whole file.
+    #[serde(default)]
+    minimum_client_version: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
