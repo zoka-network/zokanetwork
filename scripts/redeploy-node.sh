@@ -7,8 +7,9 @@
 #   bash redeploy-node.sh
 #
 # It: ensures build swap (the droplets are RAM-light), updates the repo to the
-# target branch, builds the `zokahd` release binary with a low-memory job count,
-# installs it, restarts the service, and verifies /chain/height.
+# target branch, builds the `zoka` core and `zokahd` wrapper release binaries
+# with a low-memory job count, installs both, restarts the service, and verifies
+# /chain/height.
 #
 # Confirm these match your droplet before running:
 set -euo pipefail
@@ -19,6 +20,8 @@ BRANCH="${BRANCH:-codex/network-sync-encrypted-send}"
 SERVICE="${SERVICE:-zoka-bootstrap.service}"
 BIN_NAME="${BIN_NAME:-zokahd}"
 BIN_DEST="${BIN_DEST:-/usr/local/bin/zokahd}"
+CORE_BIN_NAME="${CORE_BIN_NAME:-zoka}"
+CORE_BIN_DEST="${CORE_BIN_DEST:-/usr/local/bin/zoka}"
 RPC_PORT="${RPC_PORT:-3000}"
 BUILD_JOBS="${BUILD_JOBS:-1}"             # 1 = lowest memory; raise if RAM allows
 
@@ -42,14 +45,17 @@ else
   git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$REPO_DIR"
 fi
 
-# 3) Build the node binary (release, with RandomX so it can mine mainnet).
-log "Building $BIN_NAME (release, -j$BUILD_JOBS) — this is slow on a small droplet"
+# 3) Build the node wrapper and the core CLI. `zokahd` delegates to a sibling
+# `zoka` binary, so installing only the wrapper can leave old consensus code
+# in production.
+log "Building $CORE_BIN_NAME + $BIN_NAME (release, -j$BUILD_JOBS) - this is slow on a small droplet"
 cd "$REPO_DIR"
-cargo build --release --bin "$BIN_NAME" -j "$BUILD_JOBS"
+cargo build --release --bin "$CORE_BIN_NAME" --bin "$BIN_NAME" -j "$BUILD_JOBS"
 
-# 4) Swap in the new binary and restart.
-log "Installing $BIN_NAME and restarting $SERVICE"
+# 4) Swap in the new binaries and restart.
+log "Installing $CORE_BIN_NAME + $BIN_NAME and restarting $SERVICE"
 systemctl stop "$SERVICE" || true
+install -m 0755 "target/release/$CORE_BIN_NAME" "$CORE_BIN_DEST"
 install -m 0755 "target/release/$BIN_NAME" "$BIN_DEST"
 systemctl start "$SERVICE"
 

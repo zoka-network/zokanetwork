@@ -67,7 +67,7 @@ fn print_usage() {
     );
     println!("  zoka wallet-generate-seed [--seed-words 12|24] [--json]");
     println!(
-        "  zoka mine <wallet-zka1> [--network mainnet|testnet] [--password <pwd>] [--db <path>] [--minutes <n>] [--blocks <n>] [--power low|normal|max] [--allow-unsynced-mining]"
+        "  zoka mine <wallet-zka1> [--network mainnet|testnet] [--password <pwd>] [--db <path>] [--rpc <http-url>] [--network-config <file>] [--minutes <n>] [--blocks <n>] [--power low|normal|max] [--allow-unsynced-mining]"
     );
     println!(
         "  zoka node [--network mainnet|testnet] [--password <pwd>|--password-env <var>|--password-stdin] [--seed <multiaddr> ...] [--power low|normal|max] [--tor-proxy host:port] [--tor-only]"
@@ -92,6 +92,12 @@ fn print_usage() {
         "  block-info --height <n> [--network mainnet|testnet] [--db <path>] [--json]  (miner address and reward for a specific block height)"
     );
     println!("  chain-stats [--network mainnet|testnet] [--db <path>] [--json]");
+    println!(
+        "  chain-economics-migrate [--network mainnet|testnet] [--db <path>] [--dry-run|--yes] [--repair-supply] [--json]"
+    );
+    println!(
+        "  private-pending-diagnostics [--network mainnet|testnet] [--db <path>] [--height <n>] [--limit <n>] [--json]"
+    );
     println!(
         "  rpc-list [--network mainnet|testnet] [--network-config <file>] [--json]  (lists configured read-only public RPC endpoints)"
     );
@@ -764,6 +770,46 @@ fn configured_api_bind_addr(args: &[String], network: NetworkProfile) -> Result<
         )
     })?;
     api_bind_addr_from_local_rpc_url(&rpc)
+}
+
+fn active_public_rpc_urls(config: &MainnetNetworkConfig) -> Vec<String> {
+    config
+        .public_rpc
+        .iter()
+        .filter(|rpc| rpc.status.eq_ignore_ascii_case("active"))
+        .map(|rpc| rpc.url.trim_end_matches('/').to_string())
+        .collect()
+}
+
+fn rpc_sync_endpoints_from_args(
+    args: &[String],
+    network: NetworkProfile,
+) -> Result<Vec<String>, String> {
+    let manual = option_values(args, "--rpc");
+    if !manual.is_empty() {
+        for rpc in &manual {
+            parse_rpc_http_url(rpc)?;
+        }
+        return Ok(manual
+            .into_iter()
+            .map(|rpc| rpc.trim_end_matches('/').to_string())
+            .collect());
+    }
+    if has_flag(args, "--no-network-config") {
+        return Ok(Vec::new());
+    }
+
+    let config_path = network_config_path_from_args(args, network);
+    let config = if config_path.exists() {
+        load_network_config_for(&config_path, network)?
+    } else {
+        parse_network_config_for(embedded_network_config_for(network), network)?
+    };
+    let endpoints = active_public_rpc_urls(&config);
+    for rpc in &endpoints {
+        parse_rpc_http_url(rpc)?;
+    }
+    Ok(endpoints)
 }
 
 #[cfg(test)]
@@ -2105,6 +2151,10 @@ struct MiningEngineConfig {
     /// ingress path shared with peer-received blocks). Defaults to the
     /// fullnode's standard DB when None.
     chain_db_path: Option<String>,
+    /// Public RPC peers used to pull pending private transactions immediately
+    /// before mining/assembling a block. This keeps standalone miners aligned
+    /// with the network queue instead of producing empty private bundles.
+    rpc_sync_endpoints: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2643,12 +2693,32 @@ fn local_pending_private_tx_hashes_at(
     limit: usize,
     target_block_height: Option<u64>,
 ) -> Result<Vec<String>, String> {
+    Ok(
+        local_pending_private_tx_selection_diagnostics_at(db_path, limit, target_block_height)?
+            .selected,
+    )
+}
+
+fn local_pending_private_tx_selection_diagnostics_at(
+    db_path: &str,
+    limit: usize,
+    target_block_height: Option<u64>,
+) -> Result<PendingPrivateTxSelectionDiagnostics, String> {
     let storage = match open_storage(db_path) {
         Ok(storage) => storage,
         // Sidecar files are only candidates after they have been imported,
         // decoded, and validated. Mining file names directly could commit a
         // tx hash without its spent-nullifier set while RocksDB is locked.
-        Err(e) if is_storage_lock_error(&e) => return Ok(Vec::new()),
+        Err(e) if is_storage_lock_error(&e) => {
+            return Ok(PendingPrivateTxSelectionDiagnostics {
+                target_block_height: target_block_height.unwrap_or(0),
+                limit,
+                total_candidates: 0,
+                selected: Vec::new(),
+                candidates: Vec::new(),
+                storage_locked: true,
+            })
+        }
         Err(e) => return Err(e),
     };
     let hashes = storage
@@ -2656,7 +2726,7 @@ fn local_pending_private_tx_hashes_at(
         .map_err(|e| format!("failed to read pending private txs: {e}"))?;
     let target_block_height = target_block_height
         .unwrap_or_else(|| storage.get_chain_height().unwrap_or(0).saturating_add(1));
-    Ok(select_non_conflicting_pending_private_tx_hashes(
+    Ok(diagnose_pending_private_tx_selection(
         &storage,
         hashes,
         limit,
@@ -2750,12 +2820,200 @@ fn validate_private_tx_for_block_candidate_at(
         .map_err(|e| format!("private transaction validation failed: {e}"))
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct PendingPrivateTxCandidateDiagnostic {
+    hash: String,
+    selected: bool,
+    reason: String,
+    tag_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PendingPrivateTxSelectionDiagnostics {
+    target_block_height: u64,
+    limit: usize,
+    total_candidates: usize,
+    selected: Vec<String>,
+    candidates: Vec<PendingPrivateTxCandidateDiagnostic>,
+    storage_locked: bool,
+}
+
+fn diagnose_pending_private_tx_selection(
+    storage: &RocksDbStorage,
+    hashes: Vec<String>,
+    limit: usize,
+    target_block_height: u64,
+) -> PendingPrivateTxSelectionDiagnostics {
+    let total_candidates = hashes.len();
+    let mut selected = Vec::new();
+    let mut seen_spend_tags = HashSet::new();
+    let mut candidates = Vec::new();
+
+    for hash in hashes {
+        if selected.len() >= limit {
+            candidates.push(PendingPrivateTxCandidateDiagnostic {
+                hash,
+                selected: false,
+                reason: "limit reached".to_string(),
+                tag_count: 0,
+            });
+            continue;
+        }
+
+        let Some(body) = storage.get_private_transaction_bytes(&hash).ok().flatten() else {
+            candidates.push(PendingPrivateTxCandidateDiagnostic {
+                hash,
+                selected: false,
+                reason: "missing private tx body".to_string(),
+                tag_count: 0,
+            });
+            continue;
+        };
+
+        let tx = match serde_json::from_slice::<zoka::private_wallet::PrivateTransaction>(&body) {
+            Ok(tx) => tx,
+            Err(err) => {
+                candidates.push(PendingPrivateTxCandidateDiagnostic {
+                    hash,
+                    selected: false,
+                    reason: format!("invalid private tx body: {err}"),
+                    tag_count: 0,
+                });
+                continue;
+            }
+        };
+
+        if tx.tx_hash.trim() != hash.trim() {
+            candidates.push(PendingPrivateTxCandidateDiagnostic {
+                hash,
+                selected: false,
+                reason: format!("body hash mismatch: {}", tx.tx_hash),
+                tag_count: 0,
+            });
+            continue;
+        }
+
+        if let Err(err) = validate_private_tx_for_block_candidate(&tx, target_block_height) {
+            candidates.push(PendingPrivateTxCandidateDiagnostic {
+                hash,
+                selected: false,
+                reason: err,
+                tag_count: 0,
+            });
+            continue;
+        }
+
+        let tags = private_tx_spend_tags(&tx);
+        if tags.is_empty() {
+            candidates.push(PendingPrivateTxCandidateDiagnostic {
+                hash,
+                selected: false,
+                reason: "no spend/nullifier tags".to_string(),
+                tag_count: 0,
+            });
+            continue;
+        }
+
+        let tag_count = tags.len();
+        if tags.iter().any(|tag| seen_spend_tags.contains(tag)) {
+            candidates.push(PendingPrivateTxCandidateDiagnostic {
+                hash,
+                selected: false,
+                reason: "conflicts with earlier selected pending private tx".to_string(),
+                tag_count,
+            });
+            continue;
+        }
+
+        if tags
+            .iter()
+            .any(|tag| storage.is_nullifier_spent(tag).unwrap_or(false))
+        {
+            candidates.push(PendingPrivateTxCandidateDiagnostic {
+                hash,
+                selected: false,
+                reason: "nullifier already spent on-chain".to_string(),
+                tag_count,
+            });
+            continue;
+        }
+
+        seen_spend_tags.extend(tags);
+        selected.push(hash.clone());
+        candidates.push(PendingPrivateTxCandidateDiagnostic {
+            hash,
+            selected: true,
+            reason: "selected".to_string(),
+            tag_count,
+        });
+    }
+
+    PendingPrivateTxSelectionDiagnostics {
+        target_block_height,
+        limit,
+        total_candidates,
+        selected,
+        candidates,
+        storage_locked: false,
+    }
+}
+
+fn summarize_pending_private_tx_selection(
+    diagnostics: &PendingPrivateTxSelectionDiagnostics,
+) -> String {
+    if diagnostics.storage_locked {
+        return "storage locked while reading pending private txs".to_string();
+    }
+    if diagnostics.total_candidates == 0 {
+        return "no pending private tx candidates".to_string();
+    }
+    let mut reason_counts = HashMap::<String, usize>::new();
+    for candidate in &diagnostics.candidates {
+        if candidate.selected {
+            continue;
+        }
+        *reason_counts.entry(candidate.reason.clone()).or_default() += 1;
+    }
+    let mut reasons: Vec<String> = reason_counts
+        .into_iter()
+        .map(|(reason, count)| format!("{count}x {reason}"))
+        .collect();
+    reasons.sort();
+    format!(
+        "height={} candidates={} selected={} skipped=[{}]",
+        diagnostics.target_block_height,
+        diagnostics.total_candidates,
+        diagnostics.selected.len(),
+        reasons.join("; ")
+    )
+}
+
+#[cfg(test)]
 fn select_non_conflicting_pending_private_tx_hashes(
     storage: &RocksDbStorage,
     hashes: Vec<String>,
     limit: usize,
     target_block_height: u64,
 ) -> Vec<String> {
+    diagnose_pending_private_tx_selection(storage, hashes, limit, target_block_height).selected
+}
+
+#[cfg(test)]
+#[allow(dead_code, unreachable_code)]
+fn select_non_conflicting_pending_private_tx_hashes_legacy(
+    storage: &RocksDbStorage,
+    hashes: Vec<String>,
+    limit: usize,
+    target_block_height: u64,
+) -> Vec<String> {
+    return diagnose_pending_private_tx_selection(
+        storage,
+        hashes.clone(),
+        limit,
+        target_block_height,
+    )
+    .selected;
+
     let mut selected = Vec::new();
     let mut seen_spend_tags = HashSet::new();
 
@@ -4957,8 +5215,19 @@ fn run_mining_batch_with_progress(
         // Import any private txs queued in the sidecar directory by other
         // processes that could not write to the DB while we held the lock.
         if let Some(path) = config.chain_db_path.as_deref() {
+            let staged = pull_pending_private_txs_from_rpc(path, &config.rpc_sync_endpoints);
+            if staged > 0 {
+                mining_log(&format!(
+                    "pulled {staged} pending private tx(s) from RPC before PoW"
+                ));
+            }
             if let Ok(storage) = open_storage(path) {
-                import_sidecar_private_txs(path, &storage);
+                let imported = import_sidecar_private_txs(path, &storage);
+                if imported > 0 {
+                    mining_log(&format!(
+                        "imported {imported} sidecar private tx(s) before PoW"
+                    ));
+                }
             }
         }
 
@@ -5042,16 +5311,42 @@ fn run_mining_batch_with_progress(
         // Import the sidecar queue again here so the block we just solved can
         // carry those txs instead of making the user wait for the next block.
         if let Some(path) = config.chain_db_path.as_deref() {
+            let staged = pull_pending_private_txs_from_rpc(path, &config.rpc_sync_endpoints);
+            if staged > 0 {
+                mining_log(&format!(
+                    "pulled {staged} pending private tx(s) from RPC before block assembly"
+                ));
+            }
             if let Ok(storage) = open_storage(path) {
-                import_sidecar_private_txs(path, &storage);
+                let imported = import_sidecar_private_txs(path, &storage);
+                if imported > 0 {
+                    mining_log(&format!(
+                        "imported {imported} sidecar private tx(s) before block assembly"
+                    ));
+                }
             }
         }
-        let mut private_tx_hashes_for_block = match config.chain_db_path.as_deref() {
-            Some(path) => local_pending_private_tx_hashes_at(
+        let private_selection_diagnostics = match config.chain_db_path.as_deref() {
+            Some(path) => Some(local_pending_private_tx_selection_diagnostics_at(
                 path,
                 LOCAL_PRIVATE_TXS_PER_BLOCK_LIMIT,
                 Some(height),
-            )?,
+            )?),
+            None => None,
+        };
+        if let Some(diagnostics) = private_selection_diagnostics.as_ref() {
+            if diagnostics.total_candidates > 0
+                || diagnostics.storage_locked
+                || !diagnostics.selected.is_empty()
+            {
+                mining_log(&format!(
+                    "private tx selection: {}",
+                    summarize_pending_private_tx_selection(diagnostics)
+                ));
+            }
+        }
+        let mut private_tx_hashes_for_block = match private_selection_diagnostics {
+            Some(diagnostics) => diagnostics.selected,
             None => Vec::new(),
         };
         let private_tx_bodies_for_block = if economics::private_tx_canonical_bundle_required(height)
@@ -6435,14 +6730,21 @@ fn open_storage(db_path: &str) -> Result<Arc<RocksDbStorage>, String> {
 
 const CHAIN_ECONOMICS_VERSION_KEY: &str = "chain:economics:version";
 
-fn ensure_atomic_economics_db(storage: &RocksDbStorage) -> Result<(), String> {
-    if let Some(raw) = storage
+fn read_chain_economics_marker(storage: &RocksDbStorage) -> Result<Option<String>, String> {
+    storage
         .get_raw(CHAIN_ECONOMICS_VERSION_KEY)
         .map_err(|e| format!("failed to read chain economics metadata: {e}"))?
-    {
-        let version = String::from_utf8(raw)
-            .map_err(|_| "chain economics metadata is not valid UTF-8".to_string())?;
-        if version.trim() == economics::ECONOMICS_VERSION {
+        .map(|raw| {
+            String::from_utf8(raw)
+                .map(|value| value.trim().to_string())
+                .map_err(|_| "chain economics metadata is not valid UTF-8".to_string())
+        })
+        .transpose()
+}
+
+fn ensure_atomic_economics_db(storage: &RocksDbStorage) -> Result<(), String> {
+    if let Some(version) = read_chain_economics_marker(storage)? {
+        if version == economics::ECONOMICS_VERSION {
             return Ok(());
         }
         return Err(format!(
@@ -6475,6 +6777,181 @@ fn ensure_atomic_economics_db(storage: &RocksDbStorage) -> Result<(), String> {
             economics::ECONOMICS_VERSION.as_bytes().to_vec(),
         )
         .map_err(|e| format!("failed to write chain economics metadata: {e}"))
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EconomicsMigrationReport {
+    db_path: String,
+    chain_id: String,
+    economics_version: String,
+    height: u64,
+    total_supply_emitted_atoms: u64,
+    computed_emission_atoms: u64,
+    marker_before: Option<String>,
+    marker_written: bool,
+    supply_repaired: bool,
+    dry_run: bool,
+}
+
+fn read_utf8_metadata(storage: &RocksDbStorage, key: &str) -> Result<Option<String>, String> {
+    storage
+        .get_raw(key)
+        .map_err(|e| format!("failed to read {key}: {e}"))?
+        .map(|raw| {
+            String::from_utf8(raw)
+                .map(|value| value.trim().to_string())
+                .map_err(|_| format!("{key} is not valid UTF-8"))
+        })
+        .transpose()
+}
+
+fn validate_genesis_network_marker(
+    storage: &RocksDbStorage,
+    network: NetworkProfile,
+) -> Result<(), String> {
+    let Some(genesis_network) = read_utf8_metadata(storage, "chain:genesis:network")? else {
+        return Ok(());
+    };
+    if genesis_network == network.chain_id() || genesis_network == network.label() {
+        return Ok(());
+    }
+    Err(format!(
+        "DB genesis network '{}' does not match requested {} ({})",
+        genesis_network,
+        network.label(),
+        network.chain_id()
+    ))
+}
+
+fn audit_atomic_economics_chain(
+    storage: &RocksDbStorage,
+    network: NetworkProfile,
+) -> Result<(u64, u64), String> {
+    validate_genesis_network_marker(storage, network)?;
+    let height = storage
+        .get_chain_height()
+        .map_err(|e| format!("failed to read chain height: {e}"))?;
+    let mut computed_emission = 0u64;
+    for height_i in 1..=height {
+        let block = storage
+            .get_block_by_height(height_i)
+            .map_err(|e| format!("failed to read block {height_i}: {e}"))?
+            .ok_or_else(|| format!("missing canonical block at height {height_i}"))?;
+        if block.header.block_height != height_i {
+            return Err(format!(
+                "canonical height index mismatch at {height_i}: block says {}",
+                block.header.block_height
+            ));
+        }
+        let coinbase_amount = block.transactions.first().map(|tx| tx.amount).unwrap_or(0);
+        let expected = economics::block_reward_for_height(height_i, computed_emission);
+        if coinbase_amount != expected {
+            return Err(format!(
+                "block {height_i} coinbase amount is {} atoms, expected {} atoms for {}; refusing to mark this DB as atomic economics",
+                coinbase_amount,
+                expected,
+                network.chain_id()
+            ));
+        }
+        computed_emission = computed_emission
+            .checked_add(coinbase_amount)
+            .ok_or_else(|| format!("computed emission overflow at block {height_i}"))?;
+    }
+    Ok((height, computed_emission))
+}
+
+fn migrate_atomic_economics_marker(
+    storage: &RocksDbStorage,
+    db_path: &str,
+    network: NetworkProfile,
+    dry_run: bool,
+    yes: bool,
+    repair_supply: bool,
+) -> Result<EconomicsMigrationReport, String> {
+    let marker_before = read_chain_economics_marker(storage)?;
+    let height = storage
+        .get_chain_height()
+        .map_err(|e| format!("failed to read chain height: {e}"))?;
+    let total_supply_emitted_atoms = storage
+        .get_total_supply_emitted()
+        .map_err(|e| format!("failed to read emitted supply: {e}"))?;
+    let (audited_height, computed_emission_atoms) = audit_atomic_economics_chain(storage, network)?;
+    if audited_height != height {
+        return Err("internal migration audit height mismatch".to_string());
+    }
+
+    if let Some(existing) = marker_before.as_deref() {
+        if existing != economics::ECONOMICS_VERSION {
+            return Err(format!(
+                "DB already has economics marker '{}', expected '{}'",
+                existing,
+                economics::ECONOMICS_VERSION
+            ));
+        }
+        return Ok(EconomicsMigrationReport {
+            db_path: db_path.to_string(),
+            chain_id: network.chain_id().to_string(),
+            economics_version: economics::ECONOMICS_VERSION.to_string(),
+            height,
+            total_supply_emitted_atoms,
+            computed_emission_atoms,
+            marker_before,
+            marker_written: false,
+            supply_repaired: false,
+            dry_run,
+        });
+    }
+
+    let mut supply_repaired = false;
+    if total_supply_emitted_atoms != computed_emission_atoms {
+        if repair_supply && yes && !dry_run {
+            storage
+                .set_total_supply_emitted(computed_emission_atoms)
+                .map_err(|e| format!("failed to repair emitted supply metadata: {e}"))?;
+            supply_repaired = true;
+        } else {
+            return Err(format!(
+                "emitted supply metadata mismatch: stored={} atoms, computed={} atoms. Re-run with --repair-supply --yes only if this computed value is expected.",
+                total_supply_emitted_atoms,
+                computed_emission_atoms
+            ));
+        }
+    }
+
+    if !dry_run && !yes {
+        return Err(
+            "refusing to write economics marker without --yes; run --dry-run first to inspect"
+                .to_string(),
+        );
+    }
+
+    let mut marker_written = false;
+    if !dry_run {
+        storage
+            .put_raw(
+                CHAIN_ECONOMICS_VERSION_KEY,
+                economics::ECONOMICS_VERSION.as_bytes().to_vec(),
+            )
+            .map_err(|e| format!("failed to write chain economics metadata: {e}"))?;
+        marker_written = true;
+    }
+
+    Ok(EconomicsMigrationReport {
+        db_path: db_path.to_string(),
+        chain_id: network.chain_id().to_string(),
+        economics_version: economics::ECONOMICS_VERSION.to_string(),
+        height,
+        total_supply_emitted_atoms: if supply_repaired {
+            computed_emission_atoms
+        } else {
+            total_supply_emitted_atoms
+        },
+        computed_emission_atoms,
+        marker_before,
+        marker_written,
+        supply_repaired,
+        dry_run,
+    })
 }
 
 async fn connect_and_warmup(
@@ -7151,7 +7628,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     // (EMBEDDED_MAINNET_NETWORK_CONFIG / EMBEDDED_TESTNET_NETWORK_CONFIG),
     // so this requires no network config file on disk.
     if rpc_sync_endpoints.is_empty() {
-        if let Ok(embedded) = parse_network_config_for(embedded_network_config_for(network), network)
+        if let Ok(embedded) =
+            parse_network_config_for(embedded_network_config_for(network), network)
         {
             rpc_sync_endpoints = embedded
                 .public_rpc
@@ -7754,6 +8232,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 unsafe_rehearsal_difficulty_bits,
                 target_block_time_secs: mining_target_block_time_secs,
                 chain_db_path: db_path.clone(),
+                rpc_sync_endpoints: rpc_sync_endpoints.clone(),
             };
             let progress_network = network;
             mining_task = Some(tokio::task::spawn_blocking(move || {
@@ -9773,6 +10252,105 @@ fn cmd_pending_transfers(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_private_pending_diagnostics(args: &[String]) -> Result<(), String> {
+    let network = NetworkProfile::from_args(args)?;
+    let db_path =
+        option_value(args, "--db").unwrap_or_else(|| network.default_db_path().to_string());
+    let storage = open_storage(&db_path)?;
+    let target_block_height = match option_value(args, "--height") {
+        Some(raw) => parse_u64_arg(Some(raw), 1, "--height")?,
+        None => storage
+            .get_chain_height()
+            .map_err(|e| format!("failed to read chain height: {e}"))?
+            .saturating_add(1),
+    };
+    let limit = parse_u64_arg(
+        option_value(args, "--limit"),
+        LOCAL_PRIVATE_TXS_PER_BLOCK_LIMIT as u64,
+        "--limit",
+    )? as usize;
+    let hashes = storage
+        .iterate_pending_private_transaction_hashes()
+        .map_err(|e| format!("failed to read pending private txs: {e}"))?;
+    let diagnostics =
+        diagnose_pending_private_tx_selection(&storage, hashes, limit, target_block_height);
+
+    if has_flag(args, "--json") {
+        println!(
+            "{}",
+            serde_json::json!({
+                "db": db_path,
+                "chain_id": network.chain_id(),
+                "diagnostics": diagnostics,
+            })
+        );
+        return Ok(());
+    }
+
+    println!("Pending private tx diagnostics");
+    println!("Node DB: {}", db_path);
+    println!("Chain id: {}", network.chain_id());
+    println!("{}", summarize_pending_private_tx_selection(&diagnostics));
+    for candidate in diagnostics.candidates {
+        println!(
+            "- {}: {}{}",
+            candidate.hash,
+            candidate.reason,
+            if candidate.tag_count > 0 {
+                format!(" ({} tag(s))", candidate.tag_count)
+            } else {
+                String::new()
+            }
+        );
+    }
+    Ok(())
+}
+
+fn cmd_chain_economics_migrate(args: &[String]) -> Result<(), String> {
+    let network = NetworkProfile::from_args(args)?;
+    let db_path =
+        option_value(args, "--db").unwrap_or_else(|| network.default_db_path().to_string());
+    let dry_run = has_flag(args, "--dry-run");
+    let yes = has_flag(args, "--yes");
+    let repair_supply = has_flag(args, "--repair-supply");
+    let as_json = has_flag(args, "--json");
+    let storage = RocksDbStorage::new(&db_path)
+        .map_err(|e| format!("failed to open chain db '{db_path}': {e}"))?;
+    let report =
+        migrate_atomic_economics_marker(&storage, &db_path, network, dry_run, yes, repair_supply)?;
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .map_err(|e| format!("failed to encode migration report: {e}"))?
+        );
+        return Ok(());
+    }
+
+    println!("Chain economics migration");
+    println!("DB: {}", report.db_path);
+    println!("Chain id: {}", report.chain_id);
+    println!("Economics version: {}", report.economics_version);
+    println!("Height checked: {}", report.height);
+    println!(
+        "Stored emitted: {}",
+        format_zka(report.total_supply_emitted_atoms)
+    );
+    println!(
+        "Computed emitted: {}",
+        format_zka(report.computed_emission_atoms)
+    );
+    println!(
+        "Marker before: {}",
+        report.marker_before.as_deref().unwrap_or("<missing>")
+    );
+    println!("Marker written: {}", yes_no(report.marker_written));
+    println!("Supply repaired: {}", yes_no(report.supply_repaired));
+    println!("Dry run: {}", yes_no(report.dry_run));
+    Ok(())
+}
+
 fn cmd_tx_send_unified(args: &[String]) -> Result<(), String> {
     let network = NetworkProfile::from_args(args)?;
     let from = required_option_value(args, "--from")?;
@@ -11292,6 +11870,7 @@ fn cmd_mine_easy(args: &[String]) -> Result<(), String> {
     let password = password_value(args)?;
     let db_path =
         option_value(args, "--db").or_else(|| Some(network.default_db_path().to_string()));
+    let rpc_sync_endpoints = rpc_sync_endpoints_from_args(args, network)?;
     let sync_gate_note = standalone_mining_sync_gate(args, network, db_path.as_deref())?;
     if let Some(path) = db_path.as_deref() {
         let storage = open_storage(path)?;
@@ -11453,6 +12032,7 @@ fn cmd_mine_easy(args: &[String]) -> Result<(), String> {
             unsafe_rehearsal_difficulty_bits,
             target_block_time_secs,
             chain_db_path: db_path.clone(),
+            rpc_sync_endpoints: rpc_sync_endpoints.clone(),
         };
         let batch = {
             let mut last_live_render: Option<Instant> = None;
@@ -11641,6 +12221,7 @@ async fn run() -> Result<(), String> {
         "height" => cmd_height(tail),
         "block-info" => cmd_block_info(tail),
         "chain-stats" => cmd_chain_stats(tail),
+        "chain-economics-migrate" => cmd_chain_economics_migrate(tail),
         "sync-status" => cmd_sync_status_unified(tail),
         "wallet-history" => cmd_wallet_history_unified(tail),
         "wallet-receive" => cmd_receive_address(tail),
@@ -11648,6 +12229,7 @@ async fn run() -> Result<(), String> {
         "private-tx-import" => cmd_private_tx_import(tail),
         "private-tx-publish" => cmd_private_tx_publish(tail),
         "private-tx-audit" => cmd_private_tx_audit(tail),
+        "private-pending-diagnostics" => cmd_private_pending_diagnostics(tail),
         "tx-pending" => cmd_pending_transfers(tail),
         "estimate-fee" => cmd_estimate_fee(tail),
         "fullnode" => cmd_fullnode_auto(tail).await,
@@ -12451,6 +13033,38 @@ mod tests {
         (tmp, db.to_string_lossy().to_string())
     }
 
+    fn save_test_coinbase_block(
+        storage: &RocksDbStorage,
+        height: u64,
+        amount: u64,
+        prev_hash: String,
+    ) -> String {
+        let coinbase = zoka::mining::block_validator::build_coinbase_tx(
+            "zka1testminer".to_string(),
+            amount,
+            height,
+            1_780_000_000 + height,
+        );
+        let block = zoka::types::Block::new(
+            prev_hash,
+            1_780_000_000 + height,
+            0,
+            height,
+            vec![coinbase],
+            zoka::types::PublicKey(Vec::new()),
+            zoka::types::Signature(Vec::new()),
+        );
+        let hash = block.header.hash.clone();
+        storage.save_block(&block).expect("save test block");
+        storage
+            .set_chain_height(height)
+            .expect("set test chain height");
+        storage
+            .set_last_block_hash(&hash)
+            .expect("set test last hash");
+        hash
+    }
+
     #[test]
     fn advance_private_wallet_restore_height_skips_already_scanned_blocks() {
         let tmp = tempfile::TempDir::new().expect("temp wallet dir");
@@ -12464,14 +13078,20 @@ mod tests {
         // A brand-new wallet has restore_height 0; the first sync should not
         // advance past a chain it hasn't actually scanned.
         assert_eq!(
-            manager.get_private_wallet(wallet_name).unwrap().restore_height,
+            manager
+                .get_private_wallet(wallet_name)
+                .unwrap()
+                .restore_height,
             0
         );
 
         advance_private_wallet_restore_height(&storage, &mut manager, wallet_name, None, 100)
             .expect("advance after first scan");
         assert_eq!(
-            manager.get_private_wallet(wallet_name).unwrap().restore_height,
+            manager
+                .get_private_wallet(wallet_name)
+                .unwrap()
+                .restore_height,
             101
         );
 
@@ -12480,7 +13100,10 @@ mod tests {
         advance_private_wallet_restore_height(&storage, &mut manager, wallet_name, None, 150)
             .expect("advance after second scan");
         assert_eq!(
-            manager.get_private_wallet(wallet_name).unwrap().restore_height,
+            manager
+                .get_private_wallet(wallet_name)
+                .unwrap()
+                .restore_height,
             151
         );
 
@@ -12489,20 +13112,23 @@ mod tests {
         advance_private_wallet_restore_height(&storage, &mut manager, wallet_name, None, 120)
             .expect("stale advance is a no-op");
         assert_eq!(
-            manager.get_private_wallet(wallet_name).unwrap().restore_height,
+            manager
+                .get_private_wallet(wallet_name)
+                .unwrap()
+                .restore_height,
             151
         );
 
         // The checkpoint must survive a reload from disk, otherwise every
         // unlock would still rescan from genesis.
-        let reloaded = load_private_wallet_manager_for_network(
-            &storage,
-            None,
-            NetworkProfile::Mainnet,
-        )
-        .expect("reload manager from disk");
+        let reloaded =
+            load_private_wallet_manager_for_network(&storage, None, NetworkProfile::Mainnet)
+                .expect("reload manager from disk");
         assert_eq!(
-            reloaded.get_private_wallet(wallet_name).unwrap().restore_height,
+            reloaded
+                .get_private_wallet(wallet_name)
+                .unwrap()
+                .restore_height,
             151
         );
     }
@@ -12629,6 +13255,73 @@ mod tests {
     }
 
     #[test]
+    fn atomic_economics_migration_marks_audited_atomic_chain() {
+        let (_tmp, db) = temp_db_arg();
+        let storage = RocksDbStorage::new(&db).expect("temp rocksdb");
+        let reward = economics::block_reward_for_height(1, 0);
+        save_test_coinbase_block(
+            &storage,
+            1,
+            reward,
+            genesis_pow_hash_for_chain(NetworkProfile::Mainnet.chain_id()),
+        );
+        storage
+            .set_total_supply_emitted(reward)
+            .expect("set emitted supply");
+        storage
+            .put_raw(
+                "chain:genesis:network",
+                NetworkProfile::Mainnet.chain_id().as_bytes().to_vec(),
+            )
+            .expect("set genesis network");
+
+        let report = migrate_atomic_economics_marker(
+            &storage,
+            &db,
+            NetworkProfile::Mainnet,
+            false,
+            true,
+            false,
+        )
+        .expect("migration should mark audited atomic chain");
+
+        assert!(report.marker_written);
+        assert_eq!(report.computed_emission_atoms, reward);
+        assert_eq!(
+            read_chain_economics_marker(&storage).unwrap().unwrap(),
+            economics::ECONOMICS_VERSION
+        );
+    }
+
+    #[test]
+    fn atomic_economics_migration_rejects_whole_zka_coinbase() {
+        let (_tmp, db) = temp_db_arg();
+        let storage = RocksDbStorage::new(&db).expect("temp rocksdb");
+        save_test_coinbase_block(
+            &storage,
+            1,
+            12,
+            genesis_pow_hash_for_chain(NetworkProfile::Mainnet.chain_id()),
+        );
+        storage
+            .set_total_supply_emitted(12)
+            .expect("set emitted supply");
+
+        let err = migrate_atomic_economics_marker(
+            &storage,
+            &db,
+            NetworkProfile::Mainnet,
+            false,
+            true,
+            false,
+        )
+        .expect_err("whole-ZKA chain must not be marked atomic");
+
+        assert!(err.contains("expected"));
+        assert!(err.contains("refusing to mark"));
+    }
+
+    #[test]
     fn current_known_height_with_explicit_db_ignores_local_mining_state() {
         let (_tmp, db) = temp_db_arg();
         let storage = RocksDbStorage::new(&db).expect("temp rocksdb");
@@ -12672,6 +13365,28 @@ mod tests {
             select_non_conflicting_pending_private_tx_hashes(&storage, vec![tx.tx_hash], 1, 1,)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn pending_private_tx_diagnostics_reports_skip_reason() {
+        let (_tmp, db) = temp_db_arg();
+        let storage = RocksDbStorage::new(&db).expect("temp rocksdb");
+        let tx = private_tx_with_unknown_proof_profile();
+        let body = serde_json::to_vec(&tx).expect("serialize private tx fixture");
+        storage
+            .save_private_transaction_bytes(&tx.tx_hash, &body)
+            .expect("save private tx body");
+        storage
+            .save_pending_private_transaction_hash(&tx.tx_hash)
+            .expect("save pending hash");
+
+        let diagnostics = diagnose_pending_private_tx_selection(&storage, vec![tx.tx_hash], 1, 1);
+
+        assert_eq!(diagnostics.total_candidates, 1);
+        assert!(diagnostics.selected.is_empty());
+        assert!(diagnostics.candidates[0]
+            .reason
+            .contains("private transaction validation failed"));
     }
 
     #[test]
