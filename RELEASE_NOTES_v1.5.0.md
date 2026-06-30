@@ -29,8 +29,8 @@ Nodes running 1.5.0 reject any mainnet branch above these heights that does not 
 
 ## Validation Performed
 
-- Windows release build: `cargo build --release --features randomx --bin zoka`
-- Linux release artifact built by GitHub Actions from commit `262a4473e46f6a01ffa74f2e5f1236187dc42598`.
+- Windows release build: `cargo build --release --features randomx --bins`
+- Linux release artifact built by GitHub Actions from commit `658ebbbc549b64ee3226dfa264d03dd854d8234f`.
 - Mainnet observed past height 360 with local, bootstrap, and RPC nodes on the same canonical hashes.
 - Private transaction test confirmed in block 318:
   - Tx hash: `94fec103baa98263524a278cc0912c21`
@@ -46,7 +46,7 @@ Nodes running 1.5.0 reject any mainnet branch above these heights that does not 
 
 - Windows `zoka.exe`: `88AE5F6DC8E44CD13EDE14109F33FC4122785FEE34902E087EAA145B22607C6E`
 - Windows `zokahd.exe`: `0A22596A39984BE4BDAF0DFB80C19906E1614DFA785D1B25E5E0B4FFEF7BA39F`
-- Linux `zoka`: pending final 1.5.0 build
+- Linux `zoka`: `061B752EF3F2DB611CC6B620EDC4267ED81623DD4FCACE7B59C082F443DB44A4`
 
 ## Operator Notes
 
