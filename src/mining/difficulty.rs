@@ -79,11 +79,34 @@ pub fn expected_for_next_block(storage: &RocksDbStorage) -> Result<u32, String> 
         .timestamp
         .saturating_sub(grandparent.header.timestamp);
 
-    Ok(retarget_from_solve_time(
+    let next_height = head_height.saturating_add(1);
+    let retargeted = retarget_from_solve_time(
         parent_difficulty,
         parent_solve_secs,
         economics::TARGET_BLOCK_TIME_SECS,
-    ))
+    );
+    apply_mainnet_emergency_difficulty_cap(storage, next_height, retargeted)
+}
+
+pub fn apply_mainnet_emergency_difficulty_cap(
+    storage: &RocksDbStorage,
+    next_height: u64,
+    difficulty_bits: u32,
+) -> Result<u32, String> {
+    if next_height < economics::MAINNET_EMERGENCY_DIFFICULTY_CAP_FROM_HEIGHT
+        || next_height > economics::MAINNET_EMERGENCY_DIFFICULTY_CAP_UNTIL_HEIGHT
+    {
+        return Ok(difficulty_bits);
+    }
+
+    let checkpoint_hash = storage
+        .get_canonical_block_hash_at_height(economics::MAINNET_EMERGENCY_CHECKPOINT_HEIGHT)
+        .map_err(|e| format!("read emergency checkpoint failed: {e:?}"))?;
+    if checkpoint_hash.as_deref() != Some(economics::MAINNET_EMERGENCY_CHECKPOINT_HASH) {
+        return Ok(difficulty_bits);
+    }
+
+    Ok(difficulty_bits.min(economics::MAINNET_EMERGENCY_DIFFICULTY_MAX_BITS))
 }
 
 /// Pure step function used by `expected_for_next_block`. Exposed for

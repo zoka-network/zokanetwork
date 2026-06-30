@@ -293,11 +293,21 @@ fn expected_difficulty_after_parent(
         .header
         .timestamp
         .saturating_sub(grandparent.header.timestamp);
-    Ok(difficulty::retarget_from_solve_time(
+    let next_height = parent_meta.height.saturating_add(1);
+    let retargeted = difficulty::retarget_from_solve_time(
         parent_meta.difficulty_bits,
         solve_secs,
         crate::economics::TARGET_BLOCK_TIME_SECS,
-    ))
+    );
+    if chain_id == crate::economics::MAINNET_CHAIN_ID {
+        return difficulty::apply_mainnet_emergency_difficulty_cap(
+            storage,
+            next_height,
+            retargeted,
+        )
+        .map_err(ChainError::Storage);
+    }
+    Ok(retargeted)
 }
 
 fn collect_branch_to_common_ancestor(
