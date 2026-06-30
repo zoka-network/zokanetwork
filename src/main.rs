@@ -7856,12 +7856,16 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             runtime_mining_state.last_updated = now_secs();
             let _ = save_user_mining_state_for_network(network, &runtime_mining_state);
         }
+        let runtime_chain_height = chain_storage_outer
+            .as_ref()
+            .and_then(|storage| storage.get_chain_height().ok())
+            .unwrap_or(runtime_mining_state.chain_height);
         zoka::api::global_network_runtime().set_connected_peers(node.connected_peer_count());
         zoka::api::global_network_runtime()
             .set_local_miner(
                 node.peer_id().to_string(),
                 runtime_mining_enabled || mining_active,
-                runtime_mining_state.chain_height,
+                runtime_chain_height,
                 if runtime_mining_enabled || mining_active {
                     runtime_mining_state.estimated_hashrate_hps
                 } else {
@@ -7874,7 +7878,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             let heartbeat = serde_json::json!({
                 "peer_id": node.peer_id().to_string(),
                 "address": wallet_address.as_str(),
-                "chain_height": runtime_mining_state.chain_height,
+                "chain_height": runtime_chain_height,
                 "hashrate_hps": runtime_mining_state.estimated_hashrate_hps,
                 "mining": true,
                 "client_version": env!("CARGO_PKG_VERSION"),
@@ -7895,8 +7899,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                         (Ok(_), Some(false)) | (Ok(_), None) => {
                             eprintln!(
                                 "miner heartbeat: explorer link OK via {rpc} (height={}, hps={}).",
-                                runtime_mining_state.chain_height,
-                                runtime_mining_state.estimated_hashrate_hps
+                                runtime_chain_height, runtime_mining_state.estimated_hashrate_hps
                             );
                         }
                         (Err(err), Some(true)) | (Err(err), None) => {
