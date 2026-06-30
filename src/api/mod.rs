@@ -327,6 +327,10 @@ pub struct MinerHeartbeatRequest {
     pub client_version: Option<String>,
     #[serde(default)]
     pub software: Option<String>,
+    #[serde(default)]
+    pub launcher: Option<String>,
+    #[serde(default)]
+    pub launcher_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -338,6 +342,8 @@ pub struct MinerHeartbeatRecord {
     pub mining: bool,
     pub client_version: Option<String>,
     pub software: Option<String>,
+    pub launcher: Option<String>,
+    pub launcher_version: Option<String>,
     pub legacy_client: bool,
     pub outdated_client: bool,
     pub last_seen: u64,
@@ -417,6 +423,18 @@ fn normalize_client_version(raw: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn normalize_client_label(raw: Option<String>) -> Option<String> {
+    raw.map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn heartbeat_reports_zsilent(software: Option<&str>, launcher: Option<&str>) -> bool {
+    software
+        .into_iter()
+        .chain(launcher)
+        .any(|value| value.eq_ignore_ascii_case("zsilent"))
+}
+
 fn compare_semverish(a: &str, b: &str) -> i32 {
     let parts_a: Vec<u64> = a
         .split('.')
@@ -488,11 +506,21 @@ impl NetworkRuntimeState {
             return Err("invalid peer id".to_string());
         }
         let client_version = normalize_client_version(heartbeat.client_version);
+        let software = normalize_client_label(heartbeat.software);
+        let launcher = normalize_client_label(heartbeat.launcher);
+        let launcher_version = normalize_client_version(heartbeat.launcher_version);
         let version_missing = client_version.is_none();
-        let outdated_client = client_version
+        let core_outdated = client_version
             .as_deref()
             .map(|version| compare_semverish(version, NETWORK_MIN_CLIENT_VERSION) < 0)
             .unwrap_or(true);
+        let zsilent_launcher = heartbeat_reports_zsilent(software.as_deref(), launcher.as_deref());
+        let launcher_outdated = zsilent_launcher
+            && launcher_version
+                .as_deref()
+                .map(|version| compare_semverish(version, NETWORK_MIN_CLIENT_VERSION) < 0)
+                .unwrap_or(true);
+        let outdated_client = core_outdated || launcher_outdated;
         let now = ApiRateLimiter::now_secs();
         let mut heartbeats = self.miner_heartbeats.write().await;
         let record = MinerHeartbeatRecord {
@@ -505,10 +533,9 @@ impl NetworkRuntimeState {
             hashrate_hps: heartbeat.hashrate_hps,
             mining: heartbeat.mining,
             client_version,
-            software: heartbeat
-                .software
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
+            software,
+            launcher,
+            launcher_version,
             legacy_client: legacy_client || version_missing,
             outdated_client,
             last_seen: now,
@@ -2124,6 +2151,8 @@ async fn post_miner_heartbeat(
         "status": "ok",
         "accepted_for_mining": accepted_for_mining,
         "client_version": record.client_version,
+        "launcher": record.launcher,
+        "launcher_version": record.launcher_version,
         "legacy_client": record.legacy_client,
         "outdated_client": record.outdated_client,
         "minimum_client_version": snapshot.minimum_client_version,
@@ -5138,6 +5167,69 @@ mod tests {
         assert_eq!(snapshot.total_reported_hashrate_hps, 55);
         assert_eq!(snapshot.legacy_miners_online, 0);
         assert_eq!(snapshot.outdated_miners_online, 0);
+    }
+
+    #[tokio::test]
+    async fn test_zsilent_heartbeat_requires_current_launcher_version() {
+        let runtime = NetworkRuntimeState::default();
+
+        let missing_launcher_version = runtime
+            .record_miner_heartbeat(MinerHeartbeatRequest {
+                peer_id: "zsilent-missing-launcher".to_string(),
+                mining: true,
+                hashrate_hps: 11,
+                client_version: Some(NETWORK_MIN_CLIENT_VERSION.to_string()),
+                software: Some("zsilent".to_string()),
+                launcher: Some("zsilent".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!missing_launcher_version.legacy_client);
+        assert!(missing_launcher_version.outdated_client);
+
+        let old_launcher_version = runtime
+            .record_miner_heartbeat(MinerHeartbeatRequest {
+                peer_id: "zsilent-old-launcher".to_string(),
+                mining: true,
+                hashrate_hps: 22,
+                client_version: Some(NETWORK_MIN_CLIENT_VERSION.to_string()),
+                software: Some("zsilent".to_string()),
+                launcher: Some("zsilent".to_string()),
+                launcher_version: Some("1.4.0".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!old_launcher_version.legacy_client);
+        assert!(old_launcher_version.outdated_client);
+
+        let current_launcher_version = runtime
+            .record_miner_heartbeat(MinerHeartbeatRequest {
+                peer_id: "zsilent-current-launcher".to_string(),
+                mining: true,
+                hashrate_hps: 33,
+                client_version: Some(NETWORK_MIN_CLIENT_VERSION.to_string()),
+                software: Some("zsilent".to_string()),
+                launcher: Some("zsilent".to_string()),
+                launcher_version: Some(format!("v{NETWORK_MIN_CLIENT_VERSION}")),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!current_launcher_version.legacy_client);
+        assert!(!current_launcher_version.outdated_client);
+        assert_eq!(
+            current_launcher_version.launcher_version.as_deref(),
+            Some(NETWORK_MIN_CLIENT_VERSION)
+        );
+
+        let snapshot = runtime.snapshot().await;
+        assert_eq!(snapshot.miners_online, 1);
+        assert_eq!(snapshot.remote_miners_online, 1);
+        assert_eq!(snapshot.total_reported_hashrate_hps, 33);
+        assert_eq!(snapshot.legacy_miners_online, 0);
+        assert_eq!(snapshot.outdated_miners_online, 2);
     }
 
     #[tokio::test]

@@ -8,7 +8,8 @@ Release type: mandatory mainnet hotfix.
 - Restores private transaction mining and reward accounting.
 - Anchors the mainnet recovery branch with checkpoints at heights 296, 297, and 298.
 - Rejects old/off-branch miners that do not follow the canonical recovery chain.
-- Requires miner heartbeat client version 1.5.0 or newer for ZSilent/ZokaScan active-miner reporting.
+- Requires miner heartbeat client version 1.5.0 or newer for ZokaScan/ZokaExplorer active-miner reporting.
+- Requires ZSilent launcher version 1.5.0 or newer when the miner is launched from ZSilent.
 - Adds HTTP block autopush/retry for NAT'd miners through `/sync/block`.
 - Keeps `/sync/block` enabled on public RPC/bootstrap nodes with stricter API limits.
 
@@ -30,7 +31,7 @@ Nodes running 1.5.0 reject any mainnet branch above these heights that does not 
 ## Validation Performed
 
 - Windows release build: `cargo build --release --features randomx --bins`
-- Linux release artifact built by GitHub Actions from commit `658ebbbc549b64ee3226dfa264d03dd854d8234f`.
+- Linux release artifact pending final GitHub Actions build for the launcher-gated 1.5.0 commit.
 - Mainnet observed past height 360 with local, bootstrap, and RPC nodes on the same canonical hashes.
 - Private transaction test confirmed in block 318:
   - Tx hash: `94fec103baa98263524a278cc0912c21`
@@ -44,9 +45,9 @@ Nodes running 1.5.0 reject any mainnet branch above these heights that does not 
 
 ## Checksums
 
-- Windows `zoka.exe`: `88AE5F6DC8E44CD13EDE14109F33FC4122785FEE34902E087EAA145B22607C6E`
-- Windows `zokahd.exe`: `0A22596A39984BE4BDAF0DFB80C19906E1614DFA785D1B25E5E0B4FFEF7BA39F`
-- Linux `zoka`: `061B752EF3F2DB611CC6B620EDC4267ED81623DD4FCACE7B59C082F443DB44A4`
+- Windows `zoka.exe`: `C8DF298CC7CD31DA384534467EEC042CE24FDD29A1F8B713CB4BED3FDF7767D4`
+- Windows `zokahd.exe`: `EDA80EEF674788617FA20808C72004623D860BA5910EF7A788916BEADF18BC0E`
+- Linux `zoka`: pending final launcher-gated 1.5.0 build
 
 ## Operator Notes
 
@@ -64,4 +65,5 @@ Nodes running 1.5.0 reject any mainnet branch above these heights that does not 
 
 - ZSilent Core 1.5.0 must package the 1.5.0 `zoka.exe` binary.
 - ZSilent and explorer active-miner views intentionally ignore old miner clients below 1.5.0.
+- ZSilent-launched miners must report launcher version 1.5.0 or newer; standalone `zoka`/`zokahd` 1.5.0 CLI miners remain allowed.
 - Coinbase rewards still require 60 confirmations before spend.

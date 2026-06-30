@@ -694,6 +694,19 @@ fn env_non_empty(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn miner_launcher_metadata() -> (Option<String>, Option<String>) {
+    let launcher = env_non_empty("ZOKA_MINER_LAUNCHER").or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|path| path.to_str().map(|value| value.to_ascii_lowercase()))
+            .filter(|path| path.contains("zsilent"))
+            .map(|_| "zsilent".to_string())
+    });
+    let launcher_version = env_non_empty("ZOKA_MINER_LAUNCHER_VERSION")
+        .or_else(|| env_non_empty("ZSILENT_APP_VERSION"));
+    (launcher, launcher_version)
+}
+
 fn default_mainnet_network_config_path() -> PathBuf {
     PathBuf::from("docs").join("mainnet-network.v1.json")
 }
@@ -7978,6 +7991,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             .await;
 
         if runtime_mining_enabled && tokio::time::Instant::now() >= next_miner_heartbeat_at {
+            let (launcher, launcher_version) = miner_launcher_metadata();
+            let software = launcher.clone().unwrap_or_else(|| "zoka".to_string());
             let heartbeat = serde_json::json!({
                 "peer_id": node.peer_id().to_string(),
                 "address": wallet_address.as_str(),
@@ -7985,7 +8000,9 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 "hashrate_hps": runtime_mining_state.estimated_hashrate_hps,
                 "mining": true,
                 "client_version": env!("CARGO_PKG_VERSION"),
-                "software": "zoka",
+                "software": software,
+                "launcher": launcher,
+                "launcher_version": launcher_version,
             });
             if rpc_sync_endpoints.is_empty() {
                 let key = "__no_endpoints__".to_string();
