@@ -1050,7 +1050,7 @@ impl Default for ChainSync {
 #[derive(Parser, Debug)]
 #[command(name = "zoka")]
 #[command(about = "ZOKA: 100% Private Blockchain CLI", long_about = None)]
-#[command(version = "0.1.0")]
+#[command(version)]
 pub struct CliArgs {
     #[command(subcommand)]
     pub command: Option<CliSubcommand>,

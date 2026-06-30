@@ -135,6 +135,14 @@ jobs:
           systemctl enable zoka-bootstrap
           # Stop old instance if running
           systemctl stop zoka-bootstrap 2>/dev/null || true
+          if [ -d /data/zoka/blockchain.db ]; then
+            tar -C /data/zoka -czf "/data/zoka/blockchain.db.pre-1.4.0.$(date -u +%Y%m%d%H%M%S).tgz" blockchain.db
+          fi
+          /usr/local/bin/zoka chain-economics-migrate \
+            --network mainnet \
+            --db /data/zoka/blockchain.db \
+            --yes \
+            --json
           systemctl start zoka-bootstrap
           sleep 8
           systemctl status zoka-bootstrap --no-pager -l
@@ -226,6 +234,14 @@ jobs:
           systemctl daemon-reload
           systemctl enable zoka-rpc
           systemctl stop zoka-rpc 2>/dev/null || true
+          if [ -d /data/zoka/blockchain.db ]; then
+            tar -C /data/zoka -czf "/data/zoka/blockchain.db.pre-1.4.0.$(date -u +%Y%m%d%H%M%S).tgz" blockchain.db
+          fi
+          /usr/local/bin/zoka chain-economics-migrate \
+            --network mainnet \
+            --db /data/zoka/blockchain.db \
+            --yes \
+            --json
           systemctl start zoka-rpc
           sleep 8
           systemctl status zoka-rpc --no-pager -l

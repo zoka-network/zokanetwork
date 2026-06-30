@@ -7877,6 +7877,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 "chain_height": runtime_mining_state.chain_height,
                 "hashrate_hps": runtime_mining_state.estimated_hashrate_hps,
                 "mining": true,
+                "client_version": env!("CARGO_PKG_VERSION"),
+                "software": "zoka",
             });
             if rpc_sync_endpoints.is_empty() {
                 let key = "__no_endpoints__".to_string();
@@ -12112,6 +12114,13 @@ async fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let is_hd = running_as_zokahd();
     if is_hd {
+        if matches!(
+            args.first().map(String::as_str),
+            Some("--version" | "-V" | "version")
+        ) {
+            println!("zokahd {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
         if args.is_empty() {
             return run_zokahd_guided_default().await;
         }
@@ -12147,6 +12156,10 @@ async fn run() -> Result<(), String> {
     let command = &args[0];
     let tail = &args[1..];
     match command.as_str() {
+        "version" | "--version" | "-V" => {
+            println!("zoka {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(())

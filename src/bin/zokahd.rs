@@ -20,6 +20,13 @@ fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     if args
         .iter()
+        .any(|arg| arg == "--version" || arg == "-V" || arg == "version")
+    {
+        println!("zokahd {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+    if args
+        .iter()
         .any(|arg| arg == "--help" || arg == "-h" || arg == "help")
     {
         print_usage();

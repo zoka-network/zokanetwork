@@ -52,6 +52,7 @@ pub type PrivateTxBroadcastSender =
     tokio::sync::mpsc::UnboundedSender<crate::private_wallet::PrivateTransaction>;
 
 const MINER_HEARTBEAT_TTL_SECS: u64 = 90;
+const NETWORK_MIN_CLIENT_VERSION: &str = "1.4.0";
 
 #[derive(Clone, Debug)]
 pub struct ApiSecurityConfig {
@@ -201,14 +202,8 @@ impl Default for ApiSecurityConfig {
                 }
                 enabled
             },
-            enable_mining_control_endpoint: parse_bool_env(
-                "ZOKA_API_ENABLE_MINING_CONTROL",
-                false,
-            ),
-            enable_block_submit_endpoint: parse_bool_env(
-                "ZOKA_API_ENABLE_BLOCK_SUBMIT",
-                false,
-            ),
+            enable_mining_control_endpoint: parse_bool_env("ZOKA_API_ENABLE_MINING_CONTROL", false),
+            enable_block_submit_endpoint: parse_bool_env("ZOKA_API_ENABLE_BLOCK_SUBMIT", false),
             write_clients: parse_csv_env("ZOKA_API_WRITE_CLIENTS"),
             admin_clients: parse_csv_env("ZOKA_API_ADMIN_CLIENTS"),
             ip_whitelist,
@@ -318,6 +313,7 @@ pub struct ApiSecurityStats {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MinerHeartbeatRequest {
+    #[serde(default)]
     pub peer_id: String,
     #[serde(default)]
     pub address: Option<String>,
@@ -327,6 +323,10 @@ pub struct MinerHeartbeatRequest {
     pub hashrate_hps: u64,
     #[serde(default)]
     pub mining: bool,
+    #[serde(default)]
+    pub client_version: Option<String>,
+    #[serde(default)]
+    pub software: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -336,6 +336,10 @@ pub struct MinerHeartbeatRecord {
     pub chain_height: u64,
     pub hashrate_hps: u64,
     pub mining: bool,
+    pub client_version: Option<String>,
+    pub software: Option<String>,
+    pub legacy_client: bool,
+    pub outdated_client: bool,
     pub last_seen: u64,
 }
 
@@ -349,6 +353,9 @@ pub struct NetworkRuntimeSnapshot {
     pub local_peer_id: Option<String>,
     pub total_reported_hashrate_hps: u64,
     pub heartbeat_ttl_secs: u64,
+    pub legacy_miners_online: u64,
+    pub outdated_miners_online: u64,
+    pub minimum_client_version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -405,6 +412,41 @@ pub struct NetworkRuntimeState {
     miner_heartbeats: RwLock<HashMap<String, MinerHeartbeatRecord>>,
 }
 
+fn normalize_client_version(raw: Option<String>) -> Option<String> {
+    raw.map(|value| value.trim().trim_start_matches('v').to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn compare_semverish(a: &str, b: &str) -> i32 {
+    let parts_a: Vec<u64> = a
+        .split('.')
+        .map(|part| part.parse::<u64>().unwrap_or(0))
+        .collect();
+    let parts_b: Vec<u64> = b
+        .split('.')
+        .map(|part| part.parse::<u64>().unwrap_or(0))
+        .collect();
+    let len = parts_a.len().max(parts_b.len()).max(3);
+    for i in 0..len {
+        let av = *parts_a.get(i).unwrap_or(&0);
+        let bv = *parts_b.get(i).unwrap_or(&0);
+        if av != bv {
+            return if av > bv { 1 } else { -1 };
+        }
+    }
+    0
+}
+
+fn legacy_peer_id_for_heartbeat(heartbeat: &MinerHeartbeatRequest) -> String {
+    heartbeat
+        .address
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|address| format!("legacy-address:{address}"))
+        .unwrap_or_else(|| "legacy-miner:unknown".to_string())
+}
+
 impl NetworkRuntimeState {
     pub fn set_connected_peers(&self, peers: usize) {
         self.connected_peers.store(peers as u64, Ordering::Relaxed);
@@ -434,30 +476,47 @@ impl NetworkRuntimeState {
     pub async fn record_miner_heartbeat(
         &self,
         heartbeat: MinerHeartbeatRequest,
-    ) -> Result<(), String> {
+    ) -> Result<MinerHeartbeatRecord, String> {
         let peer_id = heartbeat.peer_id.trim();
-        if peer_id.is_empty() || peer_id.len() > 128 {
+        let legacy_client = peer_id.is_empty();
+        let peer_id = if legacy_client {
+            legacy_peer_id_for_heartbeat(&heartbeat)
+        } else {
+            peer_id.to_string()
+        };
+        if peer_id.len() > 256 {
             return Err("invalid peer id".to_string());
         }
+        let client_version = normalize_client_version(heartbeat.client_version);
+        let version_missing = client_version.is_none();
+        let outdated_client = client_version
+            .as_deref()
+            .map(|version| compare_semverish(version, NETWORK_MIN_CLIENT_VERSION) < 0)
+            .unwrap_or(true);
         let now = ApiRateLimiter::now_secs();
         let mut heartbeats = self.miner_heartbeats.write().await;
-        heartbeats.insert(
-            peer_id.to_string(),
-            MinerHeartbeatRecord {
-                peer_id: peer_id.to_string(),
-                address: heartbeat
-                    .address
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty()),
-                chain_height: heartbeat.chain_height,
-                hashrate_hps: heartbeat.hashrate_hps,
-                mining: heartbeat.mining,
-                last_seen: now,
-            },
-        );
+        let record = MinerHeartbeatRecord {
+            peer_id: peer_id.clone(),
+            address: heartbeat
+                .address
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            chain_height: heartbeat.chain_height,
+            hashrate_hps: heartbeat.hashrate_hps,
+            mining: heartbeat.mining,
+            client_version,
+            software: heartbeat
+                .software
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            legacy_client: legacy_client || version_missing,
+            outdated_client,
+            last_seen: now,
+        };
+        heartbeats.insert(peer_id, record.clone());
         heartbeats
             .retain(|_, record| now.saturating_sub(record.last_seen) <= MINER_HEARTBEAT_TTL_SECS);
-        Ok(())
+        Ok(record)
     }
 
     pub async fn snapshot(&self) -> NetworkRuntimeSnapshot {
@@ -466,6 +525,8 @@ impl NetworkRuntimeState {
         let local_mining = self.local_mining.load(Ordering::Relaxed) == 1;
         let mut miner_ids = HashSet::new();
         let mut total_hashrate = 0u64;
+        let mut legacy_miners = 0u64;
+        let mut outdated_miners = 0u64;
         if local_mining {
             if let Some(peer_id) = local_peer_id.clone() {
                 miner_ids.insert(peer_id);
@@ -479,6 +540,15 @@ impl NetworkRuntimeState {
             .retain(|_, record| now.saturating_sub(record.last_seen) <= MINER_HEARTBEAT_TTL_SECS);
         for record in heartbeats.values() {
             if !record.mining {
+                continue;
+            }
+            if record.legacy_client {
+                legacy_miners = legacy_miners.saturating_add(1);
+            }
+            if record.outdated_client {
+                outdated_miners = outdated_miners.saturating_add(1);
+            }
+            if record.legacy_client || record.outdated_client {
                 continue;
             }
             if miner_ids.insert(record.peer_id.clone()) {
@@ -496,7 +566,20 @@ impl NetworkRuntimeState {
             local_peer_id,
             total_reported_hashrate_hps: total_hashrate,
             heartbeat_ttl_secs: MINER_HEARTBEAT_TTL_SECS,
+            legacy_miners_online: legacy_miners,
+            outdated_miners_online: outdated_miners,
+            minimum_client_version: NETWORK_MIN_CLIENT_VERSION.to_string(),
         }
+    }
+
+    pub async fn miner_records(&self) -> Vec<MinerHeartbeatRecord> {
+        let now = ApiRateLimiter::now_secs();
+        let mut heartbeats = self.miner_heartbeats.write().await;
+        heartbeats
+            .retain(|_, record| now.saturating_sub(record.last_seen) <= MINER_HEARTBEAT_TTL_SECS);
+        let mut records: Vec<_> = heartbeats.values().cloned().collect();
+        records.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
+        records
     }
 }
 
@@ -2008,10 +2091,13 @@ async fn get_stats(State(app_state): State<Arc<AppState>>) -> Json<serde_json::V
         "hashrate_hs": hashrate_hs,
         "emission_zka": emission_zka_f,
         "last_block_time": last_block_time,
-        "network_version": "0.1.0",
+        "network_version": env!("CARGO_PKG_VERSION"),
         "connected_peers": runtime.connected_peers,
         "miners_online": runtime.miners_online,
         "remote_miners_online": runtime.remote_miners_online,
+        "legacy_miners_online": runtime.legacy_miners_online,
+        "outdated_miners_online": runtime.outdated_miners_online,
+        "minimum_client_version": runtime.minimum_client_version,
         "local_mining": runtime.local_mining,
         "reported_hashrate_hps": runtime.total_reported_hashrate_hps,
     }))
@@ -2028,16 +2114,34 @@ async fn get_network_runtime(
 async fn post_miner_heartbeat(
     Json(heartbeat): Json<MinerHeartbeatRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    global_network_runtime()
+    let record = global_network_runtime()
         .record_miner_heartbeat(heartbeat)
         .await
         .map_err(|err| (StatusCode::BAD_REQUEST, err))?;
     let snapshot = global_network_runtime().snapshot().await;
+    let accepted_for_mining = record.mining && !record.legacy_client && !record.outdated_client;
     Ok(Json(serde_json::json!({
         "status": "ok",
+        "accepted_for_mining": accepted_for_mining,
+        "client_version": record.client_version,
+        "legacy_client": record.legacy_client,
+        "outdated_client": record.outdated_client,
+        "minimum_client_version": snapshot.minimum_client_version,
         "miners_online": snapshot.miners_online,
         "heartbeat_ttl_secs": snapshot.heartbeat_ttl_secs,
     })))
+}
+
+async fn get_network_miners() -> Json<serde_json::Value> {
+    let records = global_network_runtime().miner_records().await;
+    let snapshot = global_network_runtime().snapshot().await;
+    Json(serde_json::json!({
+        "miners_online": snapshot.miners_online,
+        "legacy_miners_online": snapshot.legacy_miners_online,
+        "outdated_miners_online": snapshot.outdated_miners_online,
+        "minimum_client_version": snapshot.minimum_client_version,
+        "miners": records,
+    }))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2485,7 +2589,10 @@ async fn get_pending_private_txs(
         if let Ok(Some(bytes)) = app_state.state_manager.get_private_transaction_bytes(&hash) {
             if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                 if let Some(obj) = value.as_object_mut() {
-                    obj.insert("tx_hash".to_string(), serde_json::Value::String(hash.clone()));
+                    obj.insert(
+                        "tx_hash".to_string(),
+                        serde_json::Value::String(hash.clone()),
+                    );
                 }
                 txs.push(value);
             }
@@ -2893,7 +3000,10 @@ async fn get_private_coinbases_range(
     Path((from, to)): Path<(u64, u64)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if from > to {
-        return Err((StatusCode::BAD_REQUEST, "Invalid range: from > to".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid range: from > to".to_string(),
+        ));
     }
     if to - from > 1000 {
         return Err((
@@ -4392,6 +4502,7 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
     let mut router = Router::new()
         .route("/stats", get(get_stats))
         .route("/network/runtime", get(get_network_runtime))
+        .route("/network/miners", get(get_network_miners))
         .route("/network/miners/heartbeat", post(post_miner_heartbeat))
         .route("/local/mining/control", get(get_local_mining_control))
         .route("/local/mining/start", post(post_local_mining_start))
@@ -4431,7 +4542,10 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         .route("/private/pending", get(get_pending_private_txs))
         .route("/private/tx/:hash", get(get_private_tx_by_hash))
         .route("/blocks/range/:from/:to", get(get_blocks_range))
-        .route("/private/coinbases/range/:from/:to", get(get_private_coinbases_range))
+        .route(
+            "/private/coinbases/range/:from/:to",
+            get(get_private_coinbases_range),
+        )
         .route("/blocks/range/:from/:to/raw", get(get_raw_blocks_range))
         .route("/transactions/:hash", get(get_transaction_by_hash))
         .route("/admin/rollback", post(admin_rollback))
@@ -4955,6 +5069,75 @@ mod tests {
         assert_eq!(conflict.0, "tx-pending");
         assert_eq!(conflict.1, "shared-nullifier");
         let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[tokio::test]
+    async fn test_legacy_or_outdated_heartbeats_do_not_count_as_active_miners() {
+        let runtime = NetworkRuntimeState::default();
+
+        let legacy_record = runtime
+            .record_miner_heartbeat(MinerHeartbeatRequest {
+                peer_id: "legacy-peer".to_string(),
+                mining: true,
+                hashrate_hps: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(legacy_record.legacy_client);
+        assert!(legacy_record.outdated_client);
+
+        let outdated_record = runtime
+            .record_miner_heartbeat(MinerHeartbeatRequest {
+                peer_id: "outdated-peer".to_string(),
+                mining: true,
+                hashrate_hps: 20,
+                client_version: Some("1.3.0".to_string()),
+                software: Some("zsilent".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!outdated_record.legacy_client);
+        assert!(outdated_record.outdated_client);
+
+        let snapshot = runtime.snapshot().await;
+        assert_eq!(snapshot.miners_online, 0);
+        assert_eq!(snapshot.remote_miners_online, 0);
+        assert_eq!(snapshot.total_reported_hashrate_hps, 0);
+        assert_eq!(snapshot.legacy_miners_online, 1);
+        assert_eq!(snapshot.outdated_miners_online, 2);
+        assert_eq!(snapshot.minimum_client_version, NETWORK_MIN_CLIENT_VERSION);
+    }
+
+    #[tokio::test]
+    async fn test_current_heartbeat_counts_as_active_miner() {
+        let runtime = NetworkRuntimeState::default();
+
+        let record = runtime
+            .record_miner_heartbeat(MinerHeartbeatRequest {
+                peer_id: "current-peer".to_string(),
+                mining: true,
+                hashrate_hps: 55,
+                client_version: Some(format!("v{NETWORK_MIN_CLIENT_VERSION}")),
+                software: Some("zoka".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!record.legacy_client);
+        assert!(!record.outdated_client);
+        assert_eq!(
+            record.client_version.as_deref(),
+            Some(NETWORK_MIN_CLIENT_VERSION)
+        );
+
+        let snapshot = runtime.snapshot().await;
+        assert_eq!(snapshot.miners_online, 1);
+        assert_eq!(snapshot.remote_miners_online, 1);
+        assert_eq!(snapshot.total_reported_hashrate_hps, 55);
+        assert_eq!(snapshot.legacy_miners_online, 0);
+        assert_eq!(snapshot.outdated_miners_online, 0);
     }
 
     #[tokio::test]
