@@ -6007,6 +6007,109 @@ fn publish_recent_chain_blocks(
     Ok(Some(event))
 }
 
+fn post_block_to_rpc_targets(block: &zoka::types::Block, targets: &[&str]) -> (u64, u64) {
+    if targets.is_empty() {
+        return (0, 0);
+    }
+    let body = match serde_json::to_value(block) {
+        Ok(value) => value,
+        Err(_) => return (0, targets.len() as u64),
+    };
+    let mut submitted = 0u64;
+    let mut failures = 0u64;
+    for rpc in targets {
+        match rpc_http_post_json(rpc, "/sync/block", &body, 5) {
+            Ok(_) => submitted = submitted.saturating_add(1),
+            Err(_) => failures = failures.saturating_add(1),
+        }
+    }
+    (submitted, failures)
+}
+
+fn post_recent_chain_blocks_to_rpcs(
+    chain_db_path: Option<&str>,
+    rpc_endpoints: &[String],
+    max_blocks: u64,
+) -> Result<Option<String>, String> {
+    if max_blocks == 0 || rpc_endpoints.is_empty() {
+        return Ok(None);
+    }
+    let Some(path) = chain_db_path else {
+        return Ok(None);
+    };
+    let storage = match RocksDbStorage::new(path) {
+        Ok(storage) => storage,
+        Err(err) => {
+            return Ok(Some(format!(
+                "Skipped RPC block autopush retry: storage open failed ({err})"
+            )));
+        }
+    };
+    let head = match storage.get_chain_height() {
+        Ok(height) => height,
+        Err(err) => {
+            return Ok(Some(format!(
+                "Skipped RPC block autopush retry: read height failed ({err})"
+            )));
+        }
+    };
+    if head == 0 {
+        return Ok(None);
+    }
+
+    let (samples, _) = sample_rpc_heights(rpc_endpoints, 3);
+    let rpc_heights = samples
+        .into_iter()
+        .map(|sample| (sample.rpc, sample.height))
+        .collect::<HashMap<_, _>>();
+    let start = head.saturating_sub(max_blocks.saturating_sub(1)).max(1);
+    let mut submitted = 0u64;
+    let mut failures = 0u64;
+    let mut skipped = 0u64;
+
+    for height in start..=head {
+        let targets = rpc_endpoints
+            .iter()
+            .filter_map(|rpc| {
+                rpc_heights
+                    .get(rpc.as_str())
+                    .copied()
+                    .filter(|remote_height| *remote_height < height)
+                    .map(|_| rpc.as_str())
+            })
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            continue;
+        }
+        let block = match storage.get_block_by_height(height) {
+            Ok(Some(block)) => block,
+            Ok(None) => {
+                skipped = skipped.saturating_add(1);
+                continue;
+            }
+            Err(_) => {
+                skipped = skipped.saturating_add(1);
+                continue;
+            }
+        };
+        let (ok, failed) = post_block_to_rpc_targets(&block, &targets);
+        submitted = submitted.saturating_add(ok);
+        failures = failures.saturating_add(failed);
+    }
+
+    if submitted == 0 && failures == 0 && skipped == 0 {
+        return Ok(None);
+    }
+    let event = if failures == 0 && skipped == 0 {
+        format!("RPC block autopush retry submitted {submitted} block delivery attempt(s).")
+    } else {
+        format!(
+            "RPC block autopush retry submitted {submitted} block delivery attempt(s) ({failures} failure(s), {skipped} skipped block(s))."
+        )
+    };
+    Ok(Some(event))
+}
+
 fn sync_outcome_to_event(outcome: zoka::state::sync::SyncOutcome) -> String {
     match outcome {
         zoka::state::sync::SyncOutcome::Applied(head) => format!(
@@ -7977,6 +8080,13 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     last_event = rebroadcast_event;
                 }
             }
+            if let Some(rpc_rebroadcast_event) = post_recent_chain_blocks_to_rpcs(
+                db_path.as_deref(),
+                &rpc_sync_endpoints,
+                sync_rebroadcast_recent_blocks,
+            )? {
+                last_event = rpc_rebroadcast_event;
+            }
             next_sync_state_at = tokio::time::Instant::now() + Duration::from_secs(3);
         }
 
@@ -8120,13 +8230,15 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             // endpoints (/sync/block). P2P gossip alone is unreliable for a
             // NAT'd local miner, so this HTTP push delivers the block straight
             // to the cloud nodes for efficient sync.
+            let mut rpc_submit_failures = 0u64;
             if !rpc_sync_endpoints.is_empty() {
+                let rpc_targets = rpc_sync_endpoints
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
                 for block in &batch.produced_blocks {
-                    if let Ok(body) = serde_json::to_value(block) {
-                        for rpc in &rpc_sync_endpoints {
-                            let _ = rpc_http_post_json(rpc, "/sync/block", &body, 5);
-                        }
-                    }
+                    let (_, failed) = post_block_to_rpc_targets(block, &rpc_targets);
+                    rpc_submit_failures = rpc_submit_failures.saturating_add(failed);
                 }
             }
             last_event = if publish_failures == 0 {
@@ -8145,6 +8257,11 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     batch.last_difficulty_bits,
                 )
             };
+            if rpc_submit_failures > 0 {
+                last_event = format!(
+                    "{last_event} RPC autopush had {rpc_submit_failures} endpoint failure(s); retry loop will keep rebroadcasting recent blocks."
+                );
+            }
             if let Some(sync_event) = publish_local_sync_state(&mut node, db_path.as_deref())? {
                 last_event = format!("{last_event} {sync_event}");
             }

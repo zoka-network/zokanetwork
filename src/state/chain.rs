@@ -476,8 +476,27 @@ fn enforce_mainnet_emergency_checkpoint(
         return Ok(());
     }
 
-    let checkpoint_height = crate::economics::MAINNET_EMERGENCY_CHECKPOINT_HEIGHT;
-    let checkpoint_hash = crate::economics::MAINNET_EMERGENCY_CHECKPOINT_HASH;
+    for (checkpoint_height, checkpoint_hash) in crate::economics::MAINNET_EMERGENCY_CHECKPOINTS {
+        enforce_mainnet_checkpoint_at(
+            storage,
+            candidate,
+            parent,
+            extends_head,
+            *checkpoint_height,
+            checkpoint_hash,
+        )?;
+    }
+    Ok(())
+}
+
+fn enforce_mainnet_checkpoint_at(
+    storage: &RocksDbStorage,
+    candidate: &Block,
+    parent: &Block,
+    extends_head: bool,
+    checkpoint_height: u64,
+    checkpoint_hash: &str,
+) -> Result<(), ChainError> {
     let candidate_height = candidate.header.block_height;
 
     if candidate_height < checkpoint_height {

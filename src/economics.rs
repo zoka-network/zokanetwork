@@ -19,6 +19,29 @@ pub const TESTNET_CHAIN_ID: &str = "zoka-testnet-v1";
 pub const MAINNET_EMERGENCY_CHECKPOINT_HEIGHT: u64 = 296;
 pub const MAINNET_EMERGENCY_CHECKPOINT_HASH: &str =
     "d8c4b8d5945469c46fb32c002d34c08cb736ef470578f2464c3054ac190ac95c";
+/// Canonical blocks mined during the isolated 1.4.0 recovery. These close the
+/// post-296 fork window: upgraded nodes reject any branch above 296 that does
+/// not contain this exact recovery chain.
+pub const MAINNET_RECOVERY_CHECKPOINT_297_HEIGHT: u64 = 297;
+pub const MAINNET_RECOVERY_CHECKPOINT_297_HASH: &str =
+    "a086b823ec51052473860211327bc7e5bad9262cb68df264ecafc05ee070e22f";
+pub const MAINNET_RECOVERY_CHECKPOINT_298_HEIGHT: u64 = 298;
+pub const MAINNET_RECOVERY_CHECKPOINT_298_HASH: &str =
+    "bee49728c38951fc82dfda00d2b4000980cb7a3b07046d6f6c636bd1f2d98227";
+pub const MAINNET_EMERGENCY_CHECKPOINTS: &[(u64, &str)] = &[
+    (
+        MAINNET_EMERGENCY_CHECKPOINT_HEIGHT,
+        MAINNET_EMERGENCY_CHECKPOINT_HASH,
+    ),
+    (
+        MAINNET_RECOVERY_CHECKPOINT_297_HEIGHT,
+        MAINNET_RECOVERY_CHECKPOINT_297_HASH,
+    ),
+    (
+        MAINNET_RECOVERY_CHECKPOINT_298_HEIGHT,
+        MAINNET_RECOVERY_CHECKPOINT_298_HASH,
+    ),
+];
 /// Temporary one-miner recovery window after the 1.4.x checkpoint. The cap is
 /// only applied when the local canonical chain contains the checkpoint above.
 pub const MAINNET_EMERGENCY_DIFFICULTY_CAP_FROM_HEIGHT: u64 =
