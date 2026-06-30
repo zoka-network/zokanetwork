@@ -7143,6 +7143,25 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             .push("No seed peer configured; running standalone until peers connect.".to_string());
     }
 
+    // Safety net: regardless of CLI flags, every node should still be able to
+    // pull pending private txs from the network's public RPCs so a tx
+    // submitted to one droplet doesn't get stranded forever because the
+    // miner that wins the next block happened to start without
+    // --network-config. The binary embeds the manifest at compile time
+    // (EMBEDDED_MAINNET_NETWORK_CONFIG / EMBEDDED_TESTNET_NETWORK_CONFIG),
+    // so this requires no network config file on disk.
+    if rpc_sync_endpoints.is_empty() {
+        if let Ok(embedded) = parse_network_config_for(embedded_network_config_for(network), network)
+        {
+            rpc_sync_endpoints = embedded
+                .public_rpc
+                .iter()
+                .filter(|rpc| rpc.status.eq_ignore_ascii_case("active"))
+                .map(|rpc| rpc.url.clone())
+                .collect();
+        }
+    }
+
     let session_started = Instant::now();
     let mut session_mined_blocks = 0u64;
     let mut session_mined_rewards = 0u64;
@@ -13055,7 +13074,7 @@ mod tests {
           "schema": "zoka-mainnet-network-v1",
           "status": "prelaunch-template",
           "chain_id": "zoka-mainnet-zenith-v1",
-          "protocol_freeze_id": "/zoka/1.0.1-mainnet-zenith",
+          "protocol_freeze_id": "/zoka/1.0.2-mainnet-zenith",
           "transport_policy": {
             "anonymous_transport_preferred": true,
             "clearnet_requires_explicit_operator_choice": true,
@@ -13086,7 +13105,7 @@ mod tests {
           "schema": "zoka-mainnet-network-v1",
           "status": "launch-ready",
           "chain_id": "zoka-mainnet-zenith-v1",
-          "protocol_freeze_id": "/zoka/1.0.1-mainnet-zenith",
+          "protocol_freeze_id": "/zoka/1.0.2-mainnet-zenith",
           "transport_policy": {
             "anonymous_transport_preferred": true,
             "clearnet_requires_explicit_operator_choice": true,
@@ -13157,7 +13176,7 @@ mod tests {
           "schema": "zoka-mainnet-network-v1",
           "status": "bad",
           "chain_id": "zoka-test-net",
-          "protocol_freeze_id": "/zoka/1.0.1-mainnet-zenith",
+          "protocol_freeze_id": "/zoka/1.0.2-mainnet-zenith",
           "transport_policy": {
             "anonymous_transport_preferred": true,
             "clearnet_requires_explicit_operator_choice": true,
@@ -13178,7 +13197,7 @@ mod tests {
           "schema": "zoka-mainnet-network-v1",
           "status": "candidate",
           "chain_id": "zoka-mainnet-zenith-v1",
-          "protocol_freeze_id": "/zoka/1.0.1-mainnet-zenith",
+          "protocol_freeze_id": "/zoka/1.0.2-mainnet-zenith",
           "transport_policy": {
             "anonymous_transport_preferred": true,
             "clearnet_requires_explicit_operator_choice": true,
