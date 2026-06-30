@@ -19,7 +19,7 @@ pub const TESTNET_CHAIN_ID: &str = "zoka-testnet-v1";
 pub const MAINNET_EMERGENCY_CHECKPOINT_HEIGHT: u64 = 296;
 pub const MAINNET_EMERGENCY_CHECKPOINT_HASH: &str =
     "d8c4b8d5945469c46fb32c002d34c08cb736ef470578f2464c3054ac190ac95c";
-/// Canonical blocks mined during the isolated 1.4.0 recovery. These close the
+/// Canonical blocks mined during the isolated 1.5.0 recovery. These close the
 /// post-296 fork window: upgraded nodes reject any branch above 296 that does
 /// not contain this exact recovery chain.
 pub const MAINNET_RECOVERY_CHECKPOINT_297_HEIGHT: u64 = 297;
