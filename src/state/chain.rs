@@ -96,6 +96,13 @@ pub enum ChainError {
 
     #[error("invalid canonical private transaction bundle: {0}")]
     InvalidPrivateTxBundle(String),
+
+    #[error("mainnet checkpoint mismatch at height {height}: expected {expected}, got {actual}")]
+    MainnetCheckpointMismatch {
+        height: u64,
+        expected: String,
+        actual: String,
+    },
 }
 
 impl From<StorageError> for ChainError {
@@ -448,6 +455,68 @@ fn validate_private_nullifiers(
     Ok(())
 }
 
+fn enforce_mainnet_emergency_checkpoint(
+    storage: &RocksDbStorage,
+    chain_id: &str,
+    candidate: &Block,
+    parent: &Block,
+    extends_head: bool,
+) -> Result<(), ChainError> {
+    if chain_id != crate::economics::MAINNET_CHAIN_ID {
+        return Ok(());
+    }
+
+    let checkpoint_height = crate::economics::MAINNET_EMERGENCY_CHECKPOINT_HEIGHT;
+    let checkpoint_hash = crate::economics::MAINNET_EMERGENCY_CHECKPOINT_HASH;
+    let candidate_height = candidate.header.block_height;
+
+    if candidate_height < checkpoint_height {
+        return Ok(());
+    }
+
+    if candidate_height == checkpoint_height {
+        if candidate.header.hash == checkpoint_hash {
+            return Ok(());
+        }
+        return Err(ChainError::MainnetCheckpointMismatch {
+            height: checkpoint_height,
+            expected: checkpoint_hash.to_string(),
+            actual: candidate.header.hash.clone(),
+        });
+    }
+
+    if extends_head
+        && canonical_hash_at_height(storage, checkpoint_height)?.as_deref() == Some(checkpoint_hash)
+    {
+        return Ok(());
+    }
+
+    let mut cursor = parent.clone();
+    while cursor.header.block_height > checkpoint_height {
+        cursor = storage
+            .get_block(&cursor.header.prev_hash)?
+            .ok_or_else(|| ChainError::DoesNotExtendHead {
+                head: cursor.header.prev_hash.clone(),
+                candidate: candidate.header.hash.clone(),
+            })?;
+    }
+
+    if cursor.header.block_height == checkpoint_height && cursor.header.hash == checkpoint_hash {
+        return Ok(());
+    }
+
+    let actual = if cursor.header.block_height == checkpoint_height {
+        cursor.header.hash
+    } else {
+        format!("missing checkpoint ancestor before height {candidate_height}")
+    };
+    Err(ChainError::MainnetCheckpointMismatch {
+        height: checkpoint_height,
+        expected: checkpoint_hash.to_string(),
+        actual,
+    })
+}
+
 /// Persist every nullifier committed in `block` into the global spent index,
 /// keyed at the block's height. Call this whenever a block becomes part of
 /// the canonical chain.
@@ -528,6 +597,7 @@ fn apply_block_inner(
     };
     let extends_head = candidate.header.prev_hash == expected_prev_hash
         && candidate.header.block_height == parent_height.saturating_add(1);
+    enforce_mainnet_emergency_checkpoint(storage, chain_id, candidate, &parent, extends_head)?;
 
     let effective_expected_difficulty = if force_expected_difficulty || extends_head {
         expected_difficulty_bits

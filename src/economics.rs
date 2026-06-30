@@ -13,6 +13,13 @@ pub const TOKEN_SYMBOL: &str = "ZKA";
 pub const MAINNET_CHAIN_ID: &str = "zoka-mainnet-zenith-v1";
 pub const TESTNET_CHAIN_ID: &str = "zoka-testnet-v1";
 
+/// Emergency mainnet checkpoint used by the 1.4.x hotfix rollout. Nodes that
+/// have this checkpoint must not reorganize onto a branch that does not contain
+/// this exact block.
+pub const MAINNET_EMERGENCY_CHECKPOINT_HEIGHT: u64 = 296;
+pub const MAINNET_EMERGENCY_CHECKPOINT_HASH: &str =
+    "d8c4b8d5945469c46fb32c002d34c08cb736ef470578f2464c3054ac190ac95c";
+
 pub const ZKA_DECIMALS: u32 = 6;
 pub const ATOMS_PER_ZKA: u64 = 1_000_000;
 pub const MAX_SUPPLY_ZKA: u64 = 23_000_000;

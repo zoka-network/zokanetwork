@@ -8162,14 +8162,41 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             && mining_task.is_none()
             && tokio::time::Instant::now() >= next_mine_at
         {
-            if node.connected_peer_count() < min_mine_peers {
+            let connected_peers = node.connected_peer_count();
+            let rpc_checkpoint_allows_peerless_mining =
+                if connected_peers < min_mine_peers && !rpc_sync_endpoints.is_empty() {
+                    chain_storage_outer
+                        .as_ref()
+                        .and_then(|storage| storage.get_chain_height().ok())
+                        .filter(|height| *height > 0)
+                        .and_then(|local_height| {
+                            best_rpc_height_sample(&rpc_sync_endpoints, 3).and_then(|sample| {
+                                let matches_rpc_height = sample.height == local_height;
+                                let matches_rpc_chain = matches_rpc_height
+                                    && ensure_local_chain_matches_rpc_at_height(
+                                        &sample.rpc,
+                                        db_path.as_deref(),
+                                        local_height,
+                                    )
+                                    .is_ok();
+                                matches_rpc_chain.then_some((sample.rpc, local_height))
+                            })
+                        })
+                } else {
+                    None
+                };
+            if connected_peers < min_mine_peers && rpc_checkpoint_allows_peerless_mining.is_none() {
                 last_event = format!(
                     "Auto-mining waiting for peers: connected {}, required {}.",
-                    node.connected_peer_count(),
-                    min_mine_peers
+                    connected_peers, min_mine_peers
                 );
                 next_mine_at = tokio::time::Instant::now() + Duration::from_secs(1);
                 continue;
+            }
+            if let Some((rpc, local_height)) = rpc_checkpoint_allows_peerless_mining {
+                last_event = format!(
+                    "Auto-mining peer gate satisfied by RPC checkpoint at height {local_height} via {rpc}."
+                );
             }
             if let Some(path) = db_path.as_deref() {
                 match RocksDbStorage::new(path).and_then(|storage| storage.get_chain_height()) {
