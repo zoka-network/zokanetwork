@@ -37,7 +37,7 @@ pub const MIXER_TOPIC_NAME: &str = "zoka/mixer/v1";
 // block. This makes a stale pre-reset chain harmless over P2P regardless of
 // its accumulated work, instead of relying on miners voluntarily wiping
 // their local DB.
-pub const PROTOCOL_FREEZE_ID: &str = "/zoka/1.0.1-mainnet-zenith";
+pub const PROTOCOL_FREEZE_ID: &str = "/zoka/1.0.2-mainnet-zenith";
 pub const DEFAULT_PRIVATE_PADDING_BYTES: usize = 1024;
 pub const DEFAULT_STEM_HOPS: u8 = 2;
 pub const DEFAULT_MIXER_HOLD_MS: u64 = 2000;

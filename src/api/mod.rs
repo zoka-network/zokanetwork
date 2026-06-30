@@ -2483,7 +2483,10 @@ async fn get_pending_private_txs(
             continue;
         }
         if let Ok(Some(bytes)) = app_state.state_manager.get_private_transaction_bytes(&hash) {
-            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("tx_hash".to_string(), serde_json::Value::String(hash.clone()));
+                }
                 txs.push(value);
             }
         }
