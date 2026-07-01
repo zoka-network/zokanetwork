@@ -4462,14 +4462,6 @@ async fn post_block_submit(
     use crate::network::message::BlockResponseMessage;
     use crate::state::sync::{try_apply_synced_block_payload, SyncOutcome};
 
-    let current_height = app_state.state_manager.get_height().await;
-    if block.header.block_height <= current_height {
-        return Ok(Json(serde_json::json!({
-            "status": "already_known",
-            "height": block.header.block_height
-        })));
-    }
-
     // Wrap block in BlockResponseMessage — same format used by rpc-sync
     let encrypted_block = serde_json::to_vec(&block).map_err(|e| {
         (
@@ -4502,10 +4494,23 @@ async fn post_block_submit(
                 "hash": block.header.hash
             })))
         }
-        SyncOutcome::AlreadyKnown { .. } | SyncOutcome::BehindOrSibling { .. } => {
+        SyncOutcome::AlreadyKnown { height, hash } => {
             Ok(Json(serde_json::json!({
                 "status": "already_known",
-                "height": block.header.block_height
+                "height": height,
+                "hash": hash
+            })))
+        }
+        SyncOutcome::BehindOrSibling {
+            local_head,
+            candidate,
+            candidate_hash,
+        } => {
+            Ok(Json(serde_json::json!({
+                "status": "side_branch_stored",
+                "height": candidate,
+                "hash": candidate_hash,
+                "local_head": local_head
             })))
         }
         SyncOutcome::GapAhead {
