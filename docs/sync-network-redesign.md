@@ -1368,6 +1368,44 @@ Criterio de aceptacion:
 
 - Ningun cambio de red se mergea sin pasar simulacion multi-nodo.
 
+### Fase 7.5 - Robustez de peer discovery y gossip (previo a v1.6.0)
+
+Auditoria puntual del descubrimiento de pares (Kademlia + PeerStore) y gossip
+(BlockAnnounce, gossipsub), hecha con evidencia de logs reales de produccion
+la noche del 2026-07-02. Veredicto: nada roto, 5 puntos de deuda tecnica
+concretos, cerrados todos antes de cortar v1.6.0 (agrupados con el bump de
+`PROTOCOL_FREEZE_ID` de esa version).
+
+- [x] Re-bootstrap periodico de Kademlia (antes solo se disparaba al arrancar
+  y, condicionalmente, cuando el peerstore observaba direcciones nuevas).
+  Timer independiente cada 15 min en `src/main.rs`.
+- [x] Poda del PeerStore (`src/network/peer_store.rs::prune()`): cap de 500
+  entradas, descarta fallos viejos (14+ dias, 10+ fallos) salvo que haya
+  habido conexion exitosa reciente (30 dias de gracia).
+- [x] Gossipsub sintonizado al tamano real de la red (`mesh_n=4,
+  mesh_n_low=2, mesh_n_high=8, mesh_outbound_min=1` en vez de los defaults de
+  libp2p pensados para 50+ peers).
+- [x] Reintento con backoff para `BlockAnnounce`: antes se pedia el cuerpo
+  del bloque anunciado una sola vez por gossip, sin reintento si se perdia.
+  Ahora hay barrido cada 2s (`sweep_block_announce_retries` en
+  `src/main.rs`) con backoff 2s/4s/8s, hasta 3 intentos via
+  `request_block_with_retry` (directo + fallback gossip), auto-limpieza si
+  el bloque ya llego por otra via.
+- [x] Metrica de tamano real del mesh de gossip (`GossipStats.mesh_peer_count`,
+  via `gossipsub::mesh_peers()` del topic principal, no `all_peers()` que
+  puede verse sano con el mesh vacio) - expuesta en el snapshot de red.
+
+Excluido a proposito: backoff por IP en conexiones P2P entrantes fallidas
+("Failed to negotiate transport protocol(s)", visto en logs de BOOT). La
+mitigacion correcta es rate-limiting a nivel de firewall/iptables en el
+droplet al momento del deploy, no un `NetworkBehaviour` custom nuevo en
+libp2p (cambio mas grande y riesgoso para el beneficio que da).
+
+Verificado con `cargo check --bins` tras cada item y un arranque real
+aislado (`--allow-isolated-start`, red/DB descartables) que llego a estado
+`RUNNING` sin panics. Local unicamente - no desplegado a BOOT/VPS2 ni
+publicado, sigue el mismo patron de esta sesion.
+
 ## 6. Tabla de prioridades
 
 | Prioridad | Trabajo | Impacto | Riesgo |

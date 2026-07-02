@@ -223,7 +223,38 @@ impl PeerStore {
             .collect()
     }
 
-    pub fn save(&self) -> io::Result<()> {
+    /// Drops entries that failed repeatedly a long time ago and never
+    /// connected successfully since, and caps total size so a long-running
+    /// node's peer store can't grow without bound. A peer that failed many
+    /// times but connected recently is deliberately kept - past failures
+    /// (e.g. a network blip) shouldn't outweigh recent proven usefulness.
+    pub fn prune(&mut self) {
+        const MAX_ENTRIES: usize = 500;
+        const STALE_FAILURE_AGE_SECS: u64 = 14 * 24 * 3600;
+        const STALE_FAILURE_THRESHOLD: u32 = 10;
+        const SUCCESS_GRACE_SECS: u64 = 30 * 24 * 3600;
+
+        let now = now_secs();
+        self.file.peers.retain(|entry| {
+            let stale_failed = entry.failures >= STALE_FAILURE_THRESHOLD
+                && now.saturating_sub(entry.last_failed_at) >= STALE_FAILURE_AGE_SECS;
+            let recently_useful = entry.last_connected_at > 0
+                && now.saturating_sub(entry.last_connected_at) < SUCCESS_GRACE_SECS;
+            !(stale_failed && !recently_useful)
+        });
+
+        if self.file.peers.len() > MAX_ENTRIES {
+            self.file.peers.sort_by(|a, b| {
+                b.score
+                    .cmp(&a.score)
+                    .then_with(|| b.last_connected_at.cmp(&a.last_connected_at))
+            });
+            self.file.peers.truncate(MAX_ENTRIES);
+        }
+    }
+
+    pub fn save(&mut self) -> io::Result<()> {
+        self.prune();
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }

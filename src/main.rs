@@ -5780,13 +5780,71 @@ fn handle_block_announce(
     }
 
     match node.publish_block_request(height, Some(hash.to_string())) {
-        Ok(()) => Some(format!(
-            "Block announce @ height {height} received; requested body {hash}."
-        )),
+        Ok(()) => {
+            node.track_block_announce_retry(height, hash);
+            Some(format!(
+                "Block announce @ height {height} received; requested body {hash}."
+            ))
+        }
         Err(err) => Some(format!(
             "Block announce @ height {height} received but request publish failed: {err}"
         )),
     }
+}
+
+/// Retries BlockAnnounce-triggered fetches that never got a body, on a
+/// short backoff, instead of silently relying on the (much slower) normal
+/// headers-first IBD polling to eventually notice the gap. Self-healing:
+/// checks local storage first, so a block that already arrived via the
+/// normal path just gets its tracking entry dropped, never double-applied
+/// in a way that matters (apply_block is idempotent regardless).
+async fn sweep_block_announce_retries(
+    node: &mut Node,
+    chain_id: &str,
+    chain_db_path: Option<&str>,
+) -> Option<String> {
+    let due = node.due_block_announce_retries();
+    if due.is_empty() {
+        return None;
+    }
+    let path = chain_db_path?;
+    let storage = RocksDbStorage::new(path).ok()?;
+    let mut last_event = None;
+    for (height, hash, attempts) in due {
+        let local_height = storage.get_chain_height().unwrap_or(0);
+        if local_height >= height {
+            node.forget_block_announce_retry(height, &hash);
+            continue;
+        }
+        if !node.bump_block_announce_retry(height, &hash) {
+            last_event = Some(format!(
+                "BlockAnnounce retry exhausted for height {height}; leaving to normal IBD."
+            ));
+            continue;
+        }
+        match node
+            .request_block_with_retry(height, Some(hash.clone()), 2, Duration::from_secs(3))
+            .await
+        {
+            Ok(response) => {
+                let outcome =
+                    zoka::state::sync::try_apply_synced_block_payload(&storage, chain_id, &response);
+                if matches!(outcome, zoka::state::sync::SyncOutcome::Applied(_)) {
+                    node.forget_block_announce_retry(height, &hash);
+                }
+                last_event = Some(format!(
+                    "BlockAnnounce retry {attempts} for height {height}: {}",
+                    sync_outcome_to_event(outcome)
+                ));
+            }
+            Err(err) => {
+                last_event = Some(format!(
+                    "BlockAnnounce retry {attempts} for height {height} failed: {err}"
+                ));
+            }
+        }
+    }
+    last_event
 }
 
 fn block_body_response_from_storage(
@@ -9120,6 +9178,13 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut next_ibd_at = tokio::time::Instant::now();
     let mut next_miner_heartbeat_at = tokio::time::Instant::now();
     let mut next_peer_store_save_at = tokio::time::Instant::now() + Duration::from_secs(15);
+    // Backstop for DHT staleness: the peer-store-save branch below already
+    // re-bootstraps Kademlia reactively when it observes brand-new
+    // addresses, but if nothing new surfaces through that path the routing
+    // table never refreshes on its own. This fires unconditionally on a
+    // slow cadence regardless of whether new addresses were seen.
+    let mut next_kad_rebootstrap_at = tokio::time::Instant::now() + Duration::from_secs(900);
+    let mut next_block_announce_retry_sweep_at = tokio::time::Instant::now() + Duration::from_secs(2);
     // Periodic RPC pull of pending private txs from public peers. This is the
     // NAT-friendly counterpart to libp2p gossip: a miner that can only open
     // outbound HTTP pulls pending private txs into its own pool so it can mine
@@ -9248,6 +9313,26 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 }
             }
             next_peer_store_save_at = tokio::time::Instant::now() + Duration::from_secs(60);
+        }
+
+        if tokio::time::Instant::now() >= next_kad_rebootstrap_at {
+            next_kad_rebootstrap_at = tokio::time::Instant::now() + Duration::from_secs(900);
+            if let Err(err) = node.bootstrap_kademlia() {
+                tracing::warn!(
+                    target: "zoka.network",
+                    error = %err,
+                    "Periodic Kademlia re-bootstrap failed"
+                );
+            }
+        }
+
+        if tokio::time::Instant::now() >= next_block_announce_retry_sweep_at {
+            next_block_announce_retry_sweep_at = tokio::time::Instant::now() + Duration::from_secs(2);
+            if let Some(retry_event) =
+                sweep_block_announce_retries(&mut node, &chain_id, db_path.as_deref()).await
+            {
+                last_event = retry_event;
+            }
         }
 
         if runtime_mining_enabled && tokio::time::Instant::now() >= next_miner_heartbeat_at {

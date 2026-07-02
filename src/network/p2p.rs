@@ -88,6 +88,11 @@ pub struct GossipStats {
     pub publish_ok: u64,
     pub publish_err: u64,
     pub last_rx_block_at: u64,
+    /// Live count of peers in the gossipsub mesh for the general topic
+    /// (not just connected-with-gossipsub-support): the true propagation
+    /// mesh size, so an empty mesh with everything falling back to
+    /// flood-publish is visible instead of looking "connected and healthy".
+    pub mesh_peer_count: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -167,6 +172,12 @@ struct PendingOutboundBlockBodyRequest {
     peer: PeerId,
     request: BlockBodyRequest,
     started_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct BlockAnnounceRetry {
+    attempts: u8,
+    last_attempt_at: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -386,6 +397,10 @@ pub struct Node {
     /// Outbound block body requests waiting for direct responses.
     pending_outbound_block_body_requests:
         HashMap<request_response::OutboundRequestId, PendingOutboundBlockBodyRequest>,
+    /// BlockAnnounce-triggered fetches still awaiting a body, keyed by
+    /// (height, hash) so a sweep can retry them on a backoff instead of
+    /// silently dropping the block if the first gossip request is lost.
+    pending_block_announce_retries: HashMap<(u64, String), BlockAnnounceRetry>,
     /// Direct block body responses received while the caller was not waiting.
     received_block_body_responses: VecDeque<ReceivedBlockBodyResponse>,
     /// Direct block body request failures received from libp2p.
@@ -1206,10 +1221,21 @@ impl Node {
                     kad::Config::default(),
                 );
 
+                // Mesh size tuned for the current network scale (roughly 2-20
+                // real peers), not libp2p's defaults (mesh_n=6/low=5/high=12),
+                // which are sized for 50+ peer networks. At this scale the
+                // defaults leave every node permanently below mesh_n_low,
+                // causing continuous pointless GRAFT churn every heartbeat.
+                // mesh_outbound_min=1 (down from 2) because a 2-seed-only
+                // topology can't always satisfy 2 outbound mesh slots.
                 let gossipsub_config = gossipsub::ConfigBuilder::default()
                     .heartbeat_interval(Duration::from_secs(1))
                     .validation_mode(gossipsub::ValidationMode::Strict)
                     .flood_publish(true)
+                    .mesh_n(4)
+                    .mesh_n_low(2)
+                    .mesh_n_high(8)
+                    .mesh_outbound_min(1)
                     .build()
                     .map_err(|e| io::Error::other(format!("gossipsub config error: {e}")))?;
 
@@ -1294,6 +1320,7 @@ impl Node {
             gossip_stats: GossipStats::default(),
             pending_block_body_requests: VecDeque::new(),
             pending_outbound_block_body_requests: HashMap::new(),
+            pending_block_announce_retries: HashMap::new(),
             received_block_body_responses: VecDeque::new(),
             block_body_request_failures: VecDeque::new(),
             block_request_response_stats: BlockRequestResponseStats::default(),
@@ -3221,12 +3248,88 @@ impl Node {
 
     /// Return local gossip counters for runtime observability.
     pub fn gossip_stats(&self) -> GossipStats {
-        self.gossip_stats.clone()
+        let mut stats = self.gossip_stats.clone();
+        stats.mesh_peer_count = self
+            .swarm
+            .behaviour()
+            .gossipsub
+            .mesh_peers(&self.general_topic.hash())
+            .count() as u64;
+        stats
     }
 
     /// Return number of peers blocked by protocol-freeze compatibility rules.
     pub fn incompatible_peer_count(&self) -> usize {
         self.incompatible_protocol_peers.len()
+    }
+
+    /// Start (or restart) tracking a BlockAnnounce-triggered fetch so a
+    /// sweep can retry it later if the body never arrives.
+    pub fn track_block_announce_retry(&mut self, height: u64, hash: &str) {
+        const MAX_TRACKED: usize = 256;
+        let key = (height, hash.to_string());
+        if !self.pending_block_announce_retries.contains_key(&key)
+            && self.pending_block_announce_retries.len() >= MAX_TRACKED
+        {
+            if let Some(oldest) = self
+                .pending_block_announce_retries
+                .iter()
+                .min_by_key(|(_, retry)| retry.last_attempt_at)
+                .map(|(k, _)| k.clone())
+            {
+                self.pending_block_announce_retries.remove(&oldest);
+            }
+        }
+        self.pending_block_announce_retries.insert(
+            key,
+            BlockAnnounceRetry {
+                attempts: 1,
+                last_attempt_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Return `(height, hash, attempts)` for tracked announces whose backoff
+    /// has elapsed. Does not mutate tracking state - callers decide whether
+    /// to retry (`bump_block_announce_retry`) or stop (`forget_block_announce_retry`).
+    pub fn due_block_announce_retries(&self) -> Vec<(u64, String, u8)> {
+        const BACKOFF_SECS: [u64; 3] = [2, 4, 8];
+        let now = Instant::now();
+        self.pending_block_announce_retries
+            .iter()
+            .filter_map(|((height, hash), retry)| {
+                let idx = (retry.attempts as usize).saturating_sub(1).min(BACKOFF_SECS.len() - 1);
+                let backoff = Duration::from_secs(BACKOFF_SECS[idx]);
+                if now.duration_since(retry.last_attempt_at) >= backoff {
+                    Some((*height, hash.clone(), retry.attempts))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Record another retry attempt for a tracked announce. Returns `false`
+    /// (and stops tracking it) once the attempt cap is reached.
+    pub fn bump_block_announce_retry(&mut self, height: u64, hash: &str) -> bool {
+        const MAX_ATTEMPTS: u8 = 3;
+        let key = (height, hash.to_string());
+        let Some(retry) = self.pending_block_announce_retries.get_mut(&key) else {
+            return false;
+        };
+        if retry.attempts >= MAX_ATTEMPTS {
+            self.pending_block_announce_retries.remove(&key);
+            return false;
+        }
+        retry.attempts += 1;
+        retry.last_attempt_at = Instant::now();
+        true
+    }
+
+    /// Stop tracking a BlockAnnounce fetch (block arrived, or giving up).
+    pub fn forget_block_announce_retry(&mut self, height: u64, hash: &str) {
+        self.pending_block_announce_retries
+            .remove(&(height, hash.to_string()));
     }
 
     /// Wait until the node reaches at least `min_peers` active connections.
