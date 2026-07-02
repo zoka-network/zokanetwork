@@ -2,8 +2,8 @@
   "schema": "zoka-mainnet-network-v1",
   "status": "active",
   "chain_id": "zoka-mainnet-zenith-v1",
-  "protocol_freeze_id": "/zoka/1.0.2-mainnet-zenith",
-  "minimum_client_version": "1.5.0",
+  "protocol_freeze_id": "/zoka/1.6.0-mainnet-zenith",
+  "minimum_client_version": "1.6.0",
   "transport_policy": {
     "anonymous_transport_preferred": false,
     "clearnet_requires_explicit_operator_choice": false,

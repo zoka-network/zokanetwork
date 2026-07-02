@@ -49,13 +49,17 @@ pub const STEM_TOPIC_NAME: &str = "zoka/stem/v1";
 pub const MIXER_TOPIC_NAME: &str = "zoka/mixer/v1";
 const PRIVATE_TX_BODY_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const PRIVATE_TX_BODY_CACHE_MAX: usize = 2048;
-// Bumped for the mainnet Zenith relaunch: any peer running the pre-relaunch
-// binary reports the old id and gets disconnected during the libp2p identify
-// handshake (enforce_protocol_freeze_for_peer), before it can gossip any
-// block. This makes a stale pre-reset chain harmless over P2P regardless of
-// its accumulated work, instead of relying on miners voluntarily wiping
-// their local DB.
-pub const PROTOCOL_FREEZE_ID: &str = "/zoka/1.0.2-mainnet-zenith";
+// Bumped for each release that requires a hard minimum-version cutover: any
+// peer running an older binary reports the old id and gets disconnected
+// during the libp2p identify handshake (enforce_protocol_freeze_for_peer),
+// before it can gossip any block. This makes staying on an old client
+// genuinely costly (isolated from P2P sync/gossip) without touching
+// consensus rules or risking a chain split - old clients simply stop
+// getting peers, they aren't told their blocks are invalid.
+//
+// Bumped 1.0.2 -> 1.6.0 for the v1.6.0 release (aligning the protocol
+// freeze id with the app version going forward, since they'd drifted).
+pub const PROTOCOL_FREEZE_ID: &str = "/zoka/1.6.0-mainnet-zenith";
 pub const DEFAULT_PRIVATE_PADDING_BYTES: usize = 1024;
 pub const DEFAULT_STEM_HOPS: u8 = 2;
 pub const DEFAULT_MIXER_HOLD_MS: u64 = 2000;

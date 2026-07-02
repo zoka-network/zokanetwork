@@ -15334,7 +15334,7 @@ mod tests {
           "schema": "zoka-mainnet-network-v1",
           "status": "prelaunch-template",
           "chain_id": "zoka-mainnet-zenith-v1",
-          "protocol_freeze_id": "/zoka/1.0.2-mainnet-zenith",
+          "protocol_freeze_id": "/zoka/1.6.0-mainnet-zenith",
           "transport_policy": {
             "anonymous_transport_preferred": true,
             "clearnet_requires_explicit_operator_choice": true,
@@ -15365,7 +15365,7 @@ mod tests {
           "schema": "zoka-mainnet-network-v1",
           "status": "launch-ready",
           "chain_id": "zoka-mainnet-zenith-v1",
-          "protocol_freeze_id": "/zoka/1.0.2-mainnet-zenith",
+          "protocol_freeze_id": "/zoka/1.6.0-mainnet-zenith",
           "transport_policy": {
             "anonymous_transport_preferred": true,
             "clearnet_requires_explicit_operator_choice": true,
@@ -15436,7 +15436,7 @@ mod tests {
           "schema": "zoka-mainnet-network-v1",
           "status": "bad",
           "chain_id": "zoka-test-net",
-          "protocol_freeze_id": "/zoka/1.0.2-mainnet-zenith",
+          "protocol_freeze_id": "/zoka/1.6.0-mainnet-zenith",
           "transport_policy": {
             "anonymous_transport_preferred": true,
             "clearnet_requires_explicit_operator_choice": true,
@@ -15457,7 +15457,7 @@ mod tests {
           "schema": "zoka-mainnet-network-v1",
           "status": "candidate",
           "chain_id": "zoka-mainnet-zenith-v1",
-          "protocol_freeze_id": "/zoka/1.0.2-mainnet-zenith",
+          "protocol_freeze_id": "/zoka/1.6.0-mainnet-zenith",
           "transport_policy": {
             "anonymous_transport_preferred": true,
             "clearnet_requires_explicit_operator_choice": true,

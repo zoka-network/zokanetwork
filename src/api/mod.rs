@@ -53,7 +53,7 @@ pub type PrivateTxBroadcastSender =
     tokio::sync::mpsc::UnboundedSender<crate::private_wallet::PrivateTransaction>;
 
 const MINER_HEARTBEAT_TTL_SECS: u64 = 90;
-const NETWORK_MIN_CLIENT_VERSION: &str = "1.5.0";
+const NETWORK_MIN_CLIENT_VERSION: &str = "1.6.0";
 
 #[derive(Clone, Debug)]
 pub struct ApiSecurityConfig {
