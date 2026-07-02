@@ -5982,6 +5982,133 @@ fn serve_pending_private_tx_body_requests(
     }
 }
 
+/// Build a `HeadersResponse` for an inbound `GetHeaders` request from local storage.
+fn headers_response_from_storage(
+    storage: &RocksDbStorage,
+    request: &zoka::network::header_request_response::GetHeaders,
+) -> zoka::network::header_request_response::HeadersResponse {
+    use zoka::network::header_request_response::{HeaderSummary, HeadersResponse};
+
+    let tip = match storage.get_chain_height() {
+        Ok(h) => h,
+        Err(e) => {
+            return HeadersResponse::NotFound {
+                reason: format!("get chain height failed: {e}"),
+            }
+        }
+    };
+
+    // Find the common ancestor by scanning the locator list.
+    let mut start_height: Option<u64> = None;
+    let mut common_ancestor = String::new();
+    for hash in &request.locator {
+        let hash = hash.trim();
+        if hash.is_empty() {
+            continue;
+        }
+        if let Ok(Some(block)) = storage.get_block(hash) {
+            start_height = Some(block.header.block_height.saturating_add(1));
+            common_ancestor = hash.to_string();
+            break;
+        }
+    }
+
+    // No common ancestor found — instruct the caller to start from genesis.
+    let start = start_height.unwrap_or(1).max(1);
+    if start > tip {
+        return HeadersResponse::Headers {
+            headers: Vec::new(),
+            common_ancestor,
+        };
+    }
+
+    let max = (request.max as u64).min(512).min(tip.saturating_sub(start) + 1);
+    let mut headers: Vec<HeaderSummary> = Vec::with_capacity(max as usize);
+
+    let mut cumulative_work = if start > 1 {
+        storage
+            .get_block_by_height(start - 1)
+            .ok()
+            .flatten()
+            .and_then(|_| storage.get_cumulative_work().ok())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    let mut difficulty_bits = storage.get_current_difficulty_bits().unwrap_or(
+        zoka::economics::POW_INITIAL_DIFFICULTY_BITS,
+    );
+
+    for h in start..=(start + max - 1) {
+        if let Some(stop) = &request.stop_hash {
+            if !stop.is_empty() {
+                if headers.last().map(|s| &s.header.hash == stop).unwrap_or(false) {
+                    break;
+                }
+            }
+        }
+        let block = match storage.get_canonical_block_by_height(h) {
+            Ok(Some(b)) => b,
+            _ => break,
+        };
+        // Approximate cumulative work from PoW bits when exact value is unavailable.
+        let block_work = 1u128 << difficulty_bits.min(127);
+        cumulative_work = cumulative_work.saturating_add(block_work);
+
+        headers.push(HeaderSummary {
+            header: block.header.clone(),
+            difficulty_bits,
+            cumulative_work,
+        });
+
+        if block.header.block_height == tip {
+            // Update difficulty for the next block window.
+            if let Ok(bits) = storage.get_current_difficulty_bits() {
+                difficulty_bits = bits;
+            }
+        }
+    }
+
+    HeadersResponse::Headers {
+        headers,
+        common_ancestor,
+    }
+}
+
+/// Drain pending inbound GetHeaders requests and serve them from local storage.
+fn serve_pending_header_requests(
+    node: &mut zoka::network::p2p::Node,
+    chain_db_path: Option<&str>,
+) -> Result<Option<String>, String> {
+    let mut served = 0u32;
+    let mut failed = 0u32;
+    while let Some(pending) = node.take_pending_header_request() {
+        let response = match chain_db_path {
+            Some(path) => match RocksDbStorage::new(path) {
+                Ok(storage) => headers_response_from_storage(&storage, &pending.request),
+                Err(err) => zoka::network::header_request_response::HeadersResponse::NotFound {
+                    reason: format!("storage open failed: {err}"),
+                },
+            },
+            None => zoka::network::header_request_response::HeadersResponse::NotFound {
+                reason: "no chain DB configured".to_string(),
+            },
+        };
+        match node.respond_header_request(pending, response) {
+            Ok(()) => served = served.saturating_add(1),
+            Err(_) => failed = failed.saturating_add(1),
+        }
+    }
+    if served == 0 && failed == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(format!(
+            "Served {served} GetHeaders request(s), {failed} response failure(s)."
+        )))
+    }
+}
+
 async fn handle_fullnode_network_message(
     node: &mut Node,
     message: &zoka::network::message::ZokaMessage,
@@ -8828,6 +8955,11 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             serve_pending_private_tx_body_requests(&mut node, db_path.as_deref())?
         {
             last_event = private_tx_event;
+        }
+        if let Some(header_event) =
+            serve_pending_header_requests(&mut node, db_path.as_deref())?
+        {
+            last_event = header_event;
         }
 
         if tokio::time::Instant::now() >= next_peer_store_save_at {

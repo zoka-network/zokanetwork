@@ -506,6 +506,113 @@ pub fn next_required_height(
     Ok(next_required_block(storage, peer_view)?.map(|request| request.height))
 }
 
+// ── Headers-first IBD helpers ─────────────────────────────────────────────
+
+/// Builds a chain locator for the `GetHeaders` request.
+///
+/// Returns a list of block hashes the local node already knows, ordered from
+/// the current tip backward with exponentially increasing gaps:
+///   [tip, tip-1, tip-2, tip-4, tip-8, …, genesis/checkpoint]
+///
+/// The responder finds the first hash it recognises on its canonical chain and
+/// returns up to `max` headers starting from that point forward.
+pub fn build_chain_locator(storage: &RocksDbStorage) -> Vec<String> {
+    let tip = match storage.get_chain_height() {
+        Ok(h) => h,
+        Err(_) => return Vec::new(),
+    };
+    if tip == 0 {
+        return storage
+            .get_last_block_hash()
+            .ok()
+            .filter(|h| !h.is_empty() && h != "0")
+            .into_iter()
+            .collect();
+    }
+
+    let mut heights: Vec<u64> = Vec::new();
+    let mut step = 1u64;
+    let mut h = tip;
+    loop {
+        heights.push(h);
+        if h == 0 {
+            break;
+        }
+        h = h.saturating_sub(step);
+        step = step.saturating_mul(2);
+        if heights.len() >= 32 {
+            // Always include genesis
+            if *heights.last().unwrap() > 0 {
+                heights.push(0);
+            }
+            break;
+        }
+    }
+
+    heights
+        .into_iter()
+        .filter_map(|height| {
+            storage
+                .get_block_by_height(height)
+                .ok()
+                .flatten()
+                .map(|block| block.header.hash)
+        })
+        .collect()
+}
+
+/// Validates a chain of `HeaderSummary` objects received from a peer.
+///
+/// Checks:
+/// 1. The chain is contiguous (each header's `prev_hash` matches the previous
+///    header's `hash`).
+/// 2. Heights are strictly increasing by 1.
+/// 3. `cumulative_work` is strictly increasing.
+///
+/// This does **not** verify the PoW seal (that requires the RandomX hash
+/// function and is done at apply time). It is a cheap structural guard
+/// against obvious garbage.
+pub fn validate_header_chain(
+    headers: &[crate::network::header_request_response::HeaderSummary],
+    common_ancestor_hash: &str,
+) -> Result<(), String> {
+    if headers.is_empty() {
+        return Ok(());
+    }
+    let first = &headers[0];
+    if !common_ancestor_hash.is_empty()
+        && first.header.prev_hash != common_ancestor_hash
+        && first.header.hash != common_ancestor_hash
+    {
+        return Err(format!(
+            "first header prev_hash ({}) does not connect to common ancestor ({})",
+            first.header.prev_hash, common_ancestor_hash
+        ));
+    }
+    for window in headers.windows(2) {
+        let (prev, next) = (&window[0], &window[1]);
+        if next.header.prev_hash != prev.header.hash {
+            return Err(format!(
+                "broken chain linkage at height {}: prev_hash={} expected={}",
+                next.header.block_height, next.header.prev_hash, prev.header.hash
+            ));
+        }
+        if next.header.block_height != prev.header.block_height + 1 {
+            return Err(format!(
+                "non-contiguous heights: {} → {}",
+                prev.header.block_height, next.header.block_height
+            ));
+        }
+        if next.cumulative_work <= prev.cumulative_work {
+            return Err(format!(
+                "cumulative_work did not increase at height {} ({} → {})",
+                next.header.block_height, prev.cumulative_work, next.cumulative_work
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Schema-tolerant deserializer for incoming peer block payloads. Used
 /// by tests and the sync helper alike.
 #[allow(dead_code)]

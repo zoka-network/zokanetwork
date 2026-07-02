@@ -8,6 +8,7 @@
 
 pub mod block_request_response;
 pub mod handler;
+pub mod header_request_response;
 pub mod message;
 pub mod p2p;
 pub mod peer_store;

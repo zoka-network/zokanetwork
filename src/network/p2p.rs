@@ -25,6 +25,10 @@ use crate::network::block_request_response::{
     BlockRequestResponseCodec,
 };
 use crate::network::handler::MessageHandler;
+use crate::network::header_request_response::{
+    protocol_name as header_request_response_protocol, GetHeaders, HeaderRequestResponseCodec,
+    HeadersResponse,
+};
 use crate::network::message::{
     BlockAnnounceMessage, BlockResponseMessage, MixerBatchMessage, PbftNetworkMessage, PingMessage,
     PrivateTransactionMessage, PrivateTxAnnounceMessage, StemPrivateTransactionMessage,
@@ -97,6 +101,20 @@ pub struct PendingBlockBodyRequest {
     pub request: BlockBodyRequest,
     pub channel: request_response::ResponseChannel<BlockBodyResponse>,
     pub received_at: Instant,
+}
+
+pub struct PendingHeaderRequest {
+    pub peer: PeerId,
+    pub request: GetHeaders,
+    pub channel: request_response::ResponseChannel<HeadersResponse>,
+    pub received_at: Instant,
+}
+
+#[derive(Debug)]
+pub struct ReceivedHeadersResponse {
+    pub peer: PeerId,
+    pub response: HeadersResponse,
+    pub latency: Duration,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -373,6 +391,10 @@ pub struct Node {
     block_request_peer_scores: HashMap<PeerId, i32>,
     /// Per-peer request/response counters used for diagnostics and peer choice.
     block_request_peer_stats: HashMap<PeerId, PeerBlockRequestStats>,
+    /// Inbound GetHeaders requests waiting for storage lookup.
+    pending_header_requests: VecDeque<PendingHeaderRequest>,
+    /// Outbound GetHeaders responses received while the caller was not waiting.
+    received_header_responses: VecDeque<ReceivedHeadersResponse>,
 }
 
 /// Behaviour set for the node.
@@ -388,6 +410,8 @@ pub struct NodeBehaviour {
     block_request_response: request_response::Behaviour<BlockRequestResponseCodec>,
     /// Direct private tx body request/response transport.
     private_tx_request_response: request_response::Behaviour<PrivateTxRequestResponseCodec>,
+    /// Header chain request/response for headers-first IBD.
+    header_request_response: request_response::Behaviour<HeaderRequestResponseCodec>,
 }
 
 impl Node {
@@ -1188,6 +1212,15 @@ impl Node {
                     request_response::Config::default()
                         .with_request_timeout(Duration::from_secs(8)),
                 );
+                let header_request_response = request_response::Behaviour::with_codec(
+                    HeaderRequestResponseCodec,
+                    [(
+                        header_request_response_protocol(),
+                        request_response::ProtocolSupport::Full,
+                    )],
+                    request_response::Config::default()
+                        .with_request_timeout(Duration::from_secs(15)),
+                );
 
                 Ok(NodeBehaviour {
                     identify: identify::Behaviour::new(identify::Config::new(
@@ -1198,6 +1231,7 @@ impl Node {
                     gossipsub,
                     block_request_response,
                     private_tx_request_response,
+                    header_request_response,
                 })
             })?
             .build();
@@ -1235,6 +1269,8 @@ impl Node {
             private_tx_announce_sources: HashMap::new(),
             block_request_peer_scores: HashMap::new(),
             block_request_peer_stats: HashMap::new(),
+            pending_header_requests: VecDeque::new(),
+            received_header_responses: VecDeque::new(),
         })
     }
 
@@ -1570,6 +1606,76 @@ impl Node {
                 *score = score.saturating_add(2).min(100);
             }
         }
+    }
+
+    fn handle_header_request_response_event(
+        &mut self,
+        event: request_response::Event<GetHeaders, HeadersResponse>,
+    ) {
+        match event {
+            request_response::Event::Message { peer, message } => match message {
+                request_response::Message::Request {
+                    request, channel, ..
+                } => {
+                    self.pending_header_requests.push_back(PendingHeaderRequest {
+                        peer,
+                        request,
+                        channel,
+                        received_at: Instant::now(),
+                    });
+                }
+                request_response::Message::Response { response, .. } => {
+                    self.received_header_responses.push_back(ReceivedHeadersResponse {
+                        peer,
+                        response,
+                        latency: Duration::default(),
+                    });
+                }
+            },
+            request_response::Event::OutboundFailure { peer, error, .. } => {
+                warn!("header request outbound failure from {}: {}", peer, error);
+            }
+            request_response::Event::InboundFailure { peer, error, .. } => {
+                warn!("header request inbound failure from {}: {}", peer, error);
+            }
+            request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
+    pub fn take_pending_header_request(&mut self) -> Option<PendingHeaderRequest> {
+        self.pending_header_requests.pop_front()
+    }
+
+    pub fn take_received_headers_response(&mut self) -> Option<ReceivedHeadersResponse> {
+        self.received_header_responses.pop_front()
+    }
+
+    pub fn respond_header_request(
+        &mut self,
+        pending: PendingHeaderRequest,
+        response: HeadersResponse,
+    ) -> Result<(), HeadersResponse> {
+        self.swarm
+            .behaviour_mut()
+            .header_request_response
+            .send_response(pending.channel, response)
+            .map_err(|e| e)
+    }
+
+    pub fn send_header_request(
+        &mut self,
+        peer: &PeerId,
+        request: GetHeaders,
+    ) -> Option<request_response::OutboundRequestId> {
+        if !self.swarm.is_connected(peer) {
+            return None;
+        }
+        let id = self
+            .swarm
+            .behaviour_mut()
+            .header_request_response
+            .send_request(peer, request);
+        Some(id)
     }
 
     fn select_block_request_peers(&self) -> Vec<PeerId> {
@@ -2087,6 +2193,9 @@ impl Node {
                         }
                         SwarmEvent::Behaviour(NodeBehaviourEvent::PrivateTxRequestResponse(event)) => {
                             self.handle_private_tx_request_response_event(event);
+                        }
+                        SwarmEvent::Behaviour(NodeBehaviourEvent::HeaderRequestResponse(event)) => {
+                            self.handle_header_request_response_event(event);
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                             info!("Peer connected while pumping: {}", peer_id);
@@ -2745,6 +2854,9 @@ impl Node {
                 }
                 SwarmEvent::Behaviour(NodeBehaviourEvent::PrivateTxRequestResponse(event)) => {
                     self.handle_private_tx_request_response_event(event);
+                }
+                SwarmEvent::Behaviour(NodeBehaviourEvent::HeaderRequestResponse(event)) => {
+                    self.handle_header_request_response_event(event);
                 }
                 _ => {}
             }
