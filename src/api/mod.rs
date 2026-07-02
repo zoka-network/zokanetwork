@@ -373,6 +373,17 @@ pub struct NetworkRuntimeSnapshot {
     pub direct_block_requests_outbound_failures: u64,
     pub direct_block_requests_invalid_responses: u64,
     pub direct_block_requests_avg_latency_ms: u64,
+    /// Private tx announced by a peer but not yet held locally when received
+    /// (fetch attempt required). See docs/sync-network-redesign.md Fase 3.5.
+    pub private_tx_announced_without_body: u64,
+    /// Body eventually fetched, but only after exceeding the "fast" latency
+    /// threshold (2s) — a signal that P2P direct fetch is degraded.
+    pub private_tx_body_received_late: u64,
+    /// Private tx confirmed committed into a locally-mined block.
+    pub private_tx_included_in_block: u64,
+    /// Private tx bodies obtained via the NAT-friendly RPC-pull fallback
+    /// instead of the primary libp2p request/response path.
+    pub private_tx_rpc_fallback_pulled: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -603,6 +614,10 @@ pub struct NetworkRuntimeState {
     direct_block_requests_invalid_responses: AtomicU64,
     direct_block_requests_latency_samples: AtomicU64,
     direct_block_requests_latency_total_ms: AtomicU64,
+    private_tx_announced_without_body: AtomicU64,
+    private_tx_body_received_late: AtomicU64,
+    private_tx_included_in_block: AtomicU64,
+    private_tx_rpc_fallback_pulled: AtomicU64,
     local_peer_id: RwLock<Option<String>>,
     sync_mode: RwLock<String>,
     sync_last_source: RwLock<Option<String>>,
@@ -692,6 +707,26 @@ impl NetworkRuntimeState {
             .store(stats.latency_samples, Ordering::Relaxed);
         self.direct_block_requests_latency_total_ms
             .store(stats.latency_total_ms, Ordering::Relaxed);
+    }
+
+    pub fn record_private_tx_announced_without_body(&self) {
+        self.private_tx_announced_without_body
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_private_tx_body_received_late(&self) {
+        self.private_tx_body_received_late
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_private_tx_included_in_block(&self, count: u64) {
+        self.private_tx_included_in_block
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn record_private_tx_rpc_fallback_pulled(&self, count: u64) {
+        self.private_tx_rpc_fallback_pulled
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     pub async fn set_sync_status(&self, update: SyncRuntimeUpdate) {
@@ -925,6 +960,18 @@ impl NetworkRuntimeState {
                         / samples
                 }
             },
+            private_tx_announced_without_body: self
+                .private_tx_announced_without_body
+                .load(Ordering::Relaxed),
+            private_tx_body_received_late: self
+                .private_tx_body_received_late
+                .load(Ordering::Relaxed),
+            private_tx_included_in_block: self
+                .private_tx_included_in_block
+                .load(Ordering::Relaxed),
+            private_tx_rpc_fallback_pulled: self
+                .private_tx_rpc_fallback_pulled
+                .load(Ordering::Relaxed),
         }
     }
 

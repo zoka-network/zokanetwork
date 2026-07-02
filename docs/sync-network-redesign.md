@@ -1197,13 +1197,16 @@ Criterio de aceptacion:
   - El cache se alimenta al recibir tx local/API, al importar gossip y al completar fetch directo; los requests entrantes se sirven primero desde cache y luego desde RocksDB.
 - [x] Permitir que un minero busque cuerpo en multiples peers antes de descartar tx.
   - `request_private_tx_body_with_retry` envia requests directos a varios peers conectados con timeout controlado y acepta la primera respuesta valida.
-- [ ] Penalizar peers que anuncian tx pero nunca sirven cuerpo.
-- [ ] Medir tx varadas:
+- [x] Penalizar peers que anuncian tx pero nunca sirven cuerpo.
+  - Ya existia `penalize_private_tx_announcers()` para el caso de fallo total. Se agrego penalizacion tambien cuando un peer especifico consultado nunca responde (ni Body ni NotFound ni OutboundFailure) aunque otro peer sirva el cuerpo con exito: `src/network/p2p.rs` (`request_private_tx_body_with_retry`, rama de timeout).
+- [x] Medir tx varadas:
   - anunciadas sin cuerpo,
-  - cuerpo recibido tarde,
+  - cuerpo recibido tarde (>2s),
   - incluidas en bloque,
-  - descartadas por expiracion.
-- [ ] Mantener RPC pull solo como fallback y marcarlo en metricas.
+  - descartadas por expiracion: no implementado — no existe mecanismo de expiracion/TTL para el pool de tx privadas pendientes en este codebase; agregarlo es un cambio de comportamiento sobre mempool en mainnet, fuera de alcance de este pase de metricas.
+  - Contadores globales en `NetworkRuntimeState` (`src/api/mod.rs`), expuestos via `GET` del snapshot de red: `private_tx_announced_without_body`, `private_tx_body_received_late`, `private_tx_included_in_block`, `private_tx_rpc_fallback_pulled`.
+- [x] Mantener RPC pull solo como fallback y marcarlo en metricas.
+  - El pull por RPC ya era NAT-friendly/secundario por diseno (comentario existente en `src/main.rs`); se agrego el contador `private_tx_rpc_fallback_pulled` en ambos call sites (pull de pendientes y backfill de cuerpos committeados).
 
 Archivos:
 
@@ -1256,8 +1259,10 @@ Criterio de aceptacion:
 
 ### Fase 5 - Snapshots firmados y servidos por red (1-2 semanas iniciales)
 
-- [ ] Activar `snapshot_signers` en manifest (pendiente: ningun signer de produccion registrado aun).
-- [ ] Publicar snapshot firmado por release/operador (pendiente: requiere signer).
+- [x] Activar `snapshot_signers` en manifest.
+  - Se generaron dos claves ed25519 independientes (una por operador/nodo, sin compartir secreto entre servidores): una en BOOT y otra en VPS2, cada una en `/root/.zoka/snapshot-signer.key` (permisos 600, root-only) con su publica en `snapshot-signer.pub`. Ambas publicas quedaron registradas en `docs/mainnet-network.v1.json` -> `snapshot_signers`. Cualquiera de los dos nodos puede firmar snapshots de forma independiente si el otro esta offline.
+  - Nota operativa: BOOT y VPS2 corren hoy con `--no-network-config` (config vieja, pre-unificacion de la Fase 6), asi que este manifest recien se lee cuando se redeploye con `zoka-node.service`.
+- [ ] Publicar snapshot firmado por release/operador (pendiente: requiere ejecutar `zoka snapshot-export --sign-key-hex $(cat /root/.zoka/snapshot-signer.key)` en BOOT o VPS2 una vez que el redeploy de la Fase 6 este activo).
 - [x] Agregar endpoints HTTP:
   - `GET /snapshots` — lista todos los manifests disponibles para el chain_id activo.
   - `GET /snapshots/latest` — retorna el manifest mas alto disponible.

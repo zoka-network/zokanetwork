@@ -106,7 +106,10 @@
       }
     ]
   },
-  "snapshot_signers": [],
+  "snapshot_signers": [
+    "2b1aa6051299d703974ad9701af8f6d40787fb17a3f5436012e015194c77987a",
+    "4c9f0ab16d1400cd69123a02738399498b0b5edf6f56ae45f3c96e01864216af"
+  ],
   "notes": [
     "Primary bootstrap for the Zoka mainnet (DigitalOcean infrastructure).",
     "Wallet secrets and private keys must remain local; this RPC is read-only chain status.",

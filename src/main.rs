@@ -5507,6 +5507,11 @@ fn run_mining_batch_with_progress(
                 &private_tx_hashes_for_block,
                 config.chain_db_path.as_deref(),
             )?;
+            if !private_tx_hashes_for_block.is_empty() {
+                zoka::api::global_network_runtime().record_private_tx_included_in_block(
+                    private_tx_hashes_for_block.len() as u64,
+                );
+            }
             let mut wallet_state_changed = private_manager
                 .mark_private_transactions_confirmed_locally(&private_tx_hashes_for_block)
                 > 0
@@ -6216,11 +6221,18 @@ async fn handle_fullnode_network_message(
                 },
                 Ok(None) => {
                     drop(storage);
+                    zoka::api::global_network_runtime()
+                        .record_private_tx_announced_without_body();
+                    let fetch_started_at = std::time::Instant::now();
                     match node
                         .request_private_tx_body_with_retry(hash, 3, Duration::from_secs(4))
                         .await
                     {
                         Ok(body) => {
+                            if fetch_started_at.elapsed() > Duration::from_millis(2000) {
+                                zoka::api::global_network_runtime()
+                                    .record_private_tx_body_received_late();
+                            }
                             let tx: zoka::private_wallet::PrivateTransaction =
                                 match serde_json::from_slice(&body) {
                                     Ok(tx) => tx,
@@ -9205,6 +9217,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             if let Some(path) = db_path.as_deref() {
                 let staged = pull_pending_private_txs_from_rpc(path, &rpc_sync_endpoints);
                 if staged > 0 {
+                    zoka::api::global_network_runtime()
+                        .record_private_tx_rpc_fallback_pulled(staged as u64);
                     last_event = format!("Pulled {staged} pending private tx(s) from RPC peers");
                 }
             }
@@ -9239,6 +9253,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                             &missing_hashes,
                         );
                         if fetched > 0 {
+                            zoka::api::global_network_runtime()
+                                .record_private_tx_rpc_fallback_pulled(fetched as u64);
                             last_event = format!(
                                 "Backfilled {fetched} committed private tx body(s) from RPC peers ({from_height}..{tip})"
                             );

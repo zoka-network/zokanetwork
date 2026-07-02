@@ -2637,6 +2637,24 @@ impl Node {
                 } else {
                     last_error
                 };
+                // Peers that announced this tx but never answered our request at
+                // all (no Body/NotFound/RateLimited, no OutboundFailure event
+                // either) get penalized here, since none of the other response
+                // branches above ever ran for them.
+                let announced_by = self.private_tx_announce_sources.get(tx_hash).cloned();
+                for request_id in &request_ids {
+                    if let Some(pending) =
+                        self.pending_outbound_private_tx_body_requests.remove(request_id)
+                    {
+                        let announced = announced_by
+                            .as_ref()
+                            .map(|peers| peers.contains(&pending.peer))
+                            .unwrap_or(false);
+                        if announced {
+                            self.record_private_tx_request_failure(pending.peer);
+                        }
+                    }
+                }
                 return Err(Box::new(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("timed out waiting for private tx body response: {detail}"),
