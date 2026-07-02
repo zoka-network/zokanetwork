@@ -6109,6 +6109,63 @@ fn serve_pending_header_requests(
     }
 }
 
+fn serve_pending_snapshot_manifest_requests(
+    node: &mut zoka::network::p2p::Node,
+) -> Result<Option<String>, String> {
+    use zoka::network::snapshot_request_response::{SnapshotManifest, SnapshotManifestsResponse};
+
+    let mut served = 0u32;
+    let mut failed = 0u32;
+    while let Some(pending) = node.take_pending_snapshot_manifest_request() {
+        let dir = zoka::snapshot::default_snapshot_dir();
+        let file_manifests = zoka::snapshot::scan_snapshot_manifests(&dir);
+        let chain_id = &pending.request.chain_id;
+        let max_height = pending.request.max_height;
+
+        let network_manifests: Vec<SnapshotManifest> = file_manifests
+            .into_iter()
+            .filter(|m| {
+                m.chain_id == *chain_id
+                    && max_height.map_or(true, |h| m.head_height <= h)
+            })
+            .map(|m| SnapshotManifest {
+                chain_id: m.chain_id,
+                schema: m.schema,
+                head_height: m.head_height,
+                head_hash: m.head_hash,
+                cumulative_work: m.cumulative_work,
+                block_count: m.block_count,
+                generated_unix_secs: m.generated_unix_secs,
+                size_bytes: m.size_bytes,
+                sha256_hex: m.sha256_hex,
+                download_urls: m.download_urls,
+                signature_hex: m.signature_hex,
+                signer_pubkey_hex: m.signer_pubkey_hex,
+            })
+            .collect();
+
+        let response = if network_manifests.is_empty() {
+            SnapshotManifestsResponse::NotAvailable {
+                reason: "no snapshots available for the requested chain/height".to_string(),
+            }
+        } else {
+            SnapshotManifestsResponse::Manifests { manifests: network_manifests }
+        };
+
+        match node.respond_snapshot_manifest_request(pending, response) {
+            Ok(()) => served = served.saturating_add(1),
+            Err(_) => failed = failed.saturating_add(1),
+        }
+    }
+    if served == 0 && failed == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(format!(
+            "Served {served} GetSnapshotManifests request(s), {failed} response failure(s)."
+        )))
+    }
+}
+
 async fn handle_fullnode_network_message(
     node: &mut Node,
     message: &zoka::network::message::ZokaMessage,
@@ -8960,6 +9017,9 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             serve_pending_header_requests(&mut node, db_path.as_deref())?
         {
             last_event = header_event;
+        }
+        if let Some(snapshot_event) = serve_pending_snapshot_manifest_requests(&mut node)? {
+            last_event = snapshot_event;
         }
 
         if tokio::time::Instant::now() >= next_peer_store_save_at {

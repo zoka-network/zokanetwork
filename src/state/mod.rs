@@ -234,6 +234,11 @@ impl StateManager {
         Arc::clone(&self.storage)
     }
 
+    /// Returns the chain ID this node is running on.
+    pub async fn chain_id(&self) -> String {
+        crate::economics::MAINNET_CHAIN_ID.to_string()
+    }
+
     fn load_state_snapshot_from_storage(storage: &RocksDbStorage) -> Result<State, StateError> {
         let mut state = State::new();
 

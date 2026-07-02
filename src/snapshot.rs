@@ -25,6 +25,7 @@
 //! private notes are recipient-side anyway). This keeps the snapshot
 //! size proportional to chain height + tx count and not to wallet count.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
@@ -374,6 +375,132 @@ pub fn verify(
 /// — same ingress path, no shortcut.
 ///
 /// Caller is responsible for having already called [`verify`].
+// ── Snapshot catalog / manifest sidecar ───────────────────────────────────
+
+/// Lightweight manifest written alongside each `.snap` file so peers and
+/// the HTTP API can advertise available snapshots without loading the full
+/// block data.
+///
+/// Stored at `<snap_path>.manifest` (e.g. `~/.zoka/snapshots/1000.snap.manifest`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotFileManifest {
+    pub chain_id: String,
+    pub schema: String,
+    pub head_height: u64,
+    pub head_hash: String,
+    pub total_supply_emitted: u64,
+    pub cumulative_work: u128,
+    pub block_count: u64,
+    pub generated_unix_secs: u64,
+    /// Size of the companion `.snap` file in bytes.
+    pub size_bytes: u64,
+    /// SHA-256 of the companion `.snap` file (hex).
+    pub sha256_hex: String,
+    /// Absolute or relative path to the companion `.snap` file.
+    pub snap_path: String,
+    /// HTTP download URLs for the `.snap` file (operator-configured).
+    #[serde(default)]
+    pub download_urls: Vec<String>,
+    /// Hex-encoded ed25519 signature over canonical snapshot bytes.
+    #[serde(default)]
+    pub signature_hex: Option<String>,
+    /// Hex-encoded ed25519 verifying key of the signer.
+    #[serde(default)]
+    pub signer_pubkey_hex: Option<String>,
+}
+
+/// Returns the sidecar path for a given `.snap` file path.
+pub fn manifest_path_for(snap_path: &Path) -> PathBuf {
+    let mut p = snap_path.to_path_buf();
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("snap")
+        .to_string();
+    p.set_extension(format!("{ext}.manifest"));
+    p
+}
+
+/// Writes a `.manifest` sidecar next to the `.snap` file described by
+/// `snap_path`. Call this right after writing the `.snap` file.
+pub fn write_manifest_sidecar(
+    snapshot: &ChainSnapshotV1,
+    snap_path: &Path,
+    size_bytes: u64,
+    sha256_hex: String,
+    download_urls: Vec<String>,
+) -> Result<PathBuf, SnapshotError> {
+    let manifest = SnapshotFileManifest {
+        chain_id: snapshot.header.chain_id.clone(),
+        schema: snapshot.header.schema.clone(),
+        head_height: snapshot.header.head_height,
+        head_hash: snapshot.header.head_hash.clone(),
+        total_supply_emitted: snapshot.header.total_supply_emitted,
+        cumulative_work: snapshot.header.cumulative_work,
+        block_count: snapshot.header.block_count,
+        generated_unix_secs: snapshot.header.generated_unix_secs,
+        size_bytes,
+        sha256_hex,
+        snap_path: snap_path.to_string_lossy().to_string(),
+        download_urls,
+        signature_hex: snapshot.signature_hex.clone(),
+        signer_pubkey_hex: snapshot.signer_pubkey_hex.clone(),
+    };
+    let sidecar_path = manifest_path_for(snap_path);
+    let json = serde_json::to_vec_pretty(&manifest)
+        .map_err(|e| SnapshotError::Serialize(e.to_string()))?;
+    std::fs::write(&sidecar_path, json)
+        .map_err(|e| SnapshotError::Storage(format!("write manifest sidecar: {e}")))?;
+    Ok(sidecar_path)
+}
+
+/// Scan `dir` for `*.snap.manifest` sidecar files and return parsed manifests
+/// sorted by `head_height` descending (newest first).
+///
+/// Files that fail to parse are skipped and logged at debug level.
+pub fn scan_snapshot_manifests(dir: &Path) -> Vec<SnapshotFileManifest> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut manifests: Vec<SnapshotFileManifest> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            let name = path.file_name()?.to_string_lossy().to_string();
+            if !name.ends_with(".snap.manifest") {
+                return None;
+            }
+            let raw = std::fs::read_to_string(&path).ok()?;
+            match serde_json::from_str::<SnapshotFileManifest>(&raw) {
+                Ok(m) => Some(m),
+                Err(err) => {
+                    tracing::debug!(
+                        "snapshot manifest parse failed for {}: {err}",
+                        path.display()
+                    );
+                    None
+                }
+            }
+        })
+        .collect();
+    manifests.sort_by(|a, b| b.head_height.cmp(&a.head_height));
+    manifests
+}
+
+/// Default snapshot directory: `$ZOKA_HOME/snapshots/` or `~/.zoka/snapshots/`.
+pub fn default_snapshot_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("ZOKA_HOME") {
+        let home = home.trim();
+        if !home.is_empty() {
+            return PathBuf::from(home).join("snapshots");
+        }
+    }
+    home::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".zoka")
+        .join("snapshots")
+}
+
 pub fn import_into_storage(
     storage: &Arc<RocksDbStorage>,
     chain_id: &str,

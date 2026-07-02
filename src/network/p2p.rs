@@ -29,6 +29,10 @@ use crate::network::header_request_response::{
     protocol_name as header_request_response_protocol, GetHeaders, HeaderRequestResponseCodec,
     HeadersResponse,
 };
+use crate::network::snapshot_request_response::{
+    protocol_name as snapshot_request_response_protocol, GetSnapshotManifests,
+    SnapshotManifestsResponse, SnapshotRequestResponseCodec,
+};
 use crate::network::message::{
     BlockAnnounceMessage, BlockResponseMessage, MixerBatchMessage, PbftNetworkMessage, PingMessage,
     PrivateTransactionMessage, PrivateTxAnnounceMessage, StemPrivateTransactionMessage,
@@ -114,6 +118,20 @@ pub struct PendingHeaderRequest {
 pub struct ReceivedHeadersResponse {
     pub peer: PeerId,
     pub response: HeadersResponse,
+    pub latency: Duration,
+}
+
+pub struct PendingSnapshotManifestRequest {
+    pub peer: PeerId,
+    pub request: GetSnapshotManifests,
+    pub channel: request_response::ResponseChannel<SnapshotManifestsResponse>,
+    pub received_at: Instant,
+}
+
+#[derive(Debug)]
+pub struct ReceivedSnapshotManifests {
+    pub peer: PeerId,
+    pub response: SnapshotManifestsResponse,
     pub latency: Duration,
 }
 
@@ -395,6 +413,10 @@ pub struct Node {
     pending_header_requests: VecDeque<PendingHeaderRequest>,
     /// Outbound GetHeaders responses received while the caller was not waiting.
     received_header_responses: VecDeque<ReceivedHeadersResponse>,
+    /// Inbound snapshot manifest requests.
+    pending_snapshot_requests: VecDeque<PendingSnapshotManifestRequest>,
+    /// Outbound snapshot manifest responses received from peers.
+    received_snapshot_manifests: VecDeque<ReceivedSnapshotManifests>,
 }
 
 /// Behaviour set for the node.
@@ -412,6 +434,8 @@ pub struct NodeBehaviour {
     private_tx_request_response: request_response::Behaviour<PrivateTxRequestResponseCodec>,
     /// Header chain request/response for headers-first IBD.
     header_request_response: request_response::Behaviour<HeaderRequestResponseCodec>,
+    /// Snapshot manifest discovery.
+    snapshot_request_response: request_response::Behaviour<SnapshotRequestResponseCodec>,
 }
 
 impl Node {
@@ -1221,6 +1245,15 @@ impl Node {
                     request_response::Config::default()
                         .with_request_timeout(Duration::from_secs(15)),
                 );
+                let snapshot_request_response = request_response::Behaviour::with_codec(
+                    SnapshotRequestResponseCodec,
+                    [(
+                        snapshot_request_response_protocol(),
+                        request_response::ProtocolSupport::Full,
+                    )],
+                    request_response::Config::default()
+                        .with_request_timeout(Duration::from_secs(10)),
+                );
 
                 Ok(NodeBehaviour {
                     identify: identify::Behaviour::new(identify::Config::new(
@@ -1232,6 +1265,7 @@ impl Node {
                     block_request_response,
                     private_tx_request_response,
                     header_request_response,
+                    snapshot_request_response,
                 })
             })?
             .build();
@@ -1271,6 +1305,8 @@ impl Node {
             block_request_peer_stats: HashMap::new(),
             pending_header_requests: VecDeque::new(),
             received_header_responses: VecDeque::new(),
+            pending_snapshot_requests: VecDeque::new(),
+            received_snapshot_manifests: VecDeque::new(),
         })
     }
 
@@ -1676,6 +1712,79 @@ impl Node {
             .header_request_response
             .send_request(peer, request);
         Some(id)
+    }
+
+    fn handle_snapshot_request_response_event(
+        &mut self,
+        event: request_response::Event<GetSnapshotManifests, SnapshotManifestsResponse>,
+    ) {
+        match event {
+            request_response::Event::Message { peer, message } => match message {
+                request_response::Message::Request {
+                    request, channel, ..
+                } => {
+                    self.pending_snapshot_requests
+                        .push_back(PendingSnapshotManifestRequest {
+                            peer,
+                            request,
+                            channel,
+                            received_at: Instant::now(),
+                        });
+                }
+                request_response::Message::Response { response, .. } => {
+                    self.received_snapshot_manifests
+                        .push_back(ReceivedSnapshotManifests {
+                            peer,
+                            response,
+                            latency: Duration::default(),
+                        });
+                }
+            },
+            request_response::Event::OutboundFailure { peer, error, .. } => {
+                debug!("snapshot manifest request failed from {}: {}", peer, error);
+            }
+            request_response::Event::InboundFailure { peer, error, .. } => {
+                debug!("snapshot manifest inbound failure from {}: {}", peer, error);
+            }
+            request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
+    pub fn take_pending_snapshot_manifest_request(
+        &mut self,
+    ) -> Option<PendingSnapshotManifestRequest> {
+        self.pending_snapshot_requests.pop_front()
+    }
+
+    pub fn take_received_snapshot_manifests(&mut self) -> Option<ReceivedSnapshotManifests> {
+        self.received_snapshot_manifests.pop_front()
+    }
+
+    pub fn respond_snapshot_manifest_request(
+        &mut self,
+        pending: PendingSnapshotManifestRequest,
+        response: SnapshotManifestsResponse,
+    ) -> Result<(), SnapshotManifestsResponse> {
+        self.swarm
+            .behaviour_mut()
+            .snapshot_request_response
+            .send_response(pending.channel, response)
+    }
+
+    pub fn send_snapshot_manifest_request(
+        &mut self,
+        peer: &PeerId,
+        request: GetSnapshotManifests,
+    ) -> Option<request_response::OutboundRequestId> {
+        if !self.swarm.is_connected(peer) {
+            return None;
+        }
+        Some(
+            self.swarm
+                .behaviour_mut()
+                .snapshot_request_response
+                .send_request(peer, request),
+        )
     }
 
     fn select_block_request_peers(&self) -> Vec<PeerId> {
@@ -2196,6 +2305,9 @@ impl Node {
                         }
                         SwarmEvent::Behaviour(NodeBehaviourEvent::HeaderRequestResponse(event)) => {
                             self.handle_header_request_response_event(event);
+                        }
+                        SwarmEvent::Behaviour(NodeBehaviourEvent::SnapshotRequestResponse(event)) => {
+                            self.handle_snapshot_request_response_event(event);
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                             info!("Peer connected while pumping: {}", peer_id);
@@ -2857,6 +2969,9 @@ impl Node {
                 }
                 SwarmEvent::Behaviour(NodeBehaviourEvent::HeaderRequestResponse(event)) => {
                     self.handle_header_request_response_event(event);
+                }
+                SwarmEvent::Behaviour(NodeBehaviourEvent::SnapshotRequestResponse(event)) => {
+                    self.handle_snapshot_request_response_event(event);
                 }
                 _ => {}
             }

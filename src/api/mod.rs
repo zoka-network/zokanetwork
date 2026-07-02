@@ -4944,6 +4944,89 @@ async fn post_block_submit(
     }
 }
 
+// ── Public snapshot endpoints ──────────────────────────────────────────────
+
+async fn get_snapshots_list(
+    State(app_state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let chain_id = app_state.state_manager.chain_id().await;
+    let dir = crate::snapshot::default_snapshot_dir();
+    let all = crate::snapshot::scan_snapshot_manifests(&dir);
+    let filtered: Vec<_> = all
+        .into_iter()
+        .filter(|m| m.chain_id == chain_id)
+        .map(|m| {
+            serde_json::json!({
+                "head_height": m.head_height,
+                "head_hash": m.head_hash,
+                "block_count": m.block_count,
+                "size_bytes": m.size_bytes,
+                "sha256_hex": m.sha256_hex,
+                "generated_unix_secs": m.generated_unix_secs,
+                "signed": m.signature_hex.is_some(),
+                "download_urls": m.download_urls,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "snapshots": filtered, "total": filtered.len() }))
+}
+
+async fn get_snapshot_latest(
+    State(app_state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let chain_id = app_state.state_manager.chain_id().await;
+    let dir = crate::snapshot::default_snapshot_dir();
+    let manifests = crate::snapshot::scan_snapshot_manifests(&dir);
+    let latest = manifests
+        .into_iter()
+        .find(|m| m.chain_id == chain_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(serde_json::json!({
+        "chain_id": latest.chain_id,
+        "head_height": latest.head_height,
+        "head_hash": latest.head_hash,
+        "block_count": latest.block_count,
+        "size_bytes": latest.size_bytes,
+        "sha256_hex": latest.sha256_hex,
+        "generated_unix_secs": latest.generated_unix_secs,
+        "signed": latest.signature_hex.is_some(),
+        "signer_pubkey_hex": latest.signer_pubkey_hex,
+        "download_urls": latest.download_urls,
+    })))
+}
+
+async fn download_snapshot(
+    State(app_state): State<Arc<AppState>>,
+    axum::extract::Path(height): axum::extract::Path<u64>,
+) -> Result<axum::response::Response, StatusCode> {
+    use axum::http::header;
+    use axum::response::IntoResponse;
+
+    let chain_id = app_state.state_manager.chain_id().await;
+    let dir = crate::snapshot::default_snapshot_dir();
+    let manifests = crate::snapshot::scan_snapshot_manifests(&dir);
+    let manifest = manifests
+        .into_iter()
+        .find(|m| m.chain_id == chain_id && m.head_height == height)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let snap_path = std::path::Path::new(&manifest.snap_path);
+    let bytes = std::fs::read(snap_path).map_err(|_| StatusCode::NOT_FOUND)?;
+
+    let filename = format!("zoka-snapshot-{height}.snap");
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
 pub fn create_router(app_state: Arc<AppState>) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -5021,7 +5104,10 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         .route("/consensus/message", post(pbft_message))
         .route("/ws/subscribe", post(ws_subscribe))
         .route("/ws/unsubscribe", post(ws_unsubscribe))
-        .route("/ws/status", get(ws_status));
+        .route("/ws/status", get(ws_status))
+        .route("/snapshots", get(get_snapshots_list))
+        .route("/snapshots/latest", get(get_snapshot_latest))
+        .route("/snapshots/:height/download", get(download_snapshot));
     if app_state.security.enable_remote_seed_endpoint {
         router = router
             .route("/crypto/server-pubkey", get(get_server_pubkey))
