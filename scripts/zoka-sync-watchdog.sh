@@ -23,13 +23,16 @@ rpc_height() {
 }
 
 # Try each comma-separated BOOT_RPC endpoint until one succeeds.
+# Prints "<endpoint> <height>" on success so the caller can capture both
+# via `read` from a single command substitution (a function invoked as
+# `x="$(fn)"` runs in a subshell, so side-effect variable assignments
+# inside it never reach the caller).
 reference_rpc_height() {
   IFS=',' read -ra endpoints <<< "$BOOT_RPC"
   for ep in "${endpoints[@]}"; do
     ep="${ep// /}"
     if h="$(rpc_height "$ep" 2>/dev/null)"; then
-      ACTIVE_BOOT_RPC="$ep"
-      echo "$h"
+      echo "$ep $h"
       return 0
     fi
   done
@@ -47,8 +50,7 @@ if ! flock --nonblock 9; then
   exit 0
 fi
 
-ACTIVE_BOOT_RPC=""
-boot_height="$(reference_rpc_height)"
+read -r ACTIVE_BOOT_RPC boot_height <<< "$(reference_rpc_height)"
 local_height="$(rpc_height "$LOCAL_RPC")"
 gap=$((boot_height - local_height))
 

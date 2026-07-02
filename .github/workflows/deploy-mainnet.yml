@@ -270,7 +270,9 @@ jobs:
           WantedBy=multi-user.target
           EOF
 
-          # Install watchdog timer
+          # Install watchdog (Restart=always loop, not a timer: OnUnitActiveSec
+          # timers got stuck at NextElapseUSecMonotonic=infinity on systemd 249
+          # after their first run and silently stopped rescheduling)
           cat > /etc/systemd/system/zoka-sync-watchdog.service << 'EOF'
           [Unit]
           Description=Zoka node sync catch-up watchdog
@@ -278,32 +280,23 @@ jobs:
           Wants=network-online.target
 
           [Service]
-          Type=oneshot
+          Type=simple
           ExecStart=/usr/local/bin/zoka-sync-watchdog.sh
           Environment=BOOT_RPC=http://159.223.119.216:3000,http://157.230.5.103:3000
           Environment=LOCAL_RPC=http://127.0.0.1:3000
           Environment=GAP_THRESHOLD=2
           Environment=MAX_PUSH=64
           Environment=CURL_TIMEOUT=30
-          EOF
-
-          cat > /etc/systemd/system/zoka-sync-watchdog.timer << 'EOF'
-          [Unit]
-          Description=Run Zoka node sync catch-up watchdog every 30 seconds
-
-          [Timer]
-          OnBootSec=20s
-          OnUnitActiveSec=30s
-          AccuracySec=5s
-          Persistent=true
+          Restart=always
+          RestartSec=30
 
           [Install]
-          WantedBy=timers.target
+          WantedBy=multi-user.target
           EOF
 
           systemctl daemon-reload
           systemctl enable zoka-node
-          systemctl enable zoka-sync-watchdog.timer
+          systemctl enable zoka-sync-watchdog.service
           systemctl stop zoka-node 2>/dev/null || true
           if [ -d /data/zoka/blockchain.db ]; then
             tar -C /data/zoka -czf "/data/zoka/blockchain.db.pre-1.5.0.$(date -u +%Y%m%d%H%M%S).tgz" blockchain.db
@@ -314,7 +307,7 @@ jobs:
             --yes \
             --json
           systemctl start zoka-node
-          systemctl start zoka-sync-watchdog.timer
+          systemctl start zoka-sync-watchdog.service
           sleep 8
           systemctl status zoka-node --no-pager -l
           REMOTE

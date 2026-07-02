@@ -4,7 +4,12 @@ After=network-online.target zoka-node.service
 Wants=network-online.target
 
 [Service]
-Type=oneshot
+# Type=simple + Restart=always instead of a timer-triggered oneshot: on
+# systemd 249 an OnUnitActiveSec timer here got stuck with
+# NextElapseUSecMonotonic=infinity after its first run and never
+# rescheduled, silently killing catch-up for 24h+. Restart=always is the
+# same self-heal mechanism zoka-node.service already relies on.
+Type=simple
 ExecStart=/usr/local/bin/zoka-sync-watchdog.sh
 # Comma-separated list of reference RPC endpoints (tried in order).
 # Having both seeds here means the watchdog survives if one server is down.
@@ -13,3 +18,8 @@ Environment=LOCAL_RPC=http://127.0.0.1:3000
 Environment=GAP_THRESHOLD=2
 Environment=MAX_PUSH=64
 Environment=CURL_TIMEOUT=30
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
