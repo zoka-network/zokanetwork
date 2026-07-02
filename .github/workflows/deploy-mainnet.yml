@@ -88,6 +88,10 @@ jobs:
           ssh -i ~/.ssh/zoka_do root@${{ env.BOOTSTRAP_IP }} bash -s << 'REMOTE'
           set -e
           mkdir -p /data/zoka
+          if command -v ufw >/dev/null 2>&1; then
+            ufw allow 28080/tcp comment 'ZOKA public P2P' || true
+            ufw reload || true
+          fi
 
           cat > /etc/systemd/system/zoka-bootstrap.service << 'EOF'
           [Unit]
@@ -193,6 +197,10 @@ jobs:
           ssh -i ~/.ssh/zoka_do root@${{ env.RPC_IP }} bash -s << REMOTE
           set -e
           mkdir -p /data/zoka
+          if command -v ufw >/dev/null 2>&1; then
+            ufw allow 28080/tcp comment 'ZOKA public P2P' || true
+            ufw reload || true
+          fi
 
           cat > /etc/systemd/system/zoka-rpc.service << 'EOF'
           [Unit]

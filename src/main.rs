@@ -12,6 +12,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::scalar::Scalar;
+use rand::seq::SliceRandom;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::time::timeout;
@@ -5675,6 +5677,7 @@ fn run_mining_batch_with_progress(
 /// verdict for the dashboard. Non-block messages return `None` so the
 /// caller falls back to the generic "received" log line.
 fn handle_inbound_block_message(
+    node: &mut Node,
     message: &zoka::network::message::ZokaMessage,
     chain_id: &str,
     chain_db_path: Option<&str>,
@@ -5716,10 +5719,270 @@ fn handle_inbound_block_message(
     };
     peer_view.record_sync_outcome(&outcome);
     peer_view.remember_block_response(&outcome, response);
+    if let zoka::state::sync::SyncOutcome::Applied(head) = &outcome {
+        if let Err(err) = node.publish_block_announce(
+            head.height,
+            head.hash.clone(),
+            head.cumulative_work.to_string(),
+            response.difficulty_bits,
+        ) {
+            tracing::warn!(
+                target: "zoka.network",
+                height = head.height,
+                error = %err,
+                "failed to publish block announce after applying peer block"
+            );
+        }
+    }
     Some(sync_outcome_to_event(outcome))
 }
 
-fn handle_fullnode_network_message(
+fn handle_block_announce(
+    node: &mut Node,
+    announce: &zoka::network::message::BlockAnnounceMessage,
+    chain_db_path: Option<&str>,
+    peer_view: &mut zoka::state::sync::PeerChainView,
+) -> Option<String> {
+    let height = announce.block_height;
+    let hash = announce.block_hash.trim();
+    if height == 0 || hash.is_empty() {
+        return Some("Ignored malformed block announce: missing height/hash.".to_string());
+    }
+
+    let announced_work = announce.cumulative_work.parse::<u128>().ok();
+    let local_head = chain_db_path
+        .and_then(|path| RocksDbStorage::new(path).ok())
+        .and_then(|storage| zoka::state::chain::read_chain_head(&storage).ok().flatten());
+    let local_height = local_head.as_ref().map(|head| head.height).unwrap_or(0);
+    peer_view.observe(height, local_height);
+
+    if let Some(head) = &local_head {
+        if head.height >= height {
+            if head.height == height && head.hash == hash {
+                return Some(format!(
+                    "Block announce @ height {height} already matches local head."
+                ));
+            }
+            if announced_work
+                .map(|work| work <= head.cumulative_work)
+                .unwrap_or(height <= head.height)
+            {
+                return Some(format!(
+                    "Ignored block announce @ height {height}: local chain has equal or stronger work."
+                ));
+            }
+        }
+    }
+
+    match node.publish_block_request(height, Some(hash.to_string())) {
+        Ok(()) => Some(format!(
+            "Block announce @ height {height} received; requested body {hash}."
+        )),
+        Err(err) => Some(format!(
+            "Block announce @ height {height} received but request publish failed: {err}"
+        )),
+    }
+}
+
+fn block_body_response_from_storage(
+    storage: &RocksDbStorage,
+    request: &zoka::network::block_request_response::BlockBodyRequest,
+) -> zoka::network::block_request_response::BlockBodyResponse {
+    let block_height = request.block_height;
+    let block = match request.block_hash.as_deref() {
+        Some(hash) => match storage.get_block(hash) {
+            Ok(Some(block)) if block.header.block_height == block_height => block,
+            Ok(Some(_)) => {
+                return zoka::network::block_request_response::BlockBodyResponse::NotFound {
+                    block_height,
+                    block_hash: request.block_hash.clone(),
+                    reason: "requested hash is at a different height".to_string(),
+                };
+            }
+            Ok(None) => {
+                return zoka::network::block_request_response::BlockBodyResponse::NotFound {
+                    block_height,
+                    block_hash: request.block_hash.clone(),
+                    reason: "requested hash not found".to_string(),
+                };
+            }
+            Err(err) => {
+                return zoka::network::block_request_response::BlockBodyResponse::Rejected {
+                    block_height,
+                    block_hash: request.block_hash.clone(),
+                    reason: format!("read hash failed: {err}"),
+                };
+            }
+        },
+        None => match storage.get_canonical_block_by_height(block_height) {
+            Ok(Some(block)) => block,
+            Ok(None) => {
+                return zoka::network::block_request_response::BlockBodyResponse::NotFound {
+                    block_height,
+                    block_hash: None,
+                    reason: "canonical block not found".to_string(),
+                };
+            }
+            Err(err) => {
+                return zoka::network::block_request_response::BlockBodyResponse::Rejected {
+                    block_height,
+                    block_hash: None,
+                    reason: format!("canonical read failed: {err}"),
+                };
+            }
+        },
+    };
+
+    let encrypted_block = match serde_json::to_vec(&block) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return zoka::network::block_request_response::BlockBodyResponse::Rejected {
+                block_height,
+                block_hash: request.block_hash.clone(),
+                reason: format!("encode failed: {err}"),
+            };
+        }
+    };
+    let bodies = collect_private_tx_bodies_from_storage(storage, &block);
+    zoka::network::block_request_response::BlockBodyResponse::Found(
+        zoka::network::message::BlockResponseMessage {
+            block_height: block.header.block_height,
+            encrypted_block,
+            block_hash: block.header.hash,
+            difficulty_bits: None,
+            private_tx_bodies: bodies,
+            timestamp: now_secs(),
+        },
+    )
+}
+
+fn serve_pending_block_body_requests(
+    node: &mut Node,
+    chain_db_path: Option<&str>,
+) -> Result<Option<String>, String> {
+    let mut served = 0u64;
+    let mut failed = 0u64;
+    let mut last_height = 0u64;
+    while let Some(pending) = node.take_pending_block_body_request() {
+        let block_height = pending.request.block_height;
+        last_height = block_height;
+        let response = match chain_db_path {
+            Some(path) => match RocksDbStorage::new(path) {
+                Ok(storage) => block_body_response_from_storage(&storage, &pending.request),
+                Err(err) => zoka::network::block_request_response::BlockBodyResponse::Rejected {
+                    block_height,
+                    block_hash: pending.request.block_hash.clone(),
+                    reason: format!("storage open failed: {err}"),
+                },
+            },
+            None => zoka::network::block_request_response::BlockBodyResponse::Rejected {
+                block_height,
+                block_hash: pending.request.block_hash.clone(),
+                reason: "no chain DB configured".to_string(),
+            },
+        };
+        match node.respond_block_body_request(pending, response) {
+            Ok(()) => served = served.saturating_add(1),
+            Err(_) => failed = failed.saturating_add(1),
+        }
+    }
+
+    if served == 0 && failed == 0 {
+        Ok(None)
+    } else if failed == 0 {
+        Ok(Some(format!(
+            "Served {served} direct block body request(s), latest height {last_height}."
+        )))
+    } else {
+        Ok(Some(format!(
+            "Served {served} direct block body request(s), {failed} response failure(s), latest height {last_height}."
+        )))
+    }
+}
+
+fn private_tx_body_response_from_storage(
+    storage: &RocksDbStorage,
+    request: &zoka::network::private_tx_request_response::PrivateTxBodyRequest,
+) -> zoka::network::private_tx_request_response::PrivateTxBodyResponse {
+    let tx_hash = request.tx_hash.trim();
+    match storage.get_private_transaction_bytes(tx_hash) {
+        Ok(Some(body)) if !body.is_empty() => {
+            zoka::network::private_tx_request_response::PrivateTxBodyResponse::Body {
+                tx_hash: tx_hash.to_string(),
+                body,
+            }
+        }
+        Ok(Some(_)) => {
+            zoka::network::private_tx_request_response::PrivateTxBodyResponse::NotFound {
+                tx_hash: tx_hash.to_string(),
+                reason: "private tx body is empty".to_string(),
+            }
+        }
+        Ok(None) => zoka::network::private_tx_request_response::PrivateTxBodyResponse::NotFound {
+            tx_hash: tx_hash.to_string(),
+            reason: "private tx body not found".to_string(),
+        },
+        Err(_) => zoka::network::private_tx_request_response::PrivateTxBodyResponse::RateLimited {
+            tx_hash: tx_hash.to_string(),
+            retry_after_secs: 2,
+        },
+    }
+}
+
+fn serve_pending_private_tx_body_requests(
+    node: &mut Node,
+    chain_db_path: Option<&str>,
+) -> Result<Option<String>, String> {
+    let mut served = 0u64;
+    let mut failed = 0u64;
+    let mut last_hash = String::new();
+    while let Some(pending) = node.take_pending_private_tx_body_request() {
+        let tx_hash = pending.request.tx_hash.clone();
+        last_hash = tx_hash.clone();
+        let response = if let Some(body) = node.cached_private_tx_body(&tx_hash) {
+            zoka::network::private_tx_request_response::PrivateTxBodyResponse::Body {
+                tx_hash,
+                body,
+            }
+        } else {
+            match chain_db_path {
+                Some(path) => match RocksDbStorage::new(path) {
+                    Ok(storage) => private_tx_body_response_from_storage(&storage, &pending.request),
+                    Err(_) => {
+                        zoka::network::private_tx_request_response::PrivateTxBodyResponse::RateLimited {
+                            tx_hash,
+                            retry_after_secs: 2,
+                        }
+                    }
+                },
+                None => zoka::network::private_tx_request_response::PrivateTxBodyResponse::NotFound {
+                    tx_hash,
+                    reason: "no chain DB configured".to_string(),
+                },
+            }
+        };
+        match node.respond_private_tx_body_request(pending, response) {
+            Ok(()) => served = served.saturating_add(1),
+            Err(_) => failed = failed.saturating_add(1),
+        }
+    }
+
+    if served == 0 && failed == 0 {
+        Ok(None)
+    } else if failed == 0 {
+        Ok(Some(format!(
+            "Served {served} direct private tx body request(s), latest {}.",
+            truncate_dashboard_text(&last_hash, 16)
+        )))
+    } else {
+        Ok(Some(format!(
+            "Served {served} direct private tx body request(s), {failed} response failure(s), latest {}.",
+            truncate_dashboard_text(&last_hash, 16)
+        )))
+    }
+}
+
+async fn handle_fullnode_network_message(
     node: &mut Node,
     message: &zoka::network::message::ZokaMessage,
     chain_id: &str,
@@ -5729,12 +5992,116 @@ fn handle_fullnode_network_message(
 ) -> Option<String> {
     match message {
         zoka::network::message::ZokaMessage::BlockResponse(_) => handle_inbound_block_message(
+            node,
             message,
             chain_id,
             chain_db_path,
             peer_view,
             unsafe_rehearsal_difficulty_bits,
         ),
+        zoka::network::message::ZokaMessage::BlockAnnounce(announce) => {
+            handle_block_announce(node, announce, chain_db_path, peer_view)
+        }
+        zoka::network::message::ZokaMessage::PrivateTxAnnounce(announce) => {
+            let hash = announce.tx_hash.trim();
+            let Some(path) = chain_db_path else {
+                return Some(format!(
+                    "Private tx announce {} received but no chain DB is configured.",
+                    truncate_dashboard_text(hash, 16)
+                ));
+            };
+            let storage = match RocksDbStorage::new(path) {
+                Ok(storage) => storage,
+                Err(err) => {
+                    return Some(format!(
+                        "Private tx announce {} ignored: storage open failed ({err})",
+                        truncate_dashboard_text(hash, 16)
+                    ))
+                }
+            };
+            match storage.get_private_transaction_bytes(hash) {
+                Ok(Some(_)) => match storage.save_pending_private_transaction_hash(hash) {
+                    Ok(()) => Some(format!(
+                        "Private tx announce {} matched local body; marked pending for miner.",
+                        truncate_dashboard_text(hash, 16)
+                    )),
+                    Err(err) => Some(format!(
+                        "Private tx announce {} matched local body but pending-marker failed: {err}",
+                        truncate_dashboard_text(hash, 16)
+                    )),
+                },
+                Ok(None) => {
+                    drop(storage);
+                    match node
+                        .request_private_tx_body_with_retry(hash, 3, Duration::from_secs(4))
+                        .await
+                    {
+                        Ok(body) => {
+                            let tx: zoka::private_wallet::PrivateTransaction =
+                                match serde_json::from_slice(&body) {
+                                    Ok(tx) => tx,
+                                    Err(err) => {
+                                        return Some(format!(
+                                            "Fetched private tx {} but decode failed: {err}",
+                                            truncate_dashboard_text(hash, 16)
+                                        ))
+                                    }
+                                };
+                            if tx.tx_hash.trim() != hash {
+                                return Some(format!(
+                                    "Fetched private tx body hash mismatch: expected {}, got {}.",
+                                    truncate_dashboard_text(hash, 16),
+                                    truncate_dashboard_text(&tx.tx_hash, 16)
+                                ));
+                            }
+                            if let Err(err) = validate_private_tx_for_pending_pool(&tx) {
+                                return Some(format!(
+                                    "Fetched private tx {} but validation failed: {err}",
+                                    truncate_dashboard_text(hash, 16)
+                                ));
+                            }
+                            node.cache_private_tx_body(hash, body.clone());
+                            let storage = match RocksDbStorage::new(path) {
+                                Ok(storage) => storage,
+                                Err(err) => {
+                                    return Some(format!(
+                                        "Fetched private tx {} but storage reopen failed: {err}",
+                                        truncate_dashboard_text(hash, 16)
+                                    ))
+                                }
+                            };
+                            if let Err(err) = storage.save_private_transaction_bytes(hash, &body) {
+                                return Some(format!(
+                                    "Fetched private tx {} but persist failed: {err}",
+                                    truncate_dashboard_text(hash, 16)
+                                ));
+                            }
+                            if let Err(err) = storage.save_pending_private_transaction_hash(hash) {
+                                return Some(format!(
+                                    "Fetched private tx {} but pending-marker failed: {err}",
+                                    truncate_dashboard_text(hash, 16)
+                                ));
+                            }
+                            Some(format!(
+                                "Fetched private tx {} by direct request/response and marked pending.",
+                                truncate_dashboard_text(hash, 16)
+                            ))
+                        }
+                        Err(err) => {
+                            node.penalize_private_tx_announcers(hash);
+                            Some(format!(
+                                "Private tx announce {} received but direct body fetch failed: {err}",
+                                truncate_dashboard_text(hash, 16)
+                            ))
+                        }
+                    }
+                }
+                Err(err) => Some(format!(
+                    "Private tx announce {} ignored: body lookup failed ({err})",
+                    truncate_dashboard_text(hash, 16)
+                )),
+            }
+        }
         zoka::network::message::ZokaMessage::SyncState(sync) => {
             let local_height = chain_db_path
                 .and_then(|path| RocksDbStorage::new(path).ok())
@@ -5881,6 +6248,7 @@ fn handle_fullnode_network_message(
                     ))
                 }
             };
+            node.cache_private_tx_body(hash, body.clone());
             if let Err(err) = storage.save_private_transaction_bytes(hash, &body) {
                 return Some(format!(
                     "Failed to persist gossiped private tx {}: {err}",
@@ -5897,10 +6265,21 @@ fn handle_fullnode_network_message(
                     truncate_dashboard_text(hash, 16)
                 ));
             }
+            let announce = zoka::network::message::PrivateTxAnnounceMessage::from_private_tx(
+                message_tx,
+                Some(body.len() as u64),
+            );
+            let announce_status = match node.publish_message(
+                &zoka::network::message::ZokaMessage::PrivateTxAnnounce(announce),
+            ) {
+                Ok(()) => " availability announced",
+                Err(_) => " availability announce failed",
+            };
             let _ = chain_id; // chain_id retained for future per-chain dedupe
             Some(format!(
-                "Imported gossiped private tx {} into local pool (marked pending).",
-                truncate_dashboard_text(hash, 16)
+                "Imported gossiped private tx {} into local pool (marked pending;{}).",
+                truncate_dashboard_text(hash, 16),
+                announce_status
             ))
         }
         _ => None,
@@ -5940,6 +6319,47 @@ fn publish_local_sync_state(
         ))),
         Err(err) => Ok(Some(format!(
             "Skipped local sync-state publish at height {}: {}",
+            head.height, err
+        ))),
+    }
+}
+
+fn publish_chain_head_block_announce(
+    node: &mut Node,
+    chain_db_path: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(path) = chain_db_path else {
+        return Ok(None);
+    };
+    let storage = match RocksDbStorage::new(path) {
+        Ok(storage) => storage,
+        Err(err) => {
+            return Ok(Some(format!(
+                "Skipped block announce publish: storage open failed ({err})"
+            )));
+        }
+    };
+    let head = match zoka::state::chain::read_chain_head(&storage) {
+        Ok(Some(head)) => head,
+        Ok(None) => return Ok(None),
+        Err(err) => {
+            return Ok(Some(format!(
+                "Skipped block announce publish: read head failed ({err})"
+            )));
+        }
+    };
+    match node.publish_block_announce(
+        head.height,
+        head.hash.clone(),
+        head.cumulative_work.to_string(),
+        None,
+    ) {
+        Ok(()) => Ok(Some(format!(
+            "Published block announce at height {}.",
+            head.height
+        ))),
+        Err(err) => Ok(Some(format!(
+            "Skipped block announce at height {}: {}",
             head.height, err
         ))),
     }
@@ -6123,6 +6543,138 @@ fn post_recent_chain_blocks_to_rpcs(
     Ok(Some(event))
 }
 
+fn append_unique_peer_addrs(
+    target: &mut Vec<String>,
+    addrs: impl IntoIterator<Item = String>,
+) -> usize {
+    let mut known = target.iter().cloned().collect::<HashSet<_>>();
+    let mut added = 0usize;
+    for addr in addrs {
+        let addr = addr.trim().to_string();
+        if addr.is_empty() || !known.insert(addr.clone()) {
+            continue;
+        }
+        target.push(addr);
+        added += 1;
+    }
+    added
+}
+
+fn shuffled_peer_addrs(seed_addrs: &[String]) -> Vec<String> {
+    let mut shuffled = seed_addrs.to_vec();
+    shuffled.shuffle(&mut rand::thread_rng());
+    shuffled
+}
+
+fn reconnect_delay_with_jitter(
+    connected_peers: usize,
+    target_peers: usize,
+    failure_streak: u32,
+) -> Duration {
+    let base_secs = if connected_peers == 0 {
+        2u64
+    } else if connected_peers < target_peers {
+        5u64
+    } else {
+        30u64
+    };
+    let backoff_multiplier = 1u64 << failure_streak.min(4);
+    let backoff_secs = base_secs.saturating_mul(backoff_multiplier).min(60);
+    let jitter_ms = rand::thread_rng().gen_range(250..=2_500);
+    Duration::from_secs(backoff_secs) + Duration::from_millis(jitter_ms)
+}
+
+fn persist_observed_peerstore(
+    node: &Node,
+    peer_store: &mut zoka::network::peer_store::PeerStore,
+) -> Result<usize, String> {
+    let observed = node.observed_peer_records();
+    if observed.is_empty() {
+        return Ok(0);
+    }
+    let count = observed.len();
+    for record in observed {
+        peer_store.mark_identified(
+            &record.addr,
+            Some(&record.peer_id),
+            record.protocol_version.as_deref(),
+            &record.protocols,
+            "identify",
+        );
+    }
+    peer_store.save().map_err(|e| {
+        format!(
+            "failed to save peerstore {}: {e}",
+            peer_store.path().display()
+        )
+    })?;
+    Ok(count)
+}
+
+async fn publish_runtime_sync_status(
+    node: &Node,
+    storage: Option<&Arc<RocksDbStorage>>,
+    peer_view: &zoka::state::sync::PeerChainView,
+    min_peers: usize,
+    rpc_fallback_active: bool,
+    last_sync_source: Option<&str>,
+    last_sync_event: Option<&str>,
+    last_sync_error: Option<&str>,
+) {
+    let local_height = storage
+        .and_then(|storage| storage.get_chain_height().ok())
+        .unwrap_or(0);
+    let target_height = peer_view.perceived_max_height.max(local_height);
+    let connected_peers = node.connected_peer_count();
+    let mode = if peer_view.has_active_branch_backfill() {
+        "backfill"
+    } else if target_height > local_height {
+        "syncing"
+    } else if connected_peers < min_peers {
+        "isolated"
+    } else {
+        "caught_up"
+    };
+    zoka::api::global_network_runtime()
+        .set_sync_status(zoka::api::SyncRuntimeUpdate {
+            mode: mode.to_string(),
+            local_height,
+            target_height,
+            min_peers: min_peers as u64,
+            rpc_fallback_active,
+            last_sync_source: last_sync_source.map(str::to_string),
+            last_sync_event: last_sync_event.map(str::to_string),
+            last_sync_error: last_sync_error.map(str::to_string),
+        })
+        .await;
+}
+
+fn remember_sync_event(
+    source: &str,
+    event: &str,
+    last_sync_source: &mut Option<String>,
+    last_sync_event: &mut Option<String>,
+    last_sync_error: &mut Option<String>,
+    rpc_fallback_active: &mut bool,
+) {
+    *last_sync_source = Some(source.to_string());
+    *last_sync_event = Some(event.to_string());
+    *rpc_fallback_active = source == "rpc";
+
+    let lowered = event.to_ascii_lowercase();
+    if lowered.contains("failed")
+        || lowered.contains("error")
+        || lowered.contains("rejected")
+        || lowered.contains("unavailable")
+        || lowered.contains("timeout")
+        || lowered.contains("pending")
+    {
+        *last_sync_error = Some(event.to_string());
+    } else {
+        *last_sync_error = None;
+    }
+}
+
 fn sync_outcome_to_event(outcome: zoka::state::sync::SyncOutcome) -> String {
     match outcome {
         zoka::state::sync::SyncOutcome::Applied(head) => format!(
@@ -6184,13 +6736,12 @@ async fn run_sync_step(
             let local_height = storage
                 .get_chain_height()
                 .map_err(|err| format!("read chain height failed: {err}"))?;
-            if local_height == 0 {
-                zoka::state::sync::SyncRequest {
-                    height: 1,
-                    expected_hash: None,
-                }
-            } else {
-                return Ok(None);
+            // Speculatively probe for the next block when peers are connected but
+            // no gossip height announcement has arrived yet (e.g. RPC is down).
+            // If the peer doesn't have it we'll get a "pending" error and retry.
+            zoka::state::sync::SyncRequest {
+                height: local_height.saturating_add(1).max(1),
+                expected_hash: None,
             }
         }
         None => return Ok(None),
@@ -6220,6 +6771,13 @@ async fn run_sync_step(
                 } else {
                     ""
                 };
+                tracing::warn!(
+                    target: "zoka.sync",
+                    height = next_height,
+                    expected_hash = ?next_request.expected_hash,
+                    error = %err,
+                    "IBD block request pending"
+                );
                 return Ok(Some(format!(
                     "IBD request for block {next_height} pending: {err}.{reset_note}"
                 )));
@@ -6234,6 +6792,20 @@ async fn run_sync_step(
     };
     peer_view.record_sync_outcome(&outcome);
     peer_view.remember_block_response(&outcome, &response);
+    if matches!(
+        &outcome,
+        zoka::state::sync::SyncOutcome::BadPayload(_)
+            | zoka::state::sync::SyncOutcome::AnnouncedHashMismatch { .. }
+            | zoka::state::sync::SyncOutcome::Rejected(_)
+    ) {
+        tracing::warn!(
+            target: "zoka.sync",
+            height = next_height,
+            source = response_source,
+            outcome = ?outcome,
+            "IBD block apply rejected"
+        );
+    }
     Ok(Some(format!(
         "IBD {response_source} block {next_height}: {}",
         sync_outcome_to_event(outcome)
@@ -6323,15 +6895,28 @@ fn sample_rpc_heights(
     rpc_endpoints: &[String],
     timeout_secs: u64,
 ) -> (Vec<RpcHeightSample>, Vec<String>) {
+    // Query all endpoints in parallel so n failing endpoints take timeout_secs
+    // total rather than n * timeout_secs, avoiding Tokio thread starvation.
+    let handles: Vec<_> = rpc_endpoints
+        .iter()
+        .map(|rpc| {
+            let rpc = rpc.clone();
+            std::thread::spawn(move || match rpc_chain_height(&rpc, timeout_secs) {
+                Ok(height) => Ok(RpcHeightSample { rpc, height }),
+                Err(err) => Err(format!("{rpc}: {err}")),
+            })
+        })
+        .collect();
     let mut samples = Vec::new();
     let mut errors = Vec::new();
-    for rpc in rpc_endpoints {
-        match rpc_chain_height(rpc, timeout_secs) {
-            Ok(height) => samples.push(RpcHeightSample {
-                rpc: rpc.clone(),
-                height,
-            }),
-            Err(err) => errors.push(format!("{rpc}: {err}")),
+    for (i, handle) in handles.into_iter().enumerate() {
+        let rpc = &rpc_endpoints[i];
+        match handle
+            .join()
+            .unwrap_or_else(|_| Err(format!("{rpc}: sampling thread panicked")))
+        {
+            Ok(sample) => samples.push(sample),
+            Err(err) => errors.push(err),
         }
     }
     samples.sort_by(|left, right| {
@@ -6385,7 +6970,15 @@ fn run_rpc_sync_batch(
         .collect::<Vec<_>>();
     if candidates.is_empty() {
         return if reachable_rpc_count == 0 && last_error.is_some() && rpc_endpoints.len() > 0 {
-            Ok(last_error.map(|err| format!("RPC sync unavailable: {err}")))
+            if let Some(err) = last_error.as_deref() {
+                tracing::warn!(
+                    target: "zoka.sync",
+                    error = %err,
+                    "RPC sync unavailable"
+                );
+            }
+            // Return None so the P2P fallback runs; the error is already logged above.
+            Ok(None)
         } else {
             Ok(None)
         };
@@ -6519,6 +7112,13 @@ fn run_rpc_sync_batch(
                 last_error = Some(format!(
                     "RPC sync rejected block {height} from {rpc}: {last_event}"
                 ));
+                tracing::warn!(
+                    target: "zoka.sync",
+                    rpc = %rpc,
+                    height,
+                    event = %last_event,
+                    "RPC sync rejected block"
+                );
                 endpoint_rejected = true;
                 break;
             }
@@ -6534,6 +7134,15 @@ fn run_rpc_sync_batch(
 
         if applied > 0 || validated_side_branch > 0 {
             let new_height = storage.get_chain_height().unwrap_or(local_height);
+            tracing::info!(
+                target: "zoka.sync",
+                rpc = %rpc,
+                applied,
+                validated_side_branch,
+                local_height = new_height,
+                remote_height,
+                "RPC sync imported blocks"
+            );
             return Ok(Some(format!(
                 "RPC sync imported {applied} block(s), validated {validated_side_branch} fork block(s) from {rpc}: local height {new_height}/{remote_height}. {last_event}"
             )));
@@ -6828,16 +7437,6 @@ async fn apply_genesis_file_to_db(
     apply_genesis_to_db(&legacy_genesis, db_path, force).await
 }
 
-async fn open_state_manager(db_path: &str) -> Result<Arc<StateManager>, String> {
-    let storage = open_storage(db_path)?;
-    let manager = Arc::new(StateManager::new(storage));
-    manager
-        .load_from_storage()
-        .await
-        .map_err(|e| format!("failed to load state: {e}"))?;
-    Ok(manager)
-}
-
 fn open_storage(db_path: &str) -> Result<Arc<RocksDbStorage>, String> {
     Ok(Arc::new(
         RocksDbStorage::new(db_path).map_err(|e| format!("failed to open storage: {e}"))?,
@@ -7075,6 +7674,7 @@ async fn connect_and_warmup(
     dial_addr: &str,
     connect_timeout: Duration,
 ) -> Result<(), String> {
+    tracing::info!(target: "zoka.network", peer = %dial_addr, "seed dial started");
     node.connect_to_peer(dial_addr)
         .await
         .map_err(|e| format!("dial error: {e}"))?;
@@ -7085,6 +7685,7 @@ async fn connect_and_warmup(
     node.wait_for_min_connected_peers(1, connect_timeout)
         .await
         .map_err(|e| format!("peer warmup error: {e}"))?;
+    tracing::info!(target: "zoka.network", peer = %dial_addr, "seed dial succeeded");
     Ok(())
 }
 
@@ -7104,7 +7705,8 @@ async fn maintain_seed_connections(
     let initial_peers = node.connected_peer_count();
     let mut failures = Vec::new();
     let mut attempted = 0usize;
-    for seed in seed_addrs {
+    let shuffled_seed_addrs = shuffled_peer_addrs(seed_addrs);
+    for seed in &shuffled_seed_addrs {
         attempted += 1;
         let before = node.connected_peer_count();
         match node.connect_to_peer(seed).await {
@@ -7115,6 +7717,13 @@ async fn maintain_seed_connections(
                     .await
                 {
                     Ok(()) if node.connected_peer_count() >= target_peers => {
+                        tracing::info!(
+                            target: "zoka.network",
+                            peer = %seed,
+                            connected_peers = node.connected_peer_count(),
+                            target_peers,
+                            "seed reconnect target reached"
+                        );
                         return Some(format!(
                             "Seed peer target reached via {seed}: active peers {}/{}.",
                             node.connected_peer_count(),
@@ -7122,10 +7731,26 @@ async fn maintain_seed_connections(
                         ));
                     }
                     Ok(()) => {}
-                    Err(err) => failures.push(format!("{seed}: {err}")),
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "zoka.network",
+                            peer = %seed,
+                            error = %err,
+                            "seed reconnect warmup failed"
+                        );
+                        failures.push(format!("{seed}: {err}"));
+                    }
                 }
             }
-            Err(err) => failures.push(format!("{seed}: {err}")),
+            Err(err) => {
+                tracing::warn!(
+                    target: "zoka.network",
+                    peer = %seed,
+                    error = %err,
+                    "seed reconnect dial failed"
+                );
+                failures.push(format!("{seed}: {err}"));
+            }
         }
         if node.connected_peer_count() >= target_peers {
             return Some(format!(
@@ -7276,6 +7901,11 @@ fn cmd_node_wallet_info(args: &[String]) -> Result<(), String> {
 async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let network = NetworkProfile::from_args(args)?;
     let chain_id = network.chain_id().to_string();
+    zoka::api::global_startup_status().reset(
+        "starting",
+        Some(format!("starting {} fullnode", network.label())),
+    );
+    zoka::api::global_startup_status().set_chain_context(network.label(), chain_id.as_str());
     let wallet_selector = wallet_selector_value(args);
     let password = password_value(args)?;
     let mut manual_seed_peers = option_values(args, "--seed");
@@ -7456,35 +8086,19 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     if let Some(db) = db_path.as_ref() {
         if let Some(genesis_file) = genesis_path.as_ref() {
             if std::path::Path::new(genesis_file).exists() {
+                zoka::api::global_startup_status().set_phase(
+                    "applying_genesis",
+                    Some("checking genesis state".to_string()),
+                );
                 let digest = apply_genesis_file_to_db(genesis_file, db, false).await?;
                 startup_notes.push(format!("Genesis ready on {} (digest={}).", db, digest));
             }
         }
-        let manager = open_state_manager(db).await?;
+        zoka::api::global_startup_status()
+            .set_phase("opening_db", Some("opening RocksDB".to_string()));
+        let storage = open_storage(db)?;
+        let manager = Arc::new(StateManager::new(storage));
         chain_storage_outer = Some(manager.raw_storage());
-        let state = manager.get_state().await;
-        startup_notes.push(format!(
-            "State ready from {}: height={}, state_root={}, accounts={}",
-            db,
-            state.current_height,
-            state.current_state_root,
-            state.accounts.len()
-        ));
-        if let Some(path) = ready_file.as_deref() {
-            write_fullnode_ready_file(
-                path,
-                "state_ready",
-                serde_json::json!({
-                    "network": network.label(),
-                    "chain_id": chain_id.as_str(),
-                    "db": db_path,
-                    "wallet": wallet_name,
-                    "wallet_address": wallet_address,
-                    "height": state.current_height,
-                    "state_root": state.current_state_root,
-                }),
-            )?;
-        }
         let api_mempool = Arc::new(zoka::mempool::Mempool::new(10_000));
         let api_bind_addr = configured_api_bind_addr(args, network)?;
         let api_public_url = format!("http://{api_bind_addr}");
@@ -7504,6 +8118,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         let _ = &mut private_tx_recv;
         tokio::spawn({
             let api_broadcaster = api_broadcaster.clone();
+            let manager = Arc::clone(&manager);
             async move {
                 if let Err(e) = zoka::api::start_api_on_bind_with_broadcaster(
                     manager,
@@ -7518,6 +8133,43 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             }
         });
         startup_notes.push(format!("HTTP API listening on {api_public_url}"));
+        zoka::api::global_startup_status()
+            .set_phase("loading_state", Some("loading chain state".to_string()));
+        manager.load_from_storage_blocking().await.map_err(|e| {
+            zoka::api::global_startup_status()
+                .mark_failed(Some(format!("failed to load chain state: {e}")));
+            format!("failed to load state: {e}")
+        })?;
+        let state = manager.get_state().await;
+        startup_notes.push(format!(
+            "State ready from {}: height={}, state_root={}, accounts={}",
+            db,
+            state.current_height,
+            state.current_state_root,
+            state.accounts.len()
+        ));
+        zoka::api::global_startup_status().set_phase(
+            "state_ready",
+            Some(format!(
+                "chain state loaded at height {}",
+                state.current_height
+            )),
+        );
+        if let Some(path) = ready_file.as_deref() {
+            write_fullnode_ready_file(
+                path,
+                "state_ready",
+                serde_json::json!({
+                    "network": network.label(),
+                    "chain_id": chain_id.as_str(),
+                    "db": db_path,
+                    "wallet": wallet_name,
+                    "wallet_address": wallet_address,
+                    "height": state.current_height,
+                    "state_root": state.current_state_root,
+                }),
+            )?;
+        }
         // Bubble the receiver out of this scope so the main fullnode
         // loop further down can poll it alongside its own P2P events.
         // Stash into the outer-scope option below.
@@ -7526,9 +8178,12 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         return Err("--genesis requires --db in fullnode".to_string());
     }
 
-    let mut node = Node::new(0)
-        .await
-        .map_err(|e| format!("node init error: {e}"))?;
+    zoka::api::global_startup_status()
+        .set_phase("starting_p2p", Some("starting libp2p node".to_string()));
+    let mut node = Node::new(0).await.map_err(|e| {
+        zoka::api::global_startup_status().mark_failed(Some(format!("node init error: {e}")));
+        format!("node init error: {e}")
+    })?;
     if let Some(proxy) = tor_proxy.as_ref() {
         node.configure_tor_proxy(proxy.clone(), tor_only);
         startup_notes.push(if tor_only {
@@ -7537,15 +8192,27 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             format!("Tor SOCKS5 proxy configured at {proxy}.")
         });
     }
-    node.listen(&listen_addr)
-        .await
-        .map_err(|e| format!("listen error: {e}"))?;
+    node.listen(&listen_addr).await.map_err(|e| {
+        zoka::api::global_startup_status().mark_failed(Some(format!("listen error: {e}")));
+        format!("listen error: {e}")
+    })?;
     let announced = timeout(Duration::from_secs(10), node.wait_for_listen_addr())
         .await
-        .map_err(|_| "listen address timeout".to_string())?
-        .map_err(|e| format!("listen address error: {e}"))?;
+        .map_err(|_| {
+            zoka::api::global_startup_status()
+                .mark_failed(Some("listen address timeout".to_string()));
+            "listen address timeout".to_string()
+        })?
+        .map_err(|e| {
+            zoka::api::global_startup_status()
+                .mark_failed(Some(format!("listen address error: {e}")));
+            format!("listen address error: {e}")
+        })?;
     let announced = announced.to_string();
     startup_notes.push(format!("Fullnode listening on {}.", announced));
+    zoka::api::global_startup_status().mark_ready(Some(format!(
+        "state loaded and P2P listening on {announced}"
+    )));
     if let Some(path) = ready_file.as_deref() {
         let peer_id = node.peer_id().to_string();
         write_fullnode_ready_file(
@@ -7570,7 +8237,37 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut seed_peer_display = None::<String>;
     let mut reconnect_seed_peers = manual_seed_peers.clone();
     let mut rpc_sync_endpoints = Vec::<String>::new();
+    let peer_store_path = zoka::network::peer_store::default_peer_store_path();
+    let mut peer_store =
+        match zoka::network::peer_store::PeerStore::load_or_default(peer_store_path.clone()) {
+            Ok(store) => {
+                if store.is_empty() {
+                    startup_notes.push(format!(
+                        "PeerStore initialized at {}.",
+                        peer_store_path.display()
+                    ));
+                } else {
+                    startup_notes.push(format!(
+                        "PeerStore loaded from {} with {} peer(s).",
+                        peer_store_path.display(),
+                        store.len()
+                    ));
+                }
+                store
+            }
+            Err(err) => {
+                startup_notes.push(format!(
+                    "PeerStore load failed at {}: {}. Starting with empty peerstore.",
+                    peer_store_path.display(),
+                    err
+                ));
+                zoka::network::peer_store::PeerStore::empty(peer_store_path.clone())
+            }
+        };
     if !manual_seed_peers.is_empty() {
+        for seed in &manual_seed_peers {
+            peer_store.upsert_addr(seed, "manual_seed");
+        }
         if use_network_config {
             let config_path = network_config_arg
                 .as_deref()
@@ -7609,9 +8306,18 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         let mut seed_failures = Vec::new();
         for seed in &manual_seed_peers {
             match connect_and_warmup(&mut node, seed, initial_seed_connect_timeout).await {
-                Ok(()) => connected_seeds.push(seed.clone()),
-                Err(err) => seed_failures.push(format!("{seed}: {err}")),
+                Ok(()) => {
+                    peer_store.mark_connected(seed, None, "manual_seed");
+                    connected_seeds.push(seed.clone());
+                }
+                Err(err) => {
+                    peer_store.mark_failed(seed);
+                    seed_failures.push(format!("{seed}: {err}"));
+                }
             }
+        }
+        if let Err(err) = peer_store.save() {
+            startup_notes.push(format!("PeerStore save failed: {err}."));
         }
         if connected_seeds.is_empty() {
             if allow_isolated_start {
@@ -7651,6 +8357,9 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         if config_path.exists() {
             let network_config = load_network_config_for(&config_path, network)?;
             let seed_candidates = network_config.active_seed_candidates(allow_clearnet_seeds);
+            for seed in &seed_candidates {
+                peer_store.upsert_addr(&seed.address, "manifest_seed");
+            }
             rpc_sync_endpoints = network_config
                 .public_rpc
                 .iter()
@@ -7687,6 +8396,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             }
             match connect_first_seed_candidate(&mut node, &seed_candidates).await {
                 Ok(Some(seed)) => {
+                    peer_store.mark_connected(&seed.address, None, "manifest_seed");
                     startup_notes.push(format!(
                         "Connected to configured seed {} via {} ({}).",
                         seed.label, seed.transport, seed.address
@@ -7718,6 +8428,9 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 }
                 Err(err) => return Err(err),
             }
+            if let Err(err) = peer_store.save() {
+                startup_notes.push(format!("PeerStore save failed: {err}."));
+            }
         } else if network_config_arg.is_some() {
             return Err(format!(
                 "{} network config file not found: {}",
@@ -7735,15 +8448,32 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         startup_notes
             .push("No seed peer configured; running standalone until peers connect.".to_string());
     }
+    let peerstore_reconnects = peer_store.dial_addrs(32);
+    let peerstore_added = append_unique_peer_addrs(&mut reconnect_seed_peers, peerstore_reconnects);
+    if peerstore_added > 0 {
+        startup_notes.push(format!(
+            "PeerStore added {peerstore_added} reconnect candidate(s)."
+        ));
+    }
+    let kademlia_seed_addrs = node.add_kademlia_peer_addrs(&reconnect_seed_peers);
+    if kademlia_seed_addrs > 0 {
+        match node.bootstrap_kademlia() {
+            Ok(_) => startup_notes.push(format!(
+                "Kademlia bootstrap started with {kademlia_seed_addrs} known peer address(es)."
+            )),
+            Err(err) => startup_notes.push(format!(
+                "Kademlia bootstrap pending with {kademlia_seed_addrs} known peer address(es): {err}."
+            )),
+        }
+    }
 
-    // Safety net: regardless of CLI flags, every node should still be able to
-    // pull pending private txs from the network's public RPCs so a tx
-    // submitted to one droplet doesn't get stranded forever because the
-    // miner that wins the next block happened to start without
-    // --network-config. The binary embeds the manifest at compile time
-    // (EMBEDDED_MAINNET_NETWORK_CONFIG / EMBEDDED_TESTNET_NETWORK_CONFIG),
-    // so this requires no network config file on disk.
-    if rpc_sync_endpoints.is_empty() {
+    // Safety net: follower nodes started with --no-network-config and a
+    // --seed peer still need RPC endpoints to do bulk IBD, so fall back to
+    // the embedded manifest. Seed nodes (no --seed flag) are excluded: they
+    // are the canonical source and would otherwise query their own RPC,
+    // blocking the single Tokio worker thread on a self-deadlock for 3s
+    // every sync poll and starving the API server.
+    if rpc_sync_endpoints.is_empty() && !manual_seed_peers.is_empty() {
         if let Ok(embedded) =
             parse_network_config_for(embedded_network_config_for(network), network)
         {
@@ -7761,10 +8491,27 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut session_mined_rewards = 0u64;
     let mut last_event = startup_notes.join(" ");
     let mut peer_chain_view = zoka::state::sync::PeerChainView::default();
+    let mut last_sync_source: Option<String> = None;
+    let mut last_sync_event: Option<String> = None;
+    let mut last_sync_error: Option<String> = None;
+    let mut rpc_fallback_active = false;
+
+    publish_runtime_sync_status(
+        &node,
+        chain_storage_outer.as_ref(),
+        &peer_chain_view,
+        min_mine_peers,
+        rpc_fallback_active,
+        last_sync_source.as_deref(),
+        last_sync_event.as_deref(),
+        last_sync_error.as_deref(),
+    )
+    .await;
 
     let warmup_deadline = tokio::time::Instant::now() + Duration::from_secs(sync_warmup_secs);
     let mut next_warmup_ibd_at = tokio::time::Instant::now();
     let mut next_warmup_seed_reconnect_at = tokio::time::Instant::now();
+    let mut warmup_seed_reconnect_failures = 0u32;
     while tokio::time::Instant::now() < warmup_deadline {
         let mut now = tokio::time::Instant::now();
         if now >= next_warmup_seed_reconnect_at {
@@ -7774,7 +8521,17 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             {
                 last_event = reconnect_event;
             }
-            next_warmup_seed_reconnect_at = tokio::time::Instant::now() + Duration::from_secs(2);
+            if node.connected_peer_count() >= target_seed_peers {
+                warmup_seed_reconnect_failures = 0;
+            } else {
+                warmup_seed_reconnect_failures = warmup_seed_reconnect_failures.saturating_add(1);
+            }
+            next_warmup_seed_reconnect_at = tokio::time::Instant::now()
+                + reconnect_delay_with_jitter(
+                    node.connected_peer_count(),
+                    target_seed_peers,
+                    warmup_seed_reconnect_failures,
+                );
             now = tokio::time::Instant::now();
         }
         let remaining = if warmup_deadline > now {
@@ -7817,7 +8574,9 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     db_path.as_deref(),
                     &mut peer_chain_view,
                     unsafe_rehearsal_difficulty_bits,
-                ) {
+                )
+                .await
+                {
                     verdict
                 } else if verbose {
                     format!(
@@ -7842,6 +8601,14 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     )? {
                         next_warmup_ibd_at =
                             tokio::time::Instant::now() + ibd_retry_delay(&sync_event);
+                        remember_sync_event(
+                            "rpc",
+                            &sync_event,
+                            &mut last_sync_source,
+                            &mut last_sync_event,
+                            &mut last_sync_error,
+                            &mut rpc_fallback_active,
+                        );
                         last_event = sync_event;
                     } else if let Some(sync_event) = run_sync_step(
                         &mut node,
@@ -7854,13 +8621,31 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     {
                         next_warmup_ibd_at =
                             tokio::time::Instant::now() + ibd_retry_delay(&sync_event);
+                        remember_sync_event(
+                            "p2p",
+                            &sync_event,
+                            &mut last_sync_source,
+                            &mut last_sync_event,
+                            &mut last_sync_error,
+                            &mut rpc_fallback_active,
+                        );
                         last_event = sync_event;
                     } else {
                         next_warmup_ibd_at = tokio::time::Instant::now() + Duration::from_secs(1);
                     }
                 }
             }
-            Ok(Err(err)) => last_event = format!("receive error: {err}"),
+            Ok(Err(err)) => {
+                last_event = format!("receive error: {err}");
+                remember_sync_event(
+                    "p2p",
+                    &last_event,
+                    &mut last_sync_source,
+                    &mut last_sync_event,
+                    &mut last_sync_error,
+                    &mut rpc_fallback_active,
+                );
+            }
             Err(_) => {
                 node.pump_for(Duration::from_millis(100))
                     .await
@@ -7876,6 +8661,14 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     )? {
                         next_warmup_ibd_at =
                             tokio::time::Instant::now() + ibd_retry_delay(&sync_event);
+                        remember_sync_event(
+                            "rpc",
+                            &sync_event,
+                            &mut last_sync_source,
+                            &mut last_sync_event,
+                            &mut last_sync_error,
+                            &mut rpc_fallback_active,
+                        );
                         last_event = sync_event;
                     } else if let Some(sync_event) = run_sync_step(
                         &mut node,
@@ -7888,6 +8681,14 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     {
                         next_warmup_ibd_at =
                             tokio::time::Instant::now() + ibd_retry_delay(&sync_event);
+                        remember_sync_event(
+                            "p2p",
+                            &sync_event,
+                            &mut last_sync_source,
+                            &mut last_sync_event,
+                            &mut last_sync_error,
+                            &mut rpc_fallback_active,
+                        );
                         last_event = sync_event;
                     } else {
                         next_warmup_ibd_at = tokio::time::Instant::now() + Duration::from_secs(1);
@@ -7895,6 +8696,17 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 }
             }
         }
+        publish_runtime_sync_status(
+            &node,
+            chain_storage_outer.as_ref(),
+            &peer_chain_view,
+            min_mine_peers,
+            rpc_fallback_active,
+            last_sync_source.as_deref(),
+            last_sync_event.as_deref(),
+            last_sync_error.as_deref(),
+        )
+        .await;
     }
     last_event = if auto_mine {
         if mine_interval_secs == 0 {
@@ -7923,8 +8735,10 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut next_mine_at = tokio::time::Instant::now();
     let mut next_sync_state_at = tokio::time::Instant::now();
     let mut next_seed_reconnect_at = tokio::time::Instant::now();
+    let mut seed_reconnect_failures = 0u32;
     let mut next_ibd_at = tokio::time::Instant::now();
     let mut next_miner_heartbeat_at = tokio::time::Instant::now();
+    let mut next_peer_store_save_at = tokio::time::Instant::now() + Duration::from_secs(15);
     // Periodic RPC pull of pending private txs from public peers. This is the
     // NAT-friendly counterpart to libp2p gossip: a miner that can only open
     // outbound HTTP pulls pending private txs into its own pool so it can mine
@@ -7977,6 +8791,9 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             .and_then(|storage| storage.get_chain_height().ok())
             .unwrap_or(runtime_mining_state.chain_height);
         zoka::api::global_network_runtime().set_connected_peers(node.connected_peer_count());
+        zoka::api::global_network_runtime().set_gossip_stats(node.gossip_stats());
+        zoka::api::global_network_runtime()
+            .set_block_request_response_stats(node.block_request_response_stats());
         zoka::api::global_network_runtime()
             .set_local_miner(
                 node.peer_id().to_string(),
@@ -7989,6 +8806,60 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 },
             )
             .await;
+
+        publish_runtime_sync_status(
+            &node,
+            chain_storage_outer.as_ref(),
+            &peer_chain_view,
+            min_mine_peers,
+            rpc_fallback_active,
+            last_sync_source.as_deref(),
+            last_sync_event.as_deref(),
+            last_sync_error.as_deref(),
+        )
+        .await;
+
+        if let Some(direct_event) =
+            serve_pending_block_body_requests(&mut node, db_path.as_deref())?
+        {
+            last_event = direct_event;
+        }
+        if let Some(private_tx_event) =
+            serve_pending_private_tx_body_requests(&mut node, db_path.as_deref())?
+        {
+            last_event = private_tx_event;
+        }
+
+        if tokio::time::Instant::now() >= next_peer_store_save_at {
+            match persist_observed_peerstore(&node, &mut peer_store) {
+                Ok(observed) if observed > 0 => {
+                    let added = append_unique_peer_addrs(
+                        &mut reconnect_seed_peers,
+                        peer_store.dial_addrs(32),
+                    );
+                    if added > 0 {
+                        let kad_added = node.add_kademlia_peer_addrs(&reconnect_seed_peers);
+                        if kad_added > 0 {
+                            if let Err(err) = node.bootstrap_kademlia() {
+                                tracing::warn!(
+                                    target: "zoka.network",
+                                    error = %err,
+                                    "Kademlia bootstrap refresh pending"
+                                );
+                            }
+                        }
+                        last_event = format!(
+                            "PeerStore persisted {observed} observed address(es), {added} new reconnect candidate(s), {kad_added} Kademlia address(es)."
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    last_event = err;
+                }
+            }
+            next_peer_store_save_at = tokio::time::Instant::now() + Duration::from_secs(60);
+        }
 
         if runtime_mining_enabled && tokio::time::Instant::now() >= next_miner_heartbeat_at {
             let (launcher, launcher_version) = miner_launcher_metadata();
@@ -8047,6 +8918,14 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 64,
             )? {
                 next_ibd_at = tokio::time::Instant::now() + ibd_retry_delay(&sync_event);
+                remember_sync_event(
+                    "rpc",
+                    &sync_event,
+                    &mut last_sync_source,
+                    &mut last_sync_event,
+                    &mut last_sync_error,
+                    &mut rpc_fallback_active,
+                );
                 last_event = sync_event;
             } else if let Some(sync_event) = run_sync_step(
                 &mut node,
@@ -8058,6 +8937,14 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             .await?
             {
                 next_ibd_at = tokio::time::Instant::now() + ibd_retry_delay(&sync_event);
+                remember_sync_event(
+                    "p2p",
+                    &sync_event,
+                    &mut last_sync_source,
+                    &mut last_sync_event,
+                    &mut last_sync_error,
+                    &mut rpc_fallback_active,
+                );
                 last_event = sync_event;
             } else {
                 next_ibd_at = tokio::time::Instant::now() + Duration::from_secs(1);
@@ -8071,13 +8958,17 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             {
                 last_event = reconnect_event;
             }
-            let reconnect_delay_secs = if node.connected_peer_count() == 0 {
-                2
+            if node.connected_peer_count() >= target_seed_peers {
+                seed_reconnect_failures = 0;
             } else {
-                5
-            };
-            next_seed_reconnect_at =
-                tokio::time::Instant::now() + Duration::from_secs(reconnect_delay_secs);
+                seed_reconnect_failures = seed_reconnect_failures.saturating_add(1);
+            }
+            next_seed_reconnect_at = tokio::time::Instant::now()
+                + reconnect_delay_with_jitter(
+                    node.connected_peer_count(),
+                    target_seed_peers,
+                    seed_reconnect_failures,
+                );
         }
 
         if tokio::time::Instant::now() >= next_sync_state_at {
@@ -8085,6 +8976,11 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             // they need to catch up — even while this node is actively mining.
             if let Some(sync_event) = publish_local_sync_state(&mut node, db_path.as_deref())? {
                 last_event = sync_event;
+            }
+            if let Some(announce_event) =
+                publish_chain_head_block_announce(&mut node, db_path.as_deref())?
+            {
+                last_event = announce_event;
             }
             // Block rebroadcast is skipped during mining to avoid flooding
             // the network with redundant payloads the miner just produced.
@@ -8276,11 +9172,16 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             };
             if rpc_submit_failures > 0 {
                 last_event = format!(
-                    "{last_event} RPC autopush had {rpc_submit_failures} endpoint failure(s); retry loop will keep rebroadcasting recent blocks."
+                    "{last_event} RPC autopush had {rpc_submit_failures} endpoint failure(s); announce/request sync will keep peers aware of the new head."
                 );
             }
             if let Some(sync_event) = publish_local_sync_state(&mut node, db_path.as_deref())? {
                 last_event = format!("{last_event} {sync_event}");
+            }
+            if let Some(announce_event) =
+                publish_chain_head_block_announce(&mut node, db_path.as_deref())?
+            {
+                last_event = format!("{last_event} {announce_event}");
             }
             if let Some(rebroadcast_event) = publish_recent_chain_blocks(
                 &mut node,
@@ -8483,16 +9384,20 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         if let Some(rx) = private_tx_recv_outer.as_mut() {
             while let Ok(broadcast_tx) = rx.try_recv() {
                 let hash_short: String = broadcast_tx.tx_hash.chars().take(16).collect();
+                let broadcast_body = serde_json::to_vec(&broadcast_tx).ok();
+                if let Some(bytes) = broadcast_body.as_ref() {
+                    node.cache_private_tx_body(&broadcast_tx.tx_hash, bytes.clone());
+                }
                 // Write to the sidecar so the local mining loop, which
                 // cannot open the DB while StateManager holds the write
                 // lock, picks up the TX on its next block attempt.
                 if let Some(db) = db_path.as_deref() {
-                    if let Ok(bytes) = serde_json::to_vec(&broadcast_tx) {
+                    if let Some(bytes) = broadcast_body.as_ref() {
                         let sidecar = private_tx_sidecar_dir(db);
                         let _ = std::fs::create_dir_all(&sidecar);
                         let _ = std::fs::write(
                             sidecar.join(format!("{}.privtx", broadcast_tx.tx_hash)),
-                            &bytes,
+                            bytes,
                         );
                     }
                 }
@@ -8500,6 +9405,18 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     serde_json::from_value::<zoka::network::message::PrivateTransactionMessage>(v)
                 }) {
                     Ok(msg) => {
+                        let announce =
+                            zoka::network::message::PrivateTxAnnounceMessage::from_private_tx(
+                                &msg,
+                                broadcast_body.as_ref().map(|bytes| bytes.len() as u64),
+                            );
+                        if let Err(e) = node.publish_message(
+                            &zoka::network::message::ZokaMessage::PrivateTxAnnounce(announce),
+                        ) {
+                            mining_log(&format!(
+                                "p2p announce private tx {hash_short}...: publish failed: {e}"
+                            ));
+                        }
                         if let Err(e) = node.publish_message(
                             &zoka::network::message::ZokaMessage::PrivateTransaction(msg),
                         ) {
@@ -8526,8 +9443,20 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     db_path.as_deref(),
                     &mut peer_chain_view,
                     unsafe_rehearsal_difficulty_bits,
-                ) {
-                    Some(verdict) => verdict,
+                )
+                .await
+                {
+                    Some(verdict) => {
+                        remember_sync_event(
+                            "p2p",
+                            &verdict,
+                            &mut last_sync_source,
+                            &mut last_sync_event,
+                            &mut last_sync_error,
+                            &mut rpc_fallback_active,
+                        );
+                        verdict
+                    }
                     None => {
                         if verbose {
                             format!(
@@ -8544,13 +9473,34 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     }
                 };
             }
-            Ok(Err(err)) => last_event = format!("receive error: {err}"),
+            Ok(Err(err)) => {
+                last_event = format!("receive error: {err}");
+                remember_sync_event(
+                    "p2p",
+                    &last_event,
+                    &mut last_sync_source,
+                    &mut last_sync_event,
+                    &mut last_sync_error,
+                    &mut rpc_fallback_active,
+                );
+            }
             Err(_) => {
                 node.pump_for(Duration::from_millis(100))
                     .await
                     .map_err(|e| format!("pump error: {e}"))?;
             }
         }
+        publish_runtime_sync_status(
+            &node,
+            chain_storage_outer.as_ref(),
+            &peer_chain_view,
+            min_mine_peers,
+            rpc_fallback_active,
+            last_sync_source.as_deref(),
+            last_sync_event.as_deref(),
+            last_sync_error.as_deref(),
+        )
+        .await;
     }
 
     let next_mine_in = if auto_mine {
@@ -13011,6 +13961,7 @@ fn cmd_genesis_verify(args: &[String]) -> Result<(), String> {
 
 #[tokio::main]
 async fn main() {
+    let _ = tracing_subscriber::fmt::try_init();
     setup_zoka_home();
     if let Err(err) = run().await {
         eprintln!("{err}");

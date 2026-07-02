@@ -6,10 +6,12 @@
 //! - Protocolo de mensajes privado
 //! - GestiÃ³n de conexiones e identidad
 
-pub mod discovery;
+pub mod block_request_response;
 pub mod handler;
 pub mod message;
 pub mod p2p;
+pub mod peer_store;
+pub mod private_tx_request_response;
 
 #[allow(unused_imports)]
 pub use handler::MessageHandler;

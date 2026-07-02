@@ -234,44 +234,30 @@ impl StateManager {
         Arc::clone(&self.storage)
     }
 
-    /// Load state from storage on node startup
-    pub async fn load_from_storage(&self) -> Result<(), StateError> {
-        let mut state = self.state.write().await;
+    fn load_state_snapshot_from_storage(storage: &RocksDbStorage) -> Result<State, StateError> {
+        let mut state = State::new();
 
-        // Load chain height
-        state.current_height = self
-            .storage
+        state.current_height = storage
             .get_chain_height()
             .map_err(|e| StateError::StorageError(e.to_string()))?;
-
-        // Load last block hash
-        state.current_hash = self
-            .storage
+        state.current_hash = storage
             .get_last_block_hash()
             .map_err(|e| StateError::StorageError(e.to_string()))?;
-
-        // Load latest state root
-        state.current_state_root = self
-            .storage
+        state.current_state_root = storage
             .get_state_root()
             .map_err(|e| StateError::StorageError(e.to_string()))?;
 
-        // Load all persisted account states.
-        state.accounts.clear();
-        let persisted_accounts = self
-            .storage
+        let persisted_accounts = storage
             .iterate_account_states()
             .map_err(|e| StateError::StorageError(e.to_string()))?;
         for account in persisted_accounts {
             state.accounts.insert(account.address.clone(), account);
         }
 
-        state.private_commitments = self
-            .storage
+        state.private_commitments = storage
             .get_private_commitments()
             .map_err(|e| StateError::StorageError(e.to_string()))?;
-        state.private_commitment_root = self
-            .storage
+        state.private_commitment_root = storage
             .get_private_commitment_root()
             .map_err(|e| StateError::StorageError(e.to_string()))?;
 
@@ -282,12 +268,32 @@ impl StateManager {
             state.private_commitment_root = recomputed_private_root;
         }
 
-        // Recompute combined state root from loaded account + private commitment sets.
         let recomputed_root = compute_state_root_for_state(&state);
         if state.current_state_root == "0" || state.current_state_root != recomputed_root {
             state.current_state_root = recomputed_root;
         }
 
+        Ok(state)
+    }
+
+    /// Load state from storage on node startup.
+    pub async fn load_from_storage(&self) -> Result<(), StateError> {
+        let loaded = Self::load_state_snapshot_from_storage(&self.storage)?;
+        let mut state = self.state.write().await;
+        *state = loaded;
+        Ok(())
+    }
+
+    /// Load state from storage without tying RocksDB scans to a Tokio worker.
+    pub async fn load_from_storage_blocking(&self) -> Result<(), StateError> {
+        let storage = Arc::clone(&self.storage);
+        let loaded =
+            tokio::task::spawn_blocking(move || Self::load_state_snapshot_from_storage(&storage))
+                .await
+                .map_err(|e| StateError::StorageError(format!("state load task failed: {e}")))??;
+
+        let mut state = self.state.write().await;
+        *state = loaded;
         Ok(())
     }
 

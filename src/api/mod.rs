@@ -1,6 +1,7 @@
 // API module: REST endpoints for node interaction
 use crate::cli::{CliConfig, MultiProfileConfig};
 use crate::consensus::pbft::PbftConsensus;
+use crate::health::HealthChecker;
 use crate::mempool::Mempool;
 use crate::private_wallet::{
     payment_address_from_scan_key, scan_private_transaction_with_view_key,
@@ -22,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
@@ -362,6 +363,179 @@ pub struct NetworkRuntimeSnapshot {
     pub legacy_miners_online: u64,
     pub outdated_miners_online: u64,
     pub minimum_client_version: String,
+    pub gossip_rx_total: u64,
+    pub gossip_rx_block_response: u64,
+    pub gossip_publish_ok: u64,
+    pub gossip_publish_err: u64,
+    pub gossip_last_rx_block_at: u64,
+    pub direct_block_requests_outbound_sent: u64,
+    pub direct_block_requests_outbound_responses: u64,
+    pub direct_block_requests_outbound_failures: u64,
+    pub direct_block_requests_invalid_responses: u64,
+    pub direct_block_requests_avg_latency_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncStatusSnapshot {
+    pub status: String,
+    pub mode: String,
+    pub ready_to_mine: bool,
+    pub local_height: u64,
+    pub target_height: u64,
+    pub lag: u64,
+    pub connected_peers: u64,
+    pub min_peers: u64,
+    pub startup_ready: bool,
+    pub startup_phase: String,
+    pub rpc_fallback_active: bool,
+    pub last_sync_source: Option<String>,
+    pub last_sync_event: Option<String>,
+    pub last_sync_error: Option<String>,
+    pub last_block_at: u64,
+    pub last_updated: u64,
+    pub gossip_rx_block_response: u64,
+    pub gossip_publish_err: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncRuntimeUpdate {
+    pub mode: String,
+    pub local_height: u64,
+    pub target_height: u64,
+    pub min_peers: u64,
+    pub rpc_fallback_active: bool,
+    pub last_sync_source: Option<String>,
+    pub last_sync_event: Option<String>,
+    pub last_sync_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartupStatusSnapshot {
+    pub status: String,
+    pub ready: bool,
+    pub phase: String,
+    pub detail: Option<String>,
+    pub network: Option<String>,
+    pub chain_id: Option<String>,
+    pub started_at: u64,
+    pub updated_at: u64,
+    pub version: String,
+}
+
+pub struct StartupStatusState {
+    ready: AtomicU64,
+    started_at: AtomicU64,
+    updated_at: AtomicU64,
+    phase: StdRwLock<String>,
+    detail: StdRwLock<Option<String>>,
+    network: StdRwLock<Option<String>>,
+    chain_id: StdRwLock<Option<String>>,
+}
+
+impl Default for StartupStatusState {
+    fn default() -> Self {
+        let now = ApiRateLimiter::now_secs();
+        Self {
+            ready: AtomicU64::new(0),
+            started_at: AtomicU64::new(now),
+            updated_at: AtomicU64::new(now),
+            phase: StdRwLock::new("starting".to_string()),
+            detail: StdRwLock::new(None),
+            network: StdRwLock::new(None),
+            chain_id: StdRwLock::new(None),
+        }
+    }
+}
+
+impl StartupStatusState {
+    pub fn reset(&self, phase: impl Into<String>, detail: Option<String>) {
+        let now = ApiRateLimiter::now_secs();
+        self.ready.store(0, Ordering::Relaxed);
+        self.started_at.store(now, Ordering::Relaxed);
+        self.set_phase_at(phase, detail, now);
+    }
+
+    pub fn set_phase(&self, phase: impl Into<String>, detail: Option<String>) {
+        self.set_phase_at(phase, detail, ApiRateLimiter::now_secs());
+    }
+
+    pub fn set_chain_context(&self, network: impl Into<String>, chain_id: impl Into<String>) {
+        if let Ok(mut current_network) = self.network.write() {
+            *current_network = Some(network.into());
+        }
+        if let Ok(mut current_chain_id) = self.chain_id.write() {
+            *current_chain_id = Some(chain_id.into());
+        }
+        self.updated_at
+            .store(ApiRateLimiter::now_secs(), Ordering::Relaxed);
+    }
+
+    pub fn mark_ready(&self, detail: Option<String>) {
+        self.ready.store(1, Ordering::Relaxed);
+        self.set_phase("ready", detail);
+    }
+
+    pub fn mark_failed(&self, detail: Option<String>) {
+        self.ready.store(0, Ordering::Relaxed);
+        self.set_phase("failed", detail);
+    }
+
+    fn set_phase_at(&self, phase: impl Into<String>, detail: Option<String>, now: u64) {
+        if let Ok(mut current_phase) = self.phase.write() {
+            *current_phase = phase.into();
+        }
+        if let Ok(mut current_detail) = self.detail.write() {
+            *current_detail = detail;
+        }
+        self.updated_at.store(now, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> StartupStatusSnapshot {
+        let ready = self.ready.load(Ordering::Relaxed) == 1;
+        let phase = self
+            .phase
+            .read()
+            .map(|phase| phase.clone())
+            .unwrap_or_else(|_| "unknown".to_string());
+        let detail = self
+            .detail
+            .read()
+            .map(|detail| detail.clone())
+            .unwrap_or(None);
+        let network = self
+            .network
+            .read()
+            .map(|network| network.clone())
+            .unwrap_or(None);
+        let chain_id = self
+            .chain_id
+            .read()
+            .map(|chain_id| chain_id.clone())
+            .unwrap_or(None);
+        let status = if ready {
+            "healthy"
+        } else if phase == "failed" {
+            "failed"
+        } else {
+            "starting"
+        };
+        StartupStatusSnapshot {
+            status: status.to_string(),
+            ready,
+            phase,
+            detail,
+            network,
+            chain_id,
+            started_at: self.started_at.load(Ordering::Relaxed),
+            updated_at: self.updated_at.load(Ordering::Relaxed),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+}
+
+pub fn global_startup_status() -> &'static StartupStatusState {
+    static STARTUP: OnceLock<StartupStatusState> = OnceLock::new();
+    STARTUP.get_or_init(StartupStatusState::default)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -414,7 +588,26 @@ pub struct NetworkRuntimeState {
     local_mining: AtomicU64,
     local_hashrate_hps: AtomicU64,
     local_chain_height: AtomicU64,
+    sync_target_height: AtomicU64,
+    sync_min_peers: AtomicU64,
+    sync_rpc_fallback_active: AtomicU64,
+    sync_last_updated: AtomicU64,
+    gossip_rx_total: AtomicU64,
+    gossip_rx_block_response: AtomicU64,
+    gossip_publish_ok: AtomicU64,
+    gossip_publish_err: AtomicU64,
+    gossip_last_rx_block_at: AtomicU64,
+    direct_block_requests_outbound_sent: AtomicU64,
+    direct_block_requests_outbound_responses: AtomicU64,
+    direct_block_requests_outbound_failures: AtomicU64,
+    direct_block_requests_invalid_responses: AtomicU64,
+    direct_block_requests_latency_samples: AtomicU64,
+    direct_block_requests_latency_total_ms: AtomicU64,
     local_peer_id: RwLock<Option<String>>,
+    sync_mode: RwLock<String>,
+    sync_last_source: RwLock<Option<String>>,
+    sync_last_event: RwLock<Option<String>>,
+    sync_last_error: RwLock<Option<String>>,
     miner_heartbeats: RwLock<HashMap<String, MinerHeartbeatRecord>>,
 }
 
@@ -468,6 +661,113 @@ fn legacy_peer_id_for_heartbeat(heartbeat: &MinerHeartbeatRequest) -> String {
 impl NetworkRuntimeState {
     pub fn set_connected_peers(&self, peers: usize) {
         self.connected_peers.store(peers as u64, Ordering::Relaxed);
+    }
+
+    pub fn set_gossip_stats(&self, stats: crate::network::p2p::GossipStats) {
+        self.gossip_rx_total
+            .store(stats.rx_total, Ordering::Relaxed);
+        self.gossip_rx_block_response
+            .store(stats.rx_block_response, Ordering::Relaxed);
+        self.gossip_publish_ok
+            .store(stats.publish_ok, Ordering::Relaxed);
+        self.gossip_publish_err
+            .store(stats.publish_err, Ordering::Relaxed);
+        self.gossip_last_rx_block_at
+            .store(stats.last_rx_block_at, Ordering::Relaxed);
+    }
+
+    pub fn set_block_request_response_stats(
+        &self,
+        stats: crate::network::p2p::BlockRequestResponseStats,
+    ) {
+        self.direct_block_requests_outbound_sent
+            .store(stats.outbound_sent, Ordering::Relaxed);
+        self.direct_block_requests_outbound_responses
+            .store(stats.outbound_responses, Ordering::Relaxed);
+        self.direct_block_requests_outbound_failures
+            .store(stats.outbound_failures, Ordering::Relaxed);
+        self.direct_block_requests_invalid_responses
+            .store(stats.invalid_responses, Ordering::Relaxed);
+        self.direct_block_requests_latency_samples
+            .store(stats.latency_samples, Ordering::Relaxed);
+        self.direct_block_requests_latency_total_ms
+            .store(stats.latency_total_ms, Ordering::Relaxed);
+    }
+
+    pub async fn set_sync_status(&self, update: SyncRuntimeUpdate) {
+        self.local_chain_height
+            .store(update.local_height, Ordering::Relaxed);
+        self.sync_target_height
+            .store(update.target_height, Ordering::Relaxed);
+        self.sync_min_peers
+            .store(update.min_peers, Ordering::Relaxed);
+        self.sync_rpc_fallback_active.store(
+            if update.rpc_fallback_active { 1 } else { 0 },
+            Ordering::Relaxed,
+        );
+        self.sync_last_updated
+            .store(ApiRateLimiter::now_secs(), Ordering::Relaxed);
+        *self.sync_mode.write().await = update.mode;
+        *self.sync_last_source.write().await = update.last_sync_source;
+        *self.sync_last_event.write().await = update.last_sync_event;
+        *self.sync_last_error.write().await = update.last_sync_error;
+    }
+
+    pub async fn sync_status_snapshot(
+        &self,
+        local_height: u64,
+        last_block_at: u64,
+    ) -> SyncStatusSnapshot {
+        let startup = global_startup_status().snapshot();
+        let runtime = self.snapshot().await;
+        let target_height = self
+            .sync_target_height
+            .load(Ordering::Relaxed)
+            .max(local_height);
+        let lag = target_height.saturating_sub(local_height);
+        let min_peers = self.sync_min_peers.load(Ordering::Relaxed);
+        let connected_peers = runtime.connected_peers;
+        let mode = self.sync_mode.read().await.clone();
+        let rpc_fallback_active = self.sync_rpc_fallback_active.load(Ordering::Relaxed) == 1;
+        let last_sync_source = self.sync_last_source.read().await.clone();
+        let last_sync_event = self.sync_last_event.read().await.clone();
+        let last_sync_error = self.sync_last_error.read().await.clone();
+        let ready_to_mine = startup.ready
+            && lag == 0
+            && connected_peers >= min_peers
+            && !matches!(mode.as_str(), "loading" | "starting" | "error");
+        let status = if !startup.ready {
+            "starting"
+        } else if mode == "error" {
+            "error"
+        } else if connected_peers < min_peers {
+            "isolated"
+        } else if lag > 0 {
+            "syncing"
+        } else {
+            "caught_up"
+        };
+
+        SyncStatusSnapshot {
+            status: status.to_string(),
+            mode,
+            ready_to_mine,
+            local_height,
+            target_height,
+            lag,
+            connected_peers,
+            min_peers,
+            startup_ready: startup.ready,
+            startup_phase: startup.phase,
+            rpc_fallback_active,
+            last_sync_source,
+            last_sync_event,
+            last_sync_error,
+            last_block_at,
+            last_updated: self.sync_last_updated.load(Ordering::Relaxed),
+            gossip_rx_block_response: runtime.gossip_rx_block_response,
+            gossip_publish_err: runtime.gossip_publish_err,
+        }
     }
 
     pub async fn set_local_miner(
@@ -596,6 +896,35 @@ impl NetworkRuntimeState {
             legacy_miners_online: legacy_miners,
             outdated_miners_online: outdated_miners,
             minimum_client_version: NETWORK_MIN_CLIENT_VERSION.to_string(),
+            gossip_rx_total: self.gossip_rx_total.load(Ordering::Relaxed),
+            gossip_rx_block_response: self.gossip_rx_block_response.load(Ordering::Relaxed),
+            gossip_publish_ok: self.gossip_publish_ok.load(Ordering::Relaxed),
+            gossip_publish_err: self.gossip_publish_err.load(Ordering::Relaxed),
+            gossip_last_rx_block_at: self.gossip_last_rx_block_at.load(Ordering::Relaxed),
+            direct_block_requests_outbound_sent: self
+                .direct_block_requests_outbound_sent
+                .load(Ordering::Relaxed),
+            direct_block_requests_outbound_responses: self
+                .direct_block_requests_outbound_responses
+                .load(Ordering::Relaxed),
+            direct_block_requests_outbound_failures: self
+                .direct_block_requests_outbound_failures
+                .load(Ordering::Relaxed),
+            direct_block_requests_invalid_responses: self
+                .direct_block_requests_invalid_responses
+                .load(Ordering::Relaxed),
+            direct_block_requests_avg_latency_ms: {
+                let samples = self
+                    .direct_block_requests_latency_samples
+                    .load(Ordering::Relaxed);
+                if samples == 0 {
+                    0
+                } else {
+                    self.direct_block_requests_latency_total_ms
+                        .load(Ordering::Relaxed)
+                        / samples
+                }
+            },
         }
     }
 
@@ -997,6 +1326,7 @@ fn rate_limit_bucket(method: &str, path: &str) -> &'static str {
     } else if matches!(method, "GET" | "HEAD")
         && (path == "/chain/height"
             || path == "/stats"
+            || path == "/sync/status"
             || path == "/network/runtime"
             || path.starts_with("/blocks")
             || path.starts_with("/mempool")
@@ -1717,7 +2047,10 @@ async fn auth_and_rate_limit(
     let path = request.uri().path().to_string();
     let method = request.method().as_str().to_string();
 
-    if path == "/health" {
+    if matches!(
+        path.as_str(),
+        "/health" | "/health/checks" | "/ready" | "/startup/status"
+    ) {
         return Ok(next.run(request).await);
     }
 
@@ -2056,8 +2389,83 @@ async fn auth_and_rate_limit(
 }
 
 /// Health check endpoint
-async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"status": "healthy"}))
+async fn health(State(app_state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let startup = global_startup_status().snapshot();
+    let runtime = global_network_runtime().snapshot().await;
+    let height = app_state.state_manager.get_height().await;
+    let now = ApiRateLimiter::now_secs();
+    Json(serde_json::json!({
+        "status": startup.status,
+        "ready": startup.ready,
+        "phase": startup.phase,
+        "detail": startup.detail,
+        "network": startup.network,
+        "chain_id": startup.chain_id,
+        "height": height,
+        "peers": runtime.connected_peers,
+        "minimum_client_version": runtime.minimum_client_version,
+        "uptime_secs": now.saturating_sub(startup.started_at),
+        "started_at": startup.started_at,
+        "updated_at": startup.updated_at,
+        "version": startup.version,
+    }))
+}
+
+async fn ready() -> (StatusCode, Json<serde_json::Value>) {
+    let startup = global_startup_status().snapshot();
+    let status = if startup.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "status": if startup.ready { "ready" } else { "not_ready" },
+            "ready": startup.ready,
+            "phase": startup.phase,
+            "detail": startup.detail,
+            "network": startup.network,
+            "chain_id": startup.chain_id,
+            "updated_at": startup.updated_at,
+            "version": startup.version,
+        })),
+    )
+}
+
+async fn startup_status() -> Json<StartupStatusSnapshot> {
+    Json(global_startup_status().snapshot())
+}
+
+async fn health_checks(State(app_state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let checker = HealthChecker::new("zoka");
+    let local_height = app_state.state_manager.get_height().await;
+    let last_block_at = match app_state.state_manager.get_latest_block().await {
+        Ok(Some(block)) => block.header.timestamp,
+        _ => 0,
+    };
+    let sync = global_network_runtime()
+        .sync_status_snapshot(local_height, last_block_at)
+        .await;
+    checker.set_peer_count(sync.connected_peers as usize);
+    checker.set_block_height(local_height);
+    checker.set_syncing(sync.lag > 0);
+    let progress = if sync.target_height == 0 {
+        100.0
+    } else {
+        ((sync.local_height as f64 / sync.target_height as f64) * 100.0).min(100.0)
+    };
+    checker.set_sync_progress(progress);
+    checker.set_last_block_time(last_block_at);
+    checker.set_mempool_size(app_state.mempool.len().await);
+    let checks = checker.run_all_checks();
+    let overall = checker.overall_status();
+    Json(serde_json::json!({
+        "service": "zoka",
+        "status": overall.to_string(),
+        "sync_status": sync,
+        "checks": checks,
+    }))
 }
 
 /// Get API security counters.
@@ -2136,6 +2544,19 @@ async fn get_network_runtime(
     let mut snapshot = global_network_runtime().snapshot().await;
     snapshot.local_chain_height = app_state.state_manager.get_height().await;
     Json(snapshot)
+}
+
+async fn get_sync_status(State(app_state): State<Arc<AppState>>) -> Json<SyncStatusSnapshot> {
+    let local_height = app_state.state_manager.get_height().await;
+    let last_block_at = match app_state.state_manager.get_latest_block().await {
+        Ok(Some(block)) => block.header.timestamp,
+        _ => 0,
+    };
+    Json(
+        global_network_runtime()
+            .sync_status_snapshot(local_height, last_block_at)
+            .await,
+    )
 }
 
 async fn post_miner_heartbeat(
@@ -4494,25 +4915,21 @@ async fn post_block_submit(
                 "hash": block.header.hash
             })))
         }
-        SyncOutcome::AlreadyKnown { height, hash } => {
-            Ok(Json(serde_json::json!({
-                "status": "already_known",
-                "height": height,
-                "hash": hash
-            })))
-        }
+        SyncOutcome::AlreadyKnown { height, hash } => Ok(Json(serde_json::json!({
+            "status": "already_known",
+            "height": height,
+            "hash": hash
+        }))),
         SyncOutcome::BehindOrSibling {
             local_head,
             candidate,
             candidate_hash,
-        } => {
-            Ok(Json(serde_json::json!({
-                "status": "side_branch_stored",
-                "height": candidate,
-                "hash": candidate_hash,
-                "local_head": local_head
-            })))
-        }
+        } => Ok(Json(serde_json::json!({
+            "status": "side_branch_stored",
+            "height": candidate,
+            "hash": candidate_hash,
+            "local_head": local_head
+        }))),
         SyncOutcome::GapAhead {
             local_head,
             candidate,
@@ -4535,6 +4952,7 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
 
     let mut router = Router::new()
         .route("/stats", get(get_stats))
+        .route("/sync/status", get(get_sync_status))
         .route("/network/runtime", get(get_network_runtime))
         .route("/network/miners", get(get_network_miners))
         .route("/network/miners/heartbeat", post(post_miner_heartbeat))
@@ -4542,6 +4960,9 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         .route("/local/mining/start", post(post_local_mining_start))
         .route("/local/mining/stop", post(post_local_mining_stop))
         .route("/health", get(health))
+        .route("/health/checks", get(health_checks))
+        .route("/ready", get(ready))
+        .route("/startup/status", get(startup_status))
         .route("/metrics/security", get(get_security_metrics))
         .route("/metrics/audit", get(get_audit_logs))
         .route("/chain/height", get(get_height))

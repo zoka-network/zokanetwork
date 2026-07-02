@@ -57,6 +57,11 @@ impl MessageHandler for DefaultMessageHandler {
                 let mut stats = self.stats.write().await;
                 stats.transactions += 1;
             }
+            ZokaMessage::PrivateTxAnnounce(announce) => {
+                info!("Private tx announce received: {}", announce.tx_hash);
+                let mut stats = self.stats.write().await;
+                stats.private_tx_announces += 1;
+            }
             ZokaMessage::StemPrivateTransaction(private_tx) => {
                 info!(
                     "Processing stem private transaction: route={}, tx={}",
@@ -83,6 +88,14 @@ impl MessageHandler for DefaultMessageHandler {
                 info!("Block response received: height={}", resp.block_height);
                 let mut stats = self.stats.write().await;
                 stats.block_responses += 1;
+            }
+            ZokaMessage::BlockAnnounce(announce) => {
+                info!(
+                    "Block announce received: height={}, hash={}",
+                    announce.block_height, announce.block_hash
+                );
+                let mut stats = self.stats.write().await;
+                stats.block_announces += 1;
             }
             ZokaMessage::SyncState(sync) => {
                 info!("State sync received: remote_height={}", sync.last_height);
@@ -163,6 +176,10 @@ pub struct MessageStats {
     pub block_requests: u64,
     /// Block response messages.
     pub block_responses: u64,
+    /// Block announce messages.
+    pub block_announces: u64,
+    /// Private transaction availability announces.
+    pub private_tx_announces: u64,
     /// State sync messages.
     pub sync_messages: u64,
     /// Ping messages.
@@ -178,6 +195,8 @@ impl Default for MessageStats {
             transactions: 0,
             block_requests: 0,
             block_responses: 0,
+            block_announces: 0,
+            private_tx_announces: 0,
             sync_messages: 0,
             pings: 0,
             pbft_messages: 0,

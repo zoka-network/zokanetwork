@@ -35,6 +35,8 @@ pub enum ZokaMessage {
     Transaction(crate::types::Transaction),
     /// Transacción privada
     PrivateTransaction(PrivateTransactionMessage),
+    /// Anuncio liviano de disponibilidad de cuerpo de transaccion privada.
+    PrivateTxAnnounce(PrivateTxAnnounceMessage),
     StemPrivateTransaction(StemPrivateTransactionMessage),
     PrivateMixerBatch(MixerBatchMessage),
     /// Solicitud de bloque
@@ -45,6 +47,8 @@ pub enum ZokaMessage {
     },
     /// Respuesta con bloque
     BlockResponse(BlockResponseMessage),
+    /// Anuncio liviano de bloque disponible.
+    BlockAnnounce(BlockAnnounceMessage),
     /// Estado sincronizado
     SyncState(SyncStateMessage),
     /// Keep-alive / heartbeat
@@ -203,6 +207,27 @@ pub struct PrivateTransactionMessage {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PrivateTxAnnounceMessage {
+    pub tx_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_size_bytes: Option<u64>,
+    #[serde(default = "default_private_proof_profile")]
+    pub private_proof_profile: String,
+    pub timestamp: u64,
+}
+
+impl PrivateTxAnnounceMessage {
+    pub fn from_private_tx(tx: &PrivateTransactionMessage, body_size_bytes: Option<u64>) -> Self {
+        Self {
+            tx_hash: tx.tx_hash.clone(),
+            body_size_bytes,
+            private_proof_profile: tx.private_proof_profile.clone(),
+            timestamp: tx.timestamp,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StemPrivateTransactionMessage {
     pub route_id: String,
     #[serde(default)]
@@ -281,6 +306,17 @@ pub struct BlockResponseMessage {
 
 /// Mensaje de sincronización de estado
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BlockAnnounceMessage {
+    pub block_height: u64,
+    pub block_hash: String,
+    #[serde(default)]
+    pub cumulative_work: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub difficulty_bits: Option<u32>,
+    pub timestamp: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SyncStateMessage {
     /// Última altura conocida
     pub last_height: u64,
@@ -348,10 +384,12 @@ impl ZokaMessage {
         match self {
             ZokaMessage::Transaction(_msg) => 0, // Would get from tx
             ZokaMessage::PrivateTransaction(msg) => msg.timestamp,
+            ZokaMessage::PrivateTxAnnounce(msg) => msg.timestamp,
             ZokaMessage::StemPrivateTransaction(msg) => msg.private_tx.timestamp,
             ZokaMessage::PrivateMixerBatch(msg) => msg.timestamp,
             ZokaMessage::BlockRequest { .. } => 0,
             ZokaMessage::BlockResponse(msg) => msg.timestamp,
+            ZokaMessage::BlockAnnounce(msg) => msg.timestamp,
             ZokaMessage::SyncState(msg) => msg.timestamp,
             ZokaMessage::Ping(msg) => msg.timestamp,
             ZokaMessage::Pbft(msg) => match msg {
@@ -565,6 +603,28 @@ mod tests {
     }
 
     #[test]
+    fn test_private_tx_announce_roundtrip() {
+        let announce = PrivateTxAnnounceMessage {
+            tx_hash: "0xpriv".to_string(),
+            body_size_bytes: Some(2048),
+            private_proof_profile: PRIVATE_PROOF_PROFILE_V1.to_string(),
+            timestamp: 777,
+        };
+        let msg = ZokaMessage::PrivateTxAnnounce(announce);
+        let restored = ZokaMessage::from_bytes(&msg.to_bytes().unwrap()).unwrap();
+
+        match restored {
+            ZokaMessage::PrivateTxAnnounce(restored) => {
+                assert_eq!(restored.tx_hash, "0xpriv");
+                assert_eq!(restored.body_size_bytes, Some(2048));
+                assert_eq!(restored.private_proof_profile, PRIVATE_PROOF_PROFILE_V1);
+                assert_eq!(restored.timestamp, 777);
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_private_mixer_batch_message_roundtrip() {
         let batch = MixerBatchMessage {
             batch_id: "batch-1".to_string(),
@@ -717,6 +777,28 @@ mod tests {
         let bytes = block_msg.to_bytes().unwrap();
 
         assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn test_block_announce_roundtrip() {
+        let msg = ZokaMessage::BlockAnnounce(BlockAnnounceMessage {
+            block_height: 100,
+            block_hash: "hash-100".to_string(),
+            cumulative_work: "12345".to_string(),
+            difficulty_bits: Some(20),
+            timestamp: 123,
+        });
+        let restored = ZokaMessage::from_bytes(&msg.to_bytes().unwrap()).unwrap();
+
+        match restored {
+            ZokaMessage::BlockAnnounce(announce) => {
+                assert_eq!(announce.block_height, 100);
+                assert_eq!(announce.block_hash, "hash-100");
+                assert_eq!(announce.cumulative_work, "12345");
+                assert_eq!(announce.timestamp, 123);
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
     }
 
     #[test]

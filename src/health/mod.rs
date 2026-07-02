@@ -2,8 +2,11 @@
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
+
 /// Health check status
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HealthStatus {
     Healthy,
     Degraded,
@@ -21,7 +24,7 @@ impl std::fmt::Display for HealthStatus {
 }
 
 /// Individual health check result
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct HealthCheckResult {
     pub name: String,
     pub status: HealthStatus,
@@ -77,7 +80,6 @@ impl HealthCheckResult {
 }
 
 /// Health monitoring system with liveness and readiness checks
-#[allow(dead_code)]
 pub struct HealthChecker {
     service_name: String,
     checks: Arc<Mutex<Vec<HealthCheckResult>>>,

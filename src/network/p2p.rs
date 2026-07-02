@@ -8,7 +8,7 @@ use libp2p::{
     core::multiaddr::Multiaddr,
     gossipsub, identify, identity,
     kad::{self, store::MemoryStore},
-    noise,
+    noise, request_response,
     swarm::SwarmEvent,
     tcp, yamux, PeerId, Swarm, SwarmBuilder,
 };
@@ -18,19 +18,29 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
+use crate::network::block_request_response::{
+    protocol_name as block_request_response_protocol, BlockBodyRequest, BlockBodyResponse,
+    BlockRequestResponseCodec,
+};
 use crate::network::handler::MessageHandler;
 use crate::network::message::{
-    BlockResponseMessage, MixerBatchMessage, PbftNetworkMessage, PingMessage,
-    PrivateTransactionMessage, StemPrivateTransactionMessage, SyncStateMessage,
-    UserDiscoveryRecord, ZokaMessage,
+    BlockAnnounceMessage, BlockResponseMessage, MixerBatchMessage, PbftNetworkMessage, PingMessage,
+    PrivateTransactionMessage, PrivateTxAnnounceMessage, StemPrivateTransactionMessage,
+    SyncStateMessage, UserDiscoveryRecord, ZokaMessage,
+};
+use crate::network::private_tx_request_response::{
+    protocol_name as private_tx_request_response_protocol, PrivateTxBodyRequest,
+    PrivateTxBodyResponse, PrivateTxRequestResponseCodec,
 };
 
 pub const GENERAL_TOPIC_NAME: &str = "zoka/messages/v1";
 pub const PBFT_TOPIC_NAME: &str = "zoka/pbft/v1";
 pub const STEM_TOPIC_NAME: &str = "zoka/stem/v1";
 pub const MIXER_TOPIC_NAME: &str = "zoka/mixer/v1";
+const PRIVATE_TX_BODY_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+const PRIVATE_TX_BODY_CACHE_MAX: usize = 2048;
 // Bumped for the mainnet Zenith relaunch: any peer running the pre-relaunch
 // binary reports the old id and gets disconnected during the libp2p identify
 // handshake (enforce_protocol_freeze_for_peer), before it can gossip any
@@ -57,6 +67,124 @@ pub struct NetworkPrivacyConfig {
     pub tor_proxy: Option<String>,
     pub i2p_sam_endpoint: Option<String>,
     pub enforce_anonymous_transport: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct GossipStats {
+    pub rx_total: u64,
+    pub rx_block_response: u64,
+    pub publish_ok: u64,
+    pub publish_err: u64,
+    pub last_rx_block_at: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ObservedPeerRecord {
+    pub peer_id: String,
+    pub addr: String,
+    pub protocol_version: Option<String>,
+    pub protocols: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ObservedPeerProtocols {
+    protocol_version: Option<String>,
+    protocols: Vec<String>,
+}
+
+pub struct PendingBlockBodyRequest {
+    pub peer: PeerId,
+    pub request: BlockBodyRequest,
+    pub channel: request_response::ResponseChannel<BlockBodyResponse>,
+    pub received_at: Instant,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BlockRequestResponseStats {
+    pub outbound_sent: u64,
+    pub inbound_received: u64,
+    pub inbound_served: u64,
+    pub outbound_responses: u64,
+    pub outbound_failures: u64,
+    pub inbound_failures: u64,
+    pub invalid_responses: u64,
+    pub latency_samples: u64,
+    pub latency_total_ms: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PeerBlockRequestStats {
+    pub successes: u64,
+    pub failures: u64,
+    pub invalid_responses: u64,
+    pub latency_samples: u64,
+    pub latency_total_ms: u64,
+    pub score: i32,
+}
+
+#[derive(Clone, Debug)]
+struct PendingOutboundBlockBodyRequest {
+    peer: PeerId,
+    request: BlockBodyRequest,
+    started_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct ReceivedBlockBodyResponse {
+    request_id: request_response::OutboundRequestId,
+    peer: PeerId,
+    response: BlockBodyResponse,
+    latency: Duration,
+}
+
+#[derive(Clone, Debug)]
+struct BlockBodyRequestFailure {
+    request_id: request_response::OutboundRequestId,
+    peer: PeerId,
+    error: String,
+}
+
+pub struct PendingPrivateTxBodyRequest {
+    pub peer: PeerId,
+    pub request: PrivateTxBodyRequest,
+    pub channel: request_response::ResponseChannel<PrivateTxBodyResponse>,
+    pub received_at: Instant,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PrivateTxRequestResponseStats {
+    pub outbound_sent: u64,
+    pub inbound_received: u64,
+    pub inbound_served: u64,
+    pub outbound_responses: u64,
+    pub outbound_failures: u64,
+    pub inbound_failures: u64,
+    pub invalid_responses: u64,
+    pub rate_limited: u64,
+    pub latency_samples: u64,
+    pub latency_total_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PendingOutboundPrivateTxBodyRequest {
+    peer: PeerId,
+    request: PrivateTxBodyRequest,
+    started_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct ReceivedPrivateTxBodyResponse {
+    request_id: request_response::OutboundRequestId,
+    peer: PeerId,
+    response: PrivateTxBodyResponse,
+    latency: Duration,
+}
+
+#[derive(Clone, Debug)]
+struct PrivateTxBodyRequestFailure {
+    request_id: request_response::OutboundRequestId,
+    peer: PeerId,
+    error: String,
 }
 
 impl NetworkPrivacyConfig {
@@ -207,86 +335,44 @@ pub struct Node {
     stem_relay_cursor: usize,
     /// Peers observed with incompatible identify protocol version.
     incompatible_protocol_peers: HashSet<PeerId>,
-}
-
-/// Global peer manager for gossip protocol
-pub struct PeerManager {
-    pub known_peers: HashSet<PeerId>,
-    pub peer_scores: HashMap<PeerId, i32>,
-    pub message_cache: HashMap<String, u64>,
-    pub max_peers: usize,
-}
-
-impl Default for PeerManager {
-    fn default() -> Self {
-        PeerManager {
-            known_peers: HashSet::new(),
-            peer_scores: HashMap::new(),
-            message_cache: HashMap::new(),
-            max_peers: 1000,
-        }
-    }
-}
-
-impl PeerManager {
-    pub fn new(max_peers: usize) -> Self {
-        PeerManager {
-            known_peers: HashSet::new(),
-            peer_scores: HashMap::new(),
-            message_cache: HashMap::new(),
-            max_peers,
-        }
-    }
-
-    /// Add a peer to known peers
-    pub fn add_peer(&mut self, peer_id: PeerId) -> bool {
-        if self.known_peers.len() >= self.max_peers {
-            return false;
-        }
-        self.known_peers.insert(peer_id);
-        self.peer_scores.insert(peer_id, 0);
-        true
-    }
-
-    /// Update peer score (reputation system)
-    pub fn update_peer_score(&mut self, peer_id: PeerId, delta: i32) {
-        self.peer_scores
-            .entry(peer_id)
-            .and_modify(|score| *score += delta);
-    }
-
-    /// Get peer score
-    pub fn get_peer_score(&self, peer_id: PeerId) -> i32 {
-        self.peer_scores.get(&peer_id).copied().unwrap_or(0)
-    }
-
-    /// Remove low-score peers
-    pub fn prune_low_score_peers(&mut self, threshold: i32) {
-        self.known_peers
-            .retain(|peer_id| self.peer_scores.get(peer_id).copied().unwrap_or(0) >= threshold);
-    }
-
-    /// Cache message by ID
-    pub fn cache_message(&mut self, msg_id: String, timestamp: u64) {
-        self.message_cache.insert(msg_id, timestamp);
-    }
-
-    /// Check if message was seen before (duplicate detection)
-    pub fn has_seen_message(&self, msg_id: &str) -> bool {
-        self.message_cache.contains_key(msg_id)
-    }
-
-    /// Get peer count
-    pub fn peer_count(&self) -> usize {
-        self.known_peers.len()
-    }
-
-    /// List top peers by score
-    pub fn get_top_peers(&self, count: usize) -> Vec<(PeerId, i32)> {
-        let mut peers: Vec<_> = self.peer_scores.iter().map(|(p, s)| (*p, *s)).collect();
-        peers.sort_by(|a, b| b.1.cmp(&a.1));
-        peers.into_iter().take(count).collect()
-    }
+    /// Peer listen addresses observed through Identify.
+    observed_peer_addrs: HashMap<PeerId, HashSet<String>>,
+    /// Peer protocol metadata observed through Identify.
+    observed_peer_protocols: HashMap<PeerId, ObservedPeerProtocols>,
+    /// Lightweight local counters for production gossip visibility.
+    gossip_stats: GossipStats,
+    /// Inbound block body requests waiting for local storage lookup.
+    pending_block_body_requests: VecDeque<PendingBlockBodyRequest>,
+    /// Outbound block body requests waiting for direct responses.
+    pending_outbound_block_body_requests:
+        HashMap<request_response::OutboundRequestId, PendingOutboundBlockBodyRequest>,
+    /// Direct block body responses received while the caller was not waiting.
+    received_block_body_responses: VecDeque<ReceivedBlockBodyResponse>,
+    /// Direct block body request failures received from libp2p.
+    block_body_request_failures: VecDeque<BlockBodyRequestFailure>,
+    /// Lightweight stats for direct block request/response.
+    block_request_response_stats: BlockRequestResponseStats,
+    /// Inbound private tx body requests waiting for local storage lookup.
+    pending_private_tx_body_requests: VecDeque<PendingPrivateTxBodyRequest>,
+    /// Outbound private tx body requests waiting for direct responses.
+    pending_outbound_private_tx_body_requests:
+        HashMap<request_response::OutboundRequestId, PendingOutboundPrivateTxBodyRequest>,
+    /// Direct private tx body responses received while the caller was not waiting.
+    received_private_tx_body_responses: VecDeque<ReceivedPrivateTxBodyResponse>,
+    /// Direct private tx body request failures received from libp2p.
+    private_tx_body_request_failures: VecDeque<PrivateTxBodyRequestFailure>,
+    /// Lightweight stats for private tx body request/response.
+    private_tx_request_response_stats: PrivateTxRequestResponseStats,
+    /// Peer score used to prefer private tx body providers.
+    private_tx_request_peer_scores: HashMap<PeerId, i32>,
+    /// Short-lived private tx body cache for relays/miners serving direct fetches.
+    recent_private_tx_bodies: HashMap<String, (Vec<u8>, Instant)>,
+    /// Peers that recently announced availability for a private tx body.
+    private_tx_announce_sources: HashMap<String, HashSet<PeerId>>,
+    /// Peer score used to prefer low-latency / valid direct block responders.
+    block_request_peer_scores: HashMap<PeerId, i32>,
+    /// Per-peer request/response counters used for diagnostics and peer choice.
+    block_request_peer_stats: HashMap<PeerId, PeerBlockRequestStats>,
 }
 
 /// Behaviour set for the node.
@@ -298,6 +384,10 @@ pub struct NodeBehaviour {
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     /// Gossip transport for protocol messages.
     gossipsub: gossipsub::Behaviour,
+    /// Direct block body request/response transport.
+    block_request_response: request_response::Behaviour<BlockRequestResponseCodec>,
+    /// Direct private tx body request/response transport.
+    private_tx_request_response: request_response::Behaviour<PrivateTxRequestResponseCodec>,
 }
 
 impl Node {
@@ -455,6 +545,14 @@ impl Node {
         }
 
         None
+    }
+
+    fn kademlia_peer_from_multiaddr(addr: &Multiaddr) -> Option<(PeerId, Multiaddr)> {
+        let addr_string = addr.to_string();
+        let (dial_addr, peer_id) = addr_string.rsplit_once("/p2p/")?;
+        let peer_id = peer_id.parse::<PeerId>().ok()?;
+        let dial_addr = dial_addr.parse::<Multiaddr>().ok()?;
+        Some((peer_id, dial_addr))
     }
 
     async fn probe_tor_proxy_route(
@@ -694,11 +792,36 @@ impl Node {
         value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
     }
 
+    fn is_private_tx_announce_well_formed(announce: &PrivateTxAnnounceMessage) -> bool {
+        let hash = announce.tx_hash.trim();
+        if hash.is_empty() || hash.len() > 128 {
+            return false;
+        }
+        if hash
+            .bytes()
+            .any(|byte| !(byte.is_ascii_hexdigit() || matches!(byte, b'-' | b'_')))
+        {
+            return false;
+        }
+        if announce
+            .body_size_bytes
+            .is_some_and(|size| size == 0 || size > 2 * 1024 * 1024)
+        {
+            return false;
+        }
+        !announce.private_proof_profile.trim().is_empty()
+    }
+
     fn validate_inbound_message(&self, message: &ZokaMessage) -> Result<(), &'static str> {
         match message {
             ZokaMessage::PrivateTransaction(tx) => {
                 if !Self::is_private_tx_well_formed(tx) {
                     return Err("private tx failed protocol freeze validation");
+                }
+            }
+            ZokaMessage::PrivateTxAnnounce(announce) => {
+                if !Self::is_private_tx_announce_well_formed(announce) {
+                    return Err("private tx announce failed validation");
                 }
             }
             ZokaMessage::StemPrivateTransaction(stem) => {
@@ -734,6 +857,11 @@ impl Node {
             ZokaMessage::BlockResponse(msg) => {
                 if msg.block_hash.trim().is_empty() {
                     return Err("block response missing block hash");
+                }
+            }
+            ZokaMessage::BlockAnnounce(msg) => {
+                if msg.block_height == 0 || msg.block_hash.trim().is_empty() {
+                    return Err("block announce missing height/hash");
                 }
             }
             ZokaMessage::SyncState(msg) => {
@@ -841,12 +969,21 @@ impl Node {
         }
         let batch = self.build_mixer_batch_message(txs);
         let payload = ZokaMessage::PrivateMixerBatch(batch).to_bytes()?;
-        self.swarm
+        match self
+            .swarm
             .behaviour_mut()
             .gossipsub
             .publish(self.mixer_topic.clone(), payload)
-            .map(|_| ())
-            .map_err(|e| -> Box<dyn Error> { Box::new(e) })
+        {
+            Ok(_) => {
+                self.record_gossip_publish(true);
+                Ok(())
+            }
+            Err(e) => {
+                self.record_gossip_publish(false);
+                Err(Box::new(e))
+            }
+        }
     }
 
     fn flush_due_private_batch(&mut self) -> Result<(), Box<dyn Error>> {
@@ -888,12 +1025,21 @@ impl Node {
         stem: StemPrivateTransactionMessage,
     ) -> Result<(), Box<dyn Error>> {
         let payload = ZokaMessage::StemPrivateTransaction(stem).to_bytes()?;
-        self.swarm
+        match self
+            .swarm
             .behaviour_mut()
             .gossipsub
             .publish(self.stem_topic.clone(), payload)
-            .map(|_| ())
-            .map_err(|e| -> Box<dyn Error> { Box::new(e) })
+        {
+            Ok(_) => {
+                self.record_gossip_publish(true);
+                Ok(())
+            }
+            Err(e) => {
+                self.record_gossip_publish(false);
+                Err(Box::new(e))
+            }
+        }
     }
 
     fn stem_jitter_delay(&self, route_id: &str) -> Duration {
@@ -1024,6 +1170,24 @@ impl Node {
                 gossipsub.subscribe(&pbft_topic_for_behaviour)?;
                 gossipsub.subscribe(&stem_topic_for_behaviour)?;
                 gossipsub.subscribe(&mixer_topic_for_behaviour)?;
+                let block_request_response = request_response::Behaviour::with_codec(
+                    BlockRequestResponseCodec,
+                    [(
+                        block_request_response_protocol(),
+                        request_response::ProtocolSupport::Full,
+                    )],
+                    request_response::Config::default()
+                        .with_request_timeout(Duration::from_secs(8)),
+                );
+                let private_tx_request_response = request_response::Behaviour::with_codec(
+                    PrivateTxRequestResponseCodec,
+                    [(
+                        private_tx_request_response_protocol(),
+                        request_response::ProtocolSupport::Full,
+                    )],
+                    request_response::Config::default()
+                        .with_request_timeout(Duration::from_secs(8)),
+                );
 
                 Ok(NodeBehaviour {
                     identify: identify::Behaviour::new(identify::Config::new(
@@ -1032,6 +1196,8 @@ impl Node {
                     )),
                     kademlia,
                     gossipsub,
+                    block_request_response,
+                    private_tx_request_response,
                 })
             })?
             .build();
@@ -1051,7 +1217,586 @@ impl Node {
             seen_stem_routes: HashSet::new(),
             stem_relay_cursor: 0,
             incompatible_protocol_peers: HashSet::new(),
+            observed_peer_addrs: HashMap::new(),
+            observed_peer_protocols: HashMap::new(),
+            gossip_stats: GossipStats::default(),
+            pending_block_body_requests: VecDeque::new(),
+            pending_outbound_block_body_requests: HashMap::new(),
+            received_block_body_responses: VecDeque::new(),
+            block_body_request_failures: VecDeque::new(),
+            block_request_response_stats: BlockRequestResponseStats::default(),
+            pending_private_tx_body_requests: VecDeque::new(),
+            pending_outbound_private_tx_body_requests: HashMap::new(),
+            received_private_tx_body_responses: VecDeque::new(),
+            private_tx_body_request_failures: VecDeque::new(),
+            private_tx_request_response_stats: PrivateTxRequestResponseStats::default(),
+            private_tx_request_peer_scores: HashMap::new(),
+            recent_private_tx_bodies: HashMap::new(),
+            private_tx_announce_sources: HashMap::new(),
+            block_request_peer_scores: HashMap::new(),
+            block_request_peer_stats: HashMap::new(),
         })
+    }
+
+    fn record_identify_peer(&mut self, peer_id: PeerId, info: &identify::Info) {
+        let mut protocols = info
+            .protocols
+            .iter()
+            .map(|protocol| protocol.to_string())
+            .filter(|protocol| !protocol.trim().is_empty())
+            .collect::<Vec<_>>();
+        protocols.sort();
+        protocols.dedup();
+        self.observed_peer_protocols.insert(
+            peer_id,
+            ObservedPeerProtocols {
+                protocol_version: Some(info.protocol_version.clone()),
+                protocols,
+            },
+        );
+
+        if info.listen_addrs.is_empty() {
+            return;
+        }
+        let addrs = self.observed_peer_addrs.entry(peer_id).or_default();
+        for addr in &info.listen_addrs {
+            addrs.insert(addr.to_string());
+        }
+    }
+
+    fn record_gossip_rx(&mut self, message: &ZokaMessage) {
+        self.gossip_stats.rx_total = self.gossip_stats.rx_total.saturating_add(1);
+        if matches!(message, ZokaMessage::BlockResponse(_)) {
+            self.gossip_stats.rx_block_response =
+                self.gossip_stats.rx_block_response.saturating_add(1);
+            self.gossip_stats.last_rx_block_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+        }
+    }
+
+    fn record_gossip_publish(&mut self, ok: bool) {
+        if ok {
+            self.gossip_stats.publish_ok = self.gossip_stats.publish_ok.saturating_add(1);
+        } else {
+            self.gossip_stats.publish_err = self.gossip_stats.publish_err.saturating_add(1);
+        }
+    }
+
+    fn record_private_tx_announce_source(&mut self, peer: PeerId, message: &ZokaMessage) {
+        if let ZokaMessage::PrivateTxAnnounce(announce) = message {
+            let hash = announce.tx_hash.trim();
+            if !hash.is_empty() {
+                self.private_tx_announce_sources
+                    .entry(hash.to_string())
+                    .or_default()
+                    .insert(peer);
+            }
+        }
+    }
+
+    fn record_direct_block_success(&mut self, peer: PeerId, latency: Duration) {
+        let score = self
+            .block_request_peer_scores
+            .entry(peer.clone())
+            .or_default();
+        *score = score.saturating_add(10).min(100);
+        let latency_ms = latency.as_millis().min(u128::from(u64::MAX)) as u64;
+        let peer_stats = self.block_request_peer_stats.entry(peer).or_default();
+        peer_stats.successes = peer_stats.successes.saturating_add(1);
+        peer_stats.latency_samples = peer_stats.latency_samples.saturating_add(1);
+        peer_stats.latency_total_ms = peer_stats.latency_total_ms.saturating_add(latency_ms);
+        peer_stats.score = *score;
+        self.block_request_response_stats.latency_samples = self
+            .block_request_response_stats
+            .latency_samples
+            .saturating_add(1);
+        self.block_request_response_stats.latency_total_ms = self
+            .block_request_response_stats
+            .latency_total_ms
+            .saturating_add(latency_ms);
+    }
+
+    fn record_direct_block_failure(&mut self, peer: PeerId) {
+        let score = self
+            .block_request_peer_scores
+            .entry(peer.clone())
+            .or_default();
+        *score = score.saturating_sub(15).max(-100);
+        let peer_stats = self.block_request_peer_stats.entry(peer).or_default();
+        peer_stats.failures = peer_stats.failures.saturating_add(1);
+        peer_stats.score = *score;
+    }
+
+    fn record_direct_block_invalid_response(&mut self, peer: PeerId) {
+        self.block_request_response_stats.invalid_responses = self
+            .block_request_response_stats
+            .invalid_responses
+            .saturating_add(1);
+        self.record_direct_block_failure(peer.clone());
+        let peer_stats = self.block_request_peer_stats.entry(peer).or_default();
+        peer_stats.invalid_responses = peer_stats.invalid_responses.saturating_add(1);
+    }
+
+    fn record_private_tx_request_success(&mut self, peer: PeerId, latency: Duration) {
+        let score = self.private_tx_request_peer_scores.entry(peer).or_default();
+        *score = score.saturating_add(10).min(100);
+        self.private_tx_request_response_stats.latency_samples = self
+            .private_tx_request_response_stats
+            .latency_samples
+            .saturating_add(1);
+        self.private_tx_request_response_stats.latency_total_ms = self
+            .private_tx_request_response_stats
+            .latency_total_ms
+            .saturating_add(latency.as_millis().min(u128::from(u64::MAX)) as u64);
+    }
+
+    fn record_private_tx_request_failure(&mut self, peer: PeerId) {
+        let score = self.private_tx_request_peer_scores.entry(peer).or_default();
+        *score = score.saturating_sub(15).max(-100);
+    }
+
+    fn record_private_tx_invalid_response(&mut self, peer: PeerId) {
+        self.private_tx_request_response_stats.invalid_responses = self
+            .private_tx_request_response_stats
+            .invalid_responses
+            .saturating_add(1);
+        self.record_private_tx_request_failure(peer);
+    }
+
+    fn handle_block_request_response_event(
+        &mut self,
+        event: request_response::Event<BlockBodyRequest, BlockBodyResponse>,
+    ) {
+        match event {
+            request_response::Event::Message { peer, message } => match message {
+                request_response::Message::Request {
+                    request, channel, ..
+                } => {
+                    self.block_request_response_stats.inbound_received = self
+                        .block_request_response_stats
+                        .inbound_received
+                        .saturating_add(1);
+                    self.pending_block_body_requests
+                        .push_back(PendingBlockBodyRequest {
+                            peer,
+                            request,
+                            channel,
+                            received_at: Instant::now(),
+                        });
+                }
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                } => {
+                    let pending = self
+                        .pending_outbound_block_body_requests
+                        .remove(&request_id);
+                    let latency = pending
+                        .as_ref()
+                        .map(|pending| pending.started_at.elapsed())
+                        .unwrap_or_default();
+                    let response_peer = pending
+                        .as_ref()
+                        .map(|pending| pending.peer.clone())
+                        .unwrap_or_else(|| peer.clone());
+                    let requested_height =
+                        pending.as_ref().map(|pending| pending.request.block_height);
+                    if response_peer != peer {
+                        warn!(
+                            "direct block response peer mismatch: request_id={request_id:?} expected={} got={}",
+                            response_peer, peer
+                        );
+                    }
+                    if let Some(height) = requested_height {
+                        debug!(
+                            "direct block response received: request_id={request_id:?} peer={} height={} latency_ms={}",
+                            response_peer,
+                            height,
+                            latency.as_millis()
+                        );
+                    }
+                    self.block_request_response_stats.outbound_responses = self
+                        .block_request_response_stats
+                        .outbound_responses
+                        .saturating_add(1);
+                    self.record_direct_block_success(response_peer.clone(), latency);
+                    self.received_block_body_responses
+                        .push_back(ReceivedBlockBodyResponse {
+                            request_id,
+                            peer: response_peer,
+                            response,
+                            latency,
+                        });
+                }
+            },
+            request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+            } => {
+                self.pending_outbound_block_body_requests
+                    .remove(&request_id);
+                self.block_request_response_stats.outbound_failures = self
+                    .block_request_response_stats
+                    .outbound_failures
+                    .saturating_add(1);
+                self.record_direct_block_failure(peer);
+                self.block_body_request_failures
+                    .push_back(BlockBodyRequestFailure {
+                        request_id,
+                        peer,
+                        error: error.to_string(),
+                    });
+            }
+            request_response::Event::InboundFailure { peer, error, .. } => {
+                self.block_request_response_stats.inbound_failures = self
+                    .block_request_response_stats
+                    .inbound_failures
+                    .saturating_add(1);
+                self.record_direct_block_failure(peer);
+                warn!(
+                    "direct block request inbound failure from {}: {}",
+                    peer, error
+                );
+            }
+            request_response::Event::ResponseSent { peer, .. } => {
+                self.block_request_response_stats.inbound_served = self
+                    .block_request_response_stats
+                    .inbound_served
+                    .saturating_add(1);
+                let score = self.block_request_peer_scores.entry(peer).or_default();
+                *score = score.saturating_add(2).min(100);
+            }
+        }
+    }
+
+    fn handle_private_tx_request_response_event(
+        &mut self,
+        event: request_response::Event<PrivateTxBodyRequest, PrivateTxBodyResponse>,
+    ) {
+        match event {
+            request_response::Event::Message { peer, message } => match message {
+                request_response::Message::Request {
+                    request, channel, ..
+                } => {
+                    self.private_tx_request_response_stats.inbound_received = self
+                        .private_tx_request_response_stats
+                        .inbound_received
+                        .saturating_add(1);
+                    self.pending_private_tx_body_requests
+                        .push_back(PendingPrivateTxBodyRequest {
+                            peer,
+                            request,
+                            channel,
+                            received_at: Instant::now(),
+                        });
+                }
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                } => {
+                    let pending = self
+                        .pending_outbound_private_tx_body_requests
+                        .remove(&request_id);
+                    let latency = pending
+                        .as_ref()
+                        .map(|pending| pending.started_at.elapsed())
+                        .unwrap_or_default();
+                    let response_peer = pending
+                        .as_ref()
+                        .map(|pending| pending.peer.clone())
+                        .unwrap_or_else(|| peer.clone());
+                    if let Some(request) = pending.as_ref() {
+                        debug!(
+                            "direct private tx response received: request_id={request_id:?} peer={} hash={} latency_ms={}",
+                            response_peer,
+                            request.request.tx_hash,
+                            latency.as_millis()
+                        );
+                    }
+                    self.private_tx_request_response_stats.outbound_responses = self
+                        .private_tx_request_response_stats
+                        .outbound_responses
+                        .saturating_add(1);
+                    self.record_private_tx_request_success(response_peer.clone(), latency);
+                    self.received_private_tx_body_responses.push_back(
+                        ReceivedPrivateTxBodyResponse {
+                            request_id,
+                            peer: response_peer,
+                            response,
+                            latency,
+                        },
+                    );
+                }
+            },
+            request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+            } => {
+                self.pending_outbound_private_tx_body_requests
+                    .remove(&request_id);
+                self.private_tx_request_response_stats.outbound_failures = self
+                    .private_tx_request_response_stats
+                    .outbound_failures
+                    .saturating_add(1);
+                self.record_private_tx_request_failure(peer);
+                self.private_tx_body_request_failures
+                    .push_back(PrivateTxBodyRequestFailure {
+                        request_id,
+                        peer,
+                        error: error.to_string(),
+                    });
+            }
+            request_response::Event::InboundFailure { peer, error, .. } => {
+                self.private_tx_request_response_stats.inbound_failures = self
+                    .private_tx_request_response_stats
+                    .inbound_failures
+                    .saturating_add(1);
+                self.record_private_tx_request_failure(peer);
+                warn!(
+                    "direct private tx request inbound failure from {}: {}",
+                    peer, error
+                );
+            }
+            request_response::Event::ResponseSent { peer, .. } => {
+                self.private_tx_request_response_stats.inbound_served = self
+                    .private_tx_request_response_stats
+                    .inbound_served
+                    .saturating_add(1);
+                let score = self.private_tx_request_peer_scores.entry(peer).or_default();
+                *score = score.saturating_add(2).min(100);
+            }
+        }
+    }
+
+    fn select_block_request_peers(&self) -> Vec<PeerId> {
+        let mut peers = self.connected_peer_ids();
+        peers.sort_by(|left, right| {
+            self.block_request_peer_scores
+                .get(right)
+                .copied()
+                .unwrap_or_default()
+                .cmp(
+                    &self
+                        .block_request_peer_scores
+                        .get(left)
+                        .copied()
+                        .unwrap_or_default(),
+                )
+                .then_with(|| left.to_string().cmp(&right.to_string()))
+        });
+        peers
+    }
+
+    fn select_private_tx_request_peers(&self, tx_hash: &str) -> Vec<PeerId> {
+        let mut peers = self.connected_peer_ids();
+        let announced = self.private_tx_announce_sources.get(tx_hash.trim());
+        peers.sort_by(|left, right| {
+            let right_announced = announced
+                .map(|peers| peers.contains(right))
+                .unwrap_or(false);
+            let left_announced = announced.map(|peers| peers.contains(left)).unwrap_or(false);
+            right_announced
+                .cmp(&left_announced)
+                .then_with(|| {
+                    self.private_tx_request_peer_scores
+                        .get(right)
+                        .copied()
+                        .unwrap_or_default()
+                        .cmp(
+                            &self
+                                .private_tx_request_peer_scores
+                                .get(left)
+                                .copied()
+                                .unwrap_or_default(),
+                        )
+                })
+                .then_with(|| left.to_string().cmp(&right.to_string()))
+        });
+        peers
+    }
+
+    fn take_matching_direct_block_response(
+        &mut self,
+        request_ids: &HashSet<request_response::OutboundRequestId>,
+    ) -> Option<ReceivedBlockBodyResponse> {
+        let mut deferred = VecDeque::new();
+        let mut matched = None;
+        while let Some(response) = self.received_block_body_responses.pop_front() {
+            if matched.is_none() && request_ids.contains(&response.request_id) {
+                matched = Some(response);
+            } else {
+                deferred.push_back(response);
+            }
+        }
+        self.received_block_body_responses = deferred;
+        matched
+    }
+
+    fn take_matching_private_tx_body_response(
+        &mut self,
+        request_ids: &HashSet<request_response::OutboundRequestId>,
+    ) -> Option<ReceivedPrivateTxBodyResponse> {
+        let mut deferred = VecDeque::new();
+        let mut matched = None;
+        while let Some(response) = self.received_private_tx_body_responses.pop_front() {
+            if matched.is_none() && request_ids.contains(&response.request_id) {
+                matched = Some(response);
+            } else {
+                deferred.push_back(response);
+            }
+        }
+        self.received_private_tx_body_responses = deferred;
+        matched
+    }
+
+    fn take_matching_direct_block_failure(
+        &mut self,
+        request_ids: &HashSet<request_response::OutboundRequestId>,
+    ) -> Option<BlockBodyRequestFailure> {
+        let mut deferred = VecDeque::new();
+        let mut matched = None;
+        while let Some(failure) = self.block_body_request_failures.pop_front() {
+            if matched.is_none() && request_ids.contains(&failure.request_id) {
+                matched = Some(failure);
+            } else {
+                deferred.push_back(failure);
+            }
+        }
+        self.block_body_request_failures = deferred;
+        matched
+    }
+
+    fn take_matching_private_tx_body_failure(
+        &mut self,
+        request_ids: &HashSet<request_response::OutboundRequestId>,
+    ) -> Option<PrivateTxBodyRequestFailure> {
+        let mut deferred = VecDeque::new();
+        let mut matched = None;
+        while let Some(failure) = self.private_tx_body_request_failures.pop_front() {
+            if matched.is_none() && request_ids.contains(&failure.request_id) {
+                matched = Some(failure);
+            } else {
+                deferred.push_back(failure);
+            }
+        }
+        self.private_tx_body_request_failures = deferred;
+        matched
+    }
+
+    pub fn take_pending_block_body_request(&mut self) -> Option<PendingBlockBodyRequest> {
+        self.pending_block_body_requests.pop_front()
+    }
+
+    pub fn take_pending_private_tx_body_request(&mut self) -> Option<PendingPrivateTxBodyRequest> {
+        self.pending_private_tx_body_requests.pop_front()
+    }
+
+    pub fn respond_block_body_request(
+        &mut self,
+        pending: PendingBlockBodyRequest,
+        response: BlockBodyResponse,
+    ) -> Result<(), BlockBodyResponse> {
+        let peer = pending.peer;
+        match self
+            .swarm
+            .behaviour_mut()
+            .block_request_response
+            .send_response(pending.channel, response)
+        {
+            Ok(()) => {
+                let latency = pending.received_at.elapsed();
+                self.record_direct_block_success(peer, latency);
+                Ok(())
+            }
+            Err(response) => {
+                self.record_direct_block_failure(peer);
+                Err(response)
+            }
+        }
+    }
+
+    pub fn respond_private_tx_body_request(
+        &mut self,
+        pending: PendingPrivateTxBodyRequest,
+        response: PrivateTxBodyResponse,
+    ) -> Result<(), PrivateTxBodyResponse> {
+        let peer = pending.peer;
+        match self
+            .swarm
+            .behaviour_mut()
+            .private_tx_request_response
+            .send_response(pending.channel, response)
+        {
+            Ok(()) => {
+                let latency = pending.received_at.elapsed();
+                self.record_private_tx_request_success(peer, latency);
+                Ok(())
+            }
+            Err(response) => {
+                self.record_private_tx_request_failure(peer);
+                Err(response)
+            }
+        }
+    }
+
+    pub fn block_request_response_stats(&self) -> BlockRequestResponseStats {
+        self.block_request_response_stats.clone()
+    }
+
+    pub fn private_tx_request_response_stats(&self) -> PrivateTxRequestResponseStats {
+        self.private_tx_request_response_stats.clone()
+    }
+
+    fn prune_recent_private_tx_bodies(&mut self) {
+        let now = Instant::now();
+        self.recent_private_tx_bodies.retain(|_, (_, inserted_at)| {
+            now.duration_since(*inserted_at) <= PRIVATE_TX_BODY_CACHE_TTL
+        });
+        if self.recent_private_tx_bodies.len() <= PRIVATE_TX_BODY_CACHE_MAX {
+            return;
+        }
+        let mut entries = self
+            .recent_private_tx_bodies
+            .iter()
+            .map(|(hash, (_, inserted_at))| (hash.clone(), *inserted_at))
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(_, inserted_at)| *inserted_at);
+        let remove_count = entries.len().saturating_sub(PRIVATE_TX_BODY_CACHE_MAX);
+        for (hash, _) in entries.into_iter().take(remove_count) {
+            self.recent_private_tx_bodies.remove(&hash);
+        }
+    }
+
+    pub fn cache_private_tx_body(&mut self, tx_hash: &str, body: Vec<u8>) {
+        let tx_hash = tx_hash.trim();
+        if tx_hash.is_empty() || body.is_empty() {
+            return;
+        }
+        self.prune_recent_private_tx_bodies();
+        self.recent_private_tx_bodies
+            .insert(tx_hash.to_string(), (body, Instant::now()));
+    }
+
+    pub fn cached_private_tx_body(&mut self, tx_hash: &str) -> Option<Vec<u8>> {
+        self.prune_recent_private_tx_bodies();
+        self.recent_private_tx_bodies
+            .get(tx_hash.trim())
+            .map(|(body, _)| body.clone())
+    }
+
+    pub fn penalize_private_tx_announcers(&mut self, tx_hash: &str) {
+        let peers = self
+            .private_tx_announce_sources
+            .get(tx_hash.trim())
+            .cloned()
+            .unwrap_or_default();
+        for peer in peers {
+            self.record_private_tx_request_failure(peer);
+        }
     }
 
     /// Listen on a multiaddr string.
@@ -1072,6 +1817,44 @@ impl Node {
         self.swarm.dial(addr)?;
         info!("Dialing peer {}", peer_addr);
         Ok(())
+    }
+
+    /// Add a known peer address to Kademlia when the multiaddr carries `/p2p/<peer-id>`.
+    pub fn add_kademlia_peer_addr(&mut self, peer_addr: &str) -> Result<bool, Box<dyn Error>> {
+        let addr: Multiaddr = peer_addr.parse()?;
+        let Some((peer_id, dial_addr)) = Self::kademlia_peer_from_multiaddr(&addr) else {
+            return Ok(false);
+        };
+        self.swarm
+            .behaviour_mut()
+            .kademlia
+            .add_address(&peer_id, dial_addr);
+        Ok(true)
+    }
+
+    /// Add all usable Kademlia seed addresses and return the accepted count.
+    pub fn add_kademlia_peer_addrs<'a>(
+        &mut self,
+        peer_addrs: impl IntoIterator<Item = &'a String>,
+    ) -> usize {
+        let mut added = 0usize;
+        for addr in peer_addrs {
+            match self.add_kademlia_peer_addr(addr) {
+                Ok(true) => added += 1,
+                Ok(false) => {}
+                Err(err) => warn!("failed to add Kademlia peer address {}: {}", addr, err),
+            }
+        }
+        added
+    }
+
+    /// Start a Kademlia bootstrap query against known peers.
+    pub fn bootstrap_kademlia(&mut self) -> Result<kad::QueryId, Box<dyn Error>> {
+        self.swarm
+            .behaviour_mut()
+            .kademlia
+            .bootstrap()
+            .map_err(|e| -> Box<dyn Error> { Box::new(e) })
     }
 
     /// Wait for the next announced listen address.
@@ -1114,6 +1897,7 @@ impl Node {
                 SwarmEvent::Behaviour(NodeBehaviourEvent::Identify(
                     identify::Event::Received { peer_id, info, .. },
                 )) => {
+                    self.record_identify_peer(peer_id, &info);
                     self.enforce_protocol_freeze_for_peer(peer_id, &info.protocol_version);
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
@@ -1172,6 +1956,7 @@ impl Node {
                 SwarmEvent::Behaviour(NodeBehaviourEvent::Identify(
                     identify::Event::Received { peer_id, info, .. },
                 )) => {
+                    self.record_identify_peer(peer_id, &info);
                     self.enforce_protocol_freeze_for_peer(peer_id, &info.protocol_version);
                 }
                 _ => {}
@@ -1222,6 +2007,7 @@ impl Node {
                 SwarmEvent::Behaviour(NodeBehaviourEvent::Identify(
                     identify::Event::Received { peer_id, info, .. },
                 )) => {
+                    self.record_identify_peer(peer_id, &info);
                     self.enforce_protocol_freeze_for_peer(peer_id, &info.protocol_version);
                 }
                 _ => {}
@@ -1258,6 +2044,9 @@ impl Node {
                                 warn!("discarding invalid stem message while pumping: {}", err);
                                 continue;
                             }
+                            self.record_gossip_rx(&ZokaMessage::StemPrivateTransaction(
+                                stem.clone(),
+                            ));
                             let _ = self.maybe_intercept_stem_message(stem).await?;
                         }
                         Ok(ZokaMessage::PrivateMixerBatch(batch)) => {
@@ -1269,11 +2058,15 @@ impl Node {
                                 warn!("discarding invalid mixer batch while pumping: {}", err);
                                 continue;
                             }
+                            self.record_gossip_rx(&ZokaMessage::PrivateMixerBatch(batch.clone()));
                             self.maybe_intercept_mixer_message(propagation_source, batch)?;
                         }
                         Ok(msg) => {
                             if let Err(err) = self.validate_inbound_message(&msg) {
                                 warn!("discarding invalid message while pumping swarm: {}", err);
+                            } else {
+                                self.record_private_tx_announce_source(propagation_source, &msg);
+                                self.record_gossip_rx(&msg);
                             }
                         }
                         Err(_) => {
@@ -1286,7 +2079,14 @@ impl Node {
                             info,
                             ..
                         })) => {
+                            self.record_identify_peer(peer_id, &info);
                             self.enforce_protocol_freeze_for_peer(peer_id, &info.protocol_version);
+                        }
+                        SwarmEvent::Behaviour(NodeBehaviourEvent::BlockRequestResponse(event)) => {
+                            self.handle_block_request_response_event(event);
+                        }
+                        SwarmEvent::Behaviour(NodeBehaviourEvent::PrivateTxRequestResponse(event)) => {
+                            self.handle_private_tx_request_response_event(event);
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                             info!("Peer connected while pumping: {}", peer_id);
@@ -1334,12 +2134,16 @@ impl Node {
             ZokaMessage::PrivateMixerBatch(_) => self.mixer_topic.clone(),
             _ => self.general_topic.clone(),
         };
-        self.swarm
-            .behaviour_mut()
-            .gossipsub
-            .publish(topic, payload)
-            .map(|_| ())
-            .map_err(|e| -> Box<dyn Error> { Box::new(e) })
+        match self.swarm.behaviour_mut().gossipsub.publish(topic, payload) {
+            Ok(_) => {
+                self.record_gossip_publish(true);
+                Ok(())
+            }
+            Err(e) => {
+                self.record_gossip_publish(false);
+                Err(Box::new(e))
+            }
+        }
     }
 
     /// Publish a protocol message on the appropriate gossipsub topic.
@@ -1437,6 +2241,27 @@ impl Node {
         })
     }
 
+    /// Publish lightweight block inventory on general topic.
+    pub fn publish_block_announce(
+        &mut self,
+        block_height: u64,
+        block_hash: String,
+        cumulative_work: String,
+        difficulty_bits: Option<u32>,
+    ) -> Result<(), Box<dyn Error>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.publish_message(&ZokaMessage::BlockAnnounce(BlockAnnounceMessage {
+            block_height,
+            block_hash,
+            cumulative_work,
+            difficulty_bits,
+            timestamp: now,
+        }))
+    }
+
     /// Publish BlockResponse message on general topic.
     pub fn publish_block_response(
         &mut self,
@@ -1485,8 +2310,246 @@ impl Node {
         }
     }
 
-    /// Request a block and wait for a matching response from the network.
-    pub async fn request_block_with_retry(
+    pub async fn request_private_tx_body_with_retry(
+        &mut self,
+        tx_hash: &str,
+        attempts: u32,
+        max_wait: Duration,
+    ) -> Result<Vec<u8>, Box<dyn Error>> {
+        let tx_hash = tx_hash.trim();
+        if tx_hash.is_empty() {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private tx hash is empty",
+            )));
+        }
+
+        let peers = self.select_private_tx_request_peers(tx_hash);
+        if peers.is_empty() {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no connected peers available for private tx body request",
+            )));
+        }
+
+        let max_attempts = attempts.max(1) as usize;
+        let request = PrivateTxBodyRequest {
+            tx_hash: tx_hash.to_string(),
+        };
+        let mut request_ids = HashSet::new();
+        for peer in peers.into_iter().take(max_attempts) {
+            let request_id = self
+                .swarm
+                .behaviour_mut()
+                .private_tx_request_response
+                .send_request(&peer, request.clone());
+            self.pending_outbound_private_tx_body_requests.insert(
+                request_id,
+                PendingOutboundPrivateTxBodyRequest {
+                    peer,
+                    request: request.clone(),
+                    started_at: Instant::now(),
+                },
+            );
+            self.private_tx_request_response_stats.outbound_sent = self
+                .private_tx_request_response_stats
+                .outbound_sent
+                .saturating_add(1);
+            request_ids.insert(request_id);
+        }
+
+        let deadline = tokio::time::Instant::now() + max_wait;
+        let mut last_error = String::new();
+        loop {
+            if let Some(received) = self.take_matching_private_tx_body_response(&request_ids) {
+                match received.response {
+                    PrivateTxBodyResponse::Body { tx_hash: got, body } => {
+                        if got != tx_hash || body.is_empty() {
+                            self.record_private_tx_invalid_response(received.peer.clone());
+                            last_error = format!(
+                                "peer {} returned invalid private tx body for {}",
+                                received.peer, tx_hash
+                            );
+                            continue;
+                        }
+                        info!(
+                            "direct private tx body response hash={} from {} in {}ms",
+                            tx_hash,
+                            received.peer,
+                            received.latency.as_millis()
+                        );
+                        return Ok(body);
+                    }
+                    PrivateTxBodyResponse::NotFound { reason, .. } => {
+                        self.record_private_tx_request_failure(received.peer.clone());
+                        last_error = format!(
+                            "peer {} did not have private tx body: {reason}",
+                            received.peer
+                        );
+                    }
+                    PrivateTxBodyResponse::RateLimited {
+                        retry_after_secs, ..
+                    } => {
+                        self.private_tx_request_response_stats.rate_limited = self
+                            .private_tx_request_response_stats
+                            .rate_limited
+                            .saturating_add(1);
+                        self.record_private_tx_request_failure(received.peer.clone());
+                        last_error = format!(
+                            "peer {} rate limited private tx body request for {}s",
+                            received.peer, retry_after_secs
+                        );
+                    }
+                }
+            }
+
+            if let Some(failure) = self.take_matching_private_tx_body_failure(&request_ids) {
+                last_error = format!(
+                    "peer {} private tx body request failed: {}",
+                    failure.peer, failure.error
+                );
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                let detail = if last_error.is_empty() {
+                    "no direct PrivateTxBody response received".to_string()
+                } else {
+                    last_error
+                };
+                return Err(Box::new(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("timed out waiting for private tx body response: {detail}"),
+                )));
+            }
+
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            self.pump_for(remaining.min(Duration::from_millis(150)))
+                .await?;
+        }
+    }
+
+    async fn request_block_direct_with_retry(
+        &mut self,
+        block_height: u64,
+        expected_hash: Option<String>,
+        attempts: u32,
+        max_wait: Duration,
+    ) -> Result<BlockResponseMessage, Box<dyn Error>> {
+        let peers = self.select_block_request_peers();
+        if peers.is_empty() {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no connected peers available for direct block request",
+            )));
+        }
+
+        let max_attempts = attempts.max(1) as usize;
+        let mut request_ids = HashSet::new();
+        let request = BlockBodyRequest {
+            block_height,
+            block_hash: expected_hash.clone(),
+        };
+        for peer in peers.into_iter().take(max_attempts) {
+            let request_id = self
+                .swarm
+                .behaviour_mut()
+                .block_request_response
+                .send_request(&peer, request.clone());
+            self.pending_outbound_block_body_requests.insert(
+                request_id,
+                PendingOutboundBlockBodyRequest {
+                    peer,
+                    request: request.clone(),
+                    started_at: Instant::now(),
+                },
+            );
+            self.block_request_response_stats.outbound_sent = self
+                .block_request_response_stats
+                .outbound_sent
+                .saturating_add(1);
+            request_ids.insert(request_id);
+        }
+
+        if request_ids.is_empty() {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no direct block request could be scheduled",
+            )));
+        }
+
+        let deadline = tokio::time::Instant::now() + max_wait;
+        let mut last_error = String::new();
+        loop {
+            if let Some(received) = self.take_matching_direct_block_response(&request_ids) {
+                match received.response {
+                    BlockBodyResponse::Found(response) => {
+                        if response.block_height != block_height {
+                            self.record_direct_block_invalid_response(received.peer.clone());
+                            last_error = format!(
+                                "peer {} returned height {}, expected {}",
+                                received.peer, response.block_height, block_height
+                            );
+                            continue;
+                        }
+                        if let Some(hash) = expected_hash.as_ref() {
+                            if &response.block_hash != hash {
+                                self.record_direct_block_invalid_response(received.peer.clone());
+                                last_error = format!(
+                                    "peer {} returned hash {}, expected {}",
+                                    received.peer, response.block_hash, hash
+                                );
+                                continue;
+                            }
+                        }
+                        info!(
+                            "direct block response height={} hash={} from {} in {}ms",
+                            response.block_height,
+                            response.block_hash,
+                            received.peer,
+                            received.latency.as_millis()
+                        );
+                        return Ok(response);
+                    }
+                    BlockBodyResponse::NotFound { reason, .. } => {
+                        self.record_direct_block_failure(received.peer.clone());
+                        last_error = format!("peer {} did not have block: {reason}", received.peer);
+                    }
+                    BlockBodyResponse::Rejected { reason, .. } => {
+                        self.record_direct_block_failure(received.peer.clone());
+                        last_error = format!(
+                            "peer {} rejected direct block request: {reason}",
+                            received.peer
+                        );
+                    }
+                }
+            }
+
+            if let Some(failure) = self.take_matching_direct_block_failure(&request_ids) {
+                last_error = format!(
+                    "peer {} direct request failed: {}",
+                    failure.peer, failure.error
+                );
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                let detail = if last_error.is_empty() {
+                    "no direct BlockData response received".to_string()
+                } else {
+                    last_error
+                };
+                return Err(Box::new(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("timed out waiting for direct block response: {detail}"),
+                )));
+            }
+
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            self.pump_for(remaining.min(Duration::from_millis(150)))
+                .await?;
+        }
+    }
+
+    async fn request_block_via_gossip_with_retry(
         &mut self,
         block_height: u64,
         expected_hash: Option<String>,
@@ -1553,6 +2616,45 @@ impl Node {
         }
     }
 
+    /// Request a block and wait for a matching response from the network.
+    pub async fn request_block_with_retry(
+        &mut self,
+        block_height: u64,
+        expected_hash: Option<String>,
+        publish_attempts: u32,
+        max_wait: Duration,
+    ) -> Result<BlockResponseMessage, Box<dyn Error>> {
+        match self
+            .request_block_direct_with_retry(
+                block_height,
+                expected_hash.clone(),
+                publish_attempts,
+                max_wait,
+            )
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(direct_err) => {
+                warn!(
+                    "direct block request failed for height {} ({}); falling back to gossip legacy",
+                    block_height, direct_err
+                );
+                self.request_block_via_gossip_with_retry(
+                    block_height,
+                    expected_hash,
+                    publish_attempts,
+                    max_wait,
+                )
+                .await
+                .map_err(|gossip_err| {
+                    Box::new(io::Error::other(format!(
+                        "direct request failed: {direct_err}; gossip fallback failed: {gossip_err}"
+                    ))) as Box<dyn Error>
+                })
+            }
+        }
+    }
+
     /// Receive next protocol message from gossipsub.
     pub async fn next_message(&mut self) -> Result<ZokaMessage, Box<dyn Error>> {
         loop {
@@ -1583,6 +2685,9 @@ impl Node {
                                 warn!("discarding invalid stem message: {}", err);
                                 continue;
                             }
+                            self.record_gossip_rx(&ZokaMessage::StemPrivateTransaction(
+                                stem.clone(),
+                            ));
                             if let Some(msg) = self.maybe_intercept_stem_message(stem).await? {
                                 return Ok(msg);
                             }
@@ -1594,6 +2699,7 @@ impl Node {
                                 warn!("discarding invalid mixer batch: {}", err);
                                 continue;
                             }
+                            self.record_gossip_rx(&ZokaMessage::PrivateMixerBatch(batch.clone()));
                             self.maybe_intercept_mixer_message(propagation_source, batch)?;
                             if let Some(message) = self.inbound_queue.pop_front() {
                                 return Ok(message);
@@ -1604,6 +2710,8 @@ impl Node {
                                 warn!("discarding invalid message: {}", err);
                                 continue;
                             }
+                            self.record_private_tx_announce_source(propagation_source, &msg);
+                            self.record_gossip_rx(&msg);
                             // Diagnostic for an intermittent resync stall on
                             // follower nodes (--seed configured): confirms
                             // whether a BlockResponse genuinely never arrives
@@ -1629,7 +2737,14 @@ impl Node {
                 SwarmEvent::Behaviour(NodeBehaviourEvent::Identify(
                     identify::Event::Received { peer_id, info, .. },
                 )) => {
+                    self.record_identify_peer(peer_id, &info);
                     self.enforce_protocol_freeze_for_peer(peer_id, &info.protocol_version);
+                }
+                SwarmEvent::Behaviour(NodeBehaviourEvent::BlockRequestResponse(event)) => {
+                    self.handle_block_request_response_event(event);
+                }
+                SwarmEvent::Behaviour(NodeBehaviourEvent::PrivateTxRequestResponse(event)) => {
+                    self.handle_private_tx_request_response_event(event);
                 }
                 _ => {}
             }
@@ -1679,6 +2794,47 @@ impl Node {
     /// Return current number of connected peers.
     pub fn connected_peer_count(&self) -> usize {
         self.swarm.connected_peers().count()
+    }
+
+    /// Return peer addresses learned through Identify for persistence/redial.
+    pub fn observed_peer_addresses(&self) -> Vec<(String, String)> {
+        self.observed_peer_addrs
+            .iter()
+            .flat_map(|(peer_id, addrs)| {
+                addrs
+                    .iter()
+                    .cloned()
+                    .map(|addr| (peer_id.to_string(), addr))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Return peer addresses and protocol metadata learned through Identify.
+    pub fn observed_peer_records(&self) -> Vec<ObservedPeerRecord> {
+        self.observed_peer_addrs
+            .iter()
+            .flat_map(|(peer_id, addrs)| {
+                let protocols = self.observed_peer_protocols.get(peer_id);
+                addrs
+                    .iter()
+                    .cloned()
+                    .map(|addr| ObservedPeerRecord {
+                        peer_id: peer_id.to_string(),
+                        addr,
+                        protocol_version: protocols.and_then(|info| info.protocol_version.clone()),
+                        protocols: protocols
+                            .map(|info| info.protocols.clone())
+                            .unwrap_or_default(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Return local gossip counters for runtime observability.
+    pub fn gossip_stats(&self) -> GossipStats {
+        self.gossip_stats.clone()
     }
 
     /// Return number of peers blocked by protocol-freeze compatibility rules.
@@ -2234,6 +3390,36 @@ mod tests {
     }
 
     #[test]
+    fn test_private_tx_announce_uses_general_topic() {
+        let message = ZokaMessage::PrivateTxAnnounce(PrivateTxAnnounceMessage {
+            tx_hash: "abcdef0123456789".to_string(),
+            body_size_bytes: Some(512),
+            private_proof_profile: crate::private_wallet::PRIVATE_PROOF_PROFILE_V1.to_string(),
+            timestamp: 1,
+        });
+        assert_eq!(Node::topic_name_for_message(&message), GENERAL_TOPIC_NAME);
+    }
+
+    #[test]
+    fn test_private_tx_announce_validation_rejects_bad_payloads() {
+        let valid = PrivateTxAnnounceMessage {
+            tx_hash: "abcdef0123456789".to_string(),
+            body_size_bytes: Some(512),
+            private_proof_profile: crate::private_wallet::PRIVATE_PROOF_PROFILE_V1.to_string(),
+            timestamp: 1,
+        };
+        assert!(Node::is_private_tx_announce_well_formed(&valid));
+
+        let mut invalid_hash = valid.clone();
+        invalid_hash.tx_hash = "not valid!".to_string();
+        assert!(!Node::is_private_tx_announce_well_formed(&invalid_hash));
+
+        let mut invalid_size = valid;
+        invalid_size.body_size_bytes = Some(0);
+        assert!(!Node::is_private_tx_announce_well_formed(&invalid_size));
+    }
+
+    #[test]
     fn test_privacy_transport_mode_resolution() {
         let mut config = NetworkPrivacyConfig::default();
         assert_eq!(
@@ -2434,6 +3620,23 @@ mod tests {
         assert_eq!(i2p_target.port, 9001);
     }
 
+    #[test]
+    fn test_kademlia_peer_from_multiaddr_requires_p2p_suffix() {
+        let peer_id = PeerId::random();
+        let with_peer: Multiaddr = format!("/ip4/127.0.0.1/tcp/28080/p2p/{peer_id}")
+            .parse()
+            .expect("multiaddr with peer");
+        let (parsed_peer, dial_addr) =
+            Node::kademlia_peer_from_multiaddr(&with_peer).expect("kademlia peer");
+        assert_eq!(parsed_peer, peer_id);
+        assert_eq!(dial_addr.to_string(), "/ip4/127.0.0.1/tcp/28080");
+
+        let without_peer: Multiaddr = "/ip4/127.0.0.1/tcp/28080"
+            .parse()
+            .expect("multiaddr without peer");
+        assert!(Node::kademlia_peer_from_multiaddr(&without_peer).is_none());
+    }
+
     #[tokio::test]
     async fn test_probe_anonymous_route_uses_tor_proxy() {
         let (proxy_endpoint, proxy_task) = spawn_mock_socks5_proxy().await;
@@ -2577,290 +3780,5 @@ mod tests {
             .request_block_with_retry(42, None, 2, Duration::from_millis(400))
             .await;
         assert!(result.is_err());
-    }
-
-    // ===== PeerManager Tests =====
-
-    #[test]
-    fn test_peer_manager_creation() {
-        let pm = PeerManager::new(50);
-        assert_eq!(pm.peer_count(), 0);
-        assert_eq!(pm.max_peers, 50);
-        assert!(pm.known_peers.is_empty());
-        assert!(pm.peer_scores.is_empty());
-        assert!(pm.message_cache.is_empty());
-    }
-
-    #[test]
-    fn test_peer_manager_default() {
-        let pm = PeerManager::default();
-        assert!(pm.max_peers > 0);
-        assert_eq!(pm.peer_count(), 0);
-    }
-
-    #[test]
-    fn test_add_peer() {
-        let mut pm = PeerManager::new(10);
-        let peer1 = PeerId::random();
-        let peer2 = PeerId::random();
-
-        pm.add_peer(peer1);
-        assert_eq!(pm.peer_count(), 1);
-        assert!(pm.known_peers.contains(&peer1));
-
-        pm.add_peer(peer2);
-        assert_eq!(pm.peer_count(), 2);
-        assert!(pm.known_peers.contains(&peer2));
-
-        // Adding duplicate doesn't change count
-        pm.add_peer(peer1);
-        assert_eq!(pm.peer_count(), 2);
-    }
-
-    #[test]
-    fn test_peer_score_initialization() {
-        let mut pm = PeerManager::new(10);
-        let peer = PeerId::random();
-
-        pm.add_peer(peer);
-        let score = pm.get_peer_score(peer);
-        assert_eq!(score, 0); // New peers start with 0 score
-    }
-
-    #[test]
-    fn test_update_peer_score_positive() {
-        let mut pm = PeerManager::new(10);
-        let peer = PeerId::random();
-
-        pm.add_peer(peer);
-        pm.update_peer_score(peer, 5);
-        assert_eq!(pm.get_peer_score(peer), 5);
-
-        pm.update_peer_score(peer, 10);
-        assert_eq!(pm.get_peer_score(peer), 15);
-    }
-
-    #[test]
-    fn test_update_peer_score_negative() {
-        let mut pm = PeerManager::new(10);
-        let peer = PeerId::random();
-
-        pm.add_peer(peer);
-        pm.update_peer_score(peer, 20);
-        assert_eq!(pm.get_peer_score(peer), 20);
-
-        pm.update_peer_score(peer, -10);
-        assert_eq!(pm.get_peer_score(peer), 10);
-
-        pm.update_peer_score(peer, -15);
-        assert_eq!(pm.get_peer_score(peer), -5);
-    }
-
-    #[test]
-    fn test_prune_low_score_peers() {
-        let mut pm = PeerManager::new(10);
-        let peer1 = PeerId::random();
-        let peer2 = PeerId::random();
-        let peer3 = PeerId::random();
-
-        pm.add_peer(peer1);
-        pm.add_peer(peer2);
-        pm.add_peer(peer3);
-
-        // Set different scores
-        pm.update_peer_score(peer1, 50); // Good peer
-        pm.update_peer_score(peer2, -30); // Bad peer
-        pm.update_peer_score(peer3, 10); // Okay peer
-
-        assert_eq!(pm.peer_count(), 3);
-
-        // Prune peers with score < 0
-        pm.prune_low_score_peers(0);
-        assert_eq!(pm.peer_count(), 2);
-        assert!(!pm.known_peers.contains(&peer2));
-    }
-
-    #[test]
-    fn test_cache_message() {
-        let mut pm = PeerManager::new(10);
-        let msg_id = "msg-1".to_string();
-
-        pm.cache_message(msg_id.clone(), 1000);
-        assert!(pm.has_seen_message("msg-1"));
-
-        // Cache another message
-        let msg_id2 = "msg-2".to_string();
-        pm.cache_message(msg_id2, 1001);
-        assert!(pm.has_seen_message("msg-2"));
-        assert!(pm.has_seen_message("msg-1"));
-    }
-
-    #[test]
-    fn test_has_seen_message_not_cached() {
-        let pm = PeerManager::new(10);
-        assert!(!pm.has_seen_message("unseen-message"));
-    }
-
-    #[test]
-    fn test_duplicate_detection() {
-        let mut pm = PeerManager::new(10);
-        let msg_id = "duplicate-test".to_string();
-
-        // First time: not seen
-        assert!(!pm.has_seen_message("duplicate-test"));
-
-        // Cache it
-        pm.cache_message(msg_id.clone(), 1000);
-        assert!(pm.has_seen_message("duplicate-test"));
-
-        // Try to cache again - should still be tracked
-        pm.cache_message(msg_id, 1000);
-        assert!(pm.has_seen_message("duplicate-test"));
-    }
-
-    #[test]
-    fn test_get_top_peers() {
-        let mut pm = PeerManager::new(10);
-        let peer1 = PeerId::random();
-        let peer2 = PeerId::random();
-        let peer3 = PeerId::random();
-        let peer4 = PeerId::random();
-
-        pm.add_peer(peer1);
-        pm.add_peer(peer2);
-        pm.add_peer(peer3);
-        pm.add_peer(peer4);
-
-        // Set scores
-        pm.update_peer_score(peer1, 100);
-        pm.update_peer_score(peer2, 50);
-        pm.update_peer_score(peer3, 75);
-        pm.update_peer_score(peer4, 25);
-
-        // Get top 2 peers
-        let top_peers = pm.get_top_peers(2);
-        assert_eq!(top_peers.len(), 2);
-        // Should be peer1 (100) and peer3 (75)
-        assert!(top_peers[0].0 == peer1 || top_peers[1].0 == peer1);
-        assert!(top_peers[0].0 == peer3 || top_peers[1].0 == peer3);
-    }
-
-    #[test]
-    fn test_get_top_peers_more_than_available() {
-        let mut pm = PeerManager::new(10);
-        let peer1 = PeerId::random();
-        let peer2 = PeerId::random();
-
-        pm.add_peer(peer1);
-        pm.add_peer(peer2);
-
-        pm.update_peer_score(peer1, 100);
-        pm.update_peer_score(peer2, 50);
-
-        // Request more peers than available
-        let top_peers = pm.get_top_peers(10);
-        assert_eq!(top_peers.len(), 2); // Only 2 peers exist
-    }
-
-    #[test]
-    fn test_max_peers_limit() {
-        let mut pm = PeerManager::new(3);
-        let peer1 = PeerId::random();
-        let peer2 = PeerId::random();
-        let peer3 = PeerId::random();
-
-        pm.add_peer(peer1);
-        pm.add_peer(peer2);
-        pm.add_peer(peer3);
-
-        assert_eq!(pm.peer_count(), 3);
-        assert_eq!(pm.peer_count(), pm.max_peers);
-    }
-
-    #[test]
-    fn test_gossip_protocol_scenario() {
-        let mut pm = PeerManager::new(20);
-
-        // Simulate peer discovery
-        let mut peers = vec![];
-        for _ in 0..5 {
-            let peer = PeerId::random();
-            pm.add_peer(peer);
-            peers.push(peer);
-        }
-
-        assert_eq!(pm.peer_count(), 5);
-
-        // Simulate message propagation with duplicate detection
-        let block_hash = "block-hash-123".to_string();
-        for i in 0..3 {
-            if !pm.has_seen_message("block-hash-123") {
-                pm.cache_message(block_hash.clone(), i as u64);
-            }
-        }
-        assert!(pm.has_seen_message("block-hash-123"));
-
-        // Reward good peers
-        for peer in &peers[0..3] {
-            pm.update_peer_score(*peer, 10);
-        }
-
-        // Penalize bad peers
-        for peer in &peers[3..] {
-            pm.update_peer_score(*peer, -5);
-        }
-
-        // Prune low reputation peers
-        pm.prune_low_score_peers(-3);
-    }
-
-    #[test]
-    fn test_peer_reputation_tracking() {
-        let mut pm = PeerManager::new(10);
-        let peer = PeerId::random();
-
-        pm.add_peer(peer);
-
-        // Initial reputation
-        assert_eq!(pm.get_peer_score(peer), 0);
-
-        // Good behavior
-        pm.update_peer_score(peer, 5);
-        assert_eq!(pm.get_peer_score(peer), 5);
-
-        // More good behavior
-        pm.update_peer_score(peer, 10);
-        assert_eq!(pm.get_peer_score(peer), 15);
-
-        // One bad behavior
-        pm.update_peer_score(peer, -3);
-        assert_eq!(pm.get_peer_score(peer), 12);
-
-        // Reputation is positive but degraded
-        assert!(pm.get_peer_score(peer) > 0);
-    }
-
-    #[test]
-    fn test_peer_discovery_and_tracking() {
-        let mut pm = PeerManager::new(100);
-
-        // Simulate peer discovery from multiple sources
-        let discovered_peers: Vec<_> = (0..10).map(|_| PeerId::random()).collect();
-
-        for peer in discovered_peers.iter() {
-            pm.add_peer(*peer);
-        }
-
-        assert_eq!(pm.peer_count(), 10);
-
-        // Track message from peer discovery announcement
-        let discovery_msg_id = "peer-discovery-announce-1".to_string();
-        pm.cache_message(discovery_msg_id, 1000);
-
-        for peer in discovered_peers.iter() {
-            assert!(pm.known_peers.contains(peer));
-        }
-
-        assert!(pm.has_seen_message("peer-discovery-announce-1"));
     }
 }

@@ -75,9 +75,14 @@ for the ACME challenge):
 ```bash
 ufw allow 80/tcp
 ufw allow 443/tcp
+ufw allow 28080/tcp
 ufw deny 3000/tcp
 ufw reload
 ```
+
+Keep `28080/tcp` public for libp2p bootstrap. The raw HTTP API can be hidden
+behind Caddy, but public seed nodes must accept inbound P2P or external miners
+cannot join the network.
 
 ## 6. Point the clients at HTTPS (final step — only after the cert is live)
 
