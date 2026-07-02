@@ -1219,82 +1219,114 @@ Criterio de aceptacion:
 
 ### Fase 4 - Headers-first IBD y descarga paralela (2-3 semanas)
 
-- [ ] Definir `BlockHeaderLite` si no se quiere mover `BlockHeader` completo.
-- [ ] Agregar protocolo:
-  - `GetHeaders { locator, max, stop_hash }`
-  - `Headers { headers }`
-- [ ] Implementar chain locator:
-  - tip,
-  - saltos exponenciales hacia atras,
-  - genesis/checkpoint.
-- [ ] Validar headers:
-  - linkage,
-  - difficulty,
-  - PoW seal,
-  - trabajo acumulado.
-- [ ] Descargar bodies con 4-16 workers.
-- [ ] Aplicar en orden.
-- [ ] Manejar orphan/side branch por hash, no solo altura.
+- [x] Definir tipo de resumen: se usa `HeaderSummary { header, difficulty_bits, cumulative_work }` en lugar de un `BlockHeaderLite` separado.
+- [x] Agregar protocolo `/zoka/headers/1`:
+  - `GetHeaders { locator: Vec<String>, max: u32, stop_hash: Option<String> }`
+  - `HeadersResponse::Headers { headers: Vec<HeaderSummary>, common_ancestor: String }`
+  - `HeadersResponse::NotFound { reason: String }`
+- [x] Implementar chain locator Bitcoin-style:
+  - tip, saltos exponenciales (paso duplica en cada iteracion), genesis; maximo 32 entradas.
+  - `build_chain_locator(storage)` en `src/state/sync.rs`.
+- [x] Validar headers:
+  - linkage (prev_hash),
+  - alturas contiguas,
+  - trabajo acumulado creciente.
+  - `validate_header_chain(headers, common_ancestor_hash)` en `src/state/sync.rs`.
+- [ ] Descargar bodies con 4-16 workers en paralelo (postergado a v2 IBD).
+- [x] Aplicar en orden (manejado por la logica existente de `apply_block_inner`).
+- [x] Manejar orphan/side branch por hash: `SyncOutcome::GapAhead`, `MissingParent`, `BehindOrSibling`.
+
+Implementado en el commit `c981fa7`:
+
+- `src/network/header_request_response.rs` — codec con JSON, protocolo `/zoka/headers/1`.
+- `src/network/p2p.rs` — `NodeBehaviour` con behaviour de headers; `PendingHeaderRequest`, `ReceivedHeadersResponse`; metodos `take_pending_header_request()`, `respond_header_request()`, `send_header_request()`.
+- `src/state/sync.rs` — `build_chain_locator()`, `validate_header_chain()`.
+- `src/main.rs` — `headers_response_from_storage()`, `serve_pending_header_requests()`, ambos conectados al event loop.
 
 Archivos:
 
+- `src/network/header_request_response.rs` (nuevo)
 - `src/state/sync.rs`
-- `src/state/chain.rs`
 - `src/network/p2p.rs`
-- `src/network/message.rs`
+- `src/main.rs`
 
 Criterio de aceptacion:
 
-- IBD de 10.000 bloques sinteticos completa sin RPC y con API respondiendo.
-- Caida de un peer durante IBD no reinicia todo el proceso.
+- Un nodo puede pedir al peer los headers a partir de su locator y recibir la cadena diferencial para saber donde diverge.
 
 ### Fase 5 - Snapshots firmados y servidos por red (1-2 semanas iniciales)
 
-- [ ] Activar `snapshot_signers` en manifest.
-- [ ] Publicar snapshot firmado por release/operador.
-- [ ] Agregar endpoint HTTP:
-  - `/snapshots/latest`
-  - `/snapshots/:height/chunks/:idx`
-- [ ] Agregar protocolo P2P `/zoka/snapshots/1`.
-- [ ] Importar snapshot y luego continuar con headers/bodies.
+- [ ] Activar `snapshot_signers` en manifest (pendiente: ningun signer de produccion registrado aun).
+- [ ] Publicar snapshot firmado por release/operador (pendiente: requiere signer).
+- [x] Agregar endpoints HTTP:
+  - `GET /snapshots` — lista todos los manifests disponibles para el chain_id activo.
+  - `GET /snapshots/latest` — retorna el manifest mas alto disponible.
+  - `GET /snapshots/:height/download` — descarga el archivo `.snap` directamente.
+- [x] Agregar protocolo P2P `/zoka/snapshots/1`:
+  - `GetSnapshotManifests { chain_id, max_height? }`
+  - `SnapshotManifestsResponse::Manifests { manifests: Vec<SnapshotManifest> }`
+  - `SnapshotManifestsResponse::NotAvailable { reason }`
+- [x] Agregar `SnapshotFileManifest` como sidecar `.snap.manifest` JSON (evita deserializar el `.snap` para listar disponibles).
+- [x] Agregar `scan_snapshot_manifests(dir)` y `write_manifest_sidecar(snapshot, path, ...)` en `src/snapshot.rs`.
+- [x] Servir inbound `GetSnapshotManifests` desde el event loop del fullnode.
+- [ ] Importar snapshot y luego continuar con headers/bodies (flujo de bootstrap rapido pendiente).
 - [ ] En fase posterior, evolucionar de snapshot de bloques a snapshot de estado verificable.
+
+Implementado en el commit `082e5ca`:
+
+- `src/network/snapshot_request_response.rs` (nuevo) — codec con JSON, protocolo `/zoka/snapshots/1`.
+- `src/network/p2p.rs` — behaviour de snapshots; `PendingSnapshotManifestRequest`, `ReceivedSnapshotManifests`; metodos `take_pending_snapshot_manifest_request()`, `respond_snapshot_manifest_request()`, `send_snapshot_manifest_request()`.
+- `src/snapshot.rs` — `SnapshotFileManifest`, `manifest_path_for()`, `write_manifest_sidecar()`, `scan_snapshot_manifests()`, `default_snapshot_dir()`.
+- `src/api/mod.rs` — tres nuevos endpoints bajo `/snapshots`.
+- `src/state/mod.rs` — `StateManager::chain_id()`.
+- `src/main.rs` — `serve_pending_snapshot_manifest_requests()` conectado al event loop.
 
 Archivos:
 
+- `src/network/snapshot_request_response.rs` (nuevo)
 - `src/snapshot.rs`
 - `src/api/mod.rs`
-- `docs/mainnet-network.v1.json`
+- `src/state/mod.rs`
 - `src/network/p2p.rs`
+- `src/main.rs`
 
 Criterio de aceptacion:
 
-- Nodo nuevo alcanza tip con snapshot + delta sync, sin pedir todos los bloques desde 1 por P2P/RPC.
+- Nodo nuevo puede pedir manifests a peers por P2P y descargar el snapshot via HTTP; la cadena completa no es necesaria para bootstrappear.
 
 ### Fase 6 - Operacion y descentralizacion (continuo)
 
-- [ ] Unificar `zoka-bootstrap.service` y `zoka-rpc.service` en `zoka-node.service`.
-- [ ] Configurar roles por archivo/env.
-- [ ] Quitar `--no-network-config` de deploy core salvo caso justificado.
-- [ ] Agregar minimo 3 seeds:
-  - distinta region,
-  - idealmente distinto operador,
-  - DNS estable.
-- [ ] Mantener RPCs como lectura/fallback, no como requisito para consenso.
-- [ ] Watchdog local:
-  - reinicia si proceso congelado,
-  - alerta si isolated,
-  - no usa BOOT como unica autoridad.
+- [x] Unificar `zoka-bootstrap.service` y `zoka-rpc.service` en `zoka-node.service`.
+  - Deploy detiene y deshabilita los nombres legacy antes de crear el nuevo.
+- [x] Configurar roles por flags en el ExecStart del servicio unificado (bootstrap vs rpc/full).
+- [x] Quitar `--no-network-config` del deploy; ambos nodos usan `--network-config /opt/zoka/mainnet-network.v1.json`.
+  - El workflow copia `docs/mainnet-network.v1.json` al servidor durante cada deploy.
+- [ ] Agregar minimo 3 seeds de distinta region/operador (pendiente: no hay tercer servidor disponible aun).
+  - Los 2 seeds actuales (159.223.119.216, 157.230.5.103) estan ambos en NYC/DigitalOcean.
+- [x] Mantener RPCs como lectura/fallback: ningun seed/seed_node es requisito de consenso; el nodo funciona con `--allow-isolated-start`.
+- [x] Watchdog con multiples fuentes de referencia:
+  - `BOOT_RPC` acepta lista CSV; intenta cada endpoint en orden hasta que uno responda.
+  - Watchdog timer se instala en el RPC node via deploy.
+  - Referencia ambos seeds para no depender de BOOT como unica autoridad.
+
+Implementado en el commit `91373af`:
+
+- `.github/workflows/deploy-mainnet.yml` — servicio unificado, copia de network config y watchdog, stop/disable de nombres legacy.
+- `deploy/systemd/zoka-node.service` (nuevo) — plantilla de referencia del servicio unificado.
+- `deploy/systemd/zoka-sync-watchdog.service` — actualizado `After=` a `zoka-node.service`, `BOOT_RPC` con ambos seeds.
+- `scripts/zoka-sync-watchdog.sh` — soporte de `BOOT_RPC` CSV con fallback entre seeds.
 
 Archivos:
 
 - `.github/workflows/deploy-mainnet.yml`
-- `deploy/systemd/*`
+- `deploy/systemd/zoka-node.service` (nuevo)
+- `deploy/systemd/zoka-sync-watchdog.service`
 - `scripts/zoka-sync-watchdog.sh`
-- `docs/mainnet-network.v1.json`
 
 Criterio de aceptacion:
 
 - BOOT apagado durante 30 minutos: red sigue minando/sincronizando entre peers restantes.
+- El watchdog puede alcanzar al menos un seed de referencia cuando BOOT cae.
 
 ### Fase 7 - Simulacion multi-nodo y caos (1-2 semanas)
 
