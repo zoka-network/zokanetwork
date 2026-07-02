@@ -6912,6 +6912,73 @@ fn sync_outcome_to_event(outcome: zoka::state::sync::SyncOutcome) -> String {
     }
 }
 
+/// Fase 4 parallel IBD body download: fires several direct block-body
+/// requests to different peers up front instead of `run_sync_step`'s
+/// one-at-a-time wait/apply/wait cycle. Results are stashed into
+/// `peer_view`'s pending-response cache; `run_sync_step`'s existing
+/// `take_pending_block_response` picks them up in height order on
+/// subsequent ticks, so the apply path itself is unchanged - this only
+/// parallelizes the network fetch.
+const IBD_PARALLEL_BODY_WORKERS: usize = 8;
+
+async fn run_ibd_body_prefetch_step(
+    node: &mut Node,
+    chain_db_path: Option<&str>,
+    peer_view: &mut zoka::state::sync::PeerChainView,
+) -> Result<Option<String>, String> {
+    let Some(path) = chain_db_path else {
+        return Ok(None);
+    };
+    // Branch backfill walks backward hash-by-hash on a side branch; that
+    // flow is deliberately single-height and hash-pinned, so leave it to
+    // run_sync_step untouched rather than prefetching speculatively.
+    if peer_view.branch_backfill_height.is_some() {
+        return Ok(None);
+    }
+    if node.connected_peer_count() == 0 {
+        return Ok(None);
+    }
+    let storage = match RocksDbStorage::new(path) {
+        Ok(storage) => storage,
+        Err(_) => return Ok(None),
+    };
+    let local_height = storage
+        .get_chain_height()
+        .map_err(|err| format!("read chain height failed: {err}"))?;
+    if local_height >= peer_view.perceived_max_height {
+        return Ok(None);
+    }
+    let ceiling = peer_view
+        .perceived_max_height
+        .min(local_height.saturating_add(IBD_PARALLEL_BODY_WORKERS as u64));
+    let heights: Vec<u64> = ((local_height + 1)..=ceiling)
+        .filter(|h| !peer_view.has_pending_block_response(*h))
+        .collect();
+    if heights.len() < 2 {
+        // Not enough of a window to make pipelining worthwhile; let
+        // run_sync_step's normal single-height path handle it.
+        return Ok(None);
+    }
+    let results = node
+        .request_blocks_batch_direct(&heights, Duration::from_secs(8))
+        .await;
+    let requested = heights.len();
+    let mut fetched = 0u64;
+    for (_, result) in results {
+        if let Ok(response) = result {
+            peer_view.stash_prefetched_block_response(local_height, response);
+            fetched = fetched.saturating_add(1);
+        }
+    }
+    if fetched == 0 {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "IBD prefetch: {fetched}/{requested} block bodies fetched in parallel for heights {}..{ceiling}",
+        local_height + 1
+    )))
+}
+
 async fn run_sync_step(
     node: &mut Node,
     chain_id: &str,
@@ -9231,6 +9298,12 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         }
 
         if !mining_active && tokio::time::Instant::now() >= next_ibd_at {
+            if let Some(prefetch_event) =
+                run_ibd_body_prefetch_step(&mut node, db_path.as_deref(), &mut peer_chain_view)
+                    .await?
+            {
+                last_event = prefetch_event;
+            }
             if let Some(sync_event) = run_rpc_sync_batch(
                 &chain_id,
                 db_path.as_deref(),

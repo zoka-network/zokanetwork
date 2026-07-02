@@ -1235,7 +1235,10 @@ Criterio de aceptacion:
   - alturas contiguas,
   - trabajo acumulado creciente.
   - `validate_header_chain(headers, common_ancestor_hash)` en `src/state/sync.rs`.
-- [ ] Descargar bodies con 4-16 workers en paralelo (postergado a v2 IBD).
+- [x] Descargar bodies con 4-16 workers en paralelo.
+  - `Node::request_blocks_batch_direct` (`src/network/p2p.rs`) dispara un request directo por altura (round-robin entre peers) sin esperar entre uno y otro, y drena las respuestas conforme llegan.
+  - `run_ibd_body_prefetch_step` (`src/main.rs`, `IBD_PARALLEL_BODY_WORKERS = 8`) pide una ventana de hasta 8 alturas en paralelo y guarda cada respuesta en el cache existente de `PeerChainView` (`stash_prefetched_block_response`, nuevo helper en `src/state/sync.rs`) sin tocar el camino de aplicacion: `run_sync_step` sigue aplicando de a un bloque, en orden, via `apply_block` sin cambios - el paralelismo es solo en la descarga, no en la aplicacion. Se desactiva durante branch-backfill (esa ruta sigue siendo secuencial y con hash fijado a proposito).
+  - Nota: en BOOT/VPS2 este camino queda en segundo plano hoy porque el fallback RPC (`run_rpc_sync_batch`, ya paralelo/batched por HTTP) corre primero cuando hay endpoints RPC configurados; el beneficio es mas visible para nodos que solo tienen P2P.
 - [x] Aplicar en orden (manejado por la logica existente de `apply_block_inner`).
 - [x] Manejar orphan/side branch por hash: `SyncOutcome::GapAhead`, `MissingParent`, `BehindOrSibling`.
 

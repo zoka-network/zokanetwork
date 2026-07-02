@@ -189,6 +189,44 @@ impl PeerChainView {
         response
     }
 
+    /// Stash a block body fetched via IBD prefetch pipelining (Fase 4:
+    /// several heights requested in parallel instead of one at a time)
+    /// before it's known whether it's immediately applicable. The existing
+    /// `take_pending_block_response` (used by `run_sync_step`) picks these
+    /// up in the same order it would have fetched them one at a time, so
+    /// the apply path itself does not change. `local_head` is the chain
+    /// height observed when the batch of requests was fired.
+    pub fn stash_prefetched_block_response(
+        &mut self,
+        local_head: u64,
+        response: BlockResponseMessage,
+    ) {
+        let candidate = response.block_height;
+        if candidate <= local_head || candidate > local_head.saturating_add(MAX_PENDING_BLOCK_AHEAD)
+        {
+            return;
+        }
+        let candidate_hash = response.block_hash.clone();
+        let responses_at_height = self.pending_block_responses.entry(candidate).or_default();
+        if !responses_at_height.contains_key(&candidate_hash)
+            && responses_at_height.len() >= MAX_PENDING_BLOCKS_PER_HEIGHT
+        {
+            if let Some(oldest_hash) = responses_at_height.keys().next().cloned() {
+                responses_at_height.remove(&oldest_hash);
+            }
+        }
+        responses_at_height.insert(candidate_hash, response);
+        self.trim_pending_block_responses();
+    }
+
+    /// Peek (without removing) whether a response is already cached for
+    /// `height`, so a prefetch step can skip heights it already fetched.
+    pub fn has_pending_block_response(&self, height: u64) -> bool {
+        self.pending_block_responses
+            .get(&height)
+            .is_some_and(|m| !m.is_empty())
+    }
+
     fn pending_block_response_count(&self) -> usize {
         self.pending_block_responses
             .values()

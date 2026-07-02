@@ -2788,6 +2788,144 @@ impl Node {
         }
     }
 
+    /// Fires one direct block-body request per height in `heights` without
+    /// awaiting between them (Fase 4 IBD parallel body download: fetches N
+    /// heights concurrently instead of the one-at-a-time
+    /// request/wait/apply/request cycle `run_sync_step` used to run
+    /// serially). Each height gets exactly one peer, chosen round-robin
+    /// from `select_block_request_peers()` so the in-flight requests
+    /// spread across the peer pool. Unlike `request_block_direct_with_retry`
+    /// (which races multiple PEERS for ONE height), this fans out across
+    /// multiple HEIGHTS; a height missing from the result map simply falls
+    /// back to the normal single-height retry path on the caller's next
+    /// tick. Intentionally does not pin an expected hash per height (that
+    /// stays the job of the hash-pinned branch-backfill path) - whatever
+    /// comes back still has to pass full consensus validation in
+    /// `apply_block` before it lands in storage, so an unpinned or even
+    /// dishonest response here can't corrupt the chain, only waste a
+    /// prefetch slot.
+    pub async fn request_blocks_batch_direct(
+        &mut self,
+        heights: &[u64],
+        max_wait: Duration,
+    ) -> HashMap<u64, Result<BlockResponseMessage, String>> {
+        let mut results: HashMap<u64, Result<BlockResponseMessage, String>> = HashMap::new();
+        if heights.is_empty() {
+            return results;
+        }
+        let peers = self.select_block_request_peers();
+        if peers.is_empty() {
+            return results;
+        }
+
+        let mut request_id_to_height = HashMap::new();
+        let mut pending_heights: HashSet<u64> = HashSet::new();
+        for (i, &height) in heights.iter().enumerate() {
+            let peer = peers[i % peers.len()].clone();
+            let request = BlockBodyRequest {
+                block_height: height,
+                block_hash: None,
+            };
+            let request_id = self
+                .swarm
+                .behaviour_mut()
+                .block_request_response
+                .send_request(&peer, request.clone());
+            self.pending_outbound_block_body_requests.insert(
+                request_id,
+                PendingOutboundBlockBodyRequest {
+                    peer,
+                    request,
+                    started_at: Instant::now(),
+                },
+            );
+            self.block_request_response_stats.outbound_sent = self
+                .block_request_response_stats
+                .outbound_sent
+                .saturating_add(1);
+            request_id_to_height.insert(request_id, height);
+            pending_heights.insert(height);
+        }
+
+        let request_ids: HashSet<_> = request_id_to_height.keys().copied().collect();
+        let deadline = tokio::time::Instant::now() + max_wait;
+        while !pending_heights.is_empty() && tokio::time::Instant::now() < deadline {
+            if let Some(received) = self.take_matching_direct_block_response(&request_ids) {
+                let Some(height) = request_id_to_height.get(&received.request_id).copied()
+                else {
+                    continue;
+                };
+                if !pending_heights.remove(&height) {
+                    continue;
+                }
+                match received.response {
+                    BlockBodyResponse::Found(response) => {
+                        if response.block_height != height {
+                            self.record_direct_block_invalid_response(received.peer.clone());
+                            results.insert(
+                                height,
+                                Err(format!(
+                                    "peer {} returned height {}, expected {height}",
+                                    received.peer, response.block_height
+                                )),
+                            );
+                            continue;
+                        }
+                        info!(
+                            "direct block response height={} hash={} from {} in {}ms (batch)",
+                            response.block_height,
+                            response.block_hash,
+                            received.peer,
+                            received.latency.as_millis()
+                        );
+                        results.insert(height, Ok(response));
+                    }
+                    BlockBodyResponse::NotFound { reason, .. } => {
+                        self.record_direct_block_failure(received.peer.clone());
+                        results.insert(
+                            height,
+                            Err(format!("peer {} did not have block: {reason}", received.peer)),
+                        );
+                    }
+                    BlockBodyResponse::Rejected { reason, .. } => {
+                        self.record_direct_block_failure(received.peer.clone());
+                        results.insert(
+                            height,
+                            Err(format!(
+                                "peer {} rejected direct block request: {reason}",
+                                received.peer
+                            )),
+                        );
+                    }
+                }
+                continue;
+            }
+            if let Some(failure) = self.take_matching_direct_block_failure(&request_ids) {
+                if let Some(height) = request_id_to_height.get(&failure.request_id).copied() {
+                    if pending_heights.remove(&height) {
+                        results.insert(
+                            height,
+                            Err(format!(
+                                "peer {} direct request failed: {}",
+                                failure.peer, failure.error
+                            )),
+                        );
+                    }
+                }
+                continue;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if self
+                .pump_for(remaining.min(Duration::from_millis(150)))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        results
+    }
+
     async fn request_block_via_gossip_with_retry(
         &mut self,
         block_height: u64,
