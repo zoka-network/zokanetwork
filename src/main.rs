@@ -8293,6 +8293,124 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         zoka::api::global_startup_status()
             .set_phase("opening_db", Some("opening RocksDB".to_string()));
         let storage = open_storage(db)?;
+
+        // Fase 5 fast-bootstrap: if a local signed snapshot is well ahead of
+        // what's already on disk, replay it (every block still goes through
+        // apply_block inside import_into_storage, so PoW/coinbase/fork-link
+        // rules are re-checked exactly as if it came from the network)
+        // instead of waiting for block-by-block P2P/RPC catch-up. This only
+        // ever reads a snapshot file already present locally - it does not
+        // fetch anything. Skipped unless the network config (file or
+        // embedded fallback) has at least one snapshot_signers key the
+        // snapshot's signature verifies against; importing an unverifiable
+        // snapshot into a production chain is worse than a slow catch-up.
+        if use_network_config {
+            let local_height = storage.get_chain_height().unwrap_or(0);
+            const MIN_SNAPSHOT_LEAD_BLOCKS: u64 = 100;
+            let manifest = zoka::snapshot::scan_snapshot_manifests(
+                &zoka::snapshot::default_snapshot_dir(),
+            )
+            .into_iter()
+            .find(|m| {
+                m.chain_id == chain_id
+                    && m.head_height >= local_height.saturating_add(MIN_SNAPSHOT_LEAD_BLOCKS)
+            });
+            if let Some(manifest) = manifest {
+                let config_path = network_config_arg
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(network.default_network_config_path()));
+                let trusted_signers = load_network_config_for(&config_path, network)
+                    .map(|cfg| cfg.snapshot_signers)
+                    .unwrap_or_default();
+                if trusted_signers.is_empty() {
+                    startup_notes.push(format!(
+                        "Local snapshot at height {} found but skipped: no snapshot_signers configured.",
+                        manifest.head_height
+                    ));
+                } else {
+                    match fs::read(&manifest.snap_path) {
+                        Ok(bytes) => {
+                            let mut hasher = Sha256::new();
+                            hasher.update(&bytes);
+                            let file_digest = hex::encode(hasher.finalize());
+                            if file_digest != manifest.sha256_hex {
+                                startup_notes.push(format!(
+                                    "Local snapshot at {} skipped: sha256 mismatch against its manifest (file may be corrupt or tampered).",
+                                    manifest.snap_path
+                                ));
+                            } else {
+                                match zoka::snapshot::deserialize(&bytes) {
+                                    Ok(snapshot) => {
+                                        let mut verified = false;
+                                        let mut last_verify_err = String::new();
+                                        for signer_hex in &trusted_signers {
+                                            let Ok(decoded) = hex::decode(signer_hex.trim())
+                                            else {
+                                                continue;
+                                            };
+                                            if decoded.len() != 32 {
+                                                continue;
+                                            }
+                                            let mut pubkey = [0u8; 32];
+                                            pubkey.copy_from_slice(&decoded);
+                                            let opts = zoka::snapshot::VerifyOptions {
+                                                expected_chain_id: chain_id.as_str(),
+                                                require_signature: true,
+                                                expected_pubkey: Some(&pubkey),
+                                            };
+                                            match zoka::snapshot::verify(&snapshot, &opts) {
+                                                Ok(_) => {
+                                                    verified = true;
+                                                    break;
+                                                }
+                                                Err(e) => last_verify_err = e.to_string(),
+                                            }
+                                        }
+                                        if verified {
+                                            zoka::api::global_startup_status().set_phase(
+                                                "importing_snapshot",
+                                                Some(format!(
+                                                    "importing local snapshot at height {}",
+                                                    manifest.head_height
+                                                )),
+                                            );
+                                            match zoka::snapshot::import_into_storage(
+                                                &storage, &chain_id, &snapshot,
+                                            ) {
+                                                Ok(applied) => startup_notes.push(format!(
+                                                    "Fast-bootstrapped from local snapshot: {} block(s) applied, height {} -> {}.",
+                                                    applied,
+                                                    local_height,
+                                                    storage.get_chain_height().unwrap_or(local_height)
+                                                )),
+                                                Err(e) => startup_notes.push(format!(
+                                                    "Local snapshot import failed, continuing with normal sync: {e}"
+                                                )),
+                                            }
+                                        } else {
+                                            startup_notes.push(format!(
+                                                "Local snapshot at {} skipped: signature did not verify against any configured snapshot_signers ({last_verify_err}).",
+                                                manifest.snap_path
+                                            ));
+                                        }
+                                    }
+                                    Err(e) => startup_notes.push(format!(
+                                        "Local snapshot at {} skipped: parse failed ({e}).",
+                                        manifest.snap_path
+                                    )),
+                                }
+                            }
+                        }
+                        Err(e) => startup_notes.push(format!(
+                            "Local snapshot manifest found but file read failed ({e}): {}",
+                            manifest.snap_path
+                        )),
+                    }
+                }
+            }
+        }
+
         let manager = Arc::new(StateManager::new(storage));
         chain_storage_outer = Some(manager.raw_storage());
         let api_mempool = Arc::new(zoka::mempool::Mempool::new(10_000));
@@ -14013,7 +14131,25 @@ fn cmd_snapshot_export(args: &[String]) -> Result<(), String> {
     fs::write(&out_path, &bytes)
         .map_err(|e| format!("failed to write snapshot to '{out_path}': {e}"))?;
 
+    // Sidecar manifest is what makes this snapshot discoverable via
+    // GET /snapshots and /snapshots/latest (both scan for *.snap.manifest).
+    // Its sha256_hex covers the bytes actually written to disk, which is
+    // not the same value as `digest` above (that one hashes the canonical
+    // signed payload, excluding the signature, for verification purposes).
+    let mut file_hasher = Sha256::new();
+    file_hasher.update(&bytes);
+    let file_sha256_hex = hex::encode(file_hasher.finalize());
+    let manifest_path = zoka::snapshot::write_manifest_sidecar(
+        &snapshot,
+        std::path::Path::new(&out_path),
+        bytes.len() as u64,
+        file_sha256_hex,
+        Vec::new(),
+    )
+    .map_err(|e| format!("failed to write manifest sidecar: {e}"))?;
+
     println!("Snapshot:           {out_path}");
+    println!("Manifest sidecar:   {}", manifest_path.display());
     println!("Schema:             {}", zoka::snapshot::SNAPSHOT_SCHEMA_ID);
     println!("Chain id:           {}", snapshot.header.chain_id);
     println!("Head height:        {}", snapshot.header.head_height);

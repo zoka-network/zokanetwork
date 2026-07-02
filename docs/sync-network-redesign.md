@@ -1262,7 +1262,9 @@ Criterio de aceptacion:
 - [x] Activar `snapshot_signers` en manifest.
   - Se generaron dos claves ed25519 independientes (una por operador/nodo, sin compartir secreto entre servidores): una en BOOT y otra en VPS2, cada una en `/root/.zoka/snapshot-signer.key` (permisos 600, root-only) con su publica en `snapshot-signer.pub`. Ambas publicas quedaron registradas en `docs/mainnet-network.v1.json` -> `snapshot_signers`. Cualquiera de los dos nodos puede firmar snapshots de forma independiente si el otro esta offline.
   - Nota operativa: BOOT y VPS2 corren hoy con `--no-network-config` (config vieja, pre-unificacion de la Fase 6), asi que este manifest recien se lee cuando se redeploye con `zoka-node.service`.
-- [ ] Publicar snapshot firmado por release/operador (pendiente: requiere ejecutar `zoka snapshot-export --sign-key-hex $(cat /root/.zoka/snapshot-signer.key)` en BOOT o VPS2 una vez que el redeploy de la Fase 6 este activo).
+- [x] Publicar snapshot firmado por release/operador.
+  - `cmd_snapshot_export` no escribia el sidecar `.snap.manifest` (la funcion `write_manifest_sidecar` existia pero no se llamaba desde ningun lado); se corrigio en `src/main.rs` para que lo escriba automaticamente despues de exportar.
+  - Se genero y firmo un snapshot real en BOOT (altura 1092, `/data/zoka/snapshots/mainnet-1092.snap` + `.manifest`) con la clave de BOOT. El binario actualmente desplegado en BOOT es anterior a las rutas HTTP de la Fase 5 (`GET /snapshots` devuelve 404 hoy), asi que el snapshot queda listo en disco pero se sirve por HTTP recien despues del proximo redeploy binario (pendiente, decision del operador).
 - [x] Agregar endpoints HTTP:
   - `GET /snapshots` — lista todos los manifests disponibles para el chain_id activo.
   - `GET /snapshots/latest` — retorna el manifest mas alto disponible.
@@ -1274,7 +1276,8 @@ Criterio de aceptacion:
 - [x] Agregar `SnapshotFileManifest` como sidecar `.snap.manifest` JSON (evita deserializar el `.snap` para listar disponibles).
 - [x] Agregar `scan_snapshot_manifests(dir)` y `write_manifest_sidecar(snapshot, path, ...)` en `src/snapshot.rs`.
 - [x] Servir inbound `GetSnapshotManifests` desde el event loop del fullnode.
-- [ ] Importar snapshot y luego continuar con headers/bodies (flujo de bootstrap rapido pendiente).
+- [x] Importar snapshot y luego continuar con headers/bodies.
+  - En `cmd_fullnode_auto` (`src/main.rs`), justo despues de abrir la DB y antes de cargar el `StateManager`: si hay un snapshot local (`scan_snapshot_manifests` sobre `default_snapshot_dir()`) para el `chain_id` activo con `head_height` al menos 100 bloques por delante de la altura local, se verifica sha256 contra el manifest, se verifica la firma contra cualquiera de las claves en `snapshot_signers` del network-config (archivo o embebido), y si valida se importa via `import_into_storage` (cada bloque sigue pasando por `apply_block`, mismas reglas de consenso que la red). Sin snapshot local, sin signers configurados, o sin firma valida: no hace nada y sigue el flujo normal de headers/bodies. Solo lee un archivo ya presente en disco, no descarga nada de la red.
 - [ ] En fase posterior, evolucionar de snapshot de bloques a snapshot de estado verificable.
 
 Implementado en el commit `082e5ca`:
