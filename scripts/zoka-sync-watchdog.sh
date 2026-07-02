@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BOOT_RPC="${BOOT_RPC:-http://159.223.119.216:3000}"
+# Comma-separated list of reference RPC endpoints (tried in order until one responds).
+BOOT_RPC="${BOOT_RPC:-http://159.223.119.216:3000,http://157.230.5.103:3000}"
 LOCAL_RPC="${LOCAL_RPC:-http://127.0.0.1:3000}"
 GAP_THRESHOLD="${GAP_THRESHOLD:-2}"
 MAX_PUSH="${MAX_PUSH:-64}"
@@ -21,6 +22,21 @@ rpc_height() {
     python3 -c 'import json, sys; print(json.load(sys.stdin)["height"])'
 }
 
+# Try each comma-separated BOOT_RPC endpoint until one succeeds.
+reference_rpc_height() {
+  IFS=',' read -ra endpoints <<< "$BOOT_RPC"
+  for ep in "${endpoints[@]}"; do
+    ep="${ep// /}"
+    if h="$(rpc_height "$ep" 2>/dev/null)"; then
+      ACTIVE_BOOT_RPC="$ep"
+      echo "$h"
+      return 0
+    fi
+  done
+  echo "all reference endpoints unreachable: $BOOT_RPC" >&2
+  return 1
+}
+
 require_command curl
 require_command flock
 require_command python3
@@ -31,12 +47,13 @@ if ! flock --nonblock 9; then
   exit 0
 fi
 
-boot_height="$(rpc_height "$BOOT_RPC")"
+ACTIVE_BOOT_RPC=""
+boot_height="$(reference_rpc_height)"
 local_height="$(rpc_height "$LOCAL_RPC")"
 gap=$((boot_height - local_height))
 
 if (( gap <= GAP_THRESHOLD )); then
-  echo "sync healthy: local=$local_height boot=$boot_height gap=$gap"
+  echo "sync healthy: local=$local_height reference=$boot_height gap=$gap (via $ACTIVE_BOOT_RPC)"
   exit 0
 fi
 
@@ -45,11 +62,11 @@ if (( target_height - local_height > MAX_PUSH )); then
   target_height=$((local_height + MAX_PUSH))
 fi
 
-echo "sync catch-up: local=$local_height boot=$boot_height pushing=$((target_height - local_height))"
+echo "sync catch-up: local=$local_height reference=$boot_height pushing=$((target_height - local_height)) (via $ACTIVE_BOOT_RPC)"
 for ((height = local_height + 1; height <= target_height; height++)); do
   block="$(curl --fail --silent --show-error \
     --max-time "$CURL_TIMEOUT" \
-    "$BOOT_RPC/blocks/$height/raw")"
+    "$ACTIVE_BOOT_RPC/blocks/$height/raw")"
   result="$(curl --fail --silent --show-error \
     --max-time "$CURL_TIMEOUT" \
     --header 'Content-Type: application/json' \
@@ -60,4 +77,4 @@ for ((height = local_height + 1; height <= target_height; height++)); do
 done
 
 final_height="$(rpc_height "$LOCAL_RPC")"
-echo "sync catch-up complete: local=$final_height boot_at_start=$boot_height"
+echo "sync catch-up complete: local=$final_height reference_at_start=$boot_height"

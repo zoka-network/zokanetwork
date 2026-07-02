@@ -83,6 +83,15 @@ jobs:
           ssh -i ~/.ssh/zoka_do root@${{ env.BOOTSTRAP_IP }} "mkdir -p /opt/zoka/trusted-setup"
           scp -i ~/.ssh/zoka_do trusted-setup/* root@${{ env.BOOTSTRAP_IP }}:/opt/zoka/trusted-setup/
 
+      - name: Upload network config
+        run: |
+          scp -i ~/.ssh/zoka_do docs/mainnet-network.v1.json root@${{ env.BOOTSTRAP_IP }}:/opt/zoka/mainnet-network.v1.json
+
+      - name: Upload watchdog script
+        run: |
+          scp -i ~/.ssh/zoka_do scripts/zoka-sync-watchdog.sh root@${{ env.BOOTSTRAP_IP }}:/usr/local/bin/zoka-sync-watchdog.sh
+          ssh -i ~/.ssh/zoka_do root@${{ env.BOOTSTRAP_IP }} "chmod +x /usr/local/bin/zoka-sync-watchdog.sh"
+
       - name: Install systemd service and start
         run: |
           ssh -i ~/.ssh/zoka_do root@${{ env.BOOTSTRAP_IP }} bash -s << 'REMOTE'
@@ -93,9 +102,15 @@ jobs:
             ufw reload || true
           fi
 
-          cat > /etc/systemd/system/zoka-bootstrap.service << 'EOF'
+          # Stop and disable legacy service names if present
+          systemctl stop zoka-bootstrap 2>/dev/null || true
+          systemctl disable zoka-bootstrap 2>/dev/null || true
+          systemctl stop zoka-rpc 2>/dev/null || true
+          systemctl disable zoka-rpc 2>/dev/null || true
+
+          cat > /etc/systemd/system/zoka-node.service << 'EOF'
           [Unit]
-          Description=Zoka Bootstrap Node (P2P + Mining)
+          Description=Zoka Node — Zenith mainnet seed/bootstrap
           After=network-online.target
           Wants=network-online.target
 
@@ -105,7 +120,7 @@ jobs:
           WorkingDirectory=/data/zoka
           ExecStart=/usr/local/bin/zoka fullnode \
             --network mainnet \
-            --no-network-config \
+            --network-config /opt/zoka/mainnet-network.v1.json \
             --db /data/zoka/blockchain.db \
             --listen /ip4/0.0.0.0/tcp/28080 \
             --no-mine \
@@ -138,9 +153,8 @@ jobs:
           EOF
 
           systemctl daemon-reload
-          systemctl enable zoka-bootstrap
-          # Stop old instance if running
-          systemctl stop zoka-bootstrap 2>/dev/null || true
+          systemctl enable zoka-node
+          systemctl stop zoka-node 2>/dev/null || true
           if [ -d /data/zoka/blockchain.db ]; then
             tar -C /data/zoka -czf "/data/zoka/blockchain.db.pre-1.5.0.$(date -u +%Y%m%d%H%M%S).tgz" blockchain.db
           fi
@@ -149,15 +163,15 @@ jobs:
             --db /data/zoka/blockchain.db \
             --yes \
             --json
-          systemctl start zoka-bootstrap
+          systemctl start zoka-node
           sleep 8
-          systemctl status zoka-bootstrap --no-pager -l
+          systemctl status zoka-node --no-pager -l
           REMOTE
 
       - name: Show bootstrap logs
         run: |
           ssh -i ~/.ssh/zoka_do root@${{ env.BOOTSTRAP_IP }} \
-            "journalctl -u zoka-bootstrap -n 50 --no-pager"
+            "journalctl -u zoka-node -n 50 --no-pager"
 
   deploy-rpc:
     name: Deploy RPC node
@@ -191,10 +205,18 @@ jobs:
           ssh -i ~/.ssh/zoka_do root@${{ env.RPC_IP }} "mkdir -p /opt/zoka/trusted-setup"
           scp -i ~/.ssh/zoka_do trusted-setup/* root@${{ env.RPC_IP }}:/opt/zoka/trusted-setup/
 
+      - name: Upload network config
+        run: |
+          scp -i ~/.ssh/zoka_do docs/mainnet-network.v1.json root@${{ env.RPC_IP }}:/opt/zoka/mainnet-network.v1.json
+
+      - name: Upload watchdog script
+        run: |
+          scp -i ~/.ssh/zoka_do scripts/zoka-sync-watchdog.sh root@${{ env.RPC_IP }}:/usr/local/bin/zoka-sync-watchdog.sh
+          ssh -i ~/.ssh/zoka_do root@${{ env.RPC_IP }} "chmod +x /usr/local/bin/zoka-sync-watchdog.sh"
+
       - name: Install systemd service and start
         run: |
-          BOOTSTRAP_IP="${{ env.BOOTSTRAP_IP }}"
-          ssh -i ~/.ssh/zoka_do root@${{ env.RPC_IP }} bash -s << REMOTE
+          ssh -i ~/.ssh/zoka_do root@${{ env.RPC_IP }} bash -s << 'REMOTE'
           set -e
           mkdir -p /data/zoka
           if command -v ufw >/dev/null 2>&1; then
@@ -202,9 +224,15 @@ jobs:
             ufw reload || true
           fi
 
-          cat > /etc/systemd/system/zoka-rpc.service << 'EOF'
+          # Stop and disable legacy service names if present
+          systemctl stop zoka-bootstrap 2>/dev/null || true
+          systemctl disable zoka-bootstrap 2>/dev/null || true
+          systemctl stop zoka-rpc 2>/dev/null || true
+          systemctl disable zoka-rpc 2>/dev/null || true
+
+          cat > /etc/systemd/system/zoka-node.service << 'EOF'
           [Unit]
-          Description=Zoka RPC Node (API only, no mining)
+          Description=Zoka Node — Zenith mainnet RPC/full
           After=network-online.target
           Wants=network-online.target
 
@@ -214,11 +242,10 @@ jobs:
           WorkingDirectory=/data/zoka
           ExecStart=/usr/local/bin/zoka fullnode \
             --network mainnet \
-            --no-network-config \
+            --network-config /opt/zoka/mainnet-network.v1.json \
             --db /data/zoka/blockchain.db \
             --listen /ip4/0.0.0.0/tcp/28080 \
             --no-mine \
-            --seed /ip4/${BOOTSTRAP_IP}/tcp/28080 \
             --sync-warmup-secs 30 \
             --sync-rebroadcast-recent-blocks 32 \
             --allow-isolated-start \
@@ -243,9 +270,41 @@ jobs:
           WantedBy=multi-user.target
           EOF
 
+          # Install watchdog timer
+          cat > /etc/systemd/system/zoka-sync-watchdog.service << 'EOF'
+          [Unit]
+          Description=Zoka node sync catch-up watchdog
+          After=network-online.target zoka-node.service
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/zoka-sync-watchdog.sh
+          Environment=BOOT_RPC=http://159.223.119.216:3000,http://157.230.5.103:3000
+          Environment=LOCAL_RPC=http://127.0.0.1:3000
+          Environment=GAP_THRESHOLD=2
+          Environment=MAX_PUSH=64
+          Environment=CURL_TIMEOUT=30
+          EOF
+
+          cat > /etc/systemd/system/zoka-sync-watchdog.timer << 'EOF'
+          [Unit]
+          Description=Run Zoka node sync catch-up watchdog every 30 seconds
+
+          [Timer]
+          OnBootSec=20s
+          OnUnitActiveSec=30s
+          AccuracySec=5s
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+          EOF
+
           systemctl daemon-reload
-          systemctl enable zoka-rpc
-          systemctl stop zoka-rpc 2>/dev/null || true
+          systemctl enable zoka-node
+          systemctl enable zoka-sync-watchdog.timer
+          systemctl stop zoka-node 2>/dev/null || true
           if [ -d /data/zoka/blockchain.db ]; then
             tar -C /data/zoka -czf "/data/zoka/blockchain.db.pre-1.5.0.$(date -u +%Y%m%d%H%M%S).tgz" blockchain.db
           fi
@@ -254,12 +313,13 @@ jobs:
             --db /data/zoka/blockchain.db \
             --yes \
             --json
-          systemctl start zoka-rpc
+          systemctl start zoka-node
+          systemctl start zoka-sync-watchdog.timer
           sleep 8
-          systemctl status zoka-rpc --no-pager -l
+          systemctl status zoka-node --no-pager -l
           REMOTE
 
       - name: Show RPC logs
         run: |
           ssh -i ~/.ssh/zoka_do root@${{ env.RPC_IP }} \
-            "journalctl -u zoka-rpc -n 50 --no-pager"
+            "journalctl -u zoka-node -n 50 --no-pager"
