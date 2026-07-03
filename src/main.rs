@@ -15299,6 +15299,85 @@ mod tests {
             .contains("private transaction validation failed"));
     }
 
+    /// A double-spend attempt where an attacker (or a buggy client) resubmits
+    /// the same spend under a fresh `tx_hash` — same `nullifier`, otherwise
+    /// identical body. Block-level `validate_private_nullifiers` (see
+    /// `state::chain`) is the ultimate consensus backstop, but a miner should
+    /// never even select both into a candidate block in the first place: only
+    /// the first-seen hash may be selected, the conflicting one must be
+    /// skipped.
+    #[test]
+    fn pending_private_tx_selection_skips_conflicting_duplicate_nullifier() {
+        let (_tmp, db) = temp_db_arg();
+        let storage = RocksDbStorage::new(&db).expect("temp rocksdb");
+
+        let tx_a = valid_private_tx_fixture();
+        let mut tx_b = tx_a.clone();
+        tx_b.tx_hash = format!("{}-dup", tx_a.tx_hash);
+        assert_eq!(tx_a.nullifier, tx_b.nullifier, "fixture must share the spend tag");
+
+        for tx in [&tx_a, &tx_b] {
+            let body = serde_json::to_vec(tx).expect("serialize private tx fixture");
+            storage
+                .save_private_transaction_bytes(&tx.tx_hash, &body)
+                .expect("save private tx body");
+            storage
+                .save_pending_private_transaction_hash(&tx.tx_hash)
+                .expect("save pending hash");
+        }
+
+        let selected = select_non_conflicting_pending_private_tx_hashes(
+            &storage,
+            vec![tx_a.tx_hash.clone(), tx_b.tx_hash.clone()],
+            10,
+            1,
+        );
+
+        assert_eq!(
+            selected,
+            vec![tx_a.tx_hash.clone()],
+            "only the first-seen tx spending a shared nullifier may be selected"
+        );
+        assert!(
+            !selected.contains(&tx_b.tx_hash),
+            "conflicting duplicate-nullifier tx must be skipped from the mining candidate set"
+        );
+    }
+
+    /// A pending private tx whose nullifier is already confirmed on-chain
+    /// (e.g. it was mined via a different path, or is a replay of an old
+    /// spend) must never be re-selected for mining — it would only be
+    /// rejected downstream by `validate_private_nullifiers`, wasting PoW
+    /// work on a block that can never be accepted.
+    #[test]
+    fn pending_private_tx_selection_skips_nullifier_already_spent_on_chain() {
+        let (_tmp, db) = temp_db_arg();
+        let storage = RocksDbStorage::new(&db).expect("temp rocksdb");
+
+        let tx = valid_private_tx_fixture();
+        let body = serde_json::to_vec(&tx).expect("serialize private tx fixture");
+        storage
+            .save_private_transaction_bytes(&tx.tx_hash, &body)
+            .expect("save private tx body");
+        storage
+            .save_pending_private_transaction_hash(&tx.tx_hash)
+            .expect("save pending hash");
+        storage
+            .save_spent_nullifier(&tx.nullifier, 1)
+            .expect("mark nullifier spent on-chain");
+
+        let diagnostics =
+            diagnose_pending_private_tx_selection(&storage, vec![tx.tx_hash.clone()], 10, 2);
+
+        assert!(
+            diagnostics.selected.is_empty(),
+            "an already-spent nullifier must never be re-selected for mining"
+        );
+        assert!(diagnostics.candidates[0]
+            .reason
+            .contains("nullifier already spent on-chain"));
+    }
+
     #[test]
     fn mining_candidate_validation_uses_exact_v2_activation_height() {
         let tx = private_tx_with_unknown_proof_profile();

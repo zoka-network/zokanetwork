@@ -1620,4 +1620,139 @@ mod tests {
         assert!(storage.is_nullifier_spent("N1").expect("query"));
         assert!(storage.is_nullifier_spent("N2").expect("query"));
     }
+
+    /// `validate_private_nullifiers` runs against current storage *before*
+    /// `promote_branch_to_canonical` ever gets a chance to de-index the
+    /// losing branch. So a competing branch cannot buy its way past an
+    /// already-spent nullifier just by outweighing the canonical chain —
+    /// reorg is not a double-spend loophole, even when the incoming branch
+    /// has strictly more cumulative work.
+    #[test]
+    fn heavier_side_branch_cannot_reuse_a_nullifier_already_spent_on_canonical_chain() {
+        let chain_id = "zoka-test-net";
+        let (storage, _dir) = open_temp_storage();
+        let genesis = genesis_parent_for(chain_id);
+        let miner = "zka1miner".to_string();
+
+        let canonical = mine_block_with_nullifiers(
+            chain_id,
+            &genesis.header.hash,
+            0,
+            0,
+            &miner,
+            economics::POW_INITIAL_DIFFICULTY_BITS,
+            1_700_000_000,
+            vec!["N".to_string()],
+        );
+        let canonical_head = apply_block(&storage, chain_id, &canonical).expect("apply canonical");
+        assert!(storage.is_nullifier_spent("N").expect("query"));
+
+        // A heavier side branch at height 1 tries to spend the SAME
+        // nullifier N — must be rejected outright, never promoted, and must
+        // leave the existing canonical head completely untouched.
+        let stronger_bits = (canonical_head.cumulative_work as u32).saturating_add(1);
+        let side_branch = mine_block_with_nullifiers(
+            chain_id,
+            &genesis.header.hash,
+            0,
+            0,
+            &miner,
+            stronger_bits,
+            1_700_000_777,
+            vec!["N".to_string()],
+        );
+        let err = apply_block(&storage, chain_id, &side_branch).unwrap_err();
+        assert!(
+            matches!(err, ChainError::PrivateNullifierDoubleSpend { .. }),
+            "expected double-spend rejection for the heavier conflicting branch, got: {err:?}"
+        );
+
+        let head = read_chain_head(&storage)
+            .expect("read head")
+            .expect("head must still exist");
+        assert_eq!(
+            head.hash, canonical_head.hash,
+            "canonical head must be unchanged after the rejected reorg attempt"
+        );
+    }
+
+    /// Companion to the test above: a reorg that does NOT touch the
+    /// contested nullifier legitimately frees it (the orphaned block's
+    /// nullifiers are de-indexed by `promote_branch_to_canonical`), so a
+    /// later block on the new canonical chain may spend it — and once
+    /// spent there, it is protected against a further double-spend exactly
+    /// like any other nullifier.
+    #[test]
+    fn reorg_that_orphans_a_spend_frees_its_nullifier_then_still_blocks_a_repeat() {
+        let chain_id = "zoka-test-net";
+        let (storage, _dir) = open_temp_storage();
+        let genesis = genesis_parent_for(chain_id);
+        let miner = "zka1miner".to_string();
+
+        // Canonical: height 1 spends N.
+        let a1 = mine_block_with_nullifiers(
+            chain_id,
+            &genesis.header.hash,
+            0,
+            0,
+            &miner,
+            economics::POW_INITIAL_DIFFICULTY_BITS,
+            1_700_000_000,
+            vec!["N".to_string()],
+        );
+        let a1_head = apply_block(&storage, chain_id, &a1).expect("apply a1");
+        assert!(storage.is_nullifier_spent("N").expect("query"));
+
+        // A heavier side branch at height 1 that does NOT touch N reorgs it
+        // away — N must become free again.
+        let stronger_bits = (a1_head.cumulative_work as u32).saturating_add(1);
+        let b1 = mine_block_with_nullifiers(
+            chain_id,
+            &genesis.header.hash,
+            0,
+            0,
+            &miner,
+            stronger_bits,
+            1_700_000_777,
+            Vec::new(),
+        );
+        let b1_head =
+            apply_block(&storage, chain_id, &b1).expect("reorg to unrelated heavier branch");
+        assert_eq!(b1_head.hash, b1.header.hash);
+        assert!(
+            !storage.is_nullifier_spent("N").expect("query"),
+            "N must be freed once the block that spent it is orphaned"
+        );
+
+        // A new block on the new canonical chain may now legitimately spend N.
+        let b2 = mine_block_with_nullifiers(
+            chain_id,
+            &b1_head.hash,
+            b1_head.height,
+            b1_head.total_supply_emitted,
+            &miner,
+            economics::POW_INITIAL_DIFFICULTY_BITS,
+            1_700_000_888,
+            vec!["N".to_string()],
+        );
+        let b2_head = apply_block(&storage, chain_id, &b2).expect("apply b2 spending freed N");
+        assert!(storage.is_nullifier_spent("N").expect("query"));
+
+        // And a further attempt to spend N again must still be rejected.
+        let b3 = mine_block_with_nullifiers(
+            chain_id,
+            &b2_head.hash,
+            b2_head.height,
+            b2_head.total_supply_emitted,
+            &miner,
+            economics::POW_INITIAL_DIFFICULTY_BITS,
+            1_700_000_999,
+            vec!["N".to_string()],
+        );
+        let err = apply_block(&storage, chain_id, &b3).unwrap_err();
+        assert!(
+            matches!(err, ChainError::PrivateNullifierDoubleSpend { .. }),
+            "expected double-spend rejection, got: {err:?}"
+        );
+    }
 }
