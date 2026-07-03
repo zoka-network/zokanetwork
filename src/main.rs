@@ -2170,6 +2170,12 @@ struct MiningEngineConfig {
     /// before mining/assembling a block. This keeps standalone miners aligned
     /// with the network queue instead of producing empty private bundles.
     rpc_sync_endpoints: Vec<String>,
+    /// Abort in-flight PoW work (checked on the same 800ms tick as the
+    /// stale-parent guard) when POST /local/mining/stop flips the local
+    /// mining control off. Only set by the fullnode loop when mining is
+    /// governed by that control (no --mine flag); standalone miners and
+    /// --mine nodes ignore the control and must not churn on it.
+    honor_local_mining_control: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2418,6 +2424,7 @@ fn solve_pow_nonce(
     timestamp: u64,
     threads: usize,
     fallback_hashrate_hps: u64,
+    honor_local_mining_control: bool,
     mut progress: impl FnMut(&MiningProgressSnapshot) -> Result<(), String>,
 ) -> Result<(Vec<u8>, u64, u64, f64), String> {
     let worker_count = threads.max(1);
@@ -2505,6 +2512,16 @@ fn solve_pow_nonce(
                         found.store(true, Ordering::Relaxed);
                         return Err(format!(
                             "stale parent: chain advanced past height {height} during PoW solve"
+                        ));
+                    }
+                    // The user switched mining off (POST /local/mining/stop)
+                    // while this solve was in flight - obey within one tick
+                    // so the node stops reporting local_mining and control
+                    // UIs (ZSilent's toggle) don't bounce back to ON.
+                    if honor_local_mining_control && local_mining_stop_requested() {
+                        found.store(true, Ordering::Relaxed);
+                        return Err(format!(
+                            "mining stopped: local mining control disabled during PoW solve at height {height}"
                         ));
                     }
                     let elapsed_secs = started.elapsed().as_secs_f64();
@@ -5390,6 +5407,11 @@ fn run_mining_batch_with_progress(
                 "stale parent: chain already at or past height {height} before PoW solve started"
             ));
         }
+        if config.honor_local_mining_control && local_mining_stop_requested() {
+            return Err(format!(
+                "mining stopped: local mining control disabled before PoW solve at height {height}"
+            ));
+        }
         let reward_for_block = next_block_reward(height, state.total_supply_emitted, None);
         if reward_for_block == 0 {
             break;
@@ -5437,6 +5459,7 @@ fn run_mining_batch_with_progress(
             timestamp,
             config.threads,
             config.hashrate_hps,
+            config.honor_local_mining_control,
             |snapshot| {
                 if let Some(callback) = progress.as_deref_mut() {
                     callback(snapshot)?;
@@ -7665,6 +7688,20 @@ fn is_stale_parent_error(err: &str) -> bool {
     err.contains("stale parent:")
 }
 
+/// True once POST /local/mining/stop has explicitly flipped the control off.
+/// `updated_at == 0` means the control was never touched in this process
+/// (standalone CLI miners), so those are never asked to stop through it.
+fn local_mining_stop_requested() -> bool {
+    let control = zoka::api::global_local_mining_control().snapshot();
+    !control.enabled && control.updated_at > 0
+}
+
+/// Not a real failure either: the user switched mining off while a batch
+/// was in flight, and the batch aborted instead of finishing the solve.
+fn is_mining_stopped_error(err: &str) -> bool {
+    err.contains("mining stopped:")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GenesisAccount {
     address: String,
@@ -9829,6 +9866,16 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     next_mine_at = tokio::time::Instant::now();
                     continue;
                 }
+                Ok(Err(err)) if is_mining_stopped_error(&err) => {
+                    // Not a failure - the user switched mining off mid-solve.
+                    // The spawn gate (runtime_mining_enabled) is already off,
+                    // so nothing respawns until mining is re-enabled.
+                    mining_log("batch stopped by local mining control");
+                    last_event =
+                        "Mining stopped by local control; fullnode remains online for peers and RPC."
+                            .to_string();
+                    continue;
+                }
                 Ok(Err(err)) if is_transient_storage_lock_error(&err) => {
                     last_event = format!("Auto-mining retry pending: storage busy ({err})");
                     next_mine_at = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -10041,6 +10088,11 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 target_block_time_secs: mining_target_block_time_secs,
                 chain_db_path: db_path.clone(),
                 rpc_sync_endpoints: rpc_sync_endpoints.clone(),
+                // With --mine the CLI flag owns mining and the HTTP control
+                // cannot stop it (runtime_mining_enabled stays true), so the
+                // batch must not abort on it either or it would churn
+                // spawn/abort forever.
+                honor_local_mining_control: !auto_mine,
             };
             let progress_network = network;
             mining_task = Some(tokio::task::spawn_blocking(move || {
@@ -13899,6 +13951,9 @@ fn cmd_mine_easy(args: &[String]) -> Result<(), String> {
             target_block_time_secs,
             chain_db_path: db_path.clone(),
             rpc_sync_endpoints: rpc_sync_endpoints.clone(),
+            // Standalone miner sessions are driven by their own CLI loop,
+            // not the fullnode's HTTP mining control.
+            honor_local_mining_control: false,
         };
         let batch = {
             let mut last_live_render: Option<Instant> = None;
