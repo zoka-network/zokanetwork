@@ -28,6 +28,16 @@ pub const MAINNET_RECOVERY_CHECKPOINT_297_HASH: &str =
 pub const MAINNET_RECOVERY_CHECKPOINT_298_HEIGHT: u64 = 298;
 pub const MAINNET_RECOVERY_CHECKPOINT_298_HASH: &str =
     "bee49728c38951fc82dfda00d2b4000980cb7a3b07046d6f6c636bd1f2d98227";
+/// Canonical anchor for the 1.6.0 protocol-freeze rollout. At ship time the
+/// network had live private forks mined by stale/NAT-isolated 1.5.0 clients
+/// (one 40+ blocks ahead of the canonical head by block count); this pin
+/// guarantees upgraded nodes never reorganize onto any branch that does not
+/// contain the BOOT/VPS2 canonical chain through this block, no matter how
+/// much cumulative work such a fork later claims. Verified identical on both
+/// infrastructure nodes before pinning.
+pub const MAINNET_UPGRADE_CHECKPOINT_1460_HEIGHT: u64 = 1460;
+pub const MAINNET_UPGRADE_CHECKPOINT_1460_HASH: &str =
+    "39e45d515c49a54420922d1fa258391cfabed01a94948dbaabe312025c0fb314";
 pub const MAINNET_EMERGENCY_CHECKPOINTS: &[(u64, &str)] = &[
     (
         MAINNET_EMERGENCY_CHECKPOINT_HEIGHT,
@@ -40,6 +50,10 @@ pub const MAINNET_EMERGENCY_CHECKPOINTS: &[(u64, &str)] = &[
     (
         MAINNET_RECOVERY_CHECKPOINT_298_HEIGHT,
         MAINNET_RECOVERY_CHECKPOINT_298_HASH,
+    ),
+    (
+        MAINNET_UPGRADE_CHECKPOINT_1460_HEIGHT,
+        MAINNET_UPGRADE_CHECKPOINT_1460_HASH,
     ),
 ];
 /// Temporary one-miner recovery window after the 1.4.x checkpoint. The cap is
