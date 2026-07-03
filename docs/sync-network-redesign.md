@@ -1406,6 +1406,43 @@ aislado (`--allow-isolated-start`, red/DB descartables) que llego a estado
 `RUNNING` sin panics. Local unicamente - no desplegado a BOOT/VPS2 ni
 publicado, sigue el mismo patron de esta sesion.
 
+### Fase 7.6 - Equidad de mineria (mining_task interrumpible + RandomX cross-platform)
+
+Pedido explicito del usuario: cuando un minero gana un bloque, el resto de
+la red deberia "emparejar" la altura lo antes posible en vez de quedar en
+desventaja. Investigacion (2 agentes de exploracion + 1 de validacion de
+diseno, verificado contra codigo real) encontro que la propagacion de red
+ya estaba bien optimizada (el ganador manda el cuerpo completo por gossip
+de inmediato), pero el problema real era otro: **el `mining_task` nunca se
+cancelaba** cuando llegaba el bloque ganador de otro peer - el nodo seguia
+picando sobre un padre ya obsoleto hasta terminar su propio lote.
+
+- [x] Minado interrumpible: `solve_pow_nonce` (`src/main.rs`) ahora chequea
+  cada ~800ms (su propio intervalo de poll existente) si la altura real de
+  la cadena (`NetworkRuntimeState::local_chain_height()`, nuevo getter
+  sincrono en `src/api/mod.rs`) ya superó la altura que está minando: si es
+  asi, marca `found=true` (asi los hilos de hash paran YA, no despues) y
+  aborta con un error clasificado (`is_stale_parent_error`). El loop
+  principal detecta ese aborto y reintenta de inmediato sin backoff, en vez
+  de los 5s de espera que aplican a errores reales. Mismo chequeo agregado
+  antes de cada iteracion de un lote multi-bloque, para el caso en que la
+  altura ya quedo vieja antes de siquiera arrancar el solver.
+- [x] RandomX equitativo entre Windows/Mac/Linux: `free_ram_bytes()`
+  (`src/mining/pow.rs`) solo leia `/proc/meminfo` (Linux), asi que en
+  Windows/Mac - la mayoria de usuarios reales de ZSilent - siempre
+  devolvia 0 y forzaba el modo lento de RandomX (256MB) sin importar la
+  RAM real disponible, aunque el umbral de modo rapido (2.5GB, dataset de
+  2GB) sea alcanzable en casi cualquier maquina moderna. Reemplazado por el
+  crate `sysinfo` (nueva dependencia, gateada detras del feature
+  `randomx`), que detecta RAM libre en las 3 plataformas. Verificado en
+  esta maquina Windows: antes del fix devolvia 0 (modo lento forzado);
+  despues del fix detecta ~5.3GB libres (modo rapido, igual que Linux).
+- No se toco el modelo de recompensa (ganador se lleva el bloque completo) -
+  eso es una decision economica distinta y mayor, fuera de alcance.
+
+Local unicamente, verificado con `cargo check --bins --features randomx` y
+un smoke-test que confirmo la deteccion de RAM real en runtime.
+
 ## 6. Tabla de prioridades
 
 | Prioridad | Trabajo | Impacto | Riesgo |

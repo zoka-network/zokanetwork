@@ -30,7 +30,7 @@ default = ["randomx"]
 #   - Linux x86_64: gcc/clang, cmake >= 3.5, make, pkg-config
 #   - Windows x86_64: Visual Studio Build Tools (MSVC v143+) and cmake on PATH
 # See docs/protocol-overview.md for the network summary.
-randomx = ["dep:randomx-rs"]
+randomx = ["dep:randomx-rs", "dep:sysinfo"]
 # Enabled by the Android native crate (zkapriv/native). It marks the build as
 # the on-device prover so trusted-setup params are read WITHOUT the per-point
 # subgroup-membership check: on mobile the params come from the app's own APK
@@ -42,6 +42,9 @@ mobile = []
 
 [dependencies]
 randomx-rs = { version = "1.3", optional = true }
+# Cross-platform free-RAM detection for RandomX full/light mode selection
+# (src/mining/pow.rs::free_ram_bytes). Only needed by the randomx module.
+sysinfo = { version = "0.32", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }

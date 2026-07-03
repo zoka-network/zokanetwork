@@ -812,6 +812,15 @@ impl NetworkRuntimeState {
         }
     }
 
+    /// Synchronous height read (no `.await`), so it's usable from a
+    /// `spawn_blocking` mining thread outside the async runtime. Backed by
+    /// the same atomic `set_local_miner`/`set_sync_status` keep current
+    /// every main-loop tick, including while a mining batch is running
+    /// concurrently on tokio's blocking thread pool.
+    pub fn local_chain_height(&self) -> u64 {
+        self.local_chain_height.load(Ordering::Relaxed)
+    }
+
     pub async fn set_local_miner(
         &self,
         peer_id: String,

@@ -2496,6 +2496,17 @@ fn solve_pow_nonce(
                     });
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Someone else's block already claimed this height while
+                    // we were hashing - stop the workers now instead of
+                    // grinding minutes on dead work. `found` must be set
+                    // BEFORE returning: thread::scope blocks until every
+                    // spawned worker exits, and workers only watch `found`.
+                    if zoka::api::global_network_runtime().local_chain_height() >= height {
+                        found.store(true, Ordering::Relaxed);
+                        return Err(format!(
+                            "stale parent: chain advanced past height {height} during PoW solve"
+                        ));
+                    }
                     let elapsed_secs = started.elapsed().as_secs_f64();
                     let attempted = hashes_attempted.load(Ordering::Relaxed);
                     let estimated_hashrate_hps = if elapsed_secs > 0.0 {
@@ -5247,6 +5258,16 @@ fn run_mining_batch_with_progress(
         }
 
         let height = next_height;
+        // Closes a small gap in a multi-block batch: iteration 2+ advances
+        // height/prev_hash from the block THIS batch just mined, not a
+        // fresh storage read, so it could start already stale if an
+        // external block landed in between. solve_pow_nonce's own check
+        // only fires on its first 800ms timeout tick, so check up front too.
+        if zoka::api::global_network_runtime().local_chain_height() >= height {
+            return Err(format!(
+                "stale parent: chain already at or past height {height} before PoW solve started"
+            ));
+        }
         let reward_for_block = next_block_reward(height, state.total_supply_emitted, None);
         if reward_for_block == 0 {
             break;
@@ -7499,6 +7520,12 @@ fn is_nonrecoverable_mining_batch_error(err: &str) -> bool {
         || err.contains("chain DB was created with economics version")
 }
 
+/// Not a real failure: another peer's block already claimed the height this
+/// batch was mining, so it aborted early instead of grinding stale work.
+fn is_stale_parent_error(err: &str) -> bool {
+    err.contains("stale parent:")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GenesisAccount {
     address: String,
@@ -9572,6 +9599,17 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 .ok_or_else(|| "auto-mining task finished without a handle".to_string())?;
             let batch = match task.await {
                 Ok(Ok(batch)) => batch,
+                Ok(Err(err)) if is_stale_parent_error(&err) => {
+                    // Not a failure - someone else's block won the height we
+                    // were mining. Restart immediately against the real tip
+                    // instead of the normal 5s backoff, so we don't add
+                    // artificial delay on top of losing the race.
+                    last_event =
+                        "Restarting mining: chain tip advanced (another block was applied)."
+                            .to_string();
+                    next_mine_at = tokio::time::Instant::now();
+                    continue;
+                }
                 Ok(Err(err)) if is_transient_storage_lock_error(&err) => {
                     last_event = format!("Auto-mining retry pending: storage busy ({err})");
                     next_mine_at = tokio::time::Instant::now() + Duration::from_secs(2);

@@ -369,24 +369,17 @@ mod randomx_backend {
         })
     }
 
-    /// Best-effort free physical RAM in bytes from /proc/meminfo (Linux).
-    /// Returns 0 on failure, forcing light mode.
+    /// Best-effort free physical RAM in bytes, cross-platform (Linux,
+    /// Windows, macOS) via `sysinfo`. Returns 0 on failure, forcing light
+    /// mode - same fail-safe behavior as before. This used to only read
+    /// /proc/meminfo (Linux-only), which meant Windows/macOS nodes - most
+    /// ZSilent desktop users - always fell back to light mode regardless of
+    /// available RAM, an unintended platform-based hashrate disadvantage
+    /// unrelated to RandomX's own (intentional) CPU-fairness design.
     fn free_ram_bytes() -> u64 {
-        let Ok(content) = std::fs::read_to_string("/proc/meminfo") else {
-            return 0;
-        };
-        for line in content.lines() {
-            if line.starts_with("MemAvailable:") {
-                if let Some(kb) = line
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|s| s.parse::<u64>().ok())
-                {
-                    return kb * 1024;
-                }
-            }
-        }
-        0
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        sys.available_memory()
     }
 
     impl PowEngine for RandomXPow {
