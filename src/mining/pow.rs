@@ -318,17 +318,18 @@ mod randomx_backend {
                     }
                     (flags, vms)
                 }
-                CachedMode::Light(_) => {
-                    // Light mode: each VM gets its own fresh cache (no clone needed).
+                CachedMode::Light(rx_cache) => {
+                    // Light mode: every VM shares the one cached 256 MB cache
+                    // (Arc clone, same as full mode shares its dataset). The
+                    // cache is read-only after init, so cross-VM sharing is
+                    // the intended RandomX usage; rebuilding it per VM cost
+                    // 1-2s and 256 MB each for nothing.
                     let flags = base;
                     let mut vms = Vec::with_capacity(lanes.max(1));
                     for _ in 0..lanes.max(1) {
-                        let rx_cache = RandomXCache::new(flags, &seed).map_err(|e| {
-                            PowError::Runtime(format!("randomx cache init failed: {e:?}"))
-                        })?;
-                        let vm = RandomXVM::new(flags, Some(rx_cache), None).map_err(|e| {
-                            PowError::Runtime(format!("randomx vm init failed: {e:?}"))
-                        })?;
+                        let vm = RandomXVM::new(flags, Some(rx_cache.clone()), None).map_err(
+                            |e| PowError::Runtime(format!("randomx vm init failed: {e:?}")),
+                        )?;
                         vms.push(Self { vm: Mutex::new(vm) });
                     }
                     (flags, vms)
@@ -359,8 +360,8 @@ mod randomx_backend {
             }
         }
 
-        // Light mode: only keep the seed so we know it's cached; VMs build
-        // their own cache in new_pool above.
+        // Light mode: keep the initialized cache so new_pool can hand the
+        // same one (Arc clone) to every VM it builds for this seed.
         let rx_cache = RandomXCache::new(base, seed)
             .map_err(|e| PowError::Runtime(format!("randomx cache init failed (light): {e:?}")))?;
         Ok(ResourceCache {

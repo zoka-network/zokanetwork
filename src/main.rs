@@ -286,8 +286,8 @@ struct MainnetNetworkConfig {
     /// Minimum desktop client version the network expects; enforced by
     /// ZSilent, not by this binary. Accepted (not just ignored) so the
     /// manifest's deny_unknown_fields doesn't reject the whole file.
-    #[serde(default)]
-    minimum_client_version: String,
+    #[serde(default, rename = "minimum_client_version")]
+    _minimum_client_version: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -10017,9 +10017,12 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 continue;
             }
             if let Some((rpc, local_height)) = rpc_checkpoint_allows_peerless_mining {
-                last_event = format!(
-                    "Auto-mining peer gate satisfied by RPC checkpoint at height {local_height} via {rpc}."
-                );
+                // Log instead of assigning to last_event: every path from
+                // here overwrites last_event before the dashboard reads it,
+                // so the assignment silently discarded this diagnostic.
+                mining_log(&format!(
+                    "peer gate satisfied by RPC checkpoint at height {local_height} via {rpc}"
+                ));
             }
             if let Some(path) = db_path.as_deref() {
                 match RocksDbStorage::new(path).and_then(|storage| storage.get_chain_height()) {
