@@ -7058,6 +7058,18 @@ async fn run_ibd_body_prefetch_step(
     )))
 }
 
+/// Prefer syncing from the P2P peer mesh over centralized RPC endpoints
+/// once there's a healthy-enough mesh to do it, so load distributes across
+/// the network instead of concentrating on whichever RPC endpoints happen
+/// to be configured (typically the operator's own seed nodes). Matches the
+/// mesh_n_low=2 threshold already used to tune gossipsub for this network's
+/// scale.
+const MIN_PEERS_TO_PREFER_P2P_SYNC: usize = 2;
+
+fn should_prefer_p2p_sync(node: &Node) -> bool {
+    node.connected_peer_count() >= MIN_PEERS_TO_PREFER_P2P_SYNC
+}
+
 async fn run_sync_step(
     node: &mut Node,
     chain_id: &str,
@@ -9057,47 +9069,66 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     "Warmup traffic received.".to_string()
                 };
                 if tokio::time::Instant::now() >= next_warmup_ibd_at {
-                    if let Some(sync_event) = run_rpc_sync_batch(
-                        &chain_id,
-                        db_path.as_deref(),
-                        &rpc_sync_endpoints,
-                        &mut peer_chain_view,
-                        unsafe_rehearsal_difficulty_bits,
-                        32,
-                    )? {
-                        next_warmup_ibd_at =
-                            tokio::time::Instant::now() + ibd_retry_delay(&sync_event);
-                        remember_sync_event(
-                            "rpc",
-                            &sync_event,
-                            &mut last_sync_source,
-                            &mut last_sync_event,
-                            &mut last_sync_error,
-                            &mut rpc_fallback_active,
-                        );
-                        last_event = sync_event;
-                    } else if let Some(sync_event) = run_sync_step(
-                        &mut node,
-                        &chain_id,
-                        db_path.as_deref(),
-                        &mut peer_chain_view,
-                        unsafe_rehearsal_difficulty_bits,
-                    )
-                    .await?
-                    {
-                        next_warmup_ibd_at =
-                            tokio::time::Instant::now() + ibd_retry_delay(&sync_event);
-                        remember_sync_event(
-                            "p2p",
-                            &sync_event,
-                            &mut last_sync_source,
-                            &mut last_sync_event,
-                            &mut last_sync_error,
-                            &mut rpc_fallback_active,
-                        );
-                        last_event = sync_event;
+                    let sync_result = if should_prefer_p2p_sync(&node) {
+                        match run_sync_step(
+                            &mut node,
+                            &chain_id,
+                            db_path.as_deref(),
+                            &mut peer_chain_view,
+                            unsafe_rehearsal_difficulty_bits,
+                        )
+                        .await?
+                        {
+                            Some(event) => Some(("p2p", event)),
+                            None => run_rpc_sync_batch(
+                                &chain_id,
+                                db_path.as_deref(),
+                                &rpc_sync_endpoints,
+                                &mut peer_chain_view,
+                                unsafe_rehearsal_difficulty_bits,
+                                32,
+                            )?
+                            .map(|event| ("rpc", event)),
+                        }
                     } else {
-                        next_warmup_ibd_at = tokio::time::Instant::now() + Duration::from_secs(1);
+                        match run_rpc_sync_batch(
+                            &chain_id,
+                            db_path.as_deref(),
+                            &rpc_sync_endpoints,
+                            &mut peer_chain_view,
+                            unsafe_rehearsal_difficulty_bits,
+                            32,
+                        )? {
+                            Some(event) => Some(("rpc", event)),
+                            None => run_sync_step(
+                                &mut node,
+                                &chain_id,
+                                db_path.as_deref(),
+                                &mut peer_chain_view,
+                                unsafe_rehearsal_difficulty_bits,
+                            )
+                            .await?
+                            .map(|event| ("p2p", event)),
+                        }
+                    };
+                    match sync_result {
+                        Some((source, sync_event)) => {
+                            next_warmup_ibd_at =
+                                tokio::time::Instant::now() + ibd_retry_delay(&sync_event);
+                            remember_sync_event(
+                                source,
+                                &sync_event,
+                                &mut last_sync_source,
+                                &mut last_sync_event,
+                                &mut last_sync_error,
+                                &mut rpc_fallback_active,
+                            );
+                            last_event = sync_event;
+                        }
+                        None => {
+                            next_warmup_ibd_at =
+                                tokio::time::Instant::now() + Duration::from_secs(1);
+                        }
                     }
                 }
             }
@@ -9117,47 +9148,66 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     .await
                     .map_err(|e| format!("pump error: {e}"))?;
                 if tokio::time::Instant::now() >= next_warmup_ibd_at {
-                    if let Some(sync_event) = run_rpc_sync_batch(
-                        &chain_id,
-                        db_path.as_deref(),
-                        &rpc_sync_endpoints,
-                        &mut peer_chain_view,
-                        unsafe_rehearsal_difficulty_bits,
-                        32,
-                    )? {
-                        next_warmup_ibd_at =
-                            tokio::time::Instant::now() + ibd_retry_delay(&sync_event);
-                        remember_sync_event(
-                            "rpc",
-                            &sync_event,
-                            &mut last_sync_source,
-                            &mut last_sync_event,
-                            &mut last_sync_error,
-                            &mut rpc_fallback_active,
-                        );
-                        last_event = sync_event;
-                    } else if let Some(sync_event) = run_sync_step(
-                        &mut node,
-                        &chain_id,
-                        db_path.as_deref(),
-                        &mut peer_chain_view,
-                        unsafe_rehearsal_difficulty_bits,
-                    )
-                    .await?
-                    {
-                        next_warmup_ibd_at =
-                            tokio::time::Instant::now() + ibd_retry_delay(&sync_event);
-                        remember_sync_event(
-                            "p2p",
-                            &sync_event,
-                            &mut last_sync_source,
-                            &mut last_sync_event,
-                            &mut last_sync_error,
-                            &mut rpc_fallback_active,
-                        );
-                        last_event = sync_event;
+                    let sync_result = if should_prefer_p2p_sync(&node) {
+                        match run_sync_step(
+                            &mut node,
+                            &chain_id,
+                            db_path.as_deref(),
+                            &mut peer_chain_view,
+                            unsafe_rehearsal_difficulty_bits,
+                        )
+                        .await?
+                        {
+                            Some(event) => Some(("p2p", event)),
+                            None => run_rpc_sync_batch(
+                                &chain_id,
+                                db_path.as_deref(),
+                                &rpc_sync_endpoints,
+                                &mut peer_chain_view,
+                                unsafe_rehearsal_difficulty_bits,
+                                32,
+                            )?
+                            .map(|event| ("rpc", event)),
+                        }
                     } else {
-                        next_warmup_ibd_at = tokio::time::Instant::now() + Duration::from_secs(1);
+                        match run_rpc_sync_batch(
+                            &chain_id,
+                            db_path.as_deref(),
+                            &rpc_sync_endpoints,
+                            &mut peer_chain_view,
+                            unsafe_rehearsal_difficulty_bits,
+                            32,
+                        )? {
+                            Some(event) => Some(("rpc", event)),
+                            None => run_sync_step(
+                                &mut node,
+                                &chain_id,
+                                db_path.as_deref(),
+                                &mut peer_chain_view,
+                                unsafe_rehearsal_difficulty_bits,
+                            )
+                            .await?
+                            .map(|event| ("p2p", event)),
+                        }
+                    };
+                    match sync_result {
+                        Some((source, sync_event)) => {
+                            next_warmup_ibd_at =
+                                tokio::time::Instant::now() + ibd_retry_delay(&sync_event);
+                            remember_sync_event(
+                                source,
+                                &sync_event,
+                                &mut last_sync_source,
+                                &mut last_sync_event,
+                                &mut last_sync_error,
+                                &mut rpc_fallback_active,
+                            );
+                            last_event = sync_event;
+                        }
+                        None => {
+                            next_warmup_ibd_at =
+                                tokio::time::Instant::now() + Duration::from_secs(1);
+                        }
                     }
                 }
             }
@@ -9416,45 +9466,64 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             {
                 last_event = prefetch_event;
             }
-            if let Some(sync_event) = run_rpc_sync_batch(
-                &chain_id,
-                db_path.as_deref(),
-                &rpc_sync_endpoints,
-                &mut peer_chain_view,
-                unsafe_rehearsal_difficulty_bits,
-                64,
-            )? {
-                next_ibd_at = tokio::time::Instant::now() + ibd_retry_delay(&sync_event);
-                remember_sync_event(
-                    "rpc",
-                    &sync_event,
-                    &mut last_sync_source,
-                    &mut last_sync_event,
-                    &mut last_sync_error,
-                    &mut rpc_fallback_active,
-                );
-                last_event = sync_event;
-            } else if let Some(sync_event) = run_sync_step(
-                &mut node,
-                &chain_id,
-                db_path.as_deref(),
-                &mut peer_chain_view,
-                unsafe_rehearsal_difficulty_bits,
-            )
-            .await?
-            {
-                next_ibd_at = tokio::time::Instant::now() + ibd_retry_delay(&sync_event);
-                remember_sync_event(
-                    "p2p",
-                    &sync_event,
-                    &mut last_sync_source,
-                    &mut last_sync_event,
-                    &mut last_sync_error,
-                    &mut rpc_fallback_active,
-                );
-                last_event = sync_event;
+            let sync_result = if should_prefer_p2p_sync(&node) {
+                match run_sync_step(
+                    &mut node,
+                    &chain_id,
+                    db_path.as_deref(),
+                    &mut peer_chain_view,
+                    unsafe_rehearsal_difficulty_bits,
+                )
+                .await?
+                {
+                    Some(event) => Some(("p2p", event)),
+                    None => run_rpc_sync_batch(
+                        &chain_id,
+                        db_path.as_deref(),
+                        &rpc_sync_endpoints,
+                        &mut peer_chain_view,
+                        unsafe_rehearsal_difficulty_bits,
+                        64,
+                    )?
+                    .map(|event| ("rpc", event)),
+                }
             } else {
-                next_ibd_at = tokio::time::Instant::now() + Duration::from_secs(1);
+                match run_rpc_sync_batch(
+                    &chain_id,
+                    db_path.as_deref(),
+                    &rpc_sync_endpoints,
+                    &mut peer_chain_view,
+                    unsafe_rehearsal_difficulty_bits,
+                    64,
+                )? {
+                    Some(event) => Some(("rpc", event)),
+                    None => run_sync_step(
+                        &mut node,
+                        &chain_id,
+                        db_path.as_deref(),
+                        &mut peer_chain_view,
+                        unsafe_rehearsal_difficulty_bits,
+                    )
+                    .await?
+                    .map(|event| ("p2p", event)),
+                }
+            };
+            match sync_result {
+                Some((source, sync_event)) => {
+                    next_ibd_at = tokio::time::Instant::now() + ibd_retry_delay(&sync_event);
+                    remember_sync_event(
+                        source,
+                        &sync_event,
+                        &mut last_sync_source,
+                        &mut last_sync_event,
+                        &mut last_sync_error,
+                        &mut rpc_fallback_active,
+                    );
+                    last_event = sync_event;
+                }
+                None => {
+                    next_ibd_at = tokio::time::Instant::now() + Duration::from_secs(1);
+                }
             }
         }
 

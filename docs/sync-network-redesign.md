@@ -1443,6 +1443,41 @@ picando sobre un padre ya obsoleto hasta terminar su propio lote.
 Local unicamente, verificado con `cargo check --bins --features randomx` y
 un smoke-test que confirmo la deteccion de RAM real en runtime.
 
+### Fase 7.7 - Preferir sync P2P sobre RPC centralizado con mesh sano
+
+Pedido del usuario: aprovechar que ya hay mineros corriendo el binario
+propio para sincronizar como Bitcoin (pidiendole a otros nodos, no solo a
+los droplets propios), manteniendo ambos metodos disponibles a la vez.
+
+Diagnostico: en los 3 puntos del loop principal donde se decide como
+sincronizar (`src/main.rs`, dos durante warmup de arranque, uno en el loop
+estable), el orden era siempre RPC primero, P2P nativo solo si RPC no
+tenia nada que ofrecer. `run_rpc_sync_batch` solo cede el paso a P2P
+cuando no hay endpoints RPC configurados o ninguno reporta estar mas
+adelante que la altura local - como el manifest trae embebidas las URLs
+RPC de BOOT+VPS2 por defecto, practicamente todo nodo terminaba
+prefiriendo pegarle a los droplets, subutilizando el prefetch P2P paralelo
+de la Fase 4 (RPC baja hasta 64 bloques por tick contra 8 de P2P, casi
+siempre gana la carrera). Esto explica en parte la sobrecarga de BOOT.
+
+- [x] Nuevo helper `should_prefer_p2p_sync()` (`src/main.rs`): true cuando
+  `connected_peer_count() >= 2` (mismo umbral usado para sintonizar
+  `mesh_n_low` de gossipsub en la Fase 7.5).
+- [x] Los 3 puntos de decision ahora invierten el orden segun ese chequeo:
+  con mesh sano, P2P primero y RPC como fallback; con pocos peers (nodos
+  aislados/detras de NAT), RPC sigue primero tal como funciona hoy. Ningun
+  metodo se elimina, solo cambia la prioridad segun salud del mesh.
+- Riesgo aceptado conscientemente: `run_sync_step` puede tardar hasta 8s si
+  cree que un peer tiene el bloque pero no responde, antes de caer a RPC en
+  la vuelta siguiente - el mismo timeout que ya existia cuando RPC estaba
+  vacio, ahora solo se activa con mas frecuencia.
+
+Verificado con `cargo check --bins --features randomx` y un arranque
+aislado con 0 peers (se comporta igual que antes: RPC primero, ya que
+`connected_peer_count() < 2`). Confirmar que P2P efectivamente gana cuando
+hay 2+ peers sanos requiere BOOT/VPS2 conectados entre si - pendiente para
+despues del redeploy.
+
 ## 6. Tabla de prioridades
 
 | Prioridad | Trabajo | Impacto | Riesgo |
