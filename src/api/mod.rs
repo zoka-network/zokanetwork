@@ -983,9 +983,7 @@ impl NetworkRuntimeState {
             private_tx_body_received_late: self
                 .private_tx_body_received_late
                 .load(Ordering::Relaxed),
-            private_tx_included_in_block: self
-                .private_tx_included_in_block
-                .load(Ordering::Relaxed),
+            private_tx_included_in_block: self.private_tx_included_in_block.load(Ordering::Relaxed),
             private_tx_rpc_fallback_pulled: self
                 .private_tx_rpc_fallback_pulled
                 .load(Ordering::Relaxed),
@@ -5010,9 +5008,7 @@ async fn post_block_submit(
 
 // ── Public snapshot endpoints ──────────────────────────────────────────────
 
-async fn get_snapshots_list(
-    State(app_state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
+async fn get_snapshots_list(State(app_state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let chain_id = app_state.state_manager.chain_id().await;
     let dir = crate::snapshot::default_snapshot_dir();
     let all = crate::snapshot::scan_snapshot_manifests(&dir);

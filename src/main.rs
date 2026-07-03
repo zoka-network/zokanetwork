@@ -3086,6 +3086,71 @@ fn private_tx_sidecar_dir(db_path: &str) -> std::path::PathBuf {
     base.join("pending_private_queue")
 }
 
+#[derive(Debug, Clone, Default)]
+struct SidecarPrivateTxImportSummary {
+    imported: usize,
+    removed_confirmed: usize,
+    skipped_invalid: usize,
+    skipped_io: usize,
+}
+
+impl SidecarPrivateTxImportSummary {
+    fn total_activity(&self) -> usize {
+        self.imported.saturating_add(self.removed_confirmed)
+    }
+}
+
+fn list_sidecar_private_tx_hashes(db_path: &str) -> Vec<String> {
+    let sidecar = private_tx_sidecar_dir(db_path);
+    let entries = match std::fs::read_dir(&sidecar) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    let mut hashes: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            (path.extension().and_then(|s| s.to_str()) == Some("privtx"))
+                .then(|| {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_string())
+                })
+                .flatten()
+        })
+        .collect();
+    hashes.sort();
+    hashes.dedup();
+    hashes
+}
+
+fn private_tx_hash_is_confirmed(storage: &RocksDbStorage, hash: &str) -> bool {
+    let hash = hash.trim();
+    if hash.is_empty() {
+        return false;
+    }
+    let tip = storage.get_chain_height().unwrap_or(0);
+    for height in 1..=tip {
+        let Ok(Some(block)) = storage.get_block_by_height(height) else {
+            continue;
+        };
+        if block
+            .private_tx_hashes
+            .iter()
+            .any(|candidate| candidate == hash)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn private_tx_has_spent_onchain_tag(storage: &RocksDbStorage, tx: &PrivateTransaction) -> bool {
+    private_tx_spend_tags(tx)
+        .iter()
+        .any(|tag| storage.is_nullifier_spent(tag).unwrap_or(false))
+}
+
 fn persist_local_private_tx_for_node(
     db_path: &str,
     tx_hash: &str,
@@ -3124,15 +3189,22 @@ fn persist_local_private_tx_for_node(
 /// Import any private transactions sitting in the sidecar queue into the
 /// chain DB and return the count of newly imported entries.
 fn import_sidecar_private_txs(db_path: &str, storage: &RocksDbStorage) -> usize {
+    import_sidecar_private_txs_with_summary(db_path, storage).imported
+}
+
+fn import_sidecar_private_txs_with_summary(
+    db_path: &str,
+    storage: &RocksDbStorage,
+) -> SidecarPrivateTxImportSummary {
     let sidecar = private_tx_sidecar_dir(db_path);
     if !sidecar.exists() {
-        return 0;
+        return SidecarPrivateTxImportSummary::default();
     }
     let entries = match std::fs::read_dir(&sidecar) {
         Ok(e) => e,
-        Err(_) => return 0,
+        Err(_) => return SidecarPrivateTxImportSummary::default(),
     };
-    let mut imported = 0usize;
+    let mut summary = SidecarPrivateTxImportSummary::default();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("privtx") {
@@ -3140,7 +3212,10 @@ fn import_sidecar_private_txs(db_path: &str, storage: &RocksDbStorage) -> usize 
         }
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
-            Err(_) => continue,
+            Err(_) => {
+                summary.skipped_io = summary.skipped_io.saturating_add(1);
+                continue;
+            }
         };
         let tx_hash = match path
             .file_stem()
@@ -3148,13 +3223,29 @@ fn import_sidecar_private_txs(db_path: &str, storage: &RocksDbStorage) -> usize 
             .map(|s| s.to_string())
         {
             Some(h) => h,
-            None => continue,
+            None => {
+                summary.skipped_invalid = summary.skipped_invalid.saturating_add(1);
+                continue;
+            }
         };
         let tx = match serde_json::from_slice::<PrivateTransaction>(&bytes) {
             Ok(tx) if tx.tx_hash == tx_hash => tx,
-            _ => continue,
+            _ => {
+                summary.skipped_invalid = summary.skipped_invalid.saturating_add(1);
+                continue;
+            }
         };
         if validate_private_tx_for_pending_pool(&tx).is_err() {
+            summary.skipped_invalid = summary.skipped_invalid.saturating_add(1);
+            continue;
+        }
+        if private_tx_hash_is_confirmed(storage, &tx_hash)
+            || private_tx_has_spent_onchain_tag(storage, &tx)
+        {
+            let _ = storage.delete_pending_private_transaction_hash(&tx_hash);
+            if std::fs::remove_file(&path).is_ok() {
+                summary.removed_confirmed = summary.removed_confirmed.saturating_add(1);
+            }
             continue;
         }
         if storage
@@ -3165,10 +3256,41 @@ fn import_sidecar_private_txs(db_path: &str, storage: &RocksDbStorage) -> usize 
                 .is_ok()
         {
             let _ = std::fs::remove_file(&path);
-            imported += 1;
+            summary.imported = summary.imported.saturating_add(1);
         }
     }
-    imported
+    summary
+}
+
+fn prune_confirmed_pending_private_txs(storage: &RocksDbStorage, db_path: Option<&str>) -> usize {
+    let hashes = match storage.iterate_pending_private_transaction_hashes() {
+        Ok(hashes) => hashes,
+        Err(_) => return 0,
+    };
+    let mut pruned = 0usize;
+    for hash in hashes {
+        let mut should_prune = private_tx_hash_is_confirmed(storage, &hash);
+        if !should_prune {
+            if let Ok(Some(body)) = storage.get_private_transaction_bytes(&hash) {
+                if let Ok(tx) = serde_json::from_slice::<PrivateTransaction>(&body) {
+                    should_prune = private_tx_has_spent_onchain_tag(storage, &tx);
+                }
+            }
+        }
+        if should_prune
+            && storage
+                .delete_pending_private_transaction_hash(&hash)
+                .is_ok()
+        {
+            if let Some(path) = db_path {
+                let _ = std::fs::remove_file(
+                    private_tx_sidecar_dir(path).join(format!("{hash}.privtx")),
+                );
+            }
+            pruned = pruned.saturating_add(1);
+        }
+    }
+    pruned
 }
 
 /// Poll public RPC peers for their pending private transactions and stage any
@@ -5529,9 +5651,8 @@ fn run_mining_batch_with_progress(
                 config.chain_db_path.as_deref(),
             )?;
             if !private_tx_hashes_for_block.is_empty() {
-                zoka::api::global_network_runtime().record_private_tx_included_in_block(
-                    private_tx_hashes_for_block.len() as u64,
-                );
+                zoka::api::global_network_runtime()
+                    .record_private_tx_included_in_block(private_tx_hashes_for_block.len() as u64);
             }
             let mut wallet_state_changed = private_manager
                 .mark_private_transactions_confirmed_locally(&private_tx_hashes_for_block)
@@ -5848,8 +5969,9 @@ async fn sweep_block_announce_retries(
             .await
         {
             Ok(response) => {
-                let outcome =
-                    zoka::state::sync::try_apply_synced_block_payload(&storage, chain_id, &response);
+                let outcome = zoka::state::sync::try_apply_synced_block_payload(
+                    &storage, chain_id, &response,
+                );
                 if matches!(outcome, zoka::state::sync::SyncOutcome::Applied(_)) {
                     node.forget_block_announce_retry(height, &hash);
                 }
@@ -6106,7 +6228,9 @@ fn headers_response_from_storage(
         };
     }
 
-    let max = (request.max as u64).min(512).min(tip.saturating_sub(start) + 1);
+    let max = (request.max as u64)
+        .min(512)
+        .min(tip.saturating_sub(start) + 1);
     let mut headers: Vec<HeaderSummary> = Vec::with_capacity(max as usize);
 
     let mut cumulative_work = if start > 1 {
@@ -6120,14 +6244,18 @@ fn headers_response_from_storage(
         0
     };
 
-    let mut difficulty_bits = storage.get_current_difficulty_bits().unwrap_or(
-        zoka::economics::POW_INITIAL_DIFFICULTY_BITS,
-    );
+    let mut difficulty_bits = storage
+        .get_current_difficulty_bits()
+        .unwrap_or(zoka::economics::POW_INITIAL_DIFFICULTY_BITS);
 
     for h in start..=(start + max - 1) {
         if let Some(stop) = &request.stop_hash {
             if !stop.is_empty() {
-                if headers.last().map(|s| &s.header.hash == stop).unwrap_or(false) {
+                if headers
+                    .last()
+                    .map(|s| &s.header.hash == stop)
+                    .unwrap_or(false)
+                {
                     break;
                 }
             }
@@ -6208,10 +6336,7 @@ fn serve_pending_snapshot_manifest_requests(
 
         let network_manifests: Vec<SnapshotManifest> = file_manifests
             .into_iter()
-            .filter(|m| {
-                m.chain_id == *chain_id
-                    && max_height.map_or(true, |h| m.head_height <= h)
-            })
+            .filter(|m| m.chain_id == *chain_id && max_height.map_or(true, |h| m.head_height <= h))
             .map(|m| SnapshotManifest {
                 chain_id: m.chain_id,
                 schema: m.schema,
@@ -6233,7 +6358,9 @@ fn serve_pending_snapshot_manifest_requests(
                 reason: "no snapshots available for the requested chain/height".to_string(),
             }
         } else {
-            SnapshotManifestsResponse::Manifests { manifests: network_manifests }
+            SnapshotManifestsResponse::Manifests {
+                manifests: network_manifests,
+            }
         };
 
         match node.respond_snapshot_manifest_request(pending, response) {
@@ -8471,14 +8598,14 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         if use_network_config {
             let local_height = storage.get_chain_height().unwrap_or(0);
             const MIN_SNAPSHOT_LEAD_BLOCKS: u64 = 100;
-            let manifest = zoka::snapshot::scan_snapshot_manifests(
-                &zoka::snapshot::default_snapshot_dir(),
-            )
-            .into_iter()
-            .find(|m| {
-                m.chain_id == chain_id
-                    && m.head_height >= local_height.saturating_add(MIN_SNAPSHOT_LEAD_BLOCKS)
-            });
+            let manifest =
+                zoka::snapshot::scan_snapshot_manifests(&zoka::snapshot::default_snapshot_dir())
+                    .into_iter()
+                    .find(|m| {
+                        m.chain_id == chain_id
+                            && m.head_height
+                                >= local_height.saturating_add(MIN_SNAPSHOT_LEAD_BLOCKS)
+                    });
             if let Some(manifest) = manifest {
                 let config_path = network_config_arg
                     .as_deref()
@@ -8509,8 +8636,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                                         let mut verified = false;
                                         let mut last_verify_err = String::new();
                                         for signer_hex in &trusted_signers {
-                                            let Ok(decoded) = hex::decode(signer_hex.trim())
-                                            else {
+                                            let Ok(decoded) = hex::decode(signer_hex.trim()) else {
                                                 continue;
                                             };
                                             if decoded.len() != 32 {
@@ -9261,11 +9387,13 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     // table never refreshes on its own. This fires unconditionally on a
     // slow cadence regardless of whether new addresses were seen.
     let mut next_kad_rebootstrap_at = tokio::time::Instant::now() + Duration::from_secs(900);
-    let mut next_block_announce_retry_sweep_at = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut next_block_announce_retry_sweep_at =
+        tokio::time::Instant::now() + Duration::from_secs(2);
     // Periodic RPC pull of pending private txs from public peers. This is the
     // NAT-friendly counterpart to libp2p gossip: a miner that can only open
     // outbound HTTP pulls pending private txs into its own pool so it can mine
     // them, even when inbound P2P gossip never reaches it.
+    let mut next_private_sidecar_import_at = tokio::time::Instant::now();
     let mut next_private_pull_at = tokio::time::Instant::now();
     let mut next_private_body_pull_at = tokio::time::Instant::now();
     let mut last_private_body_scan_height = 0u64;
@@ -9352,9 +9480,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         {
             last_event = private_tx_event;
         }
-        if let Some(header_event) =
-            serve_pending_header_requests(&mut node, db_path.as_deref())?
-        {
+        if let Some(header_event) = serve_pending_header_requests(&mut node, db_path.as_deref())? {
             last_event = header_event;
         }
         if let Some(snapshot_event) = serve_pending_snapshot_manifest_requests(&mut node)? {
@@ -9404,7 +9530,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         }
 
         if tokio::time::Instant::now() >= next_block_announce_retry_sweep_at {
-            next_block_announce_retry_sweep_at = tokio::time::Instant::now() + Duration::from_secs(2);
+            next_block_announce_retry_sweep_at =
+                tokio::time::Instant::now() + Duration::from_secs(2);
             if let Some(retry_event) =
                 sweep_block_announce_retries(&mut node, &chain_id, db_path.as_deref()).await
             {
@@ -9577,6 +9704,29 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 last_event = rpc_rebroadcast_event;
             }
             next_sync_state_at = tokio::time::Instant::now() + Duration::from_secs(3);
+        }
+
+        // Drain private tx sidecars from the normal fullnode loop, not only
+        // from the mining loop. ZSilent wallet nodes often run with --no-mine;
+        // without this path, private sends can sit forever in
+        // pending_private_queue while /private/pending reports zero.
+        if tokio::time::Instant::now() >= next_private_sidecar_import_at {
+            if let (Some(path), Some(storage)) =
+                (db_path.as_deref(), chain_storage_outer.as_deref())
+            {
+                let pruned = prune_confirmed_pending_private_txs(storage, Some(path));
+                let summary = import_sidecar_private_txs_with_summary(path, storage);
+                if pruned > 0 || summary.total_activity() > 0 {
+                    last_event = format!(
+                        "Private tx queue drained: imported {}, removed confirmed/spent {}, pruned pending {}, skipped invalid {}.",
+                        summary.imported,
+                        summary.removed_confirmed,
+                        pruned,
+                        summary.skipped_invalid
+                    );
+                }
+            }
+            next_private_sidecar_import_at = tokio::time::Instant::now() + Duration::from_secs(2);
         }
 
         // Pull pending private txs from public RPC peers so a NAT'd miner can
@@ -11933,28 +12083,37 @@ fn cmd_pending_transfers(args: &[String]) -> Result<(), String> {
     } else {
         Vec::new()
     };
+    let sidecar_hashes = list_sidecar_private_tx_hashes(&db_path);
     if as_json {
         println!(
             "{}",
             serde_json::json!({
                 "db": db_path,
                 "count": hashes.len(),
+                "sidecar_count": sidecar_hashes.len(),
                 "pending_private_tx_hashes": hashes,
+                "sidecar_private_tx_hashes": sidecar_hashes,
             })
         );
         return Ok(());
     }
     println!("Pending private transfers");
     println!("Node DB: {}", db_path);
-    if hashes.is_empty() {
+    if hashes.is_empty() && sidecar_hashes.is_empty() {
         println!("No pending private transfers.");
         println!(
             "When you send from the console, the transfer is queued here for your local node to mine."
         );
         return Ok(());
     }
-    for hash in hashes {
+    for hash in &hashes {
         println!("- {}", hash);
+    }
+    if !sidecar_hashes.is_empty() {
+        println!("Sidecar queue (waiting for node import):");
+        for hash in sidecar_hashes {
+            println!("- {}", hash);
+        }
     }
     Ok(())
 }
@@ -15085,6 +15244,20 @@ mod tests {
         .expect("deserialize private tx fixture")
     }
 
+    fn valid_private_tx_fixture() -> PrivateTransaction {
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        let bob = manager.create_private_wallet("bob").unwrap();
+        manager.deposit_to_private_wallet("alice", 10).unwrap();
+        let tx_hash = manager
+            .send_private_transaction("alice", bob, 1)
+            .expect("create private tx");
+        manager
+            .get_private_transaction(&tx_hash)
+            .expect("created tx")
+            .clone()
+    }
+
     #[test]
     fn pending_private_tx_selection_rejects_unknown_proof_profile() {
         let (_tmp, db) = temp_db_arg();
@@ -15205,6 +15378,94 @@ mod tests {
             .get_private_transaction_bytes(&tx.tx_hash)
             .expect("read stored body")
             .is_none());
+    }
+
+    #[test]
+    fn sidecar_import_removes_already_confirmed_private_tx() {
+        let (_tmp, db) = temp_db_arg();
+        let storage = RocksDbStorage::new(&db).expect("temp rocksdb");
+        let tx = valid_private_tx_fixture();
+        let sidecar = private_tx_sidecar_dir(&db);
+        let sidecar_file = sidecar.join(format!("{}.privtx", tx.tx_hash));
+        std::fs::create_dir_all(&sidecar).expect("create sidecar dir");
+        std::fs::write(
+            &sidecar_file,
+            serde_json::to_vec(&tx).expect("serialize private tx fixture"),
+        )
+        .expect("write sidecar fixture");
+        let block = zoka::types::Block::new(
+            genesis_pow_hash_for_chain(NetworkProfile::Mainnet.chain_id()),
+            1_780_000_001,
+            0,
+            1,
+            Vec::new(),
+            zoka::types::PublicKey(Vec::new()),
+            zoka::types::Signature(Vec::new()),
+        )
+        .with_private_tx_hashes(vec![tx.tx_hash.clone()]);
+        storage.save_block(&block).expect("save confirmed block");
+        storage.set_chain_height(1).expect("set chain height");
+
+        let summary = import_sidecar_private_txs_with_summary(&db, &storage);
+
+        assert_eq!(summary.imported, 0);
+        assert_eq!(summary.removed_confirmed, 1);
+        assert!(!sidecar_file.exists());
+        assert!(storage
+            .iterate_pending_private_transaction_hashes()
+            .expect("read pending hashes")
+            .is_empty());
+    }
+
+    #[test]
+    fn prune_confirmed_pending_private_txs_removes_marker_and_sidecar() {
+        let (_tmp, db) = temp_db_arg();
+        let storage = RocksDbStorage::new(&db).expect("temp rocksdb");
+        let tx = valid_private_tx_fixture();
+        let body = serde_json::to_vec(&tx).expect("serialize private tx fixture");
+        storage
+            .save_private_transaction_bytes(&tx.tx_hash, &body)
+            .expect("save private tx body");
+        storage
+            .save_pending_private_transaction_hash(&tx.tx_hash)
+            .expect("save pending hash");
+        let sidecar = private_tx_sidecar_dir(&db);
+        let sidecar_file = sidecar.join(format!("{}.privtx", tx.tx_hash));
+        std::fs::create_dir_all(&sidecar).expect("create sidecar dir");
+        std::fs::write(&sidecar_file, &body).expect("write sidecar fixture");
+        let block = zoka::types::Block::new(
+            genesis_pow_hash_for_chain(NetworkProfile::Mainnet.chain_id()),
+            1_780_000_001,
+            0,
+            1,
+            Vec::new(),
+            zoka::types::PublicKey(Vec::new()),
+            zoka::types::Signature(Vec::new()),
+        )
+        .with_private_tx_hashes(vec![tx.tx_hash.clone()]);
+        storage.save_block(&block).expect("save confirmed block");
+        storage.set_chain_height(1).expect("set chain height");
+
+        assert_eq!(prune_confirmed_pending_private_txs(&storage, Some(&db)), 1);
+        assert!(!sidecar_file.exists());
+        assert!(storage
+            .iterate_pending_private_transaction_hashes()
+            .expect("read pending hashes")
+            .is_empty());
+    }
+
+    #[test]
+    fn sidecar_hash_listing_exposes_unimported_private_txs() {
+        let (_tmp, db) = temp_db_arg();
+        let sidecar = private_tx_sidecar_dir(&db);
+        std::fs::create_dir_all(&sidecar).expect("create sidecar dir");
+        std::fs::write(sidecar.join("b.privtx"), b"{}").expect("write sidecar b");
+        std::fs::write(sidecar.join("a.privtx"), b"{}").expect("write sidecar a");
+
+        assert_eq!(
+            list_sidecar_private_tx_hashes(&db),
+            vec!["a".to_string(), "b".to_string()]
+        );
     }
 
     #[test]

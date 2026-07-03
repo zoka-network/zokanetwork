@@ -143,8 +143,8 @@ mod tests {
                 timestamp: height * 30,
                 nonce: height,
                 block_height: height,
-                validator: PublicKey::from_bytes(b"v"),
-                seal: Signature::from_bytes(b"s"),
+                validator: PublicKey(b"v".to_vec()),
+                seal: Signature(b"s".to_vec()),
             },
             difficulty_bits: 20,
             cumulative_work: height as u128 * 1_000_000,
@@ -154,7 +154,11 @@ mod tests {
     #[test]
     fn get_headers_default_max_roundtrip() {
         let req = GetHeaders {
-            locator: vec!["hash-5".to_string(), "hash-3".to_string(), "hash-1".to_string()],
+            locator: vec![
+                "hash-5".to_string(),
+                "hash-3".to_string(),
+                "hash-1".to_string(),
+            ],
             max: default_max(),
             stop_hash: None,
         };

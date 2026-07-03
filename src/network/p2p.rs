@@ -29,10 +29,6 @@ use crate::network::header_request_response::{
     protocol_name as header_request_response_protocol, GetHeaders, HeaderRequestResponseCodec,
     HeadersResponse,
 };
-use crate::network::snapshot_request_response::{
-    protocol_name as snapshot_request_response_protocol, GetSnapshotManifests,
-    SnapshotManifestsResponse, SnapshotRequestResponseCodec,
-};
 use crate::network::message::{
     BlockAnnounceMessage, BlockResponseMessage, MixerBatchMessage, PbftNetworkMessage, PingMessage,
     PrivateTransactionMessage, PrivateTxAnnounceMessage, StemPrivateTransactionMessage,
@@ -41,6 +37,10 @@ use crate::network::message::{
 use crate::network::private_tx_request_response::{
     protocol_name as private_tx_request_response_protocol, PrivateTxBodyRequest,
     PrivateTxBodyResponse, PrivateTxRequestResponseCodec,
+};
+use crate::network::snapshot_request_response::{
+    protocol_name as snapshot_request_response_protocol, GetSnapshotManifests,
+    SnapshotManifestsResponse, SnapshotRequestResponseCodec,
 };
 
 pub const GENERAL_TOPIC_NAME: &str = "zoka/messages/v1";
@@ -1684,19 +1684,21 @@ impl Node {
                 request_response::Message::Request {
                     request, channel, ..
                 } => {
-                    self.pending_header_requests.push_back(PendingHeaderRequest {
-                        peer,
-                        request,
-                        channel,
-                        received_at: Instant::now(),
-                    });
+                    self.pending_header_requests
+                        .push_back(PendingHeaderRequest {
+                            peer,
+                            request,
+                            channel,
+                            received_at: Instant::now(),
+                        });
                 }
                 request_response::Message::Response { response, .. } => {
-                    self.received_header_responses.push_back(ReceivedHeadersResponse {
-                        peer,
-                        response,
-                        latency: Duration::default(),
-                    });
+                    self.received_header_responses
+                        .push_back(ReceivedHeadersResponse {
+                            peer,
+                            response,
+                            latency: Duration::default(),
+                        });
                 }
             },
             request_response::Event::OutboundFailure { peer, error, .. } => {
@@ -2674,8 +2676,9 @@ impl Node {
                 // branches above ever ran for them.
                 let announced_by = self.private_tx_announce_sources.get(tx_hash).cloned();
                 for request_id in &request_ids {
-                    if let Some(pending) =
-                        self.pending_outbound_private_tx_body_requests.remove(request_id)
+                    if let Some(pending) = self
+                        .pending_outbound_private_tx_body_requests
+                        .remove(request_id)
                     {
                         let announced = announced_by
                             .as_ref()
@@ -2882,8 +2885,7 @@ impl Node {
         let deadline = tokio::time::Instant::now() + max_wait;
         while !pending_heights.is_empty() && tokio::time::Instant::now() < deadline {
             if let Some(received) = self.take_matching_direct_block_response(&request_ids) {
-                let Some(height) = request_id_to_height.get(&received.request_id).copied()
-                else {
+                let Some(height) = request_id_to_height.get(&received.request_id).copied() else {
                     continue;
                 };
                 if !pending_heights.remove(&height) {
@@ -2915,7 +2917,10 @@ impl Node {
                         self.record_direct_block_failure(received.peer.clone());
                         results.insert(
                             height,
-                            Err(format!("peer {} did not have block: {reason}", received.peer)),
+                            Err(format!(
+                                "peer {} did not have block: {reason}",
+                                received.peer
+                            )),
                         );
                     }
                     BlockBodyResponse::Rejected { reason, .. } => {
@@ -3298,7 +3303,9 @@ impl Node {
         self.pending_block_announce_retries
             .iter()
             .filter_map(|((height, hash), retry)| {
-                let idx = (retry.attempts as usize).saturating_sub(1).min(BACKOFF_SECS.len() - 1);
+                let idx = (retry.attempts as usize)
+                    .saturating_sub(1)
+                    .min(BACKOFF_SECS.len() - 1);
                 let backoff = Duration::from_secs(BACKOFF_SECS[idx]);
                 if now.duration_since(retry.last_attempt_at) >= backoff {
                     Some((*height, hash.clone(), retry.attempts))

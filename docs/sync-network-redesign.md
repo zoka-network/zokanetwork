@@ -1207,6 +1207,11 @@ Criterio de aceptacion:
   - Contadores globales en `NetworkRuntimeState` (`src/api/mod.rs`), expuestos via `GET` del snapshot de red: `private_tx_announced_without_body`, `private_tx_body_received_late`, `private_tx_included_in_block`, `private_tx_rpc_fallback_pulled`.
 - [x] Mantener RPC pull solo como fallback y marcarlo en metricas.
   - El pull por RPC ya era NAT-friendly/secundario por diseno (comentario existente en `src/main.rs`); se agrego el contador `private_tx_rpc_fallback_pulled` en ambos call sites (pull de pendientes y backfill de cuerpos committeados).
+- [x] Drenar y sanear `pending_private_queue` fuera del ciclo de minado.
+  - Hallazgo operativo: BOOT mostraba `15` tx privadas pendientes mientras bloques posteriores a 1151 salian sin privadas; localmente tambien existian sidecars que podian quedar invisibles para `/private/pending`.
+  - `cmd_fullnode_auto` ahora importa sidecars cada 2s desde el loop normal del fullnode, incluso con `--no-mine`.
+  - Al importar, remueve sidecars/marcadores cuyo hash ya esta confirmado o cuyo nullifier ya esta gastado on-chain.
+  - `zoka pending --json` ahora expone `sidecar_count` y `sidecar_private_tx_hashes`, para no volver a confundir "mempool formal vacia" con "cola lateral sin importar".
 
 Archivos:
 
