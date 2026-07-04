@@ -7492,7 +7492,7 @@ fn run_rpc_sync_batch(
         let rpc = candidate.rpc.as_str();
         let remote_height = candidate.height;
 
-        peer_view.observe(remote_height, local_height);
+        peer_view.observe_trusted_height(remote_height);
         let mut applied = 0u64;
         let mut validated_side_branch = 0u64;
         let mut last_event = String::new();
@@ -15372,7 +15372,10 @@ mod tests {
         let tx_a = valid_private_tx_fixture();
         let mut tx_b = tx_a.clone();
         tx_b.tx_hash = format!("{}-dup", tx_a.tx_hash);
-        assert_eq!(tx_a.nullifier, tx_b.nullifier, "fixture must share the spend tag");
+        assert_eq!(
+            tx_a.nullifier, tx_b.nullifier,
+            "fixture must share the spend tag"
+        );
 
         for tx in [&tx_a, &tx_b] {
             let body = serde_json::to_vec(tx).expect("serialize private tx fixture");

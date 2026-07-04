@@ -82,6 +82,17 @@ impl PeerChainView {
         }
     }
 
+    /// Record a height from an operator-configured RPC endpoint. Unlike
+    /// untrusted P2P announcements, an RPC sync target can legitimately be far
+    /// ahead of a fresh local DB; block payloads are still fetched and validated
+    /// before any state is committed.
+    pub fn observe_trusted_height(&mut self, height: u64) {
+        if height > self.perceived_max_height {
+            self.perceived_max_height = height;
+            self.perceived_max_height_observed_at = Some(Instant::now());
+        }
+    }
+
     pub fn record_sync_outcome(&mut self, outcome: &SyncOutcome) {
         // Diagnostic for an intermittent resync stall seen on follower
         // (--seed configured) nodes: a growing height gap with no error in
@@ -1423,6 +1434,26 @@ mod tests {
         let (storage, _dir) = open_temp_storage();
         let mut view = PeerChainView::default();
         view.observe(5, 0);
+        let next = next_required_height(&storage, &view).expect("query");
+        assert_eq!(next, Some(1));
+    }
+
+    #[test]
+    fn untrusted_observe_ignores_implausibly_far_height() {
+        let (storage, _dir) = open_temp_storage();
+        let mut view = PeerChainView::default();
+        view.observe(MAX_PENDING_BLOCK_AHEAD + 100, 0);
+
+        let next = next_required_height(&storage, &view).expect("query");
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn trusted_observe_allows_far_rpc_bootstrap_height() {
+        let (storage, _dir) = open_temp_storage();
+        let mut view = PeerChainView::default();
+        view.observe_trusted_height(MAX_PENDING_BLOCK_AHEAD + 100);
+
         let next = next_required_height(&storage, &view).expect("query");
         assert_eq!(next, Some(1));
     }
