@@ -99,6 +99,14 @@ jobs:
           mkdir -p /data/zoka
           if command -v ufw >/dev/null 2>&1; then
             ufw allow 28080/tcp comment 'ZOKA public P2P' || true
+            # Anti-DoS: cap concurrent NEW connections per source IP
+            # (CGNAT-generous: 20 on P2P, 60 on RPC). SSH (22) untouched.
+            # Idempotent, and safe here because the node is restarted moments
+            # later in this same deploy, so the ufw reload can't wedge a live
+            # RPC. Applied via before.rules so ufw re-applies it on boot.
+            if ! grep -q 'ZOKA anti-DoS' /etc/ufw/before.rules; then
+              awk '/^COMMIT/ && !d {print "# ZOKA anti-DoS: cap concurrent NEW conns per source IP (CGNAT-generous); SSH untouched"; print "-A ufw-before-input -p tcp --dport 28080 --syn -m connlimit --connlimit-above 20 --connlimit-mask 32 -j DROP"; print "-A ufw-before-input -p tcp --dport 3000 --syn -m connlimit --connlimit-above 60 --connlimit-mask 32 -j DROP"; d=1} {print}' /etc/ufw/before.rules > /tmp/before.rules.zoka && mv /tmp/before.rules.zoka /etc/ufw/before.rules
+            fi
             ufw reload || true
           fi
 
@@ -225,6 +233,14 @@ jobs:
           mkdir -p /data/zoka
           if command -v ufw >/dev/null 2>&1; then
             ufw allow 28080/tcp comment 'ZOKA public P2P' || true
+            # Anti-DoS: cap concurrent NEW connections per source IP
+            # (CGNAT-generous: 20 on P2P, 60 on RPC). SSH (22) untouched.
+            # Idempotent, and safe here because the node is restarted moments
+            # later in this same deploy, so the ufw reload can't wedge a live
+            # RPC. Applied via before.rules so ufw re-applies it on boot.
+            if ! grep -q 'ZOKA anti-DoS' /etc/ufw/before.rules; then
+              awk '/^COMMIT/ && !d {print "# ZOKA anti-DoS: cap concurrent NEW conns per source IP (CGNAT-generous); SSH untouched"; print "-A ufw-before-input -p tcp --dport 28080 --syn -m connlimit --connlimit-above 20 --connlimit-mask 32 -j DROP"; print "-A ufw-before-input -p tcp --dport 3000 --syn -m connlimit --connlimit-above 60 --connlimit-mask 32 -j DROP"; d=1} {print}' /etc/ufw/before.rules > /tmp/before.rules.zoka && mv /tmp/before.rules.zoka /etc/ufw/before.rules
+            fi
             ufw reload || true
           fi
 

@@ -74,6 +74,42 @@ fn protocol_freeze_enforce_from_env() -> bool {
     }
 }
 
+/// Upper bound on a single gossip frame. Block responses can carry private
+/// tx bodies whose JSON encoding inflates the raw bytes ~4x, so the libp2p
+/// default is easily exceeded by a block plus a couple of ZK-proof bodies.
+/// Raised so most block+body responses fit in one gossip frame; oversized
+/// ones are still handled by dropping bodies (see
+/// `publish_block_response_with_bodies`) so we never emit a frame this large.
+const GOSSIP_MAX_TRANSMIT_SIZE: usize = 1024 * 1024;
+/// Safe ceiling (under `GOSSIP_MAX_TRANSMIT_SIZE`, leaving headroom for
+/// gossipsub framing/signing) above which a block response publishes without
+/// its attached private tx bodies. The block still propagates; receivers
+/// backfill the bodies over the point-to-point private-tx request-response.
+const MAX_GOSSIP_BLOCK_RESPONSE_BYTES: usize = 900 * 1024;
+
+/// Returns the message unchanged when it fits a gossip frame, or with its
+/// private tx bodies stripped (plus the count dropped) when the encoded size
+/// would exceed the safe gossip ceiling. Kept pure and separate from the
+/// `publish_*` methods so the size decision is unit-testable without a live
+/// swarm. Only `BlockResponse` carries bodies, so other messages pass through.
+fn fit_block_response_for_gossip(message: ZokaMessage) -> (ZokaMessage, usize) {
+    let too_large = message
+        .to_bytes()
+        .map(|encoded| encoded.len() > MAX_GOSSIP_BLOCK_RESPONSE_BYTES)
+        .unwrap_or(false);
+    if !too_large {
+        return (message, 0);
+    }
+    if let ZokaMessage::BlockResponse(mut response) = message {
+        let dropped = response.private_tx_bodies.len();
+        if dropped > 0 {
+            response.private_tx_bodies = Vec::new();
+        }
+        return (ZokaMessage::BlockResponse(response), dropped);
+    }
+    (message, 0)
+}
+
 pub const DEFAULT_PRIVATE_PADDING_BYTES: usize = 1024;
 pub const DEFAULT_STEM_HOPS: u8 = 2;
 pub const DEFAULT_MIXER_HOLD_MS: u64 = 2000;
@@ -1268,6 +1304,7 @@ impl Node {
                     .mesh_n_low(2)
                     .mesh_n_high(8)
                     .mesh_outbound_min(1)
+                    .max_transmit_size(GOSSIP_MAX_TRANSMIT_SIZE)
                     .build()
                     .map_err(|e| io::Error::other(format!("gossipsub config error: {e}")))?;
 
@@ -2581,14 +2618,27 @@ impl Node {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        self.publish_message(&ZokaMessage::BlockResponse(BlockResponseMessage {
+        let message = ZokaMessage::BlockResponse(BlockResponseMessage {
             block_height,
             encrypted_block,
             block_hash,
             difficulty_bits: None,
             private_tx_bodies,
             timestamp: now,
-        }))
+        });
+        // Gossip frames are size-bounded and JSON inflates binary bodies ~4x,
+        // so a couple of ZK-proof bodies can push a block response past the
+        // limit and gossipsub drops the whole thing (MessageTooLarge). When
+        // that would happen, publish the block WITHOUT its bodies — the block
+        // still propagates, and receivers backfill the bodies over the
+        // point-to-point private-tx request-response protocol.
+        let (message, dropped_bodies) = fit_block_response_for_gossip(message);
+        if dropped_bodies > 0 {
+            warn!(
+                "block response for height {block_height} too large for gossip; publishing block-only, {dropped_bodies} body(ies) will be backfilled"
+            );
+        }
+        self.publish_message(&message)
     }
 
     fn restore_deferred_messages(&mut self, deferred: &mut Vec<ZokaMessage>) {
@@ -3636,6 +3686,52 @@ mod tests {
     fn test_protocol_freeze_version_match() {
         assert!(Node::is_protocol_version_compatible(PROTOCOL_FREEZE_ID));
         assert!(!Node::is_protocol_version_compatible("/zoka/0.9.0"));
+    }
+
+    #[test]
+    fn oversized_block_response_drops_bodies_for_gossip() {
+        // JSON-encoding binary bodies inflates them ~4x, so two ~400 KB bodies
+        // (~3 MB encoded) blow past the gossip ceiling. The response must
+        // publish block-only; the bodies get backfilled point-to-point.
+        let big_body = vec![0u8; 400 * 1024];
+        let oversized = ZokaMessage::BlockResponse(BlockResponseMessage {
+            block_height: 1,
+            encrypted_block: vec![1, 2, 3],
+            block_hash: "h".to_string(),
+            difficulty_bits: None,
+            private_tx_bodies: vec![big_body.clone(), big_body],
+            timestamp: 0,
+        });
+        assert!(
+            oversized.to_bytes().unwrap().len() > MAX_GOSSIP_BLOCK_RESPONSE_BYTES,
+            "fixture must actually exceed the gossip ceiling"
+        );
+        let (fitted, dropped) = fit_block_response_for_gossip(oversized);
+        assert_eq!(dropped, 2);
+        match &fitted {
+            ZokaMessage::BlockResponse(r) => assert!(r.private_tx_bodies.is_empty()),
+            other => panic!("expected BlockResponse, got {other:?}"),
+        }
+        assert!(
+            fitted.to_bytes().unwrap().len() <= MAX_GOSSIP_BLOCK_RESPONSE_BYTES,
+            "block-only response must fit the gossip ceiling"
+        );
+
+        // A small block response keeps its bodies untouched.
+        let small = ZokaMessage::BlockResponse(BlockResponseMessage {
+            block_height: 2,
+            encrypted_block: vec![1],
+            block_hash: "h2".to_string(),
+            difficulty_bits: None,
+            private_tx_bodies: vec![vec![9u8; 16]],
+            timestamp: 0,
+        });
+        let (fitted_small, dropped_small) = fit_block_response_for_gossip(small);
+        assert_eq!(dropped_small, 0);
+        match &fitted_small {
+            ZokaMessage::BlockResponse(r) => assert_eq!(r.private_tx_bodies.len(), 1),
+            other => panic!("expected BlockResponse, got {other:?}"),
+        }
     }
 
     #[tokio::test]
