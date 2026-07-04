@@ -4538,6 +4538,56 @@ fn load_wallet_runtime_snapshot_from_storage(
     })
 }
 
+struct CachedDashboardWalletSnapshot {
+    key: (NetworkProfile, String),
+    loaded_at: Instant,
+    snapshot: WalletRuntimeSnapshot,
+}
+
+fn dashboard_wallet_snapshot_cache(
+) -> &'static std::sync::Mutex<Option<CachedDashboardWalletSnapshot>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<CachedDashboardWalletSnapshot>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+const DASHBOARD_WALLET_SNAPSHOT_TTL: Duration = Duration::from_secs(30);
+
+/// Dashboard-only throttled wrapper around
+/// [`load_wallet_runtime_snapshot_from_storage`]. The fullnode runtime screen
+/// redraws roughly once a second, and each raw load decrypts every private
+/// wallet with Argon2 (a deliberately expensive KDF), so on a node that holds
+/// a wallet the redraw loop kept a CPU core busy re-deriving the same
+/// balances. The snapshot is display-only (address/balances/counts, no
+/// secrets), so a short TTL is safe — balances move on ~block cadence anyway.
+/// One-shot CLI callers keep using the direct loader (no caching wanted
+/// there).
+fn load_wallet_runtime_snapshot_for_dashboard(
+    storage: &WalletStorage,
+    wallet_selector: &str,
+    password: Option<&str>,
+    network: NetworkProfile,
+) -> Result<WalletRuntimeSnapshot, String> {
+    let key = (network, wallet_selector.to_string());
+    if let Ok(guard) = dashboard_wallet_snapshot_cache().lock() {
+        if let Some(cached) = guard.as_ref() {
+            if cached.key == key && cached.loaded_at.elapsed() < DASHBOARD_WALLET_SNAPSHOT_TTL {
+                return Ok(cached.snapshot.clone());
+            }
+        }
+    }
+    let snapshot =
+        load_wallet_runtime_snapshot_from_storage(storage, wallet_selector, password, network)?;
+    if let Ok(mut guard) = dashboard_wallet_snapshot_cache().lock() {
+        *guard = Some(CachedDashboardWalletSnapshot {
+            key,
+            loaded_at: Instant::now(),
+            snapshot: snapshot.clone(),
+        });
+    }
+    Ok(snapshot)
+}
+
 fn transport_mode_label(mode: &PrivacyTransportMode) -> &'static str {
     match mode {
         PrivacyTransportMode::Direct => "direct",
@@ -5199,7 +5249,7 @@ fn draw_fullnode_runtime_screen(
     session_mined_rewards: u64,
     last_event: &str,
 ) -> Result<(), String> {
-    let wallet_snapshot = match load_wallet_runtime_snapshot_from_storage(
+    let wallet_snapshot = match load_wallet_runtime_snapshot_for_dashboard(
         wallet_storage,
         wallet_selector,
         password,
