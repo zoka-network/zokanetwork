@@ -140,6 +140,10 @@ jobs:
           Environment=ZOKA_API_TX_RATE_LIMIT=120
           Environment=ZOKA_API_MAX_BODY_BYTES=1048576
           Environment=ZOKA_API_ENABLE_BLOCK_SUBMIT=true
+          # Staged 1.6.0 rollout: keep old-protocol peers usable so the network
+          # stays live while miners upgrade. Flip to 1 (or remove) to enforce
+          # the hard protocol freeze once the fleet has migrated.
+          Environment=ZOKA_PROTOCOL_FREEZE_ENFORCE=0
           Environment=ZOKA_MINER_ADDRESS=zka1a6n1R8noF6T5vR4YGGv8ibUKpUESu8y5ESdb8BUNx6wGengyZ9mXGJA7u9dpwUh5rxk3gSFXEhBZacXgHUNjb5ET3cJn9
           Environment=ZOKA_NODE_PASSWORD=${{ secrets.ZOKA_NODE_PASSWORD }}
           Restart=on-failure
@@ -259,6 +263,8 @@ jobs:
           Environment=ZOKA_API_TX_RATE_LIMIT=120
           Environment=ZOKA_API_MAX_BODY_BYTES=1048576
           Environment=ZOKA_API_ENABLE_BLOCK_SUBMIT=true
+          # Staged 1.6.0 rollout grace window (see bootstrap unit above).
+          Environment=ZOKA_PROTOCOL_FREEZE_ENFORCE=0
           Environment=ZOKA_NODE_PASSWORD=${{ secrets.ZOKA_NODE_PASSWORD }}
           Restart=on-failure
           RestartSec=10s

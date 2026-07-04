@@ -60,6 +60,20 @@ const PRIVATE_TX_BODY_CACHE_MAX: usize = 2048;
 // Bumped 1.0.2 -> 1.6.0 for the v1.6.0 release (aligning the protocol
 // freeze id with the app version going forward, since they'd drifted).
 pub const PROTOCOL_FREEZE_ID: &str = "/zoka/1.6.0-mainnet-zenith";
+
+/// Whether a node disconnects peers running an older protocol id. Defaults to
+/// true so stock/published binaries enforce the freeze. During a staged
+/// rollout a seed operator sets `ZOKA_PROTOCOL_FREEZE_ENFORCE=0` (or `false`)
+/// to run a grace window: the node keeps old-protocol peers usable for sync so
+/// the network stays live while operators upgrade, then flips back to enforcing
+/// once the fleet has migrated — no rebuild needed, just an env change + restart.
+fn protocol_freeze_enforce_from_env() -> bool {
+    match std::env::var("ZOKA_PROTOCOL_FREEZE_ENFORCE") {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"),
+        Err(_) => true,
+    }
+}
+
 pub const DEFAULT_PRIVATE_PADDING_BYTES: usize = 1024;
 pub const DEFAULT_STEM_HOPS: u8 = 2;
 pub const DEFAULT_MIXER_HOLD_MS: u64 = 2000;
@@ -386,6 +400,12 @@ pub struct Node {
     stem_relay_cursor: usize,
     /// Peers observed with incompatible identify protocol version.
     incompatible_protocol_peers: HashSet<PeerId>,
+    /// When false, old-protocol peers are kept usable instead of being
+    /// disconnected (a grace period during a staged rollout so the network
+    /// stays live while operators upgrade). Set from ZOKA_PROTOCOL_FREEZE_ENFORCE
+    /// at startup; defaults to true (hard freeze) so stock/published binaries
+    /// enforce the freeze unless a seed operator opts into the grace window.
+    protocol_freeze_enforce: bool,
     /// Peer listen addresses observed through Identify.
     observed_peer_addrs: HashMap<PeerId, HashSet<String>>,
     /// Peer protocol metadata observed through Identify.
@@ -987,6 +1007,18 @@ impl Node {
     }
 
     fn enforce_protocol_freeze_for_peer(&mut self, peer_id: PeerId, version: &str) {
+        if !self.protocol_freeze_enforce && !Self::is_protocol_version_compatible(version) {
+            // Grace period: keep the old-protocol peer usable for sync/gossip
+            // so the network stays live while operators upgrade. Clear any
+            // stale incompatible marking (e.g. if enforcement was just turned
+            // off) and do not disconnect.
+            self.incompatible_protocol_peers.remove(&peer_id);
+            warn!(
+                "peer {} uses old protocol version {} (freeze not enforced: grace period, peer kept)",
+                peer_id, version
+            );
+            return;
+        }
         if self.mark_peer_protocol_version(peer_id, version) {
             return;
         }
@@ -1315,6 +1347,7 @@ impl Node {
             seen_stem_routes: HashSet::new(),
             stem_relay_cursor: 0,
             incompatible_protocol_peers: HashSet::new(),
+            protocol_freeze_enforce: protocol_freeze_enforce_from_env(),
             observed_peer_addrs: HashMap::new(),
             observed_peer_protocols: HashMap::new(),
             gossip_stats: GossipStats::default(),
