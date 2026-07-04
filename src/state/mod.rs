@@ -579,17 +579,49 @@ impl StateManager {
     }
 
     /// Return whether the chain already commits this private transaction hash.
+    /// Whether a private transaction with `hash` is already committed
+    /// on-chain. Best-effort convenience for the API (pending-list filtering
+    /// and submission de-dup), NOT a consensus check — the canonical
+    /// no-double-spend rule lives in
+    /// `state::chain::validate_private_nullifiers`.
+    ///
+    /// Resolved through the O(1) spent-nullifier index rather than an
+    /// O(chain-height) block scan: every canonical block records its private
+    /// txs' spend tags in the global nullifier index
+    /// (`chain::index_block_nullifiers`), so a committed tx is detectable from
+    /// its own nullifier(s). The previous implementation deserialized every
+    /// block from RocksDB on each call, and the `/private/pending` handler
+    /// invoked it once per pending hash, so ordinary miner polling pegged the
+    /// node's CPU (both runtime workers stuck in `get_block_by_height`).
     pub async fn has_private_transaction_hash(&self, hash: &str) -> Result<bool, StateError> {
-        let height = self.get_height().await;
-        for h in 1..=height {
-            if let Some(block) = self.get_block_by_height(h).await? {
-                if block
-                    .private_tx_hashes
-                    .iter()
-                    .any(|candidate| candidate == hash)
-                {
-                    return Ok(true);
-                }
+        // Body not held locally → can't derive the nullifier. Treat as
+        // not-yet-committed: both callers are best-effort and safe with a
+        // false here (the tx simply stays in the pending set).
+        let Some(bytes) = self.get_private_transaction_bytes(hash)? else {
+            return Ok(false);
+        };
+        let tx: crate::private_wallet::PrivateTransaction = match serde_json::from_slice(&bytes) {
+            Ok(tx) => tx,
+            Err(_) => return Ok(false),
+        };
+        let mut tags: Vec<&str> = Vec::with_capacity(1 + tx.input_nullifiers.len());
+        let primary = tx.nullifier.trim();
+        if !primary.is_empty() {
+            tags.push(primary);
+        }
+        for tag in &tx.input_nullifiers {
+            let tag = tag.trim();
+            if !tag.is_empty() {
+                tags.push(tag);
+            }
+        }
+        for tag in tags {
+            if self
+                .storage
+                .is_nullifier_spent(tag)
+                .map_err(|e| StateError::StorageError(e.to_string()))?
+            {
+                return Ok(true);
             }
         }
         Ok(false)
@@ -1061,6 +1093,79 @@ mod tests {
 
         assert_eq!(alice.balance, 900);
         assert_eq!(bob.balance, 100);
+
+        let _ = fs::remove_dir_all(test_dir);
+    }
+
+    #[tokio::test]
+    async fn has_private_transaction_hash_uses_nullifier_index_not_block_scan() {
+        let test_dir = ".zoka/test-suite/.test_has_priv_tx_nullifier_index";
+        let _ = fs::remove_dir_all(test_dir);
+        let storage = Arc::new(RocksDbStorage::new(test_dir).unwrap());
+        let manager = StateManager::new(storage.clone());
+
+        // Deliberately create NO blocks. A committed private tx is represented
+        // by its nullifier living in the spent index, not by appearing in a
+        // scanned block body: the old O(chain-height) block-scan returned
+        // false in exactly this setup, the O(1) index-based lookup returns
+        // true. This both pins the correct behavior and guards against a
+        // regression back to the CPU-pegging scan.
+        let committed_hash = "committed-priv-tx";
+        let committed_body = serde_json::to_vec(&serde_json::json!({
+            "tx_hash": committed_hash,
+            "commitment": "c1",
+            "private_proof_version": 2,
+            "private_proof_profile": "private_tx_v2_i1",
+            "nullifier": "NULL-committed",
+            "zk_proof": null,
+            "timestamp": 1,
+            "status": "Pending"
+        }))
+        .unwrap();
+        storage
+            .save_private_transaction_bytes(committed_hash, &committed_body)
+            .unwrap();
+        storage.save_spent_nullifier("NULL-committed", 7).unwrap();
+        assert!(
+            manager
+                .has_private_transaction_hash(committed_hash)
+                .await
+                .unwrap(),
+            "a tx whose nullifier is in the spent index must read as committed"
+        );
+
+        // A tx whose nullifier is not spent is not committed.
+        let pending_hash = "pending-priv-tx";
+        let pending_body = serde_json::to_vec(&serde_json::json!({
+            "tx_hash": pending_hash,
+            "commitment": "c2",
+            "private_proof_version": 2,
+            "private_proof_profile": "private_tx_v2_i1",
+            "nullifier": "NULL-pending",
+            "zk_proof": null,
+            "timestamp": 1,
+            "status": "Pending"
+        }))
+        .unwrap();
+        storage
+            .save_private_transaction_bytes(pending_hash, &pending_body)
+            .unwrap();
+        assert!(
+            !manager
+                .has_private_transaction_hash(pending_hash)
+                .await
+                .unwrap(),
+            "a tx whose nullifier is not spent must read as not committed"
+        );
+
+        // An unknown hash with no local body is safely not-committed.
+        assert!(
+            !manager
+                .has_private_transaction_hash("no-such-hash")
+                .await
+                .unwrap(),
+            "an unknown hash reads as not committed"
+        );
 
         let _ = fs::remove_dir_all(test_dir);
     }
