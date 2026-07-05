@@ -12,7 +12,7 @@ use crate::state::{AccountInclusionProof, StateManager};
 use crate::types::{StateError, TransactionRequest, TransactionResponse};
 use axum::{
     body::{to_bytes, Body},
-    extract::{DefaultBodyLimit, Path, Query, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State},
     http::{header, Method, StatusCode},
     middleware::{self, Next},
     response::Response,
@@ -21,6 +21,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
@@ -87,6 +88,13 @@ pub struct ApiSecurityConfig {
     pub admin_clients: Vec<String>,
     pub ip_whitelist: Vec<String>, // Empty = allow all
     pub ip_blacklist: Vec<String>,
+    /// IPs of reverse proxies/load balancers allowed to set the client's real
+    /// address via X-Forwarded-For/X-Real-IP. Empty (the default, correct for
+    /// this node's direct-exposure deployments) means those headers are never
+    /// trusted -- the real TCP peer address is used instead, since any caller
+    /// can set arbitrary header values to spoof their IP and dodge rate
+    /// limiting / erase their trail from the audit log otherwise.
+    pub trusted_proxy_ips: Vec<String>,
 }
 
 fn parse_csv_env(var: &str) -> Vec<String> {
@@ -209,6 +217,7 @@ impl Default for ApiSecurityConfig {
             admin_clients: parse_csv_env("ZOKA_API_ADMIN_CLIENTS"),
             ip_whitelist,
             ip_blacklist,
+            trusted_proxy_ips: parse_csv_env("ZOKA_TRUSTED_PROXY_IPS"),
         }
     }
 }
@@ -1478,6 +1487,32 @@ async fn write_audit_log(
 }
 
 #[allow(dead_code)]
+/// Resolve the client IP to use for rate limiting, IP allow/deny lists, and
+/// the audit trail. `peer_ip` is the real TCP connection address; it is only
+/// overridden by an `X-Forwarded-For`/`X-Real-IP` header when that peer is a
+/// configured trusted proxy -- otherwise the header is attacker-controlled
+/// input and must not be trusted (a bare "any header wins" policy lets any
+/// caller spoof a fresh IP on every request and dodge rate limiting or an
+/// allow/deny list entirely).
+fn resolve_client_ip(
+    peer_ip: Option<&str>,
+    forwarded_header: Option<&str>,
+    trusted_proxy_ips: &[String],
+) -> String {
+    let is_trusted_proxy =
+        peer_ip.is_some_and(|peer| trusted_proxy_ips.iter().any(|trusted| trusted == peer));
+    if is_trusted_proxy {
+        if let Some(forwarded) = forwarded_header
+            .and_then(|raw| raw.split(',').next())
+            .map(str::trim)
+            .filter(|ip| !ip.is_empty())
+        {
+            return forwarded.to_string();
+        }
+    }
+    peer_ip.unwrap_or("unknown").to_string()
+}
+
 fn validate_ip(ip: &str, whitelist: &[String], blacklist: &[String]) -> bool {
     // If blacklist contains IP, reject
     if !blacklist.is_empty() && blacklist.contains(&ip.to_string()) {
@@ -2116,16 +2151,26 @@ async fn auth_and_rate_limit(
         return Ok(next.run(request).await);
     }
 
-    let client_ip = request
+    // The real TCP peer address, from the connection itself (not attacker-
+    // controlled). This node is deployed with no reverse proxy in front of it,
+    // so headers like X-Forwarded-For/X-Real-IP are ordinary request data any
+    // caller can set to an arbitrary value -- trusting them unconditionally
+    // let anyone dodge rate limiting, IP allow/deny lists, and the audit trail
+    // simply by spoofing (or omitting) the header on every request.
+    let peer_ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip().to_string());
+    let forwarded_header = request
         .headers()
         .get("x-forwarded-for")
         .or_else(|| request.headers().get("x-real-ip"))
-        .and_then(|value| value.to_str().ok())
-        .and_then(|raw| raw.split(',').next())
-        .map(str::trim)
-        .filter(|ip| !ip.is_empty())
-        .unwrap_or("127.0.0.1")
-        .to_string();
+        .and_then(|value| value.to_str().ok());
+    let client_ip = resolve_client_ip(
+        peer_ip.as_deref(),
+        forwarded_header,
+        &app_state.security.trusted_proxy_ips,
+    );
 
     let client_id = request
         .headers()
@@ -4995,14 +5040,22 @@ async fn post_block_submit(
         SyncOutcome::GapAhead {
             local_head,
             candidate,
-        } => Err((
-            StatusCode::CONFLICT,
-            format!("gap: local={local_head} candidate={candidate}"),
-        )),
-        outcome => Err((
-            StatusCode::BAD_REQUEST,
-            format!("block rejected: {outcome:?}"),
-        )),
+        } => {
+            // Deliberately don't echo local_head/candidate back to the caller:
+            // this endpoint has no protocol-version gate, so it's an easy
+            // target for someone probing for a submittable block, and
+            // confirming the exact local height for free would hand them a
+            // calibration oracle to iterate against. Full detail stays in the
+            // server-side log for operators.
+            tracing::warn!(
+                "post_block_submit: rejected gap (local={local_head} candidate={candidate})"
+            );
+            Err((StatusCode::CONFLICT, "block rejected: gap".to_string()))
+        }
+        outcome => {
+            tracing::warn!("post_block_submit: rejected ({outcome:?})");
+            Err((StatusCode::BAD_REQUEST, "block rejected".to_string()))
+        }
     }
 }
 
@@ -5591,9 +5644,12 @@ pub async fn start_api_with_config_on_bind(
     println!("API server listening on http://{bind_addr}");
 
     let router = create_router(app_state);
-    axum::serve(listener, router)
-        .await
-        .map_err(|e| StateError::StorageError(e.to_string()))
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|e| StateError::StorageError(e.to_string()))
 }
 
 #[cfg(test)]
@@ -6160,6 +6216,45 @@ mod tests {
             rate_limit_key("203.0.113.10", "explorer", "public-read"),
             "client:explorer:ip:203.0.113.10:public-read"
         );
+    }
+
+    #[test]
+    fn test_resolve_client_ip_ignores_forwarded_header_from_untrusted_peer() {
+        // No trusted proxies configured: an attacker connecting directly and
+        // setting X-Forwarded-For must not be able to override their real IP.
+        let ip = resolve_client_ip(Some("198.51.100.7"), Some("1.2.3.4"), &[]);
+        assert_eq!(ip, "198.51.100.7");
+    }
+
+    #[test]
+    fn test_resolve_client_ip_trusts_forwarded_header_from_trusted_proxy() {
+        let trusted = vec!["10.0.0.1".to_string()];
+        let ip = resolve_client_ip(Some("10.0.0.1"), Some("203.0.113.9"), &trusted);
+        assert_eq!(ip, "203.0.113.9");
+    }
+
+    #[test]
+    fn test_resolve_client_ip_falls_back_to_peer_when_no_forwarded_header() {
+        let ip = resolve_client_ip(Some("198.51.100.7"), None, &[]);
+        assert_eq!(ip, "198.51.100.7");
+    }
+
+    #[test]
+    fn test_resolve_client_ip_unknown_without_any_signal() {
+        let ip = resolve_client_ip(None, None, &[]);
+        assert_eq!(ip, "unknown");
+    }
+
+    #[test]
+    fn test_resolve_client_ip_rotating_spoofed_header_no_longer_creates_distinct_identities() {
+        // Regression for the bug caught live: with no trusted proxy, spoofing
+        // a different X-Forwarded-For on every request used to mint a "new"
+        // client IP each time, bypassing rate limiting and erasing the audit
+        // trail. Same untrusted peer must resolve to the same IP regardless.
+        let a = resolve_client_ip(Some("198.51.100.7"), Some("1.1.1.1"), &[]);
+        let b = resolve_client_ip(Some("198.51.100.7"), Some("2.2.2.2"), &[]);
+        assert_eq!(a, b);
+        assert_eq!(a, "198.51.100.7");
     }
 
     #[test]

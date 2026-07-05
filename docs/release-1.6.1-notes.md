@@ -125,4 +125,40 @@ Repos:
   default `RUST_LOG` to `warn` when unset so the streaming lines stay readable
   (an explicit `RUST_LOG` still wins; the shipped launcher also sets it).
 
+### 9. Node: client IP was spoofable (rate-limit/allow-list bypass + blind audit log)
+- **Commits:** _(this commit)_ (node)
+- **Problem:** Caught live on 2026-07-05 while investigating an active
+  `POST /sync/block` hammering pattern (~1 attempt/2s, ~98% rejected on both
+  seeds, right after the protocol freeze was enforced -- consistent with a
+  frozen-out peer trying to route around it via the ungated RPC path). The
+  audit log showed **every single request as `127.0.0.1`**, on both seeds,
+  even for real remote traffic: `auth_and_rate_limit` derived `client_ip`
+  purely from the `X-Forwarded-For`/`X-Real-IP` request headers, which is
+  ordinary attacker-controlled input on a node with no reverse proxy in
+  front of it. Anyone could set an arbitrary (or absent) value on every
+  request to mint a "new" identity each time, making the per-IP rate
+  limiter and the `ip_whitelist`/`ip_blacklist` access-control lists fully
+  bypassable, and erasing any real trail from the audit log.
+- **Fix:** `client_ip` now comes from the real TCP peer address
+  (`ConnectInfo<SocketAddr>`, wired in via
+  `into_make_service_with_connect_info`), and the forwarded-for/real-ip
+  headers are only honored when that peer is in a new, empty-by-default
+  `ZOKA_TRUSTED_PROXY_IPS` allowlist (for operators who do run behind a
+  real reverse proxy). Extracted into a small pure `resolve_client_ip`
+  helper with dedicated tests, including a regression test for the exact
+  bug caught live (rotating the forwarded header no longer mints distinct
+  identities for the same untrusted peer).
+- **Also fixed in the same handler:** `POST /sync/block`'s rejection
+  responses (`GapAhead` "gap: local=X candidate=Y" and the generic
+  catch-all) echoed the exact local chain height and internal `SyncOutcome`
+  debug detail back to the caller -- free calibration feedback for whoever
+  is probing that endpoint. Both now return a generic message to the
+  client; full detail still goes to the server-side `tracing::warn!` log.
+- **Not fixed / out of scope for this pass:** the underlying probing
+  traffic itself was not blocked (it was already being safely rejected at
+  the consensus level -- no forged block was ever applied) and, since the
+  audit log was blind until this fix, we cannot retroactively attribute it
+  to a real IP. Worth watching after this ships: does the same pattern
+  keep going, now attributable to a real address?
+
 <!-- Add new entries above this line as we fix more. -->
