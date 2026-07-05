@@ -110,6 +110,45 @@ fn fit_block_response_for_gossip(message: ZokaMessage) -> (ZokaMessage, usize) {
     (message, 0)
 }
 
+/// Whether a peer-announced multiaddr is worth dialing from a public node.
+/// A peer listening on `0.0.0.0` announces every local interface via Identify,
+/// including datacenter-internal (10/8, 172.16/12, 192.168/16), loopback and
+/// link-local addresses that are unreachable from anywhere but the peer's own
+/// LAN. Dialing those just burns connection attempts and pollutes the peer
+/// store (this is why nodes kept trying the seeds' 10.x droplet-internal
+/// addresses). Non-IP transports (dns, onion, i2p) always pass. Set
+/// `ZOKA_ALLOW_PRIVATE_PEER_ADDRS=1` to keep private addresses for LAN/dev.
+fn discovered_addr_is_publicly_dialable(addr: &str) -> bool {
+    use libp2p::core::multiaddr::Protocol;
+    if std::env::var("ZOKA_ALLOW_PRIVATE_PEER_ADDRS").as_deref() == Ok("1") {
+        return true;
+    }
+    let parsed: Multiaddr = match addr.parse() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    for proto in parsed.iter() {
+        match proto {
+            Protocol::Ip4(ip) => {
+                if ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified()
+                {
+                    return false;
+                }
+            }
+            Protocol::Ip6(ip) => {
+                let seg0 = ip.segments()[0];
+                let is_unique_local = (seg0 & 0xfe00) == 0xfc00; // fc00::/7
+                let is_link_local = (seg0 & 0xffc0) == 0xfe80; // fe80::/10
+                if ip.is_loopback() || ip.is_unspecified() || is_unique_local || is_link_local {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
 pub const DEFAULT_PRIVATE_PADDING_BYTES: usize = 1024;
 pub const DEFAULT_STEM_HOPS: u8 = 2;
 pub const DEFAULT_MIXER_HOLD_MS: u64 = 2000;
@@ -1433,7 +1472,13 @@ impl Node {
         }
         let addrs = self.observed_peer_addrs.entry(peer_id).or_default();
         for addr in &info.listen_addrs {
-            addrs.insert(addr.to_string());
+            let addr = addr.to_string();
+            // Drop unreachable private/loopback/link-local addresses a peer
+            // announces (e.g. a seed's datacenter-internal 10.x interface), so
+            // they never enter the dial/reconnect pool.
+            if discovered_addr_is_publicly_dialable(&addr) {
+                addrs.insert(addr);
+            }
         }
     }
 
@@ -3686,6 +3731,30 @@ mod tests {
     fn test_protocol_freeze_version_match() {
         assert!(Node::is_protocol_version_compatible(PROTOCOL_FREEZE_ID));
         assert!(!Node::is_protocol_version_compatible("/zoka/0.9.0"));
+    }
+
+    #[test]
+    fn discovered_addr_filter_rejects_private_and_loopback() {
+        // Public routable addresses and non-IP transports are dialable.
+        assert!(discovered_addr_is_publicly_dialable(
+            "/ip4/159.223.119.216/tcp/28080"
+        ));
+        assert!(discovered_addr_is_publicly_dialable(
+            "/dns4/seed.example.com/tcp/28080"
+        ));
+        // Datacenter-internal / private / loopback / link-local are not.
+        assert!(!discovered_addr_is_publicly_dialable("/ip4/10.10.0.5/tcp/28080"));
+        assert!(!discovered_addr_is_publicly_dialable(
+            "/ip4/172.16.4.9/tcp/28080"
+        ));
+        assert!(!discovered_addr_is_publicly_dialable(
+            "/ip4/192.168.1.20/tcp/28080"
+        ));
+        assert!(!discovered_addr_is_publicly_dialable("/ip4/127.0.0.1/tcp/28080"));
+        assert!(!discovered_addr_is_publicly_dialable("/ip6/::1/tcp/28080"));
+        assert!(!discovered_addr_is_publicly_dialable(
+            "/ip6/fc00::1/tcp/28080"
+        ));
     }
 
     #[test]
