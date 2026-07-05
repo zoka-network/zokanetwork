@@ -2614,6 +2614,27 @@ fn mining_progress_log(progress: &MiningProgressSnapshot) {
     ));
 }
 
+/// One compact, scrolling status line for `--mining-console` mode. No screen
+/// clear: it appends to the terminal like a log so it coexists with the
+/// streaming `mining: progress …` lines instead of wiping them.
+fn print_mining_console_status(
+    height: u64,
+    peers: usize,
+    mining: bool,
+    hashrate_hps: u64,
+    session_blocks: u64,
+    session_rewards: u64,
+    last_event: &str,
+) {
+    println!(
+        "status  height={height}  peers={peers}  mining={}  hashrate={}  session_mined={session_blocks} ({} ZKA)  |  {}",
+        if mining { "on" } else { "off" },
+        format_hashrate_hps(hashrate_hps as f64),
+        format_zka(session_rewards),
+        truncate_dashboard_text(last_event, 80),
+    );
+}
+
 fn user_mining_state_path_for_network(network: NetworkProfile) -> Result<PathBuf, String> {
     let dir = PathBuf::from(network.local_dir());
     fs::create_dir_all(&dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
@@ -8583,6 +8604,17 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     };
     let show_keys = has_flag(args, "--show-keys");
     let verbose = has_flag(args, "--verbose");
+    // Fluid CLI mode: stream scrolling status lines instead of the full-screen
+    // dashboard, which clears the screen on every redraw and fights the mining
+    // progress lines (the terminal "goes crazy" when blocks arrive). Ideal for
+    // standalone miners. Enable with --mining-console or ZOKA_MINING_CONSOLE=1.
+    let mining_console = has_flag(args, "--mining-console")
+        || std::env::var("ZOKA_MINING_CONSOLE").as_deref() == Ok("1");
+    if mining_console {
+        println!(
+            "mining-console mode: streaming status (no full-screen dashboard). Ctrl+C to stop."
+        );
+    }
     let mining_threads = parse_thread_count_arg(args)?;
     let mining_target_block_time_secs = POW_TARGET_BLOCK_TIME_SECS;
     let mut mining_hashrate_hps = 0;
@@ -9234,6 +9266,12 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut next_warmup_ibd_at = tokio::time::Instant::now();
     let mut next_warmup_seed_reconnect_at = tokio::time::Instant::now();
     let mut warmup_seed_reconnect_failures = 0u32;
+    // --mining-console throttle, shared by the warmup loop and the main loop:
+    // emit a status line at most every few seconds, but immediately when the
+    // last event changes (so block arrivals / sync jumps show promptly)
+    // instead of clearing and redrawing the whole dashboard.
+    let mut next_console_status_at = tokio::time::Instant::now();
+    let mut last_console_event = String::new();
     while tokio::time::Instant::now() < warmup_deadline {
         let mut now = tokio::time::Instant::now();
         if now >= next_warmup_seed_reconnect_at {
@@ -9261,32 +9299,47 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         } else {
             Duration::default()
         };
-        draw_fullnode_runtime_screen(
-            &node,
-            network,
-            &storage,
-            &wallet_address,
-            password.as_deref(),
-            db_path.as_deref(),
-            false,
-            session_started.elapsed(),
-            "warmup",
-            Some(remaining),
-            &announced,
-            seed_peer_display.as_deref(),
-            auto_mine,
-            mine_interval_secs,
-            mine_blocks,
-            if auto_mine {
-                Some(mining_threads)
-            } else {
-                None
-            },
-            None,
-            session_mined_blocks,
-            session_mined_rewards,
-            &last_event,
-        )?;
+        if mining_console {
+            let now_console = tokio::time::Instant::now();
+            if now_console >= next_console_status_at || last_event != last_console_event {
+                let height = current_known_height_for_network(db_path.as_deref(), network);
+                println!(
+                    "warmup  height={height}  peers={}  syncing… ({}s left)  |  {}",
+                    node.connected_peer_count(),
+                    remaining.as_secs(),
+                    truncate_dashboard_text(&last_event, 80),
+                );
+                next_console_status_at = now_console + Duration::from_secs(6);
+                last_console_event = last_event.clone();
+            }
+        } else {
+            draw_fullnode_runtime_screen(
+                &node,
+                network,
+                &storage,
+                &wallet_address,
+                password.as_deref(),
+                db_path.as_deref(),
+                false,
+                session_started.elapsed(),
+                "warmup",
+                Some(remaining),
+                &announced,
+                seed_peer_display.as_deref(),
+                auto_mine,
+                mine_interval_secs,
+                mine_blocks,
+                if auto_mine {
+                    Some(mining_threads)
+                } else {
+                    None
+                },
+                None,
+                session_mined_blocks,
+                session_mined_rewards,
+                &last_event,
+            )?;
+        }
         match timeout(Duration::from_millis(500), node.next_message()).await {
             Ok(Ok(message)) => {
                 last_event = if let Some(verdict) = handle_fullnode_network_message(
@@ -10224,7 +10277,27 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         } else {
             None
         };
-        if let Err(err) = draw_fullnode_runtime_screen(
+        if mining_console {
+            // Fluid streaming console: no full-screen clear/redraw. The
+            // `mining: progress …` lines already stream; here we add a compact
+            // status line at most every 6s, but immediately when the last event
+            // changes so block arrivals / peer / height changes surface without
+            // wiping the scrollback.
+            let now_console = tokio::time::Instant::now();
+            if now_console >= next_console_status_at || last_event != last_console_event {
+                print_mining_console_status(
+                    runtime_chain_height,
+                    node.connected_peer_count(),
+                    runtime_mining_enabled || mining_active,
+                    runtime_mining_state.estimated_hashrate_hps,
+                    session_mined_blocks,
+                    session_mined_rewards,
+                    &last_event,
+                );
+                next_console_status_at = now_console + Duration::from_secs(6);
+                last_console_event = last_event.clone();
+            }
+        } else if let Err(err) = draw_fullnode_runtime_screen(
             &node,
             network,
             &storage,
@@ -10385,32 +10458,42 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     } else {
         None
     };
-    draw_fullnode_runtime_screen(
-        &node,
-        network,
-        &storage,
-        &wallet_address,
-        password.as_deref(),
-        db_path.as_deref(),
-        false,
-        session_started.elapsed(),
-        "stopped",
-        None,
-        &announced,
-        seed_peer_display.as_deref(),
-        auto_mine,
-        mine_interval_secs,
-        mine_blocks,
-        if auto_mine {
-            Some(mining_threads)
-        } else {
-            None
-        },
-        next_mine_in,
-        session_mined_blocks,
-        session_mined_rewards,
-        &last_event,
-    )?;
+    if mining_console {
+        let height = current_known_height_for_network(db_path.as_deref(), network);
+        println!(
+            "stopped  height={height}  peers={}  session_mined={session_mined_blocks} ({} ZKA)  |  {}",
+            node.connected_peer_count(),
+            format_zka(session_mined_rewards),
+            truncate_dashboard_text(&last_event, 80),
+        );
+    } else {
+        draw_fullnode_runtime_screen(
+            &node,
+            network,
+            &storage,
+            &wallet_address,
+            password.as_deref(),
+            db_path.as_deref(),
+            false,
+            session_started.elapsed(),
+            "stopped",
+            None,
+            &announced,
+            seed_peer_display.as_deref(),
+            auto_mine,
+            mine_interval_secs,
+            mine_blocks,
+            if auto_mine {
+                Some(mining_threads)
+            } else {
+                None
+            },
+            next_mine_in,
+            session_mined_blocks,
+            session_mined_rewards,
+            &last_event,
+        )?;
+    }
     Ok(())
 }
 

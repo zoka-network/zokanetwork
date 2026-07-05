@@ -60,4 +60,21 @@ Repos:
   consensus data, so a corrupt one now resets to default (with a warning) and
   is rebuilt on the next save, instead of stopping the node.
 
+### 5. Node: `--mining-console` fluid streaming console for standalone miners
+- **Commit:** _(this commit)_ (node)
+- **Problem:** The fullnode runtime renders a full-screen dashboard that clears
+  and redraws the terminal on every tick (`\x1B[2J\x1B[H`). That fights the
+  streaming `mining: progress …` lines: the console flows fine until a block
+  arrives or the dashboard redraws, at which point the screen wipes and "goes
+  crazy" before settling back. Fine for the ZSilent-embedded node, jarring for
+  someone running the CLI binary directly in a terminal.
+- **Fix:** New `--mining-console` flag (or `ZOKA_MINING_CONSOLE=1`) switches the
+  fullnode to a fluid, append-only console: no screen clear. The `mining:
+  progress …` lines stream as before, and a compact one-line `status …` /
+  `warmup …` / `stopped …` summary (height, peers, mining on/off, hashrate,
+  session blocks/rewards, last event) is appended at most every 6s — or
+  immediately when the last event changes, so block arrivals surface promptly
+  without wiping the scrollback. The full-screen dashboard remains the default;
+  this is opt-in for standalone/headless mining.
+
 <!-- Add new entries above this line as we fix more. -->
