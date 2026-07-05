@@ -2627,8 +2627,21 @@ fn load_user_mining_state_for_network(network: NetworkProfile) -> Result<UserMin
     }
     let raw = fs::read_to_string(&path)
         .map_err(|e| format!("failed to read mining state {}: {e}", path.display()))?;
-    let mut state: UserMiningState = serde_json::from_str(&raw)
-        .map_err(|e| format!("invalid mining state json {}: {e}", path.display()))?;
+    let mut state: UserMiningState = match serde_json::from_str(&raw) {
+        Ok(state) => state,
+        Err(e) => {
+            // The mining-state file is a local runtime cache (mining
+            // stats/progress), not consensus data. A partial or interrupted
+            // write (e.g. the process was Ctrl+C'd mid-save) leaves it empty or
+            // truncated, and that must not stop the node from starting — reset
+            // to default and let it be rebuilt on the next save.
+            eprintln!(
+                "mining state {} was unreadable ({e}); resetting it to default",
+                path.display()
+            );
+            UserMiningState::default()
+        }
+    };
     if state.total_supply_emitted == 0 && state.total_rewards > 0 {
         state.total_supply_emitted = state.total_rewards.min(EMISSION_MAX_SUPPLY);
     }

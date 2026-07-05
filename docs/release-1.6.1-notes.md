@@ -49,4 +49,15 @@ Repos:
   through. Opt out for LAN/dev with `ZOKA_ALLOW_PRIVATE_PEER_ADDRS=1`.
   Regression test: `discovered_addr_filter_rejects_private_and_loopback`.
 
+### 4. Node: tolerate a corrupt/empty mining-state file instead of crashing
+- **Commit:** _(this commit)_ (node)
+- **Problem:** `load_user_mining_state_for_network` propagated a hard error
+  ("invalid mining state json … expected value at line 1 column 1") when
+  `.zoka/<net>/user_mining_state.json` was empty or truncated — which happens
+  if the process is Ctrl+C'd mid-save. The node then refused to start. Hit by
+  a standalone CLI miner on the second run.
+- **Fix:** The mining-state file is a local runtime cache (stats/progress), not
+  consensus data, so a corrupt one now resets to default (with a warning) and
+  is rebuilt on the next save, instead of stopping the node.
+
 <!-- Add new entries above this line as we fix more. -->
