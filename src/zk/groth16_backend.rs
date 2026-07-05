@@ -330,6 +330,20 @@ fn load_setup_bundle_from_disk(dir: &std::path::Path) -> Result<SetupBundle, Str
     ))
 }
 
+/// Directories to probe for a trusted-setup bundle when
+/// `ZOKA_TRUSTED_SETUP_DIR` is unset: alongside the executable first (so a
+/// shipped folder works from anywhere), then the current working directory.
+fn auto_trusted_setup_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            out.push(dir.join("trusted-setup"));
+        }
+    }
+    out.push(PathBuf::from("trusted-setup"));
+    out
+}
+
 fn build_setup_bundle() -> SetupBundle {
     if let Ok(dir) = std::env::var(TRUSTED_SETUP_ENV) {
         let path = PathBuf::from(&dir);
@@ -349,6 +363,36 @@ fn build_setup_bundle() -> SetupBundle {
                     path.display(),
                     err,
                     TRUSTED_SETUP_ENV
+                );
+            }
+        }
+    }
+
+    // No explicit env var: auto-discover a release bundle next to the
+    // executable or in the current directory, so standalone users can just run
+    // the binary with its `trusted-setup/` folder alongside it — no env var and
+    // no wrapper script needed. The digest check in load_setup_bundle_from_disk
+    // still rejects a tampered or foreign bundle, so this is exactly as safe as
+    // pointing the env var at the same directory.
+    for candidate in auto_trusted_setup_candidates() {
+        if !candidate.is_dir() {
+            continue;
+        }
+        match load_setup_bundle_from_disk(&candidate) {
+            Ok(bundle) => {
+                tracing::info!(
+                    target: "zk::trusted_setup",
+                    path = %candidate.display(),
+                    "auto-discovered trusted setup next to the binary"
+                );
+                return bundle;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "zk::trusted_setup",
+                    path = %candidate.display(),
+                    error = %err,
+                    "found a trusted-setup directory but it did not load; ignoring it"
                 );
             }
         }

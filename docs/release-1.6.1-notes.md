@@ -77,4 +77,25 @@ Repos:
   without wiping the scrollback. The full-screen dashboard remains the default;
   this is opt-in for standalone/headless mining.
 
+### 6. Node: editable `zoka.config.json` + trusted-setup auto-discovery (no wrapper script)
+- **Commit:** _(this commit)_ (node)
+- **Problem:** Running a standalone node meant either a long command line or a
+  Windows-only `.bat`. Linux/macOS miners had no easy path, and every parameter
+  tweak meant editing the launcher. Separately, a release binary panics on boot
+  unless `ZOKA_TRUSTED_SETUP_DIR` is set, so the binary couldn't be run directly
+  next to its `trusted-setup/` folder without the wrapper exporting that var.
+- **Fix:** `zoka fullnode` now reads an optional editable `zoka.config.json`
+  (à la `bitcoin.conf`), resolved from `--config <path>`, `$ZOKA_CONFIG`, or
+  `zoka.config.json` next to the binary / in the CWD. Fields map onto existing
+  flags (`network`, `address`, `password`/`password_env`, `threads`, `power`,
+  `mine`, `mining_console`, `allow_isolated_start`, `network_config`, `db`,
+  `seeds`); the command line always overrides the file, and `seeds` are unioned
+  with the manifest. Password handling is flexible: plaintext if you want it,
+  `password_env` for safety, or prompt when left empty. Additionally, when
+  `ZOKA_TRUSTED_SETUP_DIR` is unset the node auto-discovers a `trusted-setup/`
+  folder next to the executable (digest still verified, so a tampered bundle is
+  rejected). Net effect: drop the binary + `trusted-setup/` + a `zoka.config.json`
+  in a folder and just run `zoka fullnode` — cross-platform, no `.bat`.
+  Docs: `docs/node-config.md`, example `docs/zoka.config.example.json`.
+
 <!-- Add new entries above this line as we fix more. -->

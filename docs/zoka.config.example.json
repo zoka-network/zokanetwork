@@ -1,0 +1,12 @@
+{
+  "network": "mainnet",
+  "address": "zka1REPLACE_WITH_YOUR_ADDRESS",
+  "password": "",
+  "password_env": "",
+  "threads": 3,
+  "power": "normal",
+  "mine": true,
+  "mining_console": true,
+  "allow_isolated_start": true,
+  "network_config": "mainnet-network.v1.json"
+}

@@ -8506,7 +8506,178 @@ fn cmd_node_wallet_info(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Accept both `"threads": 3` and `"threads": "3"` in the JSON config so a
+/// hand-edited file is forgiving about number-vs-string.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ConfigScalar {
+    Str(String),
+    Num(u64),
+}
+
+impl ConfigScalar {
+    fn as_arg(&self) -> String {
+        match self {
+            ConfigScalar::Str(s) => s.clone(),
+            ConfigScalar::Num(n) => n.to_string(),
+        }
+    }
+}
+
+/// Editable node config, à la `bitcoin.conf`/`config.toml` on other networks.
+/// Every field is optional and maps onto an existing CLI flag; the command
+/// line always overrides the file (see `expand_node_config_into_args`).
+#[derive(Debug, Default, Deserialize)]
+struct NodeConfigFile {
+    network: Option<String>,
+    address: Option<String>,
+    /// Plaintext wallet password (convenience). Leave empty to be prompted.
+    password: Option<String>,
+    /// Name of an environment variable holding the password (safer than
+    /// plaintext). Ignored if `password` is set.
+    password_env: Option<String>,
+    threads: Option<ConfigScalar>,
+    power: Option<String>,
+    /// false → run node without mining (injects --no-mine). Default: mine.
+    mine: Option<bool>,
+    mining_console: Option<bool>,
+    allow_isolated_start: Option<bool>,
+    network_config: Option<String>,
+    db: Option<String>,
+    seeds: Option<Vec<String>>,
+}
+
+/// Resolve the node config path: explicit `--config <path>` or `$ZOKA_CONFIG`
+/// (error if named but missing), otherwise an optional `zoka.config.json` next
+/// to the executable or in the current directory.
+fn find_node_config_path(args: &[String]) -> Result<Option<PathBuf>, String> {
+    if let Some(p) = option_value(args, "--config") {
+        let path = PathBuf::from(p.trim());
+        if !path.is_file() {
+            return Err(format!("--config: file not found: {}", path.display()));
+        }
+        return Ok(Some(path));
+    }
+    if let Ok(p) = std::env::var("ZOKA_CONFIG") {
+        let p = p.trim();
+        if !p.is_empty() {
+            let path = PathBuf::from(p);
+            if !path.is_file() {
+                return Err(format!("ZOKA_CONFIG: file not found: {}", path.display()));
+            }
+            return Ok(Some(path));
+        }
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("zoka.config.json"));
+        }
+    }
+    candidates.push(PathBuf::from("zoka.config.json"));
+    for cand in candidates {
+        if cand.is_file() {
+            return Ok(Some(cand));
+        }
+    }
+    Ok(None)
+}
+
+/// Load the optional JSON node config and expand its fields into CLI-style
+/// args. Config-derived args are appended AFTER the user's args so the command
+/// line always wins (`option_value` returns the first match); `--seed` values
+/// from both the file and the CLI are unioned. Returns the (possibly enlarged)
+/// argument list; when no config is present the args are returned unchanged.
+fn expand_node_config_into_args(args: &[String]) -> Result<Vec<String>, String> {
+    let mut out = args.to_vec();
+    let path = match find_node_config_path(args)? {
+        Some(p) => p,
+        None => return Ok(out),
+    };
+    let raw = fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read config {}: {e}", path.display()))?;
+    let cfg: NodeConfigFile = serde_json::from_str(&raw)
+        .map_err(|e| format!("invalid config {}: {e}", path.display()))?;
+    println!("Loaded node config: {}", path.display());
+
+    let mut cfg_args: Vec<String> = Vec::new();
+    let push = |a: &mut Vec<String>, flag: &str, value: &str| {
+        a.push(flag.to_string());
+        a.push(value.to_string());
+    };
+    let non_empty = |o: &Option<String>| {
+        o.as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+
+    if let Some(v) = non_empty(&cfg.network) {
+        push(&mut cfg_args, "--network", &v);
+    }
+    if let Some(v) = non_empty(&cfg.address) {
+        push(&mut cfg_args, "--address", &v);
+    }
+    if let Some(v) = non_empty(&cfg.network_config) {
+        push(&mut cfg_args, "--network-config", &v);
+    }
+    if let Some(v) = non_empty(&cfg.power) {
+        push(&mut cfg_args, "--power", &v);
+    }
+    if let Some(v) = non_empty(&cfg.db) {
+        push(&mut cfg_args, "--db", &v);
+    }
+    if let Some(threads) = &cfg.threads {
+        push(&mut cfg_args, "--threads", &threads.as_arg());
+    }
+    if let Some(seeds) = &cfg.seeds {
+        for seed in seeds {
+            let seed = seed.trim();
+            if !seed.is_empty() {
+                push(&mut cfg_args, "--seed", seed);
+            }
+        }
+    }
+    if cfg.mine == Some(false) {
+        cfg_args.push("--no-mine".to_string());
+    }
+    if cfg.mining_console == Some(true) {
+        cfg_args.push("--mining-console".to_string());
+    }
+    if cfg.allow_isolated_start == Some(true) {
+        cfg_args.push("--allow-isolated-start".to_string());
+    }
+
+    // Password: only sourced from the config when the command line didn't
+    // already supply one (checked via flag presence so we never consume stdin
+    // twice). Plaintext `password` wins; otherwise `password_env`; otherwise,
+    // if this run will actually mine, prompt for it (the "flexible" default).
+    let cli_has_password = option_value(args, "--password").is_some()
+        || option_value(args, "--wallet-password").is_some()
+        || option_value(args, "--password-env").is_some()
+        || option_value(args, "--wallet-password-env").is_some()
+        || has_flag(args, "--password-stdin")
+        || has_flag(args, "--wallet-password-stdin");
+    if !cli_has_password {
+        let plaintext = cfg.password.clone().unwrap_or_default();
+        if !plaintext.is_empty() {
+            std::env::set_var("ZOKA_CONFIG_PASSWORD", plaintext);
+            push(&mut cfg_args, "--password-env", "ZOKA_CONFIG_PASSWORD");
+        } else if let Some(env_name) = non_empty(&cfg.password_env) {
+            push(&mut cfg_args, "--password-env", &env_name);
+        } else if cfg.mine != Some(false) && non_empty(&cfg.address).is_some() {
+            let pw = prompt_required("Wallet password: ")?;
+            std::env::set_var("ZOKA_CONFIG_PASSWORD", pw);
+            push(&mut cfg_args, "--password-env", "ZOKA_CONFIG_PASSWORD");
+        }
+    }
+
+    out.extend(cfg_args);
+    Ok(out)
+}
+
 async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
+    let expanded = expand_node_config_into_args(args)?;
+    let args: &[String] = &expanded;
     let network = NetworkProfile::from_args(args)?;
     let chain_id = network.chain_id().to_string();
     zoka::api::global_startup_status().reset(
