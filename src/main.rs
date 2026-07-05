@@ -137,16 +137,27 @@ fn print_usage() {
     );
 }
 
-fn prompt_line(prompt: &str) -> Result<String, String> {
+/// Read one line from stdin. Returns `Ok(None)` on EOF (stdin closed or
+/// non-interactive), `Ok(Some(trimmed))` otherwise. Distinguishing EOF from an
+/// empty line is what lets `prompt_required` fail fast in a headless run
+/// instead of spinning forever on a `read_line` that keeps returning 0 bytes.
+fn read_prompt_line(prompt: &str) -> Result<Option<String>, String> {
     print!("{}", paint(prompt, ANSI_CYAN));
     io::stdout()
         .flush()
         .map_err(|e| format!("stdout flush failed: {e}"))?;
     let mut line = String::new();
-    io::stdin()
+    let read = io::stdin()
         .read_line(&mut line)
         .map_err(|e| format!("stdin read failed: {e}"))?;
-    Ok(line.trim().to_string())
+    if read == 0 {
+        return Ok(None);
+    }
+    Ok(Some(line.trim().to_string()))
+}
+
+fn prompt_line(prompt: &str) -> Result<String, String> {
+    Ok(read_prompt_line(prompt)?.unwrap_or_default())
 }
 
 fn prompt_optional(prompt: &str) -> Result<Option<String>, String> {
@@ -170,11 +181,19 @@ fn prompt_u64_with_default(prompt: &str, default: u64) -> Result<u64, String> {
 
 fn prompt_required(prompt: &str) -> Result<String, String> {
     loop {
-        let value = prompt_line(prompt)?;
-        if !value.is_empty() {
-            return Ok(value);
+        match read_prompt_line(prompt)? {
+            Some(value) if !value.is_empty() => return Ok(value),
+            Some(_) => {
+                println!("Value is required.");
+            }
+            None => {
+                return Err(
+                    "no input available on stdin (non-interactive session); \
+                     provide the value via a flag or the config file instead"
+                        .to_string(),
+                );
+            }
         }
-        println!("Value is required.");
     }
 }
 
@@ -2630,7 +2649,7 @@ fn print_mining_console_status(
         "status  height={height}  peers={peers}  mining={}  hashrate={}  session_mined={session_blocks} ({} ZKA)  |  {}",
         if mining { "on" } else { "off" },
         format_hashrate_hps(hashrate_hps as f64),
-        format_zka(session_rewards),
+        format_zka_amount(session_rewards),
         truncate_dashboard_text(last_event, 80),
     );
 }
@@ -9438,11 +9457,13 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut next_warmup_seed_reconnect_at = tokio::time::Instant::now();
     let mut warmup_seed_reconnect_failures = 0u32;
     // --mining-console throttle, shared by the warmup loop and the main loop:
-    // emit a status line at most every few seconds, but immediately when the
-    // last event changes (so block arrivals / sync jumps show promptly)
-    // instead of clearing and redrawing the whole dashboard.
+    // emit one compact status line every ~6s (instead of clearing and redrawing
+    // the whole dashboard). Not tied to `last_event` — during IBD that changes
+    // every block and would spam a line per block; the streaming `mining:
+    // progress …` lines already carry the live detail. A newly mined block
+    // (session count change) does bypass the throttle so it shows promptly.
     let mut next_console_status_at = tokio::time::Instant::now();
-    let mut last_console_event = String::new();
+    let mut last_console_session_blocks = 0u64;
     while tokio::time::Instant::now() < warmup_deadline {
         let mut now = tokio::time::Instant::now();
         if now >= next_warmup_seed_reconnect_at {
@@ -9472,7 +9493,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         };
         if mining_console {
             let now_console = tokio::time::Instant::now();
-            if now_console >= next_console_status_at || last_event != last_console_event {
+            if now_console >= next_console_status_at {
                 let height = current_known_height_for_network(db_path.as_deref(), network);
                 println!(
                     "warmup  height={height}  peers={}  syncing… ({}s left)  |  {}",
@@ -9481,7 +9502,6 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     truncate_dashboard_text(&last_event, 80),
                 );
                 next_console_status_at = now_console + Duration::from_secs(6);
-                last_console_event = last_event.clone();
             }
         } else {
             draw_fullnode_runtime_screen(
@@ -10455,7 +10475,9 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             // changes so block arrivals / peer / height changes surface without
             // wiping the scrollback.
             let now_console = tokio::time::Instant::now();
-            if now_console >= next_console_status_at || last_event != last_console_event {
+            if now_console >= next_console_status_at
+                || session_mined_blocks != last_console_session_blocks
+            {
                 print_mining_console_status(
                     runtime_chain_height,
                     node.connected_peer_count(),
@@ -10466,7 +10488,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     &last_event,
                 );
                 next_console_status_at = now_console + Duration::from_secs(6);
-                last_console_event = last_event.clone();
+                last_console_session_blocks = session_mined_blocks;
             }
         } else if let Err(err) = draw_fullnode_runtime_screen(
             &node,
@@ -10634,7 +10656,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         println!(
             "stopped  height={height}  peers={}  session_mined={session_mined_blocks} ({} ZKA)  |  {}",
             node.connected_peer_count(),
-            format_zka(session_mined_rewards),
+            format_zka_amount(session_mined_rewards),
             truncate_dashboard_text(&last_event, 80),
         );
     } else {
@@ -15122,6 +15144,19 @@ fn cmd_genesis_verify(args: &[String]) -> Result<(), String> {
 
 #[tokio::main]
 async fn main() {
+    // In fluid mining-console mode, keep the tracing log stream (p2p gossip
+    // INFO, etc.) from drowning the console. If the operator didn't pick a
+    // level explicitly, default to warn so the streaming status/progress lines
+    // stay readable. Only covers the `--mining-console` flag / env here (the
+    // config-file case sets RUST_LOG in the shipped launcher); an explicit
+    // RUST_LOG always wins.
+    if std::env::var_os("RUST_LOG").is_none() {
+        let console_mode = std::env::args().any(|a| a == "--mining-console")
+            || std::env::var("ZOKA_MINING_CONSOLE").as_deref() == Ok("1");
+        if console_mode {
+            std::env::set_var("RUST_LOG", "warn");
+        }
+    }
     let _ = tracing_subscriber::fmt::try_init();
     setup_zoka_home();
     if let Err(err) = run().await {

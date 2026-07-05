@@ -98,4 +98,31 @@ Repos:
   in a folder and just run `zoka fullnode` — cross-platform, no `.bat`.
   Docs: `docs/node-config.md`, example `docs/zoka.config.example.json`.
 
+### 7. Node: prompt_required no longer spins forever on non-interactive stdin
+- **Commit:** _(this commit)_ (node)
+- **Problem:** `prompt_required` looped on empty input to re-ask, but couldn't
+  tell "user pressed Enter on an empty line" from "stdin is closed/EOF"
+  (`read_line` returns 0 bytes). In a headless run (systemd, piped, no TTY) it
+  spun forever printing `Value is required.` — burning a CPU core and flooding
+  logs. The new config-file flow made this far more likely: a standalone/Linux
+  miner with an empty `password` would hit the wallet-password prompt with no
+  TTY. (Caught live: a 30s headless run produced ~2 million lines.)
+- **Fix:** `prompt_line` now distinguishes EOF (returns `None`) from an empty
+  line. `prompt_required` fails fast with a clear message on EOF instead of
+  looping; interactive behaviour (re-ask on empty Enter) is unchanged.
+
+### 8. Node: mining-console polish (single ZKA unit, 6s throttle, quiet logs)
+- **Commit:** _(this commit)_ (node)
+- **Problem:** Shaking out the fluid console on a live run surfaced three warts:
+  (a) the status line printed `0 ZKA ZKA` (double unit — `format_zka` already
+  appends the unit); (b) it emitted a status line on every `last_event` change,
+  which during IBD means one line per synced block (spam, not "fluid"); and
+  (c) the node's default INFO tracing (p2p gossip, block responses) interleaved
+  with and drowned the console.
+- **Fix:** (a) use `format_zka_amount` inside the `(… ZKA)` wrapper; (b) throttle
+  the status line to ~6s (a newly mined block still bypasses the throttle so it
+  shows promptly) instead of keying on `last_event`; (c) in mining-console mode,
+  default `RUST_LOG` to `warn` when unset so the streaming lines stay readable
+  (an explicit `RUST_LOG` still wins; the shipped launcher also sets it).
+
 <!-- Add new entries above this line as we fix more. -->
