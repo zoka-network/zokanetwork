@@ -8972,8 +8972,24 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     .filter(|rpc| rpc.status.eq_ignore_ascii_case("active"))
                     .map(|rpc| rpc.url.clone())
                     .collect();
+                // A manual --seed must AUGMENT the manifest's seeds, not
+                // replace them. Merge the manifest's active seeds into the
+                // reconnect pool so the node dials every seed (e.g. both BOOT
+                // and VPS2), not just the single --seed it was handed. Without
+                // this, a wallet app that passes one --seed pinned the node to
+                // that seed alone and it never dialed the others, capping it at
+                // a single P2P peer.
+                let seed_candidates = network_config.active_seed_candidates(allow_clearnet_seeds);
+                let mut merged_seeds = 0usize;
+                for seed in &seed_candidates {
+                    peer_store.upsert_addr(&seed.address, "manifest_seed");
+                    if !reconnect_seed_peers.iter().any(|s| s == &seed.address) {
+                        reconnect_seed_peers.push(seed.address.clone());
+                        merged_seeds += 1;
+                    }
+                }
                 startup_notes.push(format!(
-                    "{} network config loaded from {} for public RPCs: status={}, active_rpc={}.",
+                    "{} network config loaded from {}: status={}, active_rpc={}, manifest_seeds_merged={} (reconnect pool now {}).",
                     network.label(),
                     config_path.display(),
                     if network_config.status.is_empty() {
@@ -8982,6 +8998,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                         network_config.status.as_str()
                     },
                     network_config.active_rpc_count(),
+                    merged_seeds,
+                    reconnect_seed_peers.len(),
                 ));
             }
         }
