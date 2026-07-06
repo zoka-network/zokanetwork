@@ -42,4 +42,25 @@ Repos:
   restored the flag to `32` (safe now with the 120s timer) → verified RSS
   stopped growing under load.
 
+### 2. Node: `mining_console` set via `zoka.config.json` didn't quiet the logs
+- **Commit:** `3ba3b47` (node)
+- **Problem:** Caught live testing the standalone config-file flow. Enabling
+  `mining_console: true` in `zoka.config.json` (instead of passing
+  `--mining-console` on the command line) left the console cluttered with
+  raw `INFO`-level p2p/gossip noise interleaved with the clean
+  warmup/status lines — the exact "desprolijo, choca" complaint that
+  motivated `--mining-console` in the first place. Root cause: `main()`
+  decides whether to default `RUST_LOG=warn` by checking the raw process
+  argv *before* `tracing_subscriber` initializes, but `--mining-console`
+  only gets added to the effective args later, inside
+  `cmd_fullnode_auto`'s config-file expansion — by then the subscriber has
+  already initialized at whatever level `RUST_LOG` was (or wasn't), so
+  setting it afterward does nothing.
+- **Fix:** `main()` now also resolves and parses the node config file
+  (reusing `find_node_config_path`/`NodeConfigFile`) before initializing
+  tracing, and treats `mining_console: true` there the same as the CLI
+  flag. Verified live: a `--config` run with `mining_console: true` and no
+  `--mining-console` flag now shows only warmup/status/heartbeat lines,
+  zero p2p INFO spam.
+
 <!-- Add new entries above this line as we fix more. -->
