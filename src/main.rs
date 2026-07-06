@@ -15162,12 +15162,23 @@ async fn main() {
     // In fluid mining-console mode, keep the tracing log stream (p2p gossip
     // INFO, etc.) from drowning the console. If the operator didn't pick a
     // level explicitly, default to warn so the streaming status/progress lines
-    // stay readable. Only covers the `--mining-console` flag / env here (the
-    // config-file case sets RUST_LOG in the shipped launcher); an explicit
-    // RUST_LOG always wins.
+    // stay readable. Checks the raw CLI flag/env *and* an on-disk
+    // zoka.config.json's `mining_console` field -- tracing has to be
+    // initialized before cmd_fullnode_auto ever expands the config file into
+    // args, so by the time that expansion would normally notice
+    // `--mining-console`, it's too late to change the subscriber's level. An
+    // explicit RUST_LOG always wins either way.
     if std::env::var_os("RUST_LOG").is_none() {
-        let console_mode = std::env::args().any(|a| a == "--mining-console")
-            || std::env::var("ZOKA_MINING_CONSOLE").as_deref() == Ok("1");
+        let raw_args: Vec<String> = std::env::args().skip(1).collect();
+        let console_mode = raw_args.iter().any(|a| a == "--mining-console")
+            || std::env::var("ZOKA_MINING_CONSOLE").as_deref() == Ok("1")
+            || find_node_config_path(&raw_args)
+                .ok()
+                .flatten()
+                .and_then(|path| fs::read_to_string(path).ok())
+                .and_then(|raw| serde_json::from_str::<NodeConfigFile>(&raw).ok())
+                .and_then(|cfg| cfg.mining_console)
+                .unwrap_or(false);
         if console_mode {
             std::env::set_var("RUST_LOG", "warn");
         }
