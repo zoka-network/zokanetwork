@@ -63,4 +63,24 @@ Repos:
   `--mining-console` flag now shows only warmup/status/heartbeat lines,
   zero p2p INFO spam.
 
+### 3. Node: relative `network_config`/`db` paths in `zoka.config.json` resolved wrong
+- **Commit:** `3b6644f` (node)
+- **Problem:** Caught live: a standalone `zb/` setup with
+  `"network_config": "mainnet-network.v1.json"` (a bare relative filename,
+  matching the shipped example) failed with `mainnet network config file
+  not found: mainnet-network.v1.json` even though the file sat right next
+  to `zoka.exe` and `zoka.config.json`. Root cause: `main()` calls
+  `setup_zoka_home()`, which `chdir`s the process into the platform data
+  directory (e.g. `%APPDATA%\Zoka`) so the fullnode's own relative paths
+  like `.zoka/mainnet` resolve correctly — and it does this *before*
+  `cmd_fullnode_auto` ever reads `zoka.config.json`. A relative
+  `network_config`/`db` value from the config then resolved against the
+  wrong (data) directory instead of the folder the config file actually
+  lives in.
+- **Fix:** `expand_node_config_into_args` now resolves relative
+  `network_config`/`db` values against the config file's own directory
+  before pushing them as `--network-config`/`--db`, so they work
+  regardless of the later `chdir`. Verified live: a config with a bare
+  relative `network_config` now connects to seeds correctly.
+
 <!-- Add new entries above this line as we fix more. -->
