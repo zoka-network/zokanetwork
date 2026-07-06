@@ -806,46 +806,6 @@ fn configured_api_bind_addr(args: &[String], network: NetworkProfile) -> Result<
     api_bind_addr_from_local_rpc_url(&rpc)
 }
 
-fn active_public_rpc_urls(config: &MainnetNetworkConfig) -> Vec<String> {
-    config
-        .public_rpc
-        .iter()
-        .filter(|rpc| rpc.status.eq_ignore_ascii_case("active"))
-        .map(|rpc| rpc.url.trim_end_matches('/').to_string())
-        .collect()
-}
-
-fn rpc_sync_endpoints_from_args(
-    args: &[String],
-    network: NetworkProfile,
-) -> Result<Vec<String>, String> {
-    let manual = option_values(args, "--rpc");
-    if !manual.is_empty() {
-        for rpc in &manual {
-            parse_rpc_http_url(rpc)?;
-        }
-        return Ok(manual
-            .into_iter()
-            .map(|rpc| rpc.trim_end_matches('/').to_string())
-            .collect());
-    }
-    if has_flag(args, "--no-network-config") {
-        return Ok(Vec::new());
-    }
-
-    let config_path = network_config_path_from_args(args, network);
-    let config = if config_path.exists() {
-        load_network_config_for(&config_path, network)?
-    } else {
-        parse_network_config_for(embedded_network_config_for(network), network)?
-    };
-    let endpoints = active_public_rpc_urls(&config);
-    for rpc in &endpoints {
-        parse_rpc_http_url(rpc)?;
-    }
-    Ok(endpoints)
-}
-
 #[cfg(test)]
 fn parse_mainnet_network_config(raw: &str) -> Result<MainnetNetworkConfig, String> {
     parse_network_config_for(raw, NetworkProfile::Mainnet)
@@ -1500,7 +1460,7 @@ fn interactive_transfer_menu() -> Result<bool, String> {
     }
 }
 
-fn interactive_mining_menu() -> Result<bool, String> {
+async fn interactive_mining_menu() -> Result<bool, String> {
     loop {
         print_interactive_menu_screen(
             "Mining",
@@ -1517,18 +1477,27 @@ fn interactive_mining_menu() -> Result<bool, String> {
 
         match prompt_line("> ")?.as_str() {
             "1" => {
+                // Runs the same connected-fullnode path as Node > Start mining
+                // node: `cmd_mine_easy` mined into the local chain DB only,
+                // with no P2P networking at all, so nothing it "mined" was
+                // ever broadcast to real peers or credited on the real
+                // chain -- it looked like it worked and then silently went
+                // nowhere. Real mainnet mining needs the connected node.
                 let wallet = prompt_wallet_selector_with_single_default()?;
-                let threads = prompt_mining_cpu_threads()?;
-                let minutes = prompt_optional("Session minutes (empty = keep running): ")?;
-                let blocks = prompt_optional("Block limit (empty = no block limit): ")?;
                 let password = prompt_optional("Password (optional): ")?;
+                let threads = prompt_mining_cpu_threads()?;
+                let seconds = prompt_optional("Run seconds (empty = keep running): ")?;
+                let allow_isolated =
+                    prompt_yes_default("Allow standalone start if seeds fail? [Y/n]: ", true)?;
                 let mut args = vec!["--address".to_string(), wallet];
                 args.push("--threads".to_string());
                 args.push(threads.to_string());
-                push_opt_arg(&mut args, "--minutes", minutes);
-                push_opt_arg(&mut args, "--blocks", blocks);
                 push_opt_arg(&mut args, "--password", password);
-                if let Err(err) = cmd_mine_easy(&args) {
+                push_opt_arg(&mut args, "--seconds", seconds);
+                if allow_isolated {
+                    args.push("--allow-isolated-start".to_string());
+                }
+                if let Err(err) = cmd_fullnode_auto(&args).await {
                     eprintln!("{}", err);
                 }
             }
@@ -1769,7 +1738,7 @@ async fn run_interactive_menu() -> Result<(), String> {
                 }
             }
             "3" => {
-                if interactive_mining_menu()? {
+                if interactive_mining_menu().await? {
                     return Ok(());
                 }
             }
@@ -2202,7 +2171,6 @@ struct MiningBatchSummary {
     blocks_mined: u64,
     reward_credited: u64,
     last_difficulty_bits: u32,
-    last_solve_time_secs: f64,
     /// Blocks produced in this batch, in mining order. Callers that own a
     /// libp2p node use these to publish a `ZokaMessage::BlockResponse` so
     /// peers can apply the same block via `state::chain::apply_block`.
@@ -5971,7 +5939,6 @@ fn run_mining_batch_with_progress(
         blocks_mined: mined_blocks_effective,
         reward_credited: mined_reward,
         last_difficulty_bits: last_difficulty,
-        last_solve_time_secs: last_solve_secs,
         produced_blocks,
     })
 }
@@ -13322,34 +13289,6 @@ fn resolve_rpc_url(args: &[String], network: NetworkProfile) -> Result<String, S
     Ok(best.rpc)
 }
 
-fn best_reachable_rpc_height_from_args(
-    args: &[String],
-    network: NetworkProfile,
-) -> Result<RpcHeightSample, String> {
-    if let Some(rpc) = option_value(args, "--rpc") {
-        parse_rpc_http_url(&rpc)?;
-        let height = rpc_chain_height(&rpc, 3)?;
-        return Ok(RpcHeightSample { rpc, height });
-    }
-
-    let active = active_rpc_endpoints_from_config(args, network)?;
-    let endpoints = active.iter().map(|rpc| rpc.url.clone()).collect::<Vec<_>>();
-    if endpoints.is_empty() {
-        return Err("no active RPC endpoint configured; pass --rpc http://host:port".to_string());
-    }
-    let (samples, errors) = sample_rpc_heights(&endpoints, 3);
-    samples.into_iter().next().ok_or_else(|| {
-        if errors.is_empty() {
-            "no reachable active RPC endpoint configured".to_string()
-        } else {
-            format!(
-                "no reachable active RPC endpoint configured: {}",
-                errors.join("; ")
-            )
-        }
-    })
-}
-
 fn local_canonical_hash_at_height(
     db_path: Option<&str>,
     height: u64,
@@ -13382,43 +13321,6 @@ fn ensure_local_chain_matches_rpc_at_height(
         ));
     }
     Ok(())
-}
-
-fn standalone_mining_sync_gate(
-    args: &[String],
-    network: NetworkProfile,
-    db_path: Option<&str>,
-) -> Result<Option<String>, String> {
-    if has_flag(args, "--allow-unsynced-mining") {
-        return Ok(Some(
-            "Sync gate bypassed by --allow-unsynced-mining; this is only for isolated development."
-                .to_string(),
-        ));
-    }
-    if network != NetworkProfile::Mainnet {
-        return Ok(None);
-    }
-
-    let best_rpc = best_reachable_rpc_height_from_args(args, network)?;
-    let rpc = best_rpc.rpc;
-    let network_height = best_rpc.height;
-    let local_height = current_known_height_for_network(db_path, network);
-    ensure_local_chain_matches_rpc_at_height(&rpc, db_path, local_height.min(network_height))?;
-    if network_height > local_height {
-        return Err(format!(
-            "mining locked until sync completes: local height {local_height}, network height {network_height} via {rpc}. Start `zokahd --network {}` first and wait until local height catches up, or pass --allow-unsynced-mining only for isolated development.",
-            network.label()
-        ));
-    }
-    if local_height > network_height {
-        return Err(format!(
-            "mining locked because local height {local_height} is ahead of network bootstrap height {network_height} via {rpc}. Wait for the bootstrap to catch up or run a connected fullnode session; pass --allow-unsynced-mining only for isolated development."
-        ));
-    }
-
-    Ok(Some(format!(
-        "Sync gate OK: local height {local_height}, network height {network_height} via {rpc}."
-    )))
 }
 
 fn cmd_rpc_list(args: &[String]) -> Result<(), String> {
@@ -14251,246 +14153,6 @@ fn cmd_node_status(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_mine_easy(args: &[String]) -> Result<(), String> {
-    let network = NetworkProfile::from_args(args)?;
-    let chain_id = network.chain_id().to_string();
-    let wallet_selector_raw = wallet_selector_value(args)
-        .ok_or_else(|| "missing required argument: --address <wallet-address>".to_string())?;
-    let wallet_commitment = require_private_network_address(&wallet_selector_raw, "--address")?;
-    let wallet_selector = user_private_address_display(&wallet_commitment);
-    let password = password_value(args)?;
-    let db_path =
-        option_value(args, "--db").or_else(|| Some(network.default_db_path().to_string()));
-    let rpc_sync_endpoints = rpc_sync_endpoints_from_args(args, network)?;
-    let sync_gate_note = standalone_mining_sync_gate(args, network, db_path.as_deref())?;
-    if let Some(path) = db_path.as_deref() {
-        let storage = open_storage(path)?;
-        ensure_atomic_economics_db(&storage)?;
-    }
-    let mining_threads = parse_thread_count_arg(args)?;
-    let minutes_raw = option_value(args, "--minutes");
-    let minutes = parse_u64_arg(minutes_raw.clone(), 0, "--minutes")?;
-    let target_block_time_secs = POW_TARGET_BLOCK_TIME_SECS;
-    let blocks_raw = option_value(args, "--blocks");
-    let target_blocks = match blocks_raw {
-        Some(raw) => Some(parse_u64_arg(Some(raw), 1, "--blocks")?),
-        None if minutes > 0 => Some(((minutes.saturating_mul(60)) / target_block_time_secs).max(1)),
-        None => None,
-    };
-    if matches!(target_blocks, Some(0)) {
-        return Err("--blocks must be >= 1".to_string());
-    }
-    let unsafe_rehearsal_difficulty_bits = match option_value(
-        args,
-        "--unsafe-rehearsal-difficulty-bits",
-    ) {
-        Some(_) if std::env::var("ZOKA_ALLOW_UNSAFE_REHEARSAL").as_deref() != Ok("1") => {
-            return Err(
-                "--unsafe-rehearsal-difficulty-bits requires ZOKA_ALLOW_UNSAFE_REHEARSAL=1"
-                    .to_string(),
-            );
-        }
-        Some(raw) => {
-            let bits = parse_u32_arg(
-                Some(raw),
-                POW_INITIAL_DIFFICULTY_BITS,
-                "--unsafe-rehearsal-difficulty-bits",
-            )?;
-            if bits == 0 || bits > POW_MAX_DIFFICULTY_BITS {
-                return Err(format!(
-                    "--unsafe-rehearsal-difficulty-bits must be between 1 and {POW_MAX_DIFFICULTY_BITS}"
-                ));
-            }
-            Some(bits)
-        }
-        None => None,
-    };
-
-    let base_difficulty = POW_INITIAL_DIFFICULTY_BITS;
-    let deadline = if minutes == 0 {
-        None
-    } else {
-        Some(Instant::now() + Duration::from_secs(minutes.saturating_mul(60)))
-    };
-
-    let wallet_storage = wallet_storage_for_network(network)?;
-    let wallet = load_wallet_runtime_snapshot_from_storage(
-        &wallet_storage,
-        &wallet_selector,
-        password.as_deref(),
-        network,
-    )?;
-    let mut state = load_user_mining_state_for_network(network)?;
-    if legacy_pow_sim_state_detected(&state) {
-        return Err(legacy_pow_sim_reset_message());
-    }
-    state.is_mining = true;
-    state.mining_process_id = Some(std::process::id());
-    state.mode = network.mining_mode().to_string();
-    state.algorithm = active_pow_algorithm_for_chain(&chain_id).to_string();
-    state.estimated_hashrate_hps = 0;
-    state.current_difficulty_bits = state
-        .current_difficulty_bits
-        .max(base_difficulty)
-        .clamp(POW_MIN_DIFFICULTY_BITS, POW_MAX_DIFFICULTY_BITS);
-    if let Some(bits) = unsafe_rehearsal_difficulty_bits {
-        state.current_difficulty_bits = bits;
-    }
-    state.last_updated = now_secs();
-    save_user_mining_state_for_network(network, &state)?;
-    let hashrate_hps = benchmark_hashrate_hps_for_chain(&chain_id, 500);
-    state.estimated_hashrate_hps = hashrate_hps;
-    state.last_updated = now_secs();
-    save_user_mining_state_for_network(network, &state)?;
-
-    let session_started = Instant::now();
-    let mut session_blocks = 0u64;
-    let mut session_rewards = 0u64;
-    let ready_line = format!(
-        "Ready. Mining {} into {} with {} at {} bits using {}.",
-        network.label(),
-        wallet.address,
-        active_pow_algorithm_for_chain(&chain_id),
-        unsafe_rehearsal_difficulty_bits.unwrap_or(base_difficulty),
-        mining_power_label_for_threads(mining_threads)
-    );
-    let mut status_line = sync_gate_note
-        .as_deref()
-        .map(|note| format!("{note} {ready_line}"))
-        .unwrap_or(ready_line);
-
-    let render = |current_state: &UserMiningState,
-                  status_line: &str,
-                  session_blocks: u64,
-                  session_rewards: u64|
-     -> Result<(), String> {
-        let wallet_snapshot = load_wallet_runtime_snapshot_from_storage(
-            &wallet_storage,
-            &wallet_selector,
-            password.as_deref(),
-            network,
-        )?;
-        let fee_snapshot = refresh_fee_market_snapshot(db_path.as_deref(), password.as_deref());
-        let known_height = current_known_height_for_network(db_path.as_deref(), network);
-        let screen = render_mining_dashboard(
-            Some(&wallet_snapshot),
-            current_state,
-            &fee_snapshot,
-            known_height,
-            session_started.elapsed(),
-            session_blocks,
-            session_rewards,
-            target_blocks,
-            deadline,
-            Some(mining_threads),
-            status_line,
-        );
-        set_terminal_title("ZOKA Mining 1.0")?;
-        clear_runtime_screen()?;
-        print!("{}", screen);
-        io::stdout()
-            .flush()
-            .map_err(|e| format!("stdout flush failed: {e}"))?;
-        Ok(())
-    };
-
-    render(&state, &status_line, session_blocks, session_rewards)?;
-    let mut live_state = state.clone();
-
-    loop {
-        if let Some(limit) = target_blocks {
-            if session_blocks >= limit {
-                status_line = format!("Session completed. Target {} block(s) reached.", limit);
-                break;
-            }
-        }
-        if let Some(limit) = deadline {
-            if Instant::now() >= limit {
-                status_line = "Session completed. Time limit reached.".to_string();
-                break;
-            }
-        }
-
-        let mining_config = MiningEngineConfig {
-            chain_id: chain_id.clone(),
-            wallet_selector: wallet_selector.clone(),
-            password: password.clone(),
-            blocks: 1,
-            mode: network.mining_mode().to_string(),
-            hashrate_hps,
-            threads: mining_threads,
-            base_difficulty,
-            unsafe_rehearsal_difficulty_bits,
-            target_block_time_secs,
-            chain_db_path: db_path.clone(),
-            rpc_sync_endpoints: rpc_sync_endpoints.clone(),
-            // Standalone miner sessions are driven by their own CLI loop,
-            // not the fullnode's HTTP mining control.
-            honor_local_mining_control: false,
-        };
-        let batch = {
-            let mut last_live_render: Option<Instant> = None;
-            let mut last_progress_log = Instant::now() - Duration::from_secs(10);
-            let mut progress_callback = |progress: &MiningProgressSnapshot| -> Result<(), String> {
-                let should_render = last_live_render
-                    .map(|last| last.elapsed() >= Duration::from_millis(800))
-                    .unwrap_or(true);
-                if !should_render {
-                    return Ok(());
-                }
-                if last_progress_log.elapsed() >= Duration::from_secs(3) {
-                    mining_progress_log(progress);
-                    last_progress_log = Instant::now();
-                }
-
-                live_state.is_mining = true;
-                live_state.mining_process_id = Some(std::process::id());
-                live_state.current_difficulty_bits = progress.difficulty_bits;
-                live_state.estimated_hashrate_hps = if progress.estimated_hashrate_hps > 0.0 {
-                    progress.estimated_hashrate_hps.ceil() as u64
-                } else {
-                    0
-                };
-                live_state.last_updated = now_secs();
-                save_user_mining_state_for_network(network, &live_state)?;
-
-                let live_status = format!(
-                    "Mining block {} | tried {} hash(es) | {} | nonce {} | elapsed {}.",
-                    progress.height,
-                    progress.hashes_attempted,
-                    format_hashrate_hps(progress.estimated_hashrate_hps),
-                    progress.nonce,
-                    format_runtime_duration(Duration::from_secs_f64(
-                        progress.elapsed_secs.max(0.0)
-                    ))
-                );
-                render(&live_state, &live_status, session_blocks, session_rewards)?;
-                last_live_render = Some(Instant::now());
-                Ok(())
-            };
-            run_mining_batch_with_progress(&mining_config, Some(&mut progress_callback))?
-        };
-        session_blocks = session_blocks.saturating_add(batch.blocks_mined);
-        session_rewards = session_rewards.saturating_add(batch.reward_credited);
-        status_line = format!(
-            "Last block solved in {:.2}s at {} bits. Reward {} scheduled for maturity.",
-            batch.last_solve_time_secs,
-            batch.last_difficulty_bits,
-            format_zka(batch.reward_credited)
-        );
-        state = load_user_mining_state_for_network(network)?;
-        live_state = state.clone();
-        render(&state, &status_line, session_blocks, session_rewards)?;
-    }
-
-    state = load_user_mining_state_for_network(network)?;
-    state.is_mining = false;
-    state.mining_process_id = None;
-    save_user_mining_state_for_network(network, &state)?;
-    render(&state, &status_line, session_blocks, session_rewards)?;
-    Ok(())
-}
-
 fn running_as_zokahd() -> bool {
     let Some(exe_path) = std::env::args().next() else {
         return false;
@@ -14647,8 +14309,13 @@ async fn run() -> Result<(), String> {
         "mine-console" => cmd_mine_console(tail),
         "dashboard" => cmd_status_overview(tail),
         "mine" => {
+            // Alias for a connected, mining-enabled fullnode. Used to call
+            // cmd_mine_easy, which mined into the local chain DB with no P2P
+            // networking at all -- nothing it "mined" was ever broadcast to
+            // real peers or credited on the real chain, so it looked like it
+            // worked and then silently went nowhere on mainnet.
             let args = normalize_positional_alias_args(tail, &["--address"]);
-            cmd_mine_easy(&args)
+            cmd_fullnode_auto(&args).await
         }
         "genesis-verify" => cmd_genesis_verify(tail),
         "mainnet-network-lint" => cmd_mainnet_network_lint(tail),

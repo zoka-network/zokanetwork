@@ -108,4 +108,23 @@ Repos:
 - Verified live end-to-end: greeting, connecting, and status lines all
   render with correct ANSI codes while actually syncing against mainnet.
 
+### 5. Node: interactive menu's "Start mining" and `zoka mine` never actually joined the network
+- **Problem:** Found while packaging the standalone miner: `zoka.exe` run
+  with no args → `Mining` → `Start mining`, and the direct CLI alias
+  `zoka mine`, both called a legacy helper (`cmd_mine_easy`) that mined
+  straight into the local RocksDB chain state with **zero P2P networking**.
+  `rpc_sync_endpoints` was only ever used to pull pending private txs, never
+  to push or broadcast mined blocks, so anything "mined" this way was a
+  private, disconnected fork — invisible to the real network and never
+  actually credited. It looked like it worked (console output, no errors)
+  and then silently went nowhere.
+- **Fix:** Both entry points now redirect to `cmd_fullnode_auto` — the same
+  connected, P2P-mining fullnode path already used by `zoka fullnode` /
+  `--mining-console`, and already verified live multiple times this session.
+  Removed `cmd_mine_easy` and the dead code it left behind
+  (`active_public_rpc_urls`, `rpc_sync_endpoints_from_args`,
+  `best_reachable_rpc_height_from_args`, `standalone_mining_sync_gate`, the
+  unused `MiningBatchSummary.last_solve_time_secs` field). `cargo check`
+  clean with zero warnings; `cargo test --lib` green.
+
 <!-- Add new entries above this line as we fix more. -->
