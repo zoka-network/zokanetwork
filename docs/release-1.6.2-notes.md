@@ -83,4 +83,29 @@ Repos:
   regardless of the later `chdir`. Verified live: a config with a bare
   relative `network_config` now connects to seeds correctly.
 
+### 4. Node: fluid mining console becomes the default, with colors and a block-found banner
+- **Commit:** `4f67c98` (node), `9f9eb22` (zsilent-core)
+- **Change:** The streaming console is now the fullnode's default output
+  mode instead of the full-screen dashboard — no `--mining-console` flag or
+  `zoka.config.json` field needed. A new `--dashboard` flag (or
+  `ZOKA_DASHBOARD=1`, or `"mining_console": false` in the config) opts back
+  into the old full-screen view.
+- **Visual redesign** using the existing ANSI color infrastructure:
+  peer count colored green/yellow/red by health, height bolded,
+  `mining=on/off` in green/yellow, hashrate in magenta, session
+  block/reward counters in green, trailing event text dimmed. A new
+  `print_block_found_banner()` prints a prominent bold-green `*** Block
+  found! height=X reward=Y ***` line the moment this session wins a block —
+  separate from the routine status line so it doesn't blend into the
+  scrollback. The `mining: progress …` line is dimmed on the terminal only
+  (the plain-text `mining_diagnostic.log` file is untouched).
+- **ZSilent compatibility:** ZSilent's own log panel parses raw node stdout
+  and is tuned to the full-screen dashboard's line format
+  (`DASHBOARD_NOISE` in `NodeController.kt`), so `zsilent-core` now passes
+  `--dashboard` explicitly when launching the node, keeping its behavior
+  unchanged regardless of the node's new default. Accumulating in
+  `zsilent-core` for its own next release.
+- Verified live end-to-end: greeting, connecting, and status lines all
+  render with correct ANSI codes while actually syncing against mainnet.
+
 <!-- Add new entries above this line as we fix more. -->
