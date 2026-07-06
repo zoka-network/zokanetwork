@@ -2610,7 +2610,7 @@ fn retarget_difficulty(current: u32, solve_secs: f64, target_block_time_secs: u6
 }
 
 fn mining_log(message: &str) {
-    eprintln!("mining: {message}");
+    eprintln!("{}", paint(&format!("mining: {message}"), ANSI_DIM));
     let path = PathBuf::from(NetworkProfile::Mainnet.local_dir()).join("mining_diagnostic.log");
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -2633,9 +2633,9 @@ fn mining_progress_log(progress: &MiningProgressSnapshot) {
     ));
 }
 
-/// One compact, scrolling status line for `--mining-console` mode. No screen
-/// clear: it appends to the terminal like a log so it coexists with the
-/// streaming `mining: progress …` lines instead of wiping them.
+/// One compact, colored, scrolling status line for the mining console. No
+/// screen clear: it appends to the terminal like a log so it coexists with
+/// the streaming `mining: progress …` lines instead of wiping them.
 fn print_mining_console_status(
     height: u64,
     peers: usize,
@@ -2645,12 +2645,38 @@ fn print_mining_console_status(
     session_rewards: u64,
     last_event: &str,
 ) {
+    let peers_color = if peers >= 2 {
+        ANSI_GREEN
+    } else if peers == 1 {
+        ANSI_YELLOW
+    } else {
+        ANSI_RED
+    };
+    let mining_label = if mining {
+        paint("on", ANSI_GREEN)
+    } else {
+        paint("off", ANSI_YELLOW)
+    };
     println!(
-        "status  height={height}  peers={peers}  mining={}  hashrate={}  session_mined={session_blocks} ({} ZKA)  |  {}",
-        if mining { "on" } else { "off" },
-        format_hashrate_hps(hashrate_hps as f64),
-        format_zka_amount(session_rewards),
-        truncate_dashboard_text(last_event, 80),
+        "{}  height={}  peers={}  mining={mining_label}  hashrate={}  session={} block(s) / {}  {} {}",
+        paint("status", ANSI_DIM),
+        paint(&height.to_string(), ANSI_BOLD),
+        paint(&peers.to_string(), peers_color),
+        paint(&format_hashrate_hps(hashrate_hps as f64), ANSI_MAGENTA),
+        paint(&session_blocks.to_string(), ANSI_GREEN),
+        paint(&format_zka_amount(session_rewards), ANSI_GREEN),
+        paint("|", ANSI_DIM),
+        paint(&truncate_dashboard_text(last_event, 80), ANSI_DIM),
+    );
+}
+
+/// A one-time, prominent, hard-to-miss line printed the moment this session
+/// wins a block — separate from the routine status line so the actual
+/// "you got paid" event doesn't blend into the scrollback.
+fn print_block_found_banner(height: u64, reward_atoms: u64) {
+    println!(
+        "{ANSI_BOLD}{ANSI_GREEN}*** Block found! height={height}  reward={} ***{ANSI_RESET}",
+        format_zka_amount(reward_atoms)
     );
 }
 
@@ -8679,8 +8705,12 @@ fn expand_node_config_into_args(args: &[String]) -> Result<Vec<String>, String> 
     if cfg.mine == Some(false) {
         cfg_args.push("--no-mine".to_string());
     }
-    if cfg.mining_console == Some(true) {
-        cfg_args.push("--mining-console".to_string());
+    // Console mode is the default now, so `mining_console` in the config only
+    // needs to matter when explicitly set to false (opt back into the
+    // full-screen dashboard). `true` is accepted too for explicitness/older
+    // config files, but is a no-op against the default.
+    if cfg.mining_console == Some(false) {
+        cfg_args.push("--dashboard".to_string());
     }
     if cfg.allow_isolated_start == Some(true) {
         cfg_args.push("--allow-isolated-start".to_string());
@@ -8814,15 +8844,21 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     };
     let show_keys = has_flag(args, "--show-keys");
     let verbose = has_flag(args, "--verbose");
-    // Fluid CLI mode: stream scrolling status lines instead of the full-screen
-    // dashboard, which clears the screen on every redraw and fights the mining
-    // progress lines (the terminal "goes crazy" when blocks arrive). Ideal for
-    // standalone miners. Enable with --mining-console or ZOKA_MINING_CONSOLE=1.
-    let mining_console = has_flag(args, "--mining-console")
-        || std::env::var("ZOKA_MINING_CONSOLE").as_deref() == Ok("1");
+    // Fluid streaming console is the default: a scrolling status/event log
+    // instead of the full-screen dashboard, which clears the screen on every
+    // redraw and fights the mining progress lines (the terminal "goes crazy"
+    // when blocks arrive). Pass --dashboard (or ZOKA_DASHBOARD=1) to opt back
+    // into the old full-screen view; --mining-console/ZOKA_MINING_CONSOLE=1
+    // are still accepted for explicitness/back-compat but no longer needed.
+    let mining_console = !has_flag(args, "--dashboard")
+        && std::env::var("ZOKA_DASHBOARD").as_deref() != Ok("1");
     if mining_console {
         println!(
-            "mining-console mode: streaming status (no full-screen dashboard). Ctrl+C to stop."
+            "{}",
+            paint(
+                "Mining console — streaming view. Ctrl+C to stop.",
+                ANSI_CYAN
+            )
         );
     }
     let mining_threads = parse_thread_count_arg(args)?;
@@ -9484,6 +9520,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     // (session count change) does bypass the throttle so it shows promptly.
     let mut next_console_status_at = tokio::time::Instant::now();
     let mut last_console_session_blocks = 0u64;
+    let mut last_console_session_rewards = 0u64;
     while tokio::time::Instant::now() < warmup_deadline {
         let mut now = tokio::time::Instant::now();
         if now >= next_warmup_seed_reconnect_at {
@@ -9515,11 +9552,23 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             let now_console = tokio::time::Instant::now();
             if now_console >= next_console_status_at {
                 let height = current_known_height_for_network(db_path.as_deref(), network);
+                let peers = node.connected_peer_count();
+                let peers_color = if peers >= 2 {
+                    ANSI_GREEN
+                } else if peers == 1 {
+                    ANSI_YELLOW
+                } else {
+                    ANSI_RED
+                };
                 println!(
-                    "warmup  height={height}  peers={}  syncing… ({}s left)  |  {}",
-                    node.connected_peer_count(),
+                    "{}  height={}  peers={}  {} ({}s left)  {} {}",
+                    paint("connecting", ANSI_CYAN),
+                    paint(&height.to_string(), ANSI_BOLD),
+                    paint(&peers.to_string(), peers_color),
+                    paint("syncing…", ANSI_YELLOW),
                     remaining.as_secs(),
-                    truncate_dashboard_text(&last_event, 80),
+                    paint("|", ANSI_DIM),
+                    paint(&truncate_dashboard_text(&last_event, 80), ANSI_DIM),
                 );
                 next_console_status_at = now_console + Duration::from_secs(6);
             }
@@ -10509,6 +10558,13 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             // status line at most every 6s, but immediately when the last event
             // changes so block arrivals / peer / height changes surface without
             // wiping the scrollback.
+            if session_mined_blocks > last_console_session_blocks {
+                print_block_found_banner(
+                    runtime_chain_height,
+                    session_mined_rewards.saturating_sub(last_console_session_rewards),
+                );
+                last_console_session_rewards = session_mined_rewards;
+            }
             let now_console = tokio::time::Instant::now();
             if now_console >= next_console_status_at
                 || session_mined_blocks != last_console_session_blocks
@@ -10689,10 +10745,14 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     if mining_console {
         let height = current_known_height_for_network(db_path.as_deref(), network);
         println!(
-            "stopped  height={height}  peers={}  session_mined={session_mined_blocks} ({} ZKA)  |  {}",
+            "{}  height={}  peers={}  session={} block(s) / {}  {} {}",
+            paint("stopped", ANSI_RED),
+            paint(&height.to_string(), ANSI_BOLD),
             node.connected_peer_count(),
-            format_zka_amount(session_mined_rewards),
-            truncate_dashboard_text(&last_event, 80),
+            paint(&session_mined_blocks.to_string(), ANSI_GREEN),
+            paint(&format_zka_amount(session_mined_rewards), ANSI_GREEN),
+            paint("|", ANSI_DIM),
+            paint(&truncate_dashboard_text(&last_event, 80), ANSI_DIM),
         );
     } else {
         draw_fullnode_runtime_screen(
@@ -15179,27 +15239,27 @@ fn cmd_genesis_verify(args: &[String]) -> Result<(), String> {
 
 #[tokio::main]
 async fn main() {
-    // In fluid mining-console mode, keep the tracing log stream (p2p gossip
-    // INFO, etc.) from drowning the console. If the operator didn't pick a
-    // level explicitly, default to warn so the streaming status/progress lines
-    // stay readable. Checks the raw CLI flag/env *and* an on-disk
-    // zoka.config.json's `mining_console` field -- tracing has to be
-    // initialized before cmd_fullnode_auto ever expands the config file into
-    // args, so by the time that expansion would normally notice
-    // `--mining-console`, it's too late to change the subscriber's level. An
-    // explicit RUST_LOG always wins either way.
+    // The fluid streaming console is the default (see cmd_fullnode_auto), so
+    // keep the tracing log stream (p2p gossip INFO, etc.) from drowning it: if
+    // the operator didn't pick a level explicitly, default to warn. Only the
+    // full-screen --dashboard opt-out (flag, env, or an on-disk
+    // zoka.config.json explicitly setting `mining_console: false`) restores
+    // the old default (no forced level). Checked here, before
+    // tracing_subscriber initializes, because by the time cmd_fullnode_auto
+    // would normally expand the config file into args it's too late to change
+    // the subscriber's level. An explicit RUST_LOG always wins either way.
     if std::env::var_os("RUST_LOG").is_none() {
         let raw_args: Vec<String> = std::env::args().skip(1).collect();
-        let console_mode = raw_args.iter().any(|a| a == "--mining-console")
-            || std::env::var("ZOKA_MINING_CONSOLE").as_deref() == Ok("1")
+        let dashboard_opt_out = raw_args.iter().any(|a| a == "--dashboard")
+            || std::env::var("ZOKA_DASHBOARD").as_deref() == Ok("1")
             || find_node_config_path(&raw_args)
                 .ok()
                 .flatten()
                 .and_then(|path| fs::read_to_string(path).ok())
                 .and_then(|raw| serde_json::from_str::<NodeConfigFile>(&raw).ok())
                 .and_then(|cfg| cfg.mining_console)
-                .unwrap_or(false);
-        if console_mode {
+                == Some(false);
+        if !dashboard_opt_out {
             std::env::set_var("RUST_LOG", "warn");
         }
     }

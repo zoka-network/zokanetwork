@@ -35,7 +35,7 @@ All fields are optional. Unknown fields are ignored (forward-compatible).
 | `threads` | `--threads` | CPU threads for mining. Accepts a number (`3`) or string (`"3"`). |
 | `power` | `--power` | e.g. `normal`. |
 | `mine` | `--no-mine` when `false` | Default mines; set `false` to run node-only. |
-| `mining_console` | `--mining-console` | `true` = fluid streaming console instead of the full-screen dashboard. |
+| `mining_console` | `--dashboard` when `false` | The fluid streaming console is the default; set `false` to opt back into the old full-screen dashboard. |
 | `allow_isolated_start` | `--allow-isolated-start` | Start even if no peers are reachable yet. |
 | `network_config` | `--network-config` | Path to the network manifest (seeds + RPC). |
 | `db` | `--db` | Override the data/db path. |
@@ -72,7 +72,6 @@ digest is still verified, so a tampered or foreign bundle is rejected.
   "threads": 3,
   "power": "normal",
   "mine": true,
-  "mining_console": true,
   "allow_isolated_start": true,
   "network_config": "mainnet-network.v1.json"
 }
