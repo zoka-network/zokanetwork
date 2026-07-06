@@ -2605,6 +2605,7 @@ fn mining_progress_log(progress: &MiningProgressSnapshot) {
 /// screen clear: it appends to the terminal like a log so it coexists with
 /// the streaming `mining: progress …` lines instead of wiping them.
 fn print_mining_console_status(
+    wallet_name: &str,
     height: u64,
     peers: usize,
     mining: bool,
@@ -2631,8 +2632,9 @@ fn print_mining_console_status(
         None => paint("—", ANSI_DIM),
     };
     println!(
-        "{}  height={}  peers={}  mining={mining_label}  hashrate={}  balance={balance_label}  session={} block(s) / {}  {} {}",
+        "{}  wallet={}  height={}  peers={}  mining={mining_label}  hashrate={}  balance={balance_label}  session={} block(s) / {}  {} {}",
         paint("status", ANSI_DIM),
+        paint(wallet_name, ANSI_CYAN),
         paint(&height.to_string(), ANSI_BOLD),
         paint(&peers.to_string(), peers_color),
         paint(&format_hashrate_hps(hashrate_hps as f64), ANSI_MAGENTA),
@@ -10554,6 +10556,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 .map(|snapshot| snapshot.total_balance)
                 .ok();
                 print_mining_console_status(
+                    &wallet_name,
                     runtime_chain_height,
                     node.connected_peer_count(),
                     runtime_mining_enabled || mining_active,

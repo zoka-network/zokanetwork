@@ -219,6 +219,12 @@ impl PeerStore {
             .into_iter()
             .flat_map(|peer| peer.addrs.into_iter())
             .filter(|addr| !addr.trim().is_empty())
+            // Entries saved by an older build (before discovered addresses were
+            // filtered at insert time) can still have datacenter-internal/
+            // loopback/link-local addresses on disk. Re-check on read so a
+            // stale peer_store.json self-heals instead of redialing an
+            // unreachable seed's 10.x interface forever.
+            .filter(|addr| crate::network::p2p::discovered_addr_is_publicly_dialable(addr))
             .take(max)
             .collect()
     }
@@ -302,16 +308,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dial_addrs_filters_out_stale_private_entries() {
+        // A file written by an older build (before discovered addresses were
+        // filtered at insert time) can still have a datacenter-internal
+        // address on disk. dial_addrs must not hand that back out to be
+        // redialed forever.
+        let path = std::env::temp_dir().join(format!(
+            "zoka-peer-store-test-stale-{}.json",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let mut store = PeerStore::load_or_default(&path).unwrap();
+        store.upsert_addr("/ip4/10.10.0.5/tcp/28080", "identify");
+        store.upsert_addr("/ip4/203.0.113.9/tcp/28080", "seed");
+
+        let addrs = store.dial_addrs(8);
+        assert_eq!(addrs, vec!["/ip4/203.0.113.9/tcp/28080".to_string()]);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn peer_store_ranks_connected_peers_first() {
         let path =
             std::env::temp_dir().join(format!("zoka-peer-store-test-{}.json", std::process::id()));
         let _ = fs::remove_file(&path);
         let mut store = PeerStore::load_or_default(&path).unwrap();
-        store.upsert_addr("/ip4/10.0.0.1/tcp/28080", "seed");
-        store.upsert_addr("/ip4/10.0.0.2/tcp/28080", "identify");
-        store.mark_failed("/ip4/10.0.0.1/tcp/28080");
+        store.upsert_addr("/ip4/203.0.113.1/tcp/28080", "seed");
+        store.upsert_addr("/ip4/203.0.113.2/tcp/28080", "identify");
+        store.mark_failed("/ip4/203.0.113.1/tcp/28080");
         store.mark_identified(
-            "/ip4/10.0.0.2/tcp/28080",
+            "/ip4/203.0.113.2/tcp/28080",
             Some("peer-2"),
             Some("/zoka/1.0.2-mainnet-zenith"),
             &["/zoka/messages/v1".to_string(), "/zoka/pbft/v1".to_string()],
@@ -321,7 +347,7 @@ mod tests {
         let addrs = store.dial_addrs(2);
         assert_eq!(
             addrs.first().map(String::as_str),
-            Some("/ip4/10.0.0.2/tcp/28080")
+            Some("/ip4/203.0.113.2/tcp/28080")
         );
         store.save().unwrap();
 

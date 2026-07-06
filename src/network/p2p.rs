@@ -118,7 +118,7 @@ fn fit_block_response_for_gossip(message: ZokaMessage) -> (ZokaMessage, usize) {
 /// store (this is why nodes kept trying the seeds' 10.x droplet-internal
 /// addresses). Non-IP transports (dns, onion, i2p) always pass. Set
 /// `ZOKA_ALLOW_PRIVATE_PEER_ADDRS=1` to keep private addresses for LAN/dev.
-fn discovered_addr_is_publicly_dialable(addr: &str) -> bool {
+pub(crate) fn discovered_addr_is_publicly_dialable(addr: &str) -> bool {
     use libp2p::core::multiaddr::Protocol;
     if std::env::var("ZOKA_ALLOW_PRIVATE_PEER_ADDRS").as_deref() == Ok("1") {
         return true;
