@@ -2641,6 +2641,7 @@ fn print_mining_console_status(
     peers: usize,
     mining: bool,
     hashrate_hps: u64,
+    wallet_balance_atoms: Option<u64>,
     session_blocks: u64,
     session_rewards: u64,
     last_event: &str,
@@ -2657,8 +2658,12 @@ fn print_mining_console_status(
     } else {
         paint("off", ANSI_YELLOW)
     };
+    let balance_label = match wallet_balance_atoms {
+        Some(atoms) => paint(&format_zka_amount(atoms), ANSI_CYAN),
+        None => paint("—", ANSI_DIM),
+    };
     println!(
-        "{}  height={}  peers={}  mining={mining_label}  hashrate={}  session={} block(s) / {}  {} {}",
+        "{}  height={}  peers={}  mining={mining_label}  hashrate={}  balance={balance_label}  session={} block(s) / {}  {} {}",
         paint("status", ANSI_DIM),
         paint(&height.to_string(), ANSI_BOLD),
         paint(&peers.to_string(), peers_color),
@@ -10569,11 +10574,24 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             if now_console >= next_console_status_at
                 || session_mined_blocks != last_console_session_blocks
             {
+                // Reuses the dashboard's own 30s-TTL wallet snapshot cache, so
+                // this doesn't re-run the (Argon2-backed) wallet decrypt on
+                // every console tick -- same fix as the earlier CPU-pegging
+                // dashboard bug, just shared rather than re-triggered here.
+                let wallet_balance = load_wallet_runtime_snapshot_for_dashboard(
+                    &storage,
+                    &wallet_address,
+                    password.as_deref(),
+                    network,
+                )
+                .map(|snapshot| snapshot.total_balance)
+                .ok();
                 print_mining_console_status(
                     runtime_chain_height,
                     node.connected_peer_count(),
                     runtime_mining_enabled || mining_active,
                     runtime_mining_state.estimated_hashrate_hps,
+                    wallet_balance,
                     session_mined_blocks,
                     session_mined_rewards,
                     &last_event,
