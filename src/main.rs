@@ -9738,6 +9738,17 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     };
     let mut next_mine_at = tokio::time::Instant::now();
     let mut next_sync_state_at = tokio::time::Instant::now();
+    // publish_recent_chain_blocks re-gossips up to `sync_rebroadcast_recent_blocks`
+    // full block payloads. Running that on the same 3s cadence as the cheap
+    // height/announce broadcasts turned into a self-inflicted gossip storm: a
+    // seed configured with a nonzero rebroadcast count was re-publishing ~10
+    // blocks/sec forever, each as a brand-new gossipsub message (so peers can't
+    // dedupe it against the identical content they already have), which is what
+    // OOM-killed the bootstrap seed every ~15 minutes in production. Recent
+    // blocks only need to be nudged back onto the wire occasionally to help a
+    // peer that missed one during a brief disconnect -- IBD/RPC sync remains the
+    // real catch-up path -- so this gets its own far slower timer.
+    let mut next_block_rebroadcast_at = tokio::time::Instant::now();
     let mut next_seed_reconnect_at = tokio::time::Instant::now();
     let mut seed_reconnect_failures = 0u32;
     let mut next_ibd_at = tokio::time::Instant::now();
@@ -10047,6 +10058,10 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             {
                 last_event = announce_event;
             }
+            next_sync_state_at = tokio::time::Instant::now() + Duration::from_secs(3);
+        }
+
+        if tokio::time::Instant::now() >= next_block_rebroadcast_at {
             // Block rebroadcast is skipped during mining to avoid flooding
             // the network with redundant payloads the miner just produced.
             if !mining_active {
@@ -10065,7 +10080,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             )? {
                 last_event = rpc_rebroadcast_event;
             }
-            next_sync_state_at = tokio::time::Instant::now() + Duration::from_secs(3);
+            next_block_rebroadcast_at = tokio::time::Instant::now() + Duration::from_secs(120);
         }
 
         // Drain private tx sidecars from the normal fullnode loop, not only
