@@ -2605,12 +2605,13 @@ fn mining_progress_log(progress: &MiningProgressSnapshot) {
 /// screen clear: it appends to the terminal like a log so it coexists with
 /// the streaming `mining: progress …` lines instead of wiping them.
 fn print_mining_console_status(
-    wallet_name: &str,
+    wallet_address: &str,
     height: u64,
     peers: usize,
     mining: bool,
     hashrate_hps: u64,
     wallet_balance_atoms: Option<u64>,
+    wallet_balance_error: Option<&str>,
     session_blocks: u64,
     session_rewards: u64,
     last_event: &str,
@@ -2627,14 +2628,18 @@ fn print_mining_console_status(
     } else {
         paint("off", ANSI_YELLOW)
     };
-    let balance_label = match wallet_balance_atoms {
-        Some(atoms) => paint(&format_zka_amount(atoms), ANSI_CYAN),
-        None => paint("—", ANSI_DIM),
+    let balance_label = match (wallet_balance_atoms, wallet_balance_error) {
+        (Some(atoms), _) => paint(&format_zka_amount(atoms), ANSI_CYAN),
+        (None, Some(err)) => paint(
+            &format!("— ({})", truncate_dashboard_text(err, 60)),
+            ANSI_RED,
+        ),
+        (None, None) => paint("—", ANSI_DIM),
     };
     println!(
         "{}  wallet={}  height={}  peers={}  mining={mining_label}  hashrate={}  balance={balance_label}  session={} block(s) / {}  {} {}",
         paint("status", ANSI_DIM),
-        paint(wallet_name, ANSI_CYAN),
+        paint(wallet_address, ANSI_CYAN),
         paint(&height.to_string(), ANSI_BOLD),
         paint(&peers.to_string(), peers_color),
         paint(&format_hashrate_hps(hashrate_hps as f64), ANSI_MAGENTA),
@@ -10547,21 +10552,25 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 // this doesn't re-run the (Argon2-backed) wallet decrypt on
                 // every console tick -- same fix as the earlier CPU-pegging
                 // dashboard bug, just shared rather than re-triggered here.
-                let wallet_balance = load_wallet_runtime_snapshot_for_dashboard(
+                let wallet_snapshot_result = load_wallet_runtime_snapshot_for_dashboard(
                     &storage,
                     &wallet_address,
                     password.as_deref(),
                     network,
-                )
-                .map(|snapshot| snapshot.total_balance)
-                .ok();
+                );
+                let wallet_balance = wallet_snapshot_result
+                    .as_ref()
+                    .ok()
+                    .map(|snapshot| snapshot.total_balance);
+                let wallet_balance_error = wallet_snapshot_result.as_ref().err().map(String::as_str);
                 print_mining_console_status(
-                    &wallet_name,
+                    &wallet_address,
                     runtime_chain_height,
                     node.connected_peer_count(),
                     runtime_mining_enabled || mining_active,
                     runtime_mining_state.estimated_hashrate_hps,
                     wallet_balance,
+                    wallet_balance_error,
                     session_mined_blocks,
                     session_mined_rewards,
                     &last_event,
