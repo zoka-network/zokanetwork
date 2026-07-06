@@ -8619,6 +8619,26 @@ fn expand_node_config_into_args(args: &[String]) -> Result<Vec<String>, String> 
         .map_err(|e| format!("invalid config {}: {e}", path.display()))?;
     println!("Loaded node config: {}", path.display());
 
+    // `main()` chdir's the process into the Zoka home directory (so the
+    // fullnode's own relative paths like ".zoka/mainnet" resolve correctly)
+    // before this ever runs -- so by the time we get here, the process's
+    // current directory is NOT the folder the user's zoka.config.json lives
+    // in. A bare relative value like "network_config": "mainnet-network.v1.json"
+    // would then resolve against the wrong directory and fail to load. Resolve
+    // relative file paths from the config against the config file's own
+    // directory instead, so they work regardless of that chdir.
+    let config_dir = path.parent().map(std::path::Path::to_path_buf);
+    let resolve_relative_path = |value: &str| -> String {
+        let candidate = PathBuf::from(value);
+        if candidate.is_absolute() {
+            return value.to_string();
+        }
+        match &config_dir {
+            Some(dir) => dir.join(&candidate).to_string_lossy().into_owned(),
+            None => value.to_string(),
+        }
+    };
+
     let mut cfg_args: Vec<String> = Vec::new();
     let push = |a: &mut Vec<String>, flag: &str, value: &str| {
         a.push(flag.to_string());
@@ -8637,13 +8657,13 @@ fn expand_node_config_into_args(args: &[String]) -> Result<Vec<String>, String> 
         push(&mut cfg_args, "--address", &v);
     }
     if let Some(v) = non_empty(&cfg.network_config) {
-        push(&mut cfg_args, "--network-config", &v);
+        push(&mut cfg_args, "--network-config", &resolve_relative_path(&v));
     }
     if let Some(v) = non_empty(&cfg.power) {
         push(&mut cfg_args, "--power", &v);
     }
     if let Some(v) = non_empty(&cfg.db) {
-        push(&mut cfg_args, "--db", &v);
+        push(&mut cfg_args, "--db", &resolve_relative_path(&v));
     }
     if let Some(threads) = &cfg.threads {
         push(&mut cfg_args, "--threads", &threads.as_arg());
