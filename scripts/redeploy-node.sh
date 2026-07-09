@@ -16,8 +16,8 @@ set -euo pipefail
 
 REPO_DIR="${REPO_DIR:-/root/ZOKA}"        # where the source is (cloned if missing)
 REPO_URL="${REPO_URL:-https://github.com/ZokaNetwork/ZokaNetwork.git}"
-BRANCH="${BRANCH:-codex/network-sync-encrypted-send}"
-SERVICE="${SERVICE:-zoka-bootstrap.service}"
+BRANCH="${BRANCH:-codex/mainnet-hotfix-economics-private-tx}"
+SERVICE="${SERVICE:-zoka-node.service}"
 BIN_NAME="${BIN_NAME:-zokahd}"
 BIN_DEST="${BIN_DEST:-/usr/local/bin/zokahd}"
 CORE_BIN_NAME="${CORE_BIN_NAME:-zoka}"
