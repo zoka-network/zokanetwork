@@ -72,7 +72,7 @@ fn print_usage() {
         "  zoka mine <wallet-zka1> [--network mainnet|testnet] [--password <pwd>] [--db <path>] [--rpc <http-url>] [--network-config <file>] [--minutes <n>] [--blocks <n>] [--power low|normal|max] [--allow-unsynced-mining]"
     );
     println!(
-        "  zoka node [--network mainnet|testnet] [--password <pwd>|--password-env <var>|--password-stdin] [--seed <multiaddr> ...] [--power low|normal|max] [--tor-proxy host:port] [--tor-only]"
+        "  zoka node [--network mainnet|testnet] [--password <pwd>|--password-env <var>|--password-stdin] [--seed <multiaddr> ...] [--power low|normal|max] [--tor-proxy host:port] [--tor-only] [--external-addr <multiaddr> ...]"
     );
     println!("  zoka node-status [--db <path>] [--password <pwd>]");
     println!("  zoka status");
@@ -1057,6 +1057,26 @@ fn write_fullnode_ready_file(
     let json = serde_json::to_string_pretty(&serde_json::Value::Object(output))
         .map_err(|e| format!("ready file serialize failed: {e}"))?;
     fs::write(ready_path, json).map_err(|e| format!("ready file write failed: {e}"))
+}
+
+fn seed_address_for_peer(addr: &str, peer_id: &str) -> String {
+    let trimmed = addr.trim().trim_end_matches('/');
+    if trimmed.contains("/p2p/") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/p2p/{peer_id}")
+    }
+}
+
+fn seed_addresses_for_peer(addrs: &[String], peer_id: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for addr in addrs {
+        let seed = seed_address_for_peer(addr, peer_id);
+        if !out.contains(&seed) {
+            out.push(seed);
+        }
+    }
+    out
 }
 
 fn print_wallet_ready_notice(storage: &WalletStorage, wallet_name: &str) {
@@ -8758,6 +8778,11 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let genesis_path = option_value(args, "--genesis")
         .or_else(|| Some(network.default_genesis_path().to_string()));
     let ready_file = option_value(args, "--ready-file");
+    let external_addrs = option_values(args, "--external-addr")
+        .into_iter()
+        .map(|addr| addr.trim().to_string())
+        .filter(|addr| !addr.is_empty())
+        .collect::<Vec<_>>();
     if let Some(path) = ready_file.as_deref() {
         write_fullnode_ready_file(
             path,
@@ -9141,7 +9166,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
 
     zoka::api::global_startup_status()
         .set_phase("starting_p2p", Some("starting libp2p node".to_string()));
-    let mut node = Node::new(0).await.map_err(|e| {
+    let mut node = Node::new_with_tor_proxy(0, tor_proxy.clone()).await.map_err(|e| {
         zoka::api::global_startup_status().mark_failed(Some(format!("node init error: {e}")));
         format!("node init error: {e}")
     })?;
@@ -9157,6 +9182,14 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         zoka::api::global_startup_status().mark_failed(Some(format!("listen error: {e}")));
         format!("listen error: {e}")
     })?;
+    for addr in &external_addrs {
+        node.add_external_address(addr).map_err(|e| {
+            zoka::api::global_startup_status()
+                .mark_failed(Some(format!("external address error: {e}")));
+            format!("external address error: {e}")
+        })?;
+        startup_notes.push(format!("External P2P address advertised: {addr}."));
+    }
     let announced = timeout(Duration::from_secs(10), node.wait_for_listen_addr())
         .await
         .map_err(|_| {
@@ -9176,6 +9209,13 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     )));
     if let Some(path) = ready_file.as_deref() {
         let peer_id = node.peer_id().to_string();
+        let mut publishable_addrs = external_addrs.clone();
+        publishable_addrs.push(announced.clone());
+        let seed_addresses = seed_addresses_for_peer(&publishable_addrs, &peer_id);
+        let seed_address = seed_addresses
+            .first()
+            .cloned()
+            .unwrap_or_else(|| seed_address_for_peer(&announced, &peer_id));
         write_fullnode_ready_file(
             path,
             "ready",
@@ -9184,7 +9224,9 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 "chain_id": chain_id.as_str(),
                 "peer_id": peer_id,
                 "listen_address": announced,
-                "seed_address": format!("{}/p2p/{}", announced, peer_id),
+                "external_addresses": external_addrs,
+                "seed_addresses": seed_addresses,
+                "seed_address": seed_address,
                 "db": db_path,
                 "wallet": wallet_name,
                 "wallet_address": wallet_address,
@@ -14194,7 +14236,7 @@ async fn run() -> Result<(), String> {
         if first == "--help" || first == "-h" || first == "help" {
             println!("zokahd (automatic fullnode)");
             println!(
-                "Usage: zokahd [--network mainnet|testnet] [--address <wallet-address>] [--password <pwd>|--password-env <var>|--password-stdin] [--seed <multiaddr> ...] [--network-config <file>] [--no-network-config] [--allow-clearnet-seeds] [--allow-isolated-start] [--seconds <n>] [--show-keys] [--no-mine] [--power low|normal|max] [--threads <n>] [--db <path>] [--genesis <file>] [--tor-proxy host:port] [--tor-only] [--inline]"
+                "Usage: zokahd [--network mainnet|testnet] [--address <wallet-address>] [--password <pwd>|--password-env <var>|--password-stdin] [--seed <multiaddr> ...] [--network-config <file>] [--no-network-config] [--allow-clearnet-seeds] [--allow-isolated-start] [--seconds <n>] [--show-keys] [--no-mine] [--power low|normal|max] [--threads <n>] [--db <path>] [--genesis <file>] [--tor-proxy host:port] [--tor-only] [--external-addr <multiaddr> ...] [--inline]"
             );
             println!(
                 "Runs fullnode + sync warmup + auto-mining by default until interrupted. --password is required when auto-creating a wallet."
@@ -15158,6 +15200,36 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("temp db dir");
         let db = tmp.path().join("chain.db");
         (tmp, db.to_string_lossy().to_string())
+    }
+
+    #[test]
+    fn seed_address_for_peer_appends_p2p_suffix_once() {
+        let peer_id = "12D3KooWSeedPeer";
+        assert_eq!(
+            seed_address_for_peer("/onion3/exampleaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:28080", peer_id),
+            "/onion3/exampleaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:28080/p2p/12D3KooWSeedPeer"
+        );
+        assert_eq!(
+            seed_address_for_peer("/ip4/127.0.0.1/tcp/28080/p2p/12D3KooWSeedPeer", peer_id),
+            "/ip4/127.0.0.1/tcp/28080/p2p/12D3KooWSeedPeer"
+        );
+    }
+
+    #[test]
+    fn seed_addresses_for_peer_deduplicates_external_and_listen_addrs() {
+        let peer_id = "12D3KooWSeedPeer";
+        let addrs = vec![
+            "/ip4/127.0.0.1/tcp/28080".to_string(),
+            "/ip4/127.0.0.1/tcp/28080/".to_string(),
+            "/dns4/seed.example/tcp/28080/p2p/12D3KooWSeedPeer".to_string(),
+        ];
+        assert_eq!(
+            seed_addresses_for_peer(&addrs, peer_id),
+            vec![
+                "/ip4/127.0.0.1/tcp/28080/p2p/12D3KooWSeedPeer".to_string(),
+                "/dns4/seed.example/tcp/28080/p2p/12D3KooWSeedPeer".to_string(),
+            ]
+        );
     }
 
     fn save_test_coinbase_block(

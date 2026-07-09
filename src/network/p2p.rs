@@ -3,9 +3,18 @@
 //! This module now includes gossipsub transport for `ZokaMessage`,
 //! including a dedicated PBFT topic.
 
-use futures::StreamExt;
+use futures::{
+    future::{BoxFuture, FutureExt},
+    AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite, StreamExt,
+};
 use libp2p::{
-    core::multiaddr::Multiaddr,
+    core::{
+        multiaddr::Multiaddr,
+        muxing::StreamMuxerBox,
+        transport::{ListenerId, TransportError, TransportEvent},
+        upgrade::Version,
+        Transport,
+    },
     gossipsub, identify, identity,
     kad::{self, store::MemoryStore},
     noise, request_response,
@@ -14,9 +23,12 @@ use libp2p::{
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
@@ -368,6 +380,148 @@ struct DialTarget {
     host: String,
     port: u16,
     kind: DialTargetKind,
+}
+
+#[derive(Clone, Debug)]
+struct TorSocksTransport {
+    proxy_endpoint: Option<String>,
+}
+
+impl TorSocksTransport {
+    fn new(proxy_endpoint: Option<String>) -> Self {
+        Self {
+            proxy_endpoint: proxy_endpoint
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+        }
+    }
+}
+
+struct TorSocksStream(tokio_socks::tcp::Socks5Stream<tokio::net::TcpStream>);
+
+impl fmt::Debug for TorSocksStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TorSocksStream").finish_non_exhaustive()
+    }
+}
+
+impl FuturesAsyncRead for TorSocksStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        let mut read_buf = tokio::io::ReadBuf::new(buf);
+        futures::ready!(tokio::io::AsyncRead::poll_read(
+            Pin::new(&mut self.0),
+            cx,
+            &mut read_buf
+        ))?;
+        Poll::Ready(Ok(read_buf.filled().len()))
+    }
+}
+
+impl FuturesAsyncWrite for TorSocksStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        tokio::io::AsyncWrite::poll_write(Pin::new(&mut self.0), cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        tokio::io::AsyncWrite::poll_flush(Pin::new(&mut self.0), cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        tokio::io::AsyncWrite::poll_shutdown(Pin::new(&mut self.0), cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<Result<usize, io::Error>> {
+        tokio::io::AsyncWrite::poll_write_vectored(Pin::new(&mut self.0), cx, bufs)
+    }
+}
+
+impl Transport for TorSocksTransport {
+    type Output = TorSocksStream;
+    type Error = io::Error;
+    type ListenerUpgrade = futures::future::Pending<Result<Self::Output, Self::Error>>;
+    type Dial = BoxFuture<'static, Result<Self::Output, Self::Error>>;
+
+    fn listen_on(
+        &mut self,
+        _id: ListenerId,
+        addr: Multiaddr,
+    ) -> Result<(), TransportError<Self::Error>> {
+        Err(TransportError::MultiaddrNotSupported(addr))
+    }
+
+    fn remove_listener(&mut self, _id: ListenerId) -> bool {
+        false
+    }
+
+    fn dial(&mut self, addr: Multiaddr) -> Result<Self::Dial, TransportError<Self::Error>> {
+        let Some(proxy_endpoint) = self.proxy_endpoint.clone() else {
+            return Err(TransportError::MultiaddrNotSupported(addr));
+        };
+        let Some(target) = Node::dial_target_from_multiaddr(&addr) else {
+            return Err(TransportError::MultiaddrNotSupported(addr));
+        };
+        if target.kind != DialTargetKind::TorOnion {
+            return Err(TransportError::MultiaddrNotSupported(addr));
+        }
+
+        Ok(async move {
+            let stream =
+                tokio_socks::tcp::Socks5Stream::connect(
+                    proxy_endpoint.as_str(),
+                    (target.host, target.port),
+                )
+                .await
+                .map_err(|e| io::Error::other(format!("SOCKS5 connect failed: {e}")))?;
+            Ok(TorSocksStream(stream))
+        }
+        .boxed())
+    }
+
+    fn dial_as_listener(
+        &mut self,
+        addr: Multiaddr,
+    ) -> Result<Self::Dial, TransportError<Self::Error>> {
+        self.dial(addr)
+    }
+
+    fn poll(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<TransportEvent<Self::ListenerUpgrade, Self::Error>> {
+        Poll::Pending
+    }
+
+    fn address_translation(&self, _listen: &Multiaddr, _observed: &Multiaddr) -> Option<Multiaddr> {
+        None
+    }
+}
+
+fn build_tor_socks_transport(
+    key: &identity::Keypair,
+    proxy_endpoint: Option<String>,
+) -> Result<
+    libp2p::core::transport::Boxed<(PeerId, StreamMuxerBox)>,
+    Box<dyn Error + Send + Sync>,
+> {
+    let noise = noise::Config::new(key)
+        .map_err(|e| io::Error::other(format!("noise config error: {e}")))?;
+    Ok(TorSocksTransport::new(proxy_endpoint)
+        .upgrade(Version::V1Lazy)
+        .authenticate(noise)
+        .multiplex(yamux::Config::default())
+        .boxed())
 }
 
 impl Default for NetworkPrivacyConfig {
@@ -1298,7 +1452,15 @@ impl Node {
     }
 
     /// Create a new node with gossipsub + identify + kademlia.
-    pub async fn new(_listen_port: u16) -> Result<Self, Box<dyn Error>> {
+    pub async fn new(listen_port: u16) -> Result<Self, Box<dyn Error>> {
+        Self::new_with_tor_proxy(listen_port, None).await
+    }
+
+    /// Create a new node and include a Tor SOCKS transport for onion dials when configured.
+    pub async fn new_with_tor_proxy(
+        _listen_port: u16,
+        tor_proxy: Option<String>,
+    ) -> Result<Self, Box<dyn Error>> {
         let local_key = Self::load_or_generate_identity_key()?;
         let peer_id = PeerId::from(local_key.public());
         info!("Local PeerId: {}", peer_id);
@@ -1311,6 +1473,7 @@ impl Node {
         let pbft_topic_for_behaviour = pbft_topic.clone();
         let stem_topic_for_behaviour = stem_topic.clone();
         let mixer_topic_for_behaviour = mixer_topic.clone();
+        let tor_proxy_for_transport = tor_proxy.clone();
 
         let swarm = SwarmBuilder::with_existing_identity(local_key)
             .with_tokio()
@@ -1319,6 +1482,9 @@ impl Node {
                 noise::Config::new,
                 yamux::Config::default,
             )?
+            .with_other_transport(move |key| {
+                build_tor_socks_transport(key, tor_proxy_for_transport.clone())
+            })?
             // Wrap the TCP transport in a DNS resolver so `/dns4/<host>/tcp/<port>`
             // seed multiaddrs dial correctly. Without this the swarm rejects DNS
             // multiaddrs outright, which would pin the network manifest to raw
@@ -1414,6 +1580,11 @@ impl Node {
             })?
             .build();
 
+        let privacy_config = tor_proxy
+            .filter(|proxy| !proxy.trim().is_empty())
+            .map(|proxy| NetworkPrivacyConfig::default().with_tor_proxy(proxy))
+            .unwrap_or_default();
+
         Ok(Self {
             peer_id,
             swarm,
@@ -1421,7 +1592,7 @@ impl Node {
             pbft_topic,
             stem_topic,
             mixer_topic,
-            privacy_config: NetworkPrivacyConfig::default(),
+            privacy_config,
             inbound_queue: VecDeque::new(),
             mixer_batcher: MixerBatcher::new(),
             seen_mixer_batches: HashSet::new(),
@@ -2173,6 +2344,14 @@ impl Node {
         let addr: Multiaddr = addr.parse()?;
         self.swarm.listen_on(addr.clone())?;
         info!("Node listening on {}", addr);
+        Ok(())
+    }
+
+    /// Advertise an externally reachable multiaddr in Identify.
+    pub fn add_external_address(&mut self, addr: &str) -> Result<(), Box<dyn Error>> {
+        let addr: Multiaddr = addr.parse()?;
+        self.swarm.add_external_address(addr.clone());
+        info!("Node external address advertised: {}", addr);
         Ok(())
     }
 
@@ -4357,6 +4536,35 @@ mod tests {
         );
 
         let _ = proxy_task.await;
+    }
+
+    #[tokio::test]
+    async fn test_tor_socks_transport_dials_onion_via_mock_proxy() {
+        let (proxy_endpoint, proxy_task) = spawn_mock_socks5_proxy().await;
+        let mut transport = TorSocksTransport::new(Some(proxy_endpoint));
+        let onion_addr: Multiaddr =
+            "/onion3/vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd:1234"
+                .parse()
+                .expect("parse onion3");
+
+        let stream = Transport::dial(&mut transport, onion_addr)
+            .expect("onion dial should be supported")
+            .await
+            .expect("mock socks dial should succeed");
+        drop(stream);
+        let _ = proxy_task.await;
+    }
+
+    #[test]
+    fn test_tor_socks_transport_rejects_direct_addr() {
+        let mut transport = TorSocksTransport::new(Some("127.0.0.1:9050".to_string()));
+        let direct_addr: Multiaddr = "/ip4/127.0.0.1/tcp/28080"
+            .parse()
+            .expect("parse direct addr");
+        assert!(matches!(
+            Transport::dial(&mut transport, direct_addr),
+            Err(TransportError::MultiaddrNotSupported(_))
+        ));
     }
 
     #[tokio::test]
