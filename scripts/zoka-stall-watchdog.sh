@@ -26,7 +26,7 @@
 set -uo pipefail
 
 LOCAL_RPC="${LOCAL_RPC:-http://127.0.0.1:3000}"
-REFERENCE_RPC="${REFERENCE_RPC:?set REFERENCE_RPC to the other seed's RPC URL}"
+REFERENCE_RPC="${REFERENCE_RPC:?set REFERENCE_RPC to the other seed RPC URL}"
 SERVICE="${SERVICE:-zoka-node.service}"
 GAP_THRESHOLD="${GAP_THRESHOLD:-10}"
 STALL_THRESHOLD="${STALL_THRESHOLD:-3}"   # consecutive no-progress runs (>= ~15 min at */5) before restarting
