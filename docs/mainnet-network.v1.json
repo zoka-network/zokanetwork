@@ -11,44 +11,34 @@
   },
   "seed_nodes": [
     {
-      "label": "do-nyc-bootstrap-1",
+      "label": "seed1",
       "operator": "zoka-core",
-      "region": "nyc",
-      "multiaddr": "/ip4/159.223.119.216/tcp/28080",
+      "region": "community",
+      "multiaddr": "/dns4/seed1.zoka.network/tcp/28080",
       "onion": null,
       "i2p": null,
       "role": "seed",
       "status": "active",
-      "note": "Primary bootstrap - peer discovery entry point for new nodes"
+      "note": "Primary bootstrap - DNS-based so the host can move without a new binary release. Peer discovery entry point for new nodes; after first join, nodes rely on their persistent peer store and PEX."
     },
     {
-      "label": "do-nyc-rpc-1",
+      "label": "seed2",
       "operator": "zoka-core",
-      "region": "nyc",
-      "multiaddr": "/ip4/157.230.5.103/tcp/28080",
+      "region": "community",
+      "multiaddr": "/dns4/seed2.zoka.network/tcp/28080",
       "onion": null,
       "i2p": null,
       "role": "seed",
       "status": "active",
-      "note": "Secondary bootstrap - fallback peer discovery if primary is unreachable"
+      "note": "Secondary bootstrap - fallback peer discovery if seed1 is unreachable."
     }
   ],
   "public_rpc": [
     {
-      "label": "do-nyc-bootstrap-rpc-fallback",
+      "label": "rpc1",
       "operator": "zoka-core",
-      "region": "nyc",
-      "url": "http://159.223.119.216:3000",
-      "onion": null,
-      "i2p": null,
-      "status": "active",
-      "logging_policy": "no-wallet-secrets-no-private-keys"
-    },
-    {
-      "label": "do-nyc-rpc-1",
-      "operator": "zoka-core",
-      "region": "nyc",
-      "url": "http://157.230.5.103:3000",
+      "region": "community",
+      "url": "http://rpc.zoka.network:3000",
       "onion": null,
       "i2p": null,
       "status": "active",
@@ -69,7 +59,7 @@
   "joining": {
     "full_node": "zoka fullnode --network mainnet --network-config mainnet-network.v1.json --no-mine --allow-isolated-start --password <your-password>",
     "miner": "zoka fullnode --network mainnet --network-config mainnet-network.v1.json --mine-interval-secs 30 --mine-blocks 1 --min-mine-peers 1 --address <your-zka1-address> --password <your-password>",
-    "note": "The node auto-discovers peers from the seed node. Block rewards go directly to your wallet by protocol - no pool or intermediary."
+    "note": "The node auto-discovers peers from the seed nodes. After the first successful join, the persistent peer store lets the node reconnect to the mesh even if every seed is down. Block rewards go directly to your wallet by protocol - no pool or intermediary."
   },
   "trusted_setup": {
     "release": "https://github.com/ZokaNetwork/ZokaNetwork/releases/tag/trusted-setup-mainnet-v1",
@@ -111,9 +101,10 @@
     "4c9f0ab16d1400cd69123a02738399498b0b5edf6f56ae45f3c96e01864216af"
   ],
   "notes": [
-    "Primary bootstrap for the Zoka mainnet (DigitalOcean infrastructure).",
-    "Wallet secrets and private keys must remain local; this RPC is read-only chain status.",
+    "Community-run bootstrap: seeds are DNS names (seed1/seed2.zoka.network) so hosts can rotate without shipping new binaries.",
+    "Wallet secrets and private keys must remain local; public RPC is read-only chain status.",
     "Open mining network: anyone can run a node or miner and earn block rewards.",
+    "Want to help decentralize? Run a node with port 28080 reachable and ask to be added as a seed.",
     "Tor/I2P endpoints are not active yet."
   ]
 }

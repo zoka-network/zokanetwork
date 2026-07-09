@@ -1319,6 +1319,12 @@ impl Node {
                 noise::Config::new,
                 yamux::Config::default,
             )?
+            // Wrap the TCP transport in a DNS resolver so `/dns4/<host>/tcp/<port>`
+            // seed multiaddrs dial correctly. Without this the swarm rejects DNS
+            // multiaddrs outright, which would pin the network manifest to raw
+            // IPs forever — seeds must be re-pointable via DNS records, not new
+            // binary releases (the 2026-07 DigitalOcean shutdown proved why).
+            .with_dns()?
             .with_behaviour(move |key| {
                 let local_peer_id = PeerId::from(key.public());
 
