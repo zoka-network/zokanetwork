@@ -151,4 +151,38 @@ Repos:
   red instead of a silent dash — e.g. it now surfaces "could not be
   unlocked with the provided password" directly.
 
+### 8. Node: CONSENSUS — fork recovery was impossible (nullifier check wasn't branch-aware)
+- **Commit:** `34221e6`
+- **Problem:** Mainnet forked for real at height 2736 (2026-07-08). The same
+  private tx was mined into block 2736 of both branches — normal fork
+  behavior. But the double-spend check validated every block, including
+  side-branch blocks, against the global spent-nullifier index (which only
+  reflects the current branch), so a node on the losing branch rejected
+  every canonical block carrying the shared nullifier as a "double-spend"
+  and could **never reorg back — the split was permanent**. Verified live
+  twice on the bootstrap seed (original DB and a from-scratch resync both
+  wedged at the same height, same nullifier), with block hashes and the
+  shared nullifier confirmed present on both branches.
+- **Fix:** The global-index check now applies only to blocks extending the
+  head. Side branches store with intra-block validation, and the real rule
+  is enforced at promotion time against the post-reorg state: nullifiers
+  freed by the outgoing blocks may be re-spent by the incoming branch; only
+  a respend of a nullifier committed below the branch point (or duplicated
+  within the incoming branch) aborts the reorg. New regression tests both
+  ways. **All miners should upgrade — pre-1.6.2 nodes stuck repeating
+  "private double-spend: nullifier ... already committed on-chain" recover
+  by upgrading, no DB wipe needed.**
+
+### 9. Node: autonomous bootstrap — DNS-based seeds, no more hardcoded infrastructure IPs
+- **Commit:** `ef0b504`
+- **Change:** The network manifest embedded two fixed DigitalOcean IPs in
+  every binary; when that infrastructure was decommissioned (2026-07-09),
+  new nodes lost their entry point and re-pointing seeds required a new
+  release. The manifest now uses DNS names (`seed1`/`seed2.zoka.network`)
+  so seed hosts rotate with a DNS record change. Also added the libp2p
+  `dns` transport (`.with_dns()`) — without it the swarm rejected `/dns4/`
+  multiaddrs outright, so this was a code fix too, not just a config edit.
+  Existing nodes keep working regardless: the persistent peer store + peer
+  exchange keep the mesh connected with zero seeds online.
+
 <!-- Add new entries above this line as we fix more. -->
