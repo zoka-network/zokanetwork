@@ -1,15 +1,12 @@
-# ZOKA / ZSilent 1.6.2 — accumulating fixes
+# ZOKA / ZSilent 1.6.2 — patch release notes
 
-Running notes for the next patch release after 1.6.1. Nothing here is built
-or published as a standalone release yet — the node-side fix below is
-already deployed live on both seeds (an active-incident exception to the
-usual "commit now, build/publish later" rule), but no new GitHub
-release/ZSilent installer has been cut. Commits accumulate on the working
-branches until we cut 1.6.2.
+Patch release after 1.6.1. Fully protocol-compatible (same freeze id
+`/zoka/1.6.0-mainnet-zenith`), no reseed needed.
 
 Repos:
-- Node: `ZokaNetwork/ZokaNetwork` (branch `codex/mainnet-hotfix-economics-private-tx`, ahead of `v1.6.1` tag)
-- App: `ZokaNetwork/zsilent-core` (branch `main`, at `v1.6.1`)
+
+- Node: `ZokaNetwork/ZokaNetwork` (tag `v1.6.2`)
+- App: `ZokaNetwork/zsilent-core` (tag `v1.6.2`, embeds the node `v1.6.2` binaries)
 
 ## Fixes included so far
 
@@ -126,5 +123,32 @@ Repos:
   `best_reachable_rpc_height_from_args`, `standalone_mining_sync_gate`, the
   unused `MiningBatchSummary.last_solve_time_secs` field). `cargo check`
   clean with zero warnings; `cargo test --lib` green.
+
+### 6. Node: mining console didn't show which wallet was mining, and stale private peer addresses never expired
+- **Problem:** The recurring console status line showed balance and hashrate
+  but no wallet identifier, so once startup output scrolled past there was
+  no way to tell which wallet was actually mining without restarting.
+  Separately, `PeerStore::dial_addrs` could keep handing out
+  datacenter-internal peer addresses (e.g. a seed's `10.x` VPC interface)
+  written to disk by a build predating the insert-time filter added
+  earlier — a node would retry an address it could never reach forever,
+  producing constant `Failed to negotiate transport` / connection-timeout
+  noise.
+- **Fix:** `print_mining_console_status` now takes a `wallet_name` and
+  prints it on every tick. `PeerStore::dial_addrs` now re-applies
+  `discovered_addr_is_publicly_dialable` on read, so a `peer_store.json`
+  written before the filter existed self-heals instead of needing a manual
+  purge. Added a regression test for the stale-entry case.
+
+### 7. Node: console now shows the full receiving address, and surfaces why the balance failed to load
+- **Problem:** User feedback: wanted the actual `zka1...` receiving
+  address on the status line (not the short local wallet label), and
+  wanted to know *why* balance sometimes showed a bare `—` instead of a
+  number — a wrong or missing wallet password silently produces this with
+  no indication that's the cause.
+- **Fix:** The status line now shows the full wallet address. When the
+  wallet snapshot fails to load, the (truncated) error is shown inline in
+  red instead of a silent dash — e.g. it now surfaces "could not be
+  unlocked with the provided password" directly.
 
 <!-- Add new entries above this line as we fix more. -->

@@ -1,0 +1,51 @@
+name: Build Linux Release Binary
+
+# Manual-dispatch only, and deliberately independent of deploy-mainnet.yml:
+# this builds and uploads a release asset but never touches the droplets, so
+# it's safe to run any time (including while a seed is mid-resync) without
+# risking a production restart.
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing GitHub release tag to attach the binary to (must already exist)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build zoka-linux-x86_64
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Install RandomX build deps
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential pkg-config
+
+      - name: Build release binary
+        run: cargo build --release --bin zoka
+
+      - name: Rename and checksum
+        run: |
+          cp target/release/zoka zoka-linux-x86_64
+          sha256sum zoka-linux-x86_64
+
+      - name: Upload to existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ inputs.release_tag }}" zoka-linux-x86_64 --clobber
