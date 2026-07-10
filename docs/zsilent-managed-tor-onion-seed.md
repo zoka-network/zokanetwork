@@ -22,25 +22,36 @@ Log notice stdout
 
 ## Release Packaging
 
-1. Download the official Tor Project Expert Bundle for Windows x86_64.
-2. Verify it before packaging. The helper script requires a pinned SHA256 and can also verify `.asc` with GPG:
+### Step 1 — Prepare and verify the Tor Expert Bundle
+
+The helper script downloads the bundle, checksum-verifies it against a pinned
+SHA256, optionally verifies the `.asc` signature with GPG, and extracts it into
+`third_party/tor/windows-x86_64`.
+
+Pinned bundle (Tor Expert Bundle 15.0.17, tor 0.4.9.11):
+
+- URL: `https://archive.torproject.org/tor-package-archive/torbrowser/15.0.17/tor-expert-bundle-windows-x86_64-15.0.17.tar.gz`
+- SHA256: `5f91e9426bf641dfe539dc28029088c72bed0b1d8f1c79104a0f89273cb3ebe1`
+- Signature: `https://archive.torproject.org/tor-package-archive/torbrowser/15.0.17/tor-expert-bundle-windows-x86_64-15.0.17.tar.gz.asc`
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File zsilent-core/scripts/prepare-tor-expert-bundle-windows.ps1 `
-  -Url "<official-tor-expert-bundle-url>" `
-  -Sha256 "<pinned-sha256>" `
-  -AscUrl "<official-asc-url>" `
+  -Url "https://archive.torproject.org/tor-package-archive/torbrowser/15.0.17/tor-expert-bundle-windows-x86_64-15.0.17.tar.gz" `
+  -Sha256 "5f91e9426bf641dfe539dc28029088c72bed0b1d8f1c79104a0f89273cb3ebe1" `
+  -AscUrl "https://archive.torproject.org/tor-package-archive/torbrowser/15.0.17/tor-expert-bundle-windows-x86_64-15.0.17.tar.gz.asc" `
   -VerifySignature
 ```
 
-3. Build the Windows installer with Tor required:
+When bumping the bundle, update all three values together (URL, SHA256, `.asc`). Compute the SHA256 with `Get-FileHash -Algorithm SHA256`.
+
+### Step 2 — Build the Windows installer with Tor required
 
 ```powershell
 cd zsilent-core
 .\gradlew.bat packageMsi -Pzsilent.requireTorBundle=true
 ```
 
-The Gradle package task copies the prepared bundle from `third_party/tor/windows-x86_64` or from `-Pzsilent.torBundleDir=<dir>` into `common/tor/windows-x86_64/`.
+The Gradle package task copies the prepared bundle from `third_party/tor/windows-x86_64` or from `-Pzsilent.torBundleDir=<dir>` into `common/tor/windows-x86_64/`. `-Pzsilent.requireTorBundle=true` makes the build fail (instead of warn) if the bundle is missing, so a release can't silently ship without Tor.
 
 ## Operating A Public Onion Seed
 

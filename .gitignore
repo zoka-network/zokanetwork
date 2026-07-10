@@ -40,3 +40,6 @@ test_output_decrypt.py
 # Discord bot
 discord-bot/node_modules/
 discord-bot/.env
+
+# Tor Expert Bundle staged locally for packaging (downloaded, not versioned)
+third_party/
