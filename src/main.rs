@@ -9293,12 +9293,29 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 // a single P2P peer.
                 let seed_candidates = network_config.active_seed_candidates(allow_clearnet_seeds);
                 let mut merged_seeds = 0usize;
+                let mut skipped_anon_seeds = 0usize;
                 for seed in &seed_candidates {
+                    // A `tor`/`i2p` seed can only be dialed through a running
+                    // SOCKS proxy. Without --tor-proxy the node has no transport
+                    // that can reach an /onion3/ or i2p address, so adding it to
+                    // the reconnect pool just produces endless "failed to
+                    // negotiate transport" churn. Skip anonymous seeds unless a
+                    // proxy is configured; the manifest's TCP/DNS seeds still
+                    // cover a plain (non-Tor) node.
+                    if (seed.transport == "tor" || seed.transport == "i2p") && tor_proxy.is_none() {
+                        skipped_anon_seeds += 1;
+                        continue;
+                    }
                     peer_store.upsert_addr(&seed.address, "manifest_seed");
                     if !reconnect_seed_peers.iter().any(|s| s == &seed.address) {
                         reconnect_seed_peers.push(seed.address.clone());
                         merged_seeds += 1;
                     }
+                }
+                if skipped_anon_seeds > 0 {
+                    startup_notes.push(format!(
+                        "Skipped {skipped_anon_seeds} anonymous (tor/i2p) seed(s): no --tor-proxy configured to dial them."
+                    ));
                 }
                 startup_notes.push(format!(
                     "{} network config loaded from {}: status={}, active_rpc={}, manifest_seeds_merged={} (reconnect pool now {}).",
