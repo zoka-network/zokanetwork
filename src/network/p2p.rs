@@ -517,10 +517,20 @@ fn build_tor_socks_transport(
 > {
     let noise = noise::Config::new(key)
         .map_err(|e| io::Error::other(format!("noise config error: {e}")))?;
+    // The plain TCP transport gets a default connect/upgrade timeout for
+    // free from SwarmBuilder::with_tcp(); this hand-rolled transport
+    // (registered via with_other_transport, which does not add that
+    // wrapper) previously had none at all. A Tor hidden-service circuit can
+    // legitimately take longer than a raw TCP handshake to build, so this
+    // is more generous than the TCP path's timeout rather than matching it
+    // exactly -- but without any bound the dial future would hang forever
+    // on a stalled SOCKS5/Tor circuit, silently blocking that peer slot.
+    const TOR_DIAL_TIMEOUT: Duration = Duration::from_secs(45);
     Ok(TorSocksTransport::new(proxy_endpoint)
         .upgrade(Version::V1Lazy)
         .authenticate(noise)
         .multiplex(yamux::Config::default())
+        .timeout(TOR_DIAL_TIMEOUT)
         .boxed())
 }
 
@@ -685,6 +695,17 @@ pub struct Node {
     pending_snapshot_requests: VecDeque<PendingSnapshotManifestRequest>,
     /// Outbound snapshot manifest responses received from peers.
     received_snapshot_manifests: VecDeque<ReceivedSnapshotManifests>,
+    /// Optional immediate responders for inbound block/header requests. When
+    /// set (the fullnode wires these to its open chain storage), the swarm
+    /// answers an inbound request the instant it arrives, inside the event
+    /// handler, instead of parking it on a queue that the main loop only
+    /// drains between (potentially slow) sync steps. That deferral was what
+    /// starved IBD: a peer's block request could sit unanswered for the whole
+    /// duration of an outbound request the server happened to be waiting on.
+    #[allow(clippy::type_complexity)]
+    block_body_responder: Option<Box<dyn Fn(&BlockBodyRequest) -> BlockBodyResponse + Send>>,
+    #[allow(clippy::type_complexity)]
+    header_responder: Option<Box<dyn Fn(&GetHeaders) -> HeadersResponse + Send>>,
 }
 
 /// Behaviour set for the node.
@@ -1528,6 +1549,14 @@ impl Node {
                 gossipsub.subscribe(&pbft_topic_for_behaviour)?;
                 gossipsub.subscribe(&stem_topic_for_behaviour)?;
                 gossipsub.subscribe(&mixer_topic_for_behaviour)?;
+                // Request/response timeouts are sized for onion transport:
+                // a Tor circuit adds several seconds of round-trip latency and
+                // each request opens a fresh substream (multistream-select +
+                // the round trip). The old 8-15s budgets were fine for
+                // clearnet but too tight once the network's only reliable path
+                // is Tor, so IBD block fetches would time out and retry
+                // forever. 30s gives comfortable headroom over Tor while still
+                // failing a genuinely dead peer in bounded time.
                 let block_request_response = request_response::Behaviour::with_codec(
                     BlockRequestResponseCodec,
                     [(
@@ -1535,7 +1564,7 @@ impl Node {
                         request_response::ProtocolSupport::Full,
                     )],
                     request_response::Config::default()
-                        .with_request_timeout(Duration::from_secs(8)),
+                        .with_request_timeout(Duration::from_secs(30)),
                 );
                 let private_tx_request_response = request_response::Behaviour::with_codec(
                     PrivateTxRequestResponseCodec,
@@ -1544,7 +1573,7 @@ impl Node {
                         request_response::ProtocolSupport::Full,
                     )],
                     request_response::Config::default()
-                        .with_request_timeout(Duration::from_secs(8)),
+                        .with_request_timeout(Duration::from_secs(20)),
                 );
                 let header_request_response = request_response::Behaviour::with_codec(
                     HeaderRequestResponseCodec,
@@ -1553,7 +1582,7 @@ impl Node {
                         request_response::ProtocolSupport::Full,
                     )],
                     request_response::Config::default()
-                        .with_request_timeout(Duration::from_secs(15)),
+                        .with_request_timeout(Duration::from_secs(30)),
                 );
                 let snapshot_request_response = request_response::Behaviour::with_codec(
                     SnapshotRequestResponseCodec,
@@ -1562,7 +1591,7 @@ impl Node {
                         request_response::ProtocolSupport::Full,
                     )],
                     request_response::Config::default()
-                        .with_request_timeout(Duration::from_secs(10)),
+                        .with_request_timeout(Duration::from_secs(30)),
                 );
 
                 Ok(NodeBehaviour {
@@ -1578,6 +1607,18 @@ impl Node {
                     snapshot_request_response,
                 })
             })?
+            .with_swarm_config(|cfg| {
+                // libp2p 0.53+ defaults idle_connection_timeout to 0, closing a
+                // connection the instant it has no active stream. Block sync
+                // opens a fresh request/response substream per block with gaps
+                // in between; over Tor -- where re-dialing an onion peer costs
+                // many seconds of circuit build -- that made the connection
+                // drop after a block or two and IBD stall (observed: a fresh
+                // node stuck at height ~2 while the peer stayed "connected").
+                // Keep idle connections alive for several minutes so one peer
+                // stays usable across the whole sync.
+                cfg.with_idle_connection_timeout(Duration::from_secs(300))
+            })
             .build();
 
         let privacy_config = tor_proxy
@@ -1624,6 +1665,8 @@ impl Node {
             received_header_responses: VecDeque::new(),
             pending_snapshot_requests: VecDeque::new(),
             received_snapshot_manifests: VecDeque::new(),
+            block_body_responder: None,
+            header_responder: None,
         })
     }
 
@@ -1773,13 +1816,42 @@ impl Node {
                         .block_request_response_stats
                         .inbound_received
                         .saturating_add(1);
-                    self.pending_block_body_requests
-                        .push_back(PendingBlockBodyRequest {
-                            peer,
-                            request,
-                            channel,
-                            received_at: Instant::now(),
-                        });
+                    // Answer immediately when a responder is wired (fullnode
+                    // serving from open storage). Compute the response first so
+                    // the immutable borrow of `self` for the responder ends
+                    // before send_response takes a mutable borrow.
+                    let immediate = self
+                        .block_body_responder
+                        .as_ref()
+                        .map(|responder| responder(&request));
+                    match immediate {
+                        Some(response) => {
+                            let received_at = Instant::now();
+                            match self
+                                .swarm
+                                .behaviour_mut()
+                                .block_request_response
+                                .send_response(channel, response)
+                            {
+                                Ok(()) => {
+                                    self.record_direct_block_success(
+                                        peer,
+                                        received_at.elapsed(),
+                                    );
+                                }
+                                Err(_) => self.record_direct_block_failure(peer),
+                            }
+                        }
+                        None => {
+                            self.pending_block_body_requests
+                                .push_back(PendingBlockBodyRequest {
+                                    peer,
+                                    request,
+                                    channel,
+                                    received_at: Instant::now(),
+                                });
+                        }
+                    }
                 }
                 request_response::Message::Response {
                     request_id,
@@ -1976,13 +2048,28 @@ impl Node {
                 request_response::Message::Request {
                     request, channel, ..
                 } => {
-                    self.pending_header_requests
-                        .push_back(PendingHeaderRequest {
-                            peer,
-                            request,
-                            channel,
-                            received_at: Instant::now(),
-                        });
+                    let immediate = self
+                        .header_responder
+                        .as_ref()
+                        .map(|responder| responder(&request));
+                    match immediate {
+                        Some(response) => {
+                            let _ = self
+                                .swarm
+                                .behaviour_mut()
+                                .header_request_response
+                                .send_response(channel, response);
+                        }
+                        None => {
+                            self.pending_header_requests
+                                .push_back(PendingHeaderRequest {
+                                    peer,
+                                    request,
+                                    channel,
+                                    received_at: Instant::now(),
+                                });
+                        }
+                    }
                 }
                 request_response::Message::Response { response, .. } => {
                     self.received_header_responses
@@ -2225,6 +2312,26 @@ impl Node {
         }
         self.private_tx_body_request_failures = deferred;
         matched
+    }
+
+    /// Install an immediate responder for inbound block-body requests. Once
+    /// set, requests are answered synchronously in the swarm event handler
+    /// (see handle_block_request_response_event) rather than queued, which is
+    /// what keeps IBD serving from being starved by the server's own sync
+    /// waits.
+    pub fn set_block_body_responder(
+        &mut self,
+        responder: impl Fn(&BlockBodyRequest) -> BlockBodyResponse + Send + 'static,
+    ) {
+        self.block_body_responder = Some(Box::new(responder));
+    }
+
+    /// Install an immediate responder for inbound GetHeaders requests.
+    pub fn set_header_responder(
+        &mut self,
+        responder: impl Fn(&GetHeaders) -> HeadersResponse + Send + 'static,
+    ) {
+        self.header_responder = Some(Box::new(responder));
     }
 
     pub fn take_pending_block_body_request(&mut self) -> Option<PendingBlockBodyRequest> {

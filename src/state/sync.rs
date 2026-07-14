@@ -82,10 +82,15 @@ impl PeerChainView {
         }
     }
 
-    /// Record a height from an operator-configured RPC endpoint. Unlike
-    /// untrusted P2P announcements, an RPC sync target can legitimately be far
-    /// ahead of a fresh local DB; block payloads are still fetched and validated
-    /// before any state is committed.
+    /// Record a sync-target height that is trusted enough to sit far ahead of
+    /// the local head: an operator-configured RPC endpoint, or a directly
+    /// connected peer's own declared chain head (a `SyncState` message).
+    /// Unlike untrusted one-off block announces (see [`observe`]), these can
+    /// legitimately be thousands of blocks ahead of a fresh local DB, so they
+    /// are not clamped to `local_height + MAX_PENDING_BLOCK_AHEAD` -- without
+    /// this a fresh node could never learn the real head over P2P. Block
+    /// payloads are still fetched and fully validated before any state is
+    /// committed, so a dishonest height only wastes bounded fetch attempts.
     pub fn observe_trusted_height(&mut self, height: u64) {
         if height > self.perceived_max_height {
             self.perceived_max_height = height;

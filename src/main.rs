@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
@@ -5978,7 +5978,12 @@ fn handle_inbound_block_message(
     node: &mut Node,
     message: &zoka::network::message::ZokaMessage,
     chain_id: &str,
-    chain_db_path: Option<&str>,
+    // Reuse the node's already-open chain storage. This is the client-side
+    // IBD apply path -- it runs for every block a syncing node receives.
+    // Opening a fresh RocksDbStorage per received block (the previous
+    // behaviour) capped sync throughput at roughly one DB-open per block
+    // (~a block every several seconds), turning a 3k-block sync into hours.
+    storage: Option<&RocksDbStorage>,
     peer_view: &mut zoka::state::sync::PeerChainView,
     unsafe_rehearsal_difficulty_bits: Option<u32>,
 ) -> Option<String> {
@@ -5989,20 +5994,11 @@ fn handle_inbound_block_message(
 
     let height = response.block_height;
 
-    let path = match chain_db_path {
-        Some(p) => p,
+    let storage = match storage {
+        Some(s) => s,
         None => {
             return Some(format!(
                 "Peer block @ height {height} ignored: no chain DB configured"
-            ));
-        }
-    };
-
-    let storage = match RocksDbStorage::new(path) {
-        Ok(s) => s,
-        Err(err) => {
-            return Some(format!(
-                "Peer block @ height {height} dropped: storage open failed ({err})"
             ));
         }
     };
@@ -6011,9 +6007,9 @@ fn handle_inbound_block_message(
 
     let outcome = match unsafe_rehearsal_difficulty_bits {
         Some(bits) => zoka::state::sync::try_apply_synced_block_payload_with_expected_difficulty(
-            &storage, chain_id, response, bits,
+            storage, chain_id, response, bits,
         ),
-        None => zoka::state::sync::try_apply_synced_block_payload(&storage, chain_id, response),
+        None => zoka::state::sync::try_apply_synced_block_payload(storage, chain_id, response),
     };
     peer_view.record_sync_outcome(&outcome);
     peer_view.remember_block_response(&outcome, response);
@@ -6038,7 +6034,9 @@ fn handle_inbound_block_message(
 fn handle_block_announce(
     node: &mut Node,
     announce: &zoka::network::message::BlockAnnounceMessage,
-    chain_db_path: Option<&str>,
+    // Reuse the node's already-open chain storage instead of opening a fresh
+    // RocksDbStorage per gossiped announce.
+    storage: Option<&RocksDbStorage>,
     peer_view: &mut zoka::state::sync::PeerChainView,
 ) -> Option<String> {
     let height = announce.block_height;
@@ -6048,9 +6046,8 @@ fn handle_block_announce(
     }
 
     let announced_work = announce.cumulative_work.parse::<u128>().ok();
-    let local_head = chain_db_path
-        .and_then(|path| RocksDbStorage::new(path).ok())
-        .and_then(|storage| zoka::state::chain::read_chain_head(&storage).ok().flatten());
+    let local_head = storage
+        .and_then(|storage| zoka::state::chain::read_chain_head(storage).ok().flatten());
     let local_height = local_head.as_ref().map(|head| head.height).unwrap_or(0);
     peer_view.observe(height, local_height);
 
@@ -6116,7 +6113,7 @@ async fn sweep_block_announce_retries(
             continue;
         }
         match node
-            .request_block_with_retry(height, Some(hash.clone()), 2, Duration::from_secs(3))
+            .request_block_with_retry(height, Some(hash.clone()), 2, Duration::from_secs(10))
             .await
         {
             Ok(response) => {
@@ -6215,7 +6212,16 @@ fn block_body_response_from_storage(
 
 fn serve_pending_block_body_requests(
     node: &mut Node,
-    chain_db_path: Option<&str>,
+    // Reuse the node's already-open chain storage. Opening a fresh
+    // RocksDbStorage per request (the previous behaviour) is extremely
+    // expensive -- RocksDB replays the WAL and opens every SST on each
+    // open, hundreds of ms to seconds on a large DB, and can transiently
+    // fail against the primary's lock. Doing that per inbound block request
+    // serialized block serving to ~one DB-open apiece, so a peer doing IBD
+    // would receive a block or two and then have its requests time out (the
+    // node was stuck opening the DB instead of answering). Sharing the open
+    // handle makes serving effectively instant.
+    storage: Option<&RocksDbStorage>,
 ) -> Result<Option<String>, String> {
     let mut served = 0u64;
     let mut failed = 0u64;
@@ -6223,15 +6229,8 @@ fn serve_pending_block_body_requests(
     while let Some(pending) = node.take_pending_block_body_request() {
         let block_height = pending.request.block_height;
         last_height = block_height;
-        let response = match chain_db_path {
-            Some(path) => match RocksDbStorage::new(path) {
-                Ok(storage) => block_body_response_from_storage(&storage, &pending.request),
-                Err(err) => zoka::network::block_request_response::BlockBodyResponse::Rejected {
-                    block_height,
-                    block_hash: pending.request.block_hash.clone(),
-                    reason: format!("storage open failed: {err}"),
-                },
-            },
+        let response = match storage {
+            Some(storage) => block_body_response_from_storage(storage, &pending.request),
             None => zoka::network::block_request_response::BlockBodyResponse::Rejected {
                 block_height,
                 block_hash: pending.request.block_hash.clone(),
@@ -6288,7 +6287,10 @@ fn private_tx_body_response_from_storage(
 
 fn serve_pending_private_tx_body_requests(
     node: &mut Node,
-    chain_db_path: Option<&str>,
+    // Reuse the node's already-open chain storage (see
+    // serve_pending_block_body_requests) instead of opening a fresh
+    // RocksDbStorage per request.
+    storage: Option<&RocksDbStorage>,
 ) -> Result<Option<String>, String> {
     let mut served = 0u64;
     let mut failed = 0u64;
@@ -6302,16 +6304,8 @@ fn serve_pending_private_tx_body_requests(
                 body,
             }
         } else {
-            match chain_db_path {
-                Some(path) => match RocksDbStorage::new(path) {
-                    Ok(storage) => private_tx_body_response_from_storage(&storage, &pending.request),
-                    Err(_) => {
-                        zoka::network::private_tx_request_response::PrivateTxBodyResponse::RateLimited {
-                            tx_hash,
-                            retry_after_secs: 2,
-                        }
-                    }
-                },
+            match storage {
+                Some(storage) => private_tx_body_response_from_storage(storage, &pending.request),
                 None => zoka::network::private_tx_request_response::PrivateTxBodyResponse::NotFound {
                     tx_hash,
                     reason: "no chain DB configured".to_string(),
@@ -6442,18 +6436,16 @@ fn headers_response_from_storage(
 /// Drain pending inbound GetHeaders requests and serve them from local storage.
 fn serve_pending_header_requests(
     node: &mut zoka::network::p2p::Node,
-    chain_db_path: Option<&str>,
+    // Reuse the node's already-open chain storage (see
+    // serve_pending_block_body_requests) instead of opening a fresh
+    // RocksDbStorage per request.
+    storage: Option<&RocksDbStorage>,
 ) -> Result<Option<String>, String> {
     let mut served = 0u32;
     let mut failed = 0u32;
     while let Some(pending) = node.take_pending_header_request() {
-        let response = match chain_db_path {
-            Some(path) => match RocksDbStorage::new(path) {
-                Ok(storage) => headers_response_from_storage(&storage, &pending.request),
-                Err(err) => zoka::network::header_request_response::HeadersResponse::NotFound {
-                    reason: format!("storage open failed: {err}"),
-                },
-            },
+        let response = match storage {
+            Some(storage) => headers_response_from_storage(storage, &pending.request),
             None => zoka::network::header_request_response::HeadersResponse::NotFound {
                 reason: "no chain DB configured".to_string(),
             },
@@ -6533,6 +6525,7 @@ async fn handle_fullnode_network_message(
     message: &zoka::network::message::ZokaMessage,
     chain_id: &str,
     chain_db_path: Option<&str>,
+    storage: Option<&RocksDbStorage>,
     peer_view: &mut zoka::state::sync::PeerChainView,
     unsafe_rehearsal_difficulty_bits: Option<u32>,
 ) -> Option<String> {
@@ -6541,12 +6534,12 @@ async fn handle_fullnode_network_message(
             node,
             message,
             chain_id,
-            chain_db_path,
+            storage,
             peer_view,
             unsafe_rehearsal_difficulty_bits,
         ),
         zoka::network::message::ZokaMessage::BlockAnnounce(announce) => {
-            handle_block_announce(node, announce, chain_db_path, peer_view)
+            handle_block_announce(node, announce, storage, peer_view)
         }
         zoka::network::message::ZokaMessage::PrivateTxAnnounce(announce) => {
             let hash = announce.tx_hash.trim();
@@ -6656,11 +6649,17 @@ async fn handle_fullnode_network_message(
             }
         }
         zoka::network::message::ZokaMessage::SyncState(sync) => {
-            let local_height = chain_db_path
-                .and_then(|path| RocksDbStorage::new(path).ok())
-                .and_then(|storage| storage.get_chain_height().ok())
-                .unwrap_or(0);
-            peer_view.observe(sync.last_height, local_height);
+            // A directly-connected peer announcing its chain head is a
+            // legitimate IBD sync target, so treat it like a trusted height
+            // (no local-relative MAX_PENDING_BLOCK_AHEAD cap). The capped
+            // observe() is meant for untrusted one-off block announces; using
+            // it here meant a fresh node more than 512 blocks behind could
+            // never learn the real head over P2P and crawled one block at a
+            // time. Block payloads are still fully validated before commit, so
+            // a dishonest height only wastes bounded fetch attempts. (This
+            // used to open a throwaway RocksDbStorage just to read local
+            // height for the cap; the trusted path needs neither.)
+            peer_view.observe_trusted_height(sync.last_height);
             Some(format!(
                 "Observed peer sync state at height {}.",
                 sync.last_height
@@ -6841,20 +6840,20 @@ async fn handle_fullnode_network_message(
 
 fn publish_local_sync_state(
     node: &mut Node,
-    chain_db_path: Option<&str>,
+    // Reuse the node's already-open chain storage. Opening a fresh
+    // RocksDbStorage here per publish (the previous behaviour) was expensive
+    // and could transiently fail against the primary's lock -- and when it
+    // failed the node silently skipped announcing its height. That broke peer
+    // height discovery: a syncing peer never learned this node's real tip, so
+    // it treated the last block it happened to fetch as the chain head and
+    // stopped IBD early (observed: a fresh node stalling at height ~15 with
+    // target_height=15 while the server sat at 3126).
+    storage: Option<&RocksDbStorage>,
 ) -> Result<Option<String>, String> {
-    let Some(path) = chain_db_path else {
+    let Some(storage) = storage else {
         return Ok(None);
     };
-    let storage = match RocksDbStorage::new(path) {
-        Ok(storage) => storage,
-        Err(err) => {
-            return Ok(Some(format!(
-                "Skipped local sync-state publish: storage open failed ({err})"
-            )));
-        }
-    };
-    let head = match zoka::state::chain::read_chain_head(&storage) {
+    let head = match zoka::state::chain::read_chain_head(storage) {
         Ok(head) => head,
         Err(err) => {
             return Ok(Some(format!(
@@ -7390,7 +7389,11 @@ async fn run_sync_step(
                 next_height,
                 next_request.expected_hash.clone(),
                 3,
-                Duration::from_secs(8),
+                // 20s/attempt (was 8s): sized for Tor onion round trips so IBD
+                // block fetches don't spuriously time out and re-request the
+                // same height forever. Bounded by the 30s request/response
+                // behaviour timeout.
+                Duration::from_secs(20),
             )
             .await
         {
@@ -9178,6 +9181,21 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             format!("Tor SOCKS5 proxy configured at {proxy}.")
         });
     }
+    // Wire immediate responders so inbound block/header requests are answered
+    // the instant they arrive (from the already-open chain storage), instead
+    // of waiting on the main loop's serve_pending_* pass. This is what makes
+    // IBD serving fast: a peer syncing from us no longer waits behind whatever
+    // outbound sync request our own loop happens to be blocked on.
+    if let Some(storage) = chain_storage_outer.clone() {
+        let block_storage = storage.clone();
+        node.set_block_body_responder(move |request| {
+            block_body_response_from_storage(&block_storage, request)
+        });
+        let header_storage = storage.clone();
+        node.set_header_responder(move |request| {
+            headers_response_from_storage(&header_storage, request)
+        });
+    }
     node.listen(&listen_addr).await.map_err(|e| {
         zoka::api::global_startup_status().mark_failed(Some(format!("listen error: {e}")));
         format!("listen error: {e}")
@@ -9645,6 +9663,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     &message,
                     &chain_id,
                     db_path.as_deref(),
+                    chain_storage_outer.as_deref(),
                     &mut peer_chain_view,
                     unsafe_rehearsal_difficulty_bits,
                 )
@@ -9951,16 +9970,18 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         .await;
 
         if let Some(direct_event) =
-            serve_pending_block_body_requests(&mut node, db_path.as_deref())?
+            serve_pending_block_body_requests(&mut node, chain_storage_outer.as_deref())?
         {
             last_event = direct_event;
         }
         if let Some(private_tx_event) =
-            serve_pending_private_tx_body_requests(&mut node, db_path.as_deref())?
+            serve_pending_private_tx_body_requests(&mut node, chain_storage_outer.as_deref())?
         {
             last_event = private_tx_event;
         }
-        if let Some(header_event) = serve_pending_header_requests(&mut node, db_path.as_deref())? {
+        if let Some(header_event) =
+            serve_pending_header_requests(&mut node, chain_storage_outer.as_deref())?
+        {
             last_event = header_event;
         }
         if let Some(snapshot_event) = serve_pending_snapshot_manifest_requests(&mut node)? {
@@ -10157,7 +10178,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         if tokio::time::Instant::now() >= next_sync_state_at {
             // Always broadcast local height so peers behind us can discover
             // they need to catch up — even while this node is actively mining.
-            if let Some(sync_event) = publish_local_sync_state(&mut node, db_path.as_deref())? {
+            if let Some(sync_event) = publish_local_sync_state(&mut node, chain_storage_outer.as_deref())? {
                 last_event = sync_event;
             }
             if let Some(announce_event) =
@@ -10410,7 +10431,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     "{last_event} RPC autopush had {rpc_submit_failures} endpoint failure(s); announce/request sync will keep peers aware of the new head."
                 );
             }
-            if let Some(sync_event) = publish_local_sync_state(&mut node, db_path.as_deref())? {
+            if let Some(sync_event) = publish_local_sync_state(&mut node, chain_storage_outer.as_deref())? {
                 last_event = format!("{last_event} {sync_event}");
             }
             if let Some(announce_event) =
@@ -10731,6 +10752,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     &message,
                     &chain_id,
                     db_path.as_deref(),
+                    chain_storage_outer.as_deref(),
                     &mut peer_chain_view,
                     unsafe_rehearsal_difficulty_bits,
                 )
@@ -13244,7 +13266,26 @@ fn rpc_http_get_json(
     let url = parse_rpc_http_url(raw_url)?;
     let request_path = rpc_join_path(&url.base_path, path);
     let timeout = Duration::from_secs(timeout_secs.clamp(1, 10));
-    let mut stream = TcpStream::connect((url.host.as_str(), url.port))
+    // Bound the CONNECT, not just read/write. TcpStream::connect uses the OS
+    // default connect timeout (~21s on Windows, os error 10060) when the
+    // endpoint is unreachable. The node's sync loop calls this synchronously,
+    // so a single dead RPC endpoint (e.g. a decommissioned seed, or a DNS name
+    // that resolves but whose port isn't reachable) stalls the whole loop for
+    // ~21s every cycle. During that stall the libp2p swarm isn't pumped, so
+    // peer handshakes and block request/response substreams time out -- nodes
+    // then fail to connect and IBD gets stuck. Resolving + connect_timeout
+    // makes an unreachable endpoint fail within `timeout` instead.
+    let socket_addr = (url.host.as_str(), url.port)
+        .to_socket_addrs()
+        .map_err(|e| format!("RPC connect failed for {}:{}: {e}", url.host, url.port))?
+        .next()
+        .ok_or_else(|| {
+            format!(
+                "RPC connect failed for {}:{}: no address resolved",
+                url.host, url.port
+            )
+        })?;
+    let mut stream = TcpStream::connect_timeout(&socket_addr, timeout)
         .map_err(|e| format!("RPC connect failed for {}:{}: {e}", url.host, url.port))?;
     stream
         .set_read_timeout(Some(timeout))
