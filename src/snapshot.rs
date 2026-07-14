@@ -824,6 +824,50 @@ mod tests {
         );
     }
 
+    // Full snapshot-bootstrap-over-iroh pipeline: a source node exports its
+    // chain, serves the blob over an iroh QUIC connection, an independent
+    // fresh node pulls it (NAT hole-punch capable, no open ports) and replays
+    // every block into empty storage. This is exactly what a new node will do
+    // to catch up in minutes instead of crawling the block-by-block IBD.
+    #[tokio::test]
+    async fn snapshot_bootstraps_over_iroh_end_to_end() {
+        use crate::network::iroh_snapshot_transfer::{fetch_snapshot, serve_snapshot};
+        use iroh::endpoint::presets;
+
+        let chain_id = "zoka-test-net";
+        let (source, _dir1) = build_chain_with_blocks(chain_id, 3);
+        let snap = export_from_storage(&source, chain_id, 1).expect("export");
+        let bytes = serialize(&snap).expect("serialize");
+        let expected_digest = compute_digest(&snap).expect("digest");
+
+        let server = serve_snapshot(Arc::new(bytes), presets::Minimal)
+            .await
+            .expect("serve");
+        let pulled = fetch_snapshot(server.addr(), presets::Minimal)
+            .await
+            .expect("fetch");
+        server.close().await;
+
+        let received = deserialize(&pulled).expect("parse pulled snapshot");
+        assert_eq!(
+            compute_digest(&received).expect("digest"),
+            expected_digest,
+            "snapshot pulled over iroh must match the exported one"
+        );
+
+        let (target_raw, _dir2) = open_temp_storage();
+        let target = Arc::new(target_raw);
+        for block in &received.blocks {
+            apply_block_with_expected_difficulty(&target, chain_id, block, 4)
+                .expect("relaxed apply");
+        }
+        assert_eq!(target.get_chain_height().expect("h"), 3);
+        assert_eq!(
+            target.get_last_block_hash().expect("h"),
+            received.header.head_hash
+        );
+    }
+
     #[test]
     fn import_idempotent_when_blocks_are_already_known() {
         let chain_id = "zoka-test-net";
