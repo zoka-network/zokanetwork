@@ -15127,30 +15127,41 @@ async fn maybe_bootstrap_from_iroh(
                 continue;
             }
         };
-        println!("Bootstrapping chain from iroh snapshot seed {endpoint_id} ...");
-        let bytes = match zoka::network::iroh_snapshot_transfer::fetch_snapshot(
+        // Print outcomes to stdout (not tracing) so they show in the ZSilent
+        // log panel, which only captures the child's stdout. Bound the fetch
+        // with a timeout so an unreachable relay/hole-punch can't hang node
+        // startup (this runs before node.listen) -- it falls back to IBD.
+        println!("iroh bootstrap: connecting to snapshot seed {endpoint_id} over iroh (n0 relay) ...");
+        let fetch = zoka::network::iroh_snapshot_transfer::fetch_snapshot(
             endpoint_id.into(),
             iroh::endpoint::presets::N0,
-        )
-        .await
-        {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(target: "zoka.iroh", error = %e, "iroh snapshot fetch failed; trying next seed");
+        );
+        let bytes = match tokio::time::timeout(Duration::from_secs(120), fetch).await {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
+                println!("iroh bootstrap: fetch from {endpoint_id} failed: {e}. Trying next seed / falling back to IBD.");
+                continue;
+            }
+            Err(_) => {
+                println!("iroh bootstrap: fetch from {endpoint_id} timed out after 120s (relay/hole-punch unreachable from this network). Falling back to IBD.");
                 continue;
             }
         };
+        println!(
+            "iroh bootstrap: transferred {} bytes from {endpoint_id}; verifying and importing ...",
+            bytes.len()
+        );
         let snapshot = match zoka::snapshot::deserialize(&bytes) {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!(target: "zoka.iroh", error = %e, "fetched iroh snapshot failed to parse");
+                println!("iroh bootstrap: fetched snapshot failed to parse: {e}. Falling back to IBD.");
                 continue;
             }
         };
         if require_signature
             && !snapshot_signed_by_trusted(&snapshot, chain_id, &config.snapshot_signers)
         {
-            tracing::warn!(target: "zoka.iroh", "iroh snapshot rejected: not signed by a trusted snapshot_signer");
+            println!("iroh bootstrap: snapshot rejected (not signed by a trusted snapshot_signer). Falling back to IBD.");
             continue;
         }
         match zoka::snapshot::import_into_storage(storage, chain_id, &snapshot) {
@@ -15162,11 +15173,12 @@ async fn maybe_bootstrap_from_iroh(
                 return;
             }
             Err(e) => {
-                tracing::warn!(target: "zoka.iroh", error = %e, "iroh snapshot import failed; trying next seed");
+                println!("iroh bootstrap: snapshot import failed: {e}. Trying next seed / falling back to IBD.");
                 continue;
             }
         }
     }
+    println!("iroh bootstrap: no snapshot seed could be reached; using normal block-by-block IBD.");
 }
 
 /// Bind an iroh endpoint that serves this node's chain as a snapshot so fresh
