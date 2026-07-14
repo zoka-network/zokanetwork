@@ -19,7 +19,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use iroh::endpoint::presets;
-use iroh::{Endpoint, EndpointAddr};
+use iroh::{Endpoint, EndpointAddr, SecretKey};
 use tokio::io::AsyncWriteExt;
 
 /// ALPN for the Zoka snapshot pull protocol. Both ends must present the same
@@ -52,10 +52,34 @@ pub async fn serve_snapshot(
         .alpns(vec![ZOKA_SNAPSHOT_ALPN.to_vec()])
         .bind()
         .await?;
+    spawn_snapshot_accept_loop(endpoint.clone(), snapshot_bytes);
+    Ok(endpoint)
+}
 
-    let accept_endpoint = endpoint.clone();
+/// Like [`serve_snapshot`] but binds a fixed [`SecretKey`] so the endpoint's
+/// [`iroh::EndpointId`] is stable across restarts. A seed uses this with its
+/// persistent key (see [`load_or_generate_secret_key`]) so it can advertise a
+/// fixed iroh address in the network manifest -- the iroh analogue of the
+/// permanent Tor onion identity.
+pub async fn serve_snapshot_with_key(
+    snapshot_bytes: Arc<Vec<u8>>,
+    secret_key: SecretKey,
+    preset: impl presets::Preset,
+) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
+    let endpoint = Endpoint::builder(preset)
+        .secret_key(secret_key)
+        .alpns(vec![ZOKA_SNAPSHOT_ALPN.to_vec()])
+        .bind()
+        .await?;
+    spawn_snapshot_accept_loop(endpoint.clone(), snapshot_bytes);
+    Ok(endpoint)
+}
+
+/// Spawn the background accept loop that answers every inbound snapshot pull on
+/// `endpoint` with `snapshot_bytes`. Runs until the endpoint is closed/dropped.
+fn spawn_snapshot_accept_loop(endpoint: Endpoint, snapshot_bytes: Arc<Vec<u8>>) {
     tokio::spawn(async move {
-        while let Some(incoming) = accept_endpoint.accept().await {
+        while let Some(incoming) = endpoint.accept().await {
             let payload = snapshot_bytes.clone();
             tokio::spawn(async move {
                 if let Err(err) = serve_one(incoming, payload).await {
@@ -64,8 +88,26 @@ pub async fn serve_snapshot(
             });
         }
     });
+}
 
-    Ok(endpoint)
+/// Load a persistent iroh identity from `path` (32 raw secret-key bytes),
+/// generating and saving one on first use. The derived [`iroh::EndpointId`] is
+/// stable across restarts, so a seed can advertise a fixed iroh address in the
+/// network manifest just like its permanent Tor onion key.
+pub fn load_or_generate_secret_key(path: &Path) -> io::Result<SecretKey> {
+    if let Ok(bytes) = std::fs::read(path) {
+        if bytes.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            return Ok(SecretKey::from_bytes(&arr));
+        }
+    }
+    let secret_key = SecretKey::from_bytes(&rand::random::<[u8; 32]>());
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, secret_key.to_bytes())?;
+    Ok(secret_key)
 }
 
 async fn serve_one(
@@ -189,6 +231,43 @@ mod tests {
             .expect("client pulls snapshot");
 
         assert_eq!(fetched, payload, "pulled snapshot must match served bytes");
+        server.close().await;
+    }
+
+    // A persistent key file must yield the same identity every time it is
+    // loaded -- the property that lets a seed advertise a fixed iroh address.
+    #[test]
+    fn persistent_key_yields_stable_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("iroh_key");
+        let first = load_or_generate_secret_key(&path).expect("generate");
+        let second = load_or_generate_secret_key(&path).expect("reload");
+        assert_eq!(
+            first.public(),
+            second.public(),
+            "the same key file must reload to the same identity"
+        );
+    }
+
+    // A server bound to a fixed key exposes that key's stable EndpointId, and a
+    // client can still pull the snapshot from it (direct/local via Minimal).
+    #[tokio::test]
+    async fn served_with_fixed_key_exposes_stable_id_and_serves() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("iroh_key");
+        let key = load_or_generate_secret_key(&path).expect("key");
+        let expected_id = key.public();
+
+        let payload: Vec<u8> = (0..64_000u32).map(|i| (i % 97) as u8).collect();
+        let server = serve_snapshot_with_key(Arc::new(payload.clone()), key, presets::Minimal)
+            .await
+            .expect("serve");
+        assert_eq!(server.id(), expected_id, "endpoint id must match the fixed key");
+
+        let fetched = fetch_snapshot(server.addr(), presets::Minimal)
+            .await
+            .expect("fetch");
+        assert_eq!(fetched, payload);
         server.close().await;
     }
 }
