@@ -133,6 +133,9 @@ fn print_usage() {
         "  snapshot-import <in-path> [--db <path>] [--require-signature] [--signer-key <hex>]  (verifies + replays every block via state::chain::apply_block)"
     );
     println!(
+        "  snapshot-fetch-iroh --iroh-id <endpoint-id> [--db <path>] [--require-signature] [--signer-key <hex>]  (pulls a snapshot from a seed over iroh QUIC/hole-punching and imports it)"
+    );
+    println!(
         "  chain-prune --keep-last <N> [--db <path>] [--dry-run] [--json]  (drops block bodies older than head-N; floors --keep-last at PRUNE_MIN_RETAINED_BLOCKS so difficulty retarget keeps working)"
     );
 }
@@ -370,6 +373,13 @@ struct MainnetSeedNode {
     onion: Option<String>,
     #[serde(default)]
     i2p: Option<String>,
+    /// iroh EndpointId (base32 public key) of this seed's snapshot-serving
+    /// endpoint, if it offers iroh snapshot bootstrap. A fresh node can pull a
+    /// full-chain snapshot from this id over iroh (QUIC + NAT hole-punching,
+    /// no open port) instead of crawling block-by-block IBD. Stable across
+    /// restarts (see network::iroh_snapshot_transfer::load_or_generate_secret_key).
+    #[serde(default)]
+    iroh: Option<String>,
     role: String,
     status: String,
     #[serde(default, rename = "note")]
@@ -518,6 +528,26 @@ impl MainnetNetworkConfig {
             .iter()
             .filter(|rpc| rpc.status.eq_ignore_ascii_case("active"))
             .count()
+    }
+
+    /// iroh EndpointIds of active seeds that advertise snapshot bootstrap, in
+    /// manifest order. A fresh node tries these to pull a full-chain snapshot
+    /// over iroh before falling back to block-by-block IBD. (Wired into the
+    /// fullnode auto-bootstrap next; already used by tooling that reads the
+    /// manifest.)
+    #[allow(dead_code)]
+    fn iroh_snapshot_seed_ids(&self) -> Vec<String> {
+        self.seed_nodes
+            .iter()
+            .filter(|seed| seed.status.eq_ignore_ascii_case("active"))
+            .filter_map(|seed| {
+                seed.iroh
+                    .as_ref()
+                    .map(|id| id.trim())
+                    .filter(|id| !id.is_empty())
+                    .map(|id| id.to_string())
+            })
+            .collect()
     }
 }
 
@@ -14440,6 +14470,7 @@ async fn run() -> Result<(), String> {
         "snapshot-info" => cmd_snapshot_info(tail),
         "snapshot-export" => cmd_snapshot_export(tail),
         "snapshot-import" => cmd_snapshot_import(tail),
+        "snapshot-fetch-iroh" => cmd_snapshot_fetch_iroh(tail),
         "chain-prune" => cmd_chain_prune(tail),
         "chain-republish-private-txs" => cmd_chain_republish_private_txs(tail),
         "trusted-setup-init" => cmd_trusted_setup_init(tail),
@@ -14966,6 +14997,91 @@ fn cmd_snapshot_import(args: &[String]) -> Result<(), String> {
         "Blocks skipped:     {}",
         snapshot.header.block_count.saturating_sub(applied)
     );
+    println!(
+        "Local chain height: {}",
+        storage.get_chain_height().unwrap_or(0)
+    );
+    Ok(())
+}
+
+/// `zoka snapshot-fetch-iroh --iroh-id <endpoint-id> [--db <path>]
+/// [--require-signature] [--signer-key <hex>]`
+///
+/// Pull a full-chain snapshot from a seed's iroh endpoint (QUIC + NAT
+/// hole-punching over the n0 relays -- no open port, no Tor) and import it,
+/// verifying its signature exactly like `snapshot-import`. This is the fast
+/// bootstrap path: a fresh node catches up in the time it takes to transfer +
+/// replay one snapshot instead of crawling block-by-block IBD.
+fn cmd_snapshot_fetch_iroh(args: &[String]) -> Result<(), String> {
+    let iroh_id = option_value(args, "--iroh-id").ok_or_else(|| {
+        "missing --iroh-id <endpoint-id> (the seed's iroh EndpointId from the network manifest)"
+            .to_string()
+    })?;
+    let db_path_owned = option_value(args, "--db");
+    let db_path = db_path_owned.as_deref().unwrap_or(".zoka/blockchain.db");
+    let require_signature = has_flag(args, "--require-signature");
+    let pubkey_hex =
+        option_value(args, "--signer-key").or_else(|| option_value(args, "--public-key"));
+
+    let endpoint_id: iroh::EndpointId = iroh_id
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid iroh endpoint id '{iroh_id}': {e}"))?;
+
+    println!("Pulling snapshot over iroh from {endpoint_id} ...");
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| format!("failed to start tokio runtime for iroh fetch: {e}"))?;
+    let bytes = runtime
+        .block_on(async {
+            zoka::network::iroh_snapshot_transfer::fetch_snapshot(
+                endpoint_id.into(),
+                iroh::endpoint::presets::N0,
+            )
+            .await
+        })
+        .map_err(|e| format!("iroh snapshot fetch failed: {e}"))?;
+    println!("Transferred {} bytes.", bytes.len());
+
+    let snapshot =
+        zoka::snapshot::deserialize(&bytes).map_err(|e| format!("snapshot parse failed: {e}"))?;
+
+    let pubkey_array;
+    let pubkey_ref: Option<&[u8; 32]> = match pubkey_hex {
+        Some(hex_key) => {
+            let decoded = hex::decode(hex_key.trim())
+                .map_err(|e| format!("snapshot signer key must be 32-byte hex: {e}"))?;
+            if decoded.len() != 32 {
+                return Err(format!(
+                    "snapshot signer key must decode to 32 bytes (got {})",
+                    decoded.len()
+                ));
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&decoded);
+            pubkey_array = key;
+            Some(&pubkey_array)
+        }
+        None => None,
+    };
+
+    let opts = zoka::snapshot::VerifyOptions {
+        expected_chain_id: MAINNET_CHAIN_ID,
+        require_signature: require_signature || pubkey_ref.is_some(),
+        expected_pubkey: pubkey_ref,
+    };
+    let digest = zoka::snapshot::verify(&snapshot, &opts)
+        .map_err(|e| format!("snapshot verify failed: {e}"))?;
+
+    let storage = Arc::new(
+        RocksDbStorage::new(db_path)
+            .map_err(|e| format!("failed to open chain db '{db_path}': {e}"))?,
+    );
+    let applied = zoka::snapshot::import_into_storage(&storage, MAINNET_CHAIN_ID, &snapshot)
+        .map_err(|e| format!("snapshot import failed: {e}"))?;
+
+    println!("SHA-256 digest:     {digest}");
+    println!("Head height:        {}", snapshot.header.head_height);
+    println!("Blocks applied:     {applied}");
     println!(
         "Local chain height: {}",
         storage.get_chain_height().unwrap_or(0)
