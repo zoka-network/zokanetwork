@@ -14496,6 +14496,7 @@ async fn run() -> Result<(), String> {
         "snapshot-export" => cmd_snapshot_export(tail),
         "snapshot-import" => cmd_snapshot_import(tail),
         "snapshot-fetch-iroh" => cmd_snapshot_fetch_iroh(tail),
+        "iroh-id" => cmd_iroh_id(tail),
         "chain-prune" => cmd_chain_prune(tail),
         "chain-republish-private-txs" => cmd_chain_republish_private_txs(tail),
         "trusted-setup-init" => cmd_trusted_setup_init(tail),
@@ -15234,6 +15235,22 @@ async fn maybe_serve_iroh_snapshot(
     Some(endpoint)
 }
 
+/// `zoka iroh-id [--json]` -- print this node's stable iroh EndpointId (the
+/// address to advertise in the manifest 'iroh' field). Loads or generates the
+/// persistent identity key, so it matches what `--serve-iroh-snapshot` uses.
+fn cmd_iroh_id(args: &[String]) -> Result<(), String> {
+    let key_path = zoka_home().join("iroh_key");
+    let key = zoka::network::iroh_snapshot_transfer::load_or_generate_secret_key(&key_path)
+        .map_err(|e| format!("failed to load iroh key '{}': {e}", key_path.display()))?;
+    let id = key.public();
+    if has_flag(args, "--json") {
+        println!("{{\"iroh_endpoint_id\":\"{id}\"}}");
+    } else {
+        println!("{id}");
+    }
+    Ok(())
+}
+
 /// `zoka snapshot-fetch-iroh --iroh-id <endpoint-id> [--db <path>]
 /// [--require-signature] [--signer-key <hex>]`
 ///
@@ -15259,17 +15276,25 @@ fn cmd_snapshot_fetch_iroh(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("invalid iroh endpoint id '{iroh_id}': {e}"))?;
 
     println!("Pulling snapshot over iroh from {endpoint_id} ...");
-    let runtime = tokio::runtime::Runtime::new()
-        .map_err(|e| format!("failed to start tokio runtime for iroh fetch: {e}"))?;
-    let bytes = runtime
-        .block_on(async {
+    // Run the async fetch on a dedicated thread with its own runtime: the CLI
+    // dispatch may already be inside a tokio runtime, and a nested block_on
+    // panics ("Cannot start a runtime from within a runtime").
+    let bytes = std::thread::spawn(move || -> Result<Vec<u8>, String> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("failed to start runtime for iroh fetch: {e}"))?;
+        rt.block_on(async move {
             zoka::network::iroh_snapshot_transfer::fetch_snapshot(
                 endpoint_id.into(),
                 iroh::endpoint::presets::N0,
             )
             .await
+            .map_err(|e| format!("iroh snapshot fetch failed: {e}"))
         })
-        .map_err(|e| format!("iroh snapshot fetch failed: {e}"))?;
+    })
+    .join()
+    .map_err(|_| "iroh fetch thread panicked".to_string())??;
     println!("Transferred {} bytes.", bytes.len());
 
     let snapshot =
