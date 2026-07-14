@@ -16,11 +16,29 @@
 
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, SecretKey};
 use tokio::io::AsyncWriteExt;
+
+/// Shared, swappable snapshot bytes. Lets a long-running seed refresh what it
+/// serves as its chain grows (via [`update_provider`]) without rebinding the
+/// endpoint or dropping its stable identity.
+pub type SnapshotProvider = Arc<RwLock<Arc<Vec<u8>>>>;
+
+/// Wrap already-`Arc`'d snapshot bytes into an updatable provider (no copy).
+pub fn provider_from_arc(bytes: Arc<Vec<u8>>) -> SnapshotProvider {
+    Arc::new(RwLock::new(bytes))
+}
+
+/// Swap in a freshly exported snapshot for future pulls. In-flight transfers
+/// keep serving the bytes they already started with.
+pub fn update_provider(provider: &SnapshotProvider, bytes: Vec<u8>) {
+    if let Ok(mut guard) = provider.write() {
+        *guard = Arc::new(bytes);
+    }
+}
 
 /// ALPN for the Zoka snapshot pull protocol. Both ends must present the same
 /// bytestring or iroh aborts the connection during the handshake.
@@ -52,7 +70,7 @@ pub async fn serve_snapshot(
         .alpns(vec![ZOKA_SNAPSHOT_ALPN.to_vec()])
         .bind()
         .await?;
-    spawn_snapshot_accept_loop(endpoint.clone(), snapshot_bytes);
+    spawn_snapshot_accept_loop(endpoint.clone(), provider_from_arc(snapshot_bytes));
     Ok(endpoint)
 }
 
@@ -66,23 +84,35 @@ pub async fn serve_snapshot_with_key(
     secret_key: SecretKey,
     preset: impl presets::Preset,
 ) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
+    serve_snapshot_provider(provider_from_arc(snapshot_bytes), secret_key, preset).await
+}
+
+/// Serve an updatable [`SnapshotProvider`] under a fixed identity. The seed
+/// keeps the provider and calls [`update_provider`] as its chain grows so new
+/// pulls get the latest snapshot without rebinding.
+pub async fn serve_snapshot_provider(
+    provider: SnapshotProvider,
+    secret_key: SecretKey,
+    preset: impl presets::Preset,
+) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
     let endpoint = Endpoint::builder(preset)
         .secret_key(secret_key)
         .alpns(vec![ZOKA_SNAPSHOT_ALPN.to_vec()])
         .bind()
         .await?;
-    spawn_snapshot_accept_loop(endpoint.clone(), snapshot_bytes);
+    spawn_snapshot_accept_loop(endpoint.clone(), provider);
     Ok(endpoint)
 }
 
 /// Spawn the background accept loop that answers every inbound snapshot pull on
-/// `endpoint` with `snapshot_bytes`. Runs until the endpoint is closed/dropped.
-fn spawn_snapshot_accept_loop(endpoint: Endpoint, snapshot_bytes: Arc<Vec<u8>>) {
+/// `endpoint` with the provider's current bytes. Runs until the endpoint is
+/// closed/dropped.
+fn spawn_snapshot_accept_loop(endpoint: Endpoint, provider: SnapshotProvider) {
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
-            let payload = snapshot_bytes.clone();
+            let provider = provider.clone();
             tokio::spawn(async move {
-                if let Err(err) = serve_one(incoming, payload).await {
+                if let Err(err) = serve_one(incoming, provider).await {
                     tracing::warn!(target: "zoka.iroh", error = %err, "snapshot serve connection failed");
                 }
             });
@@ -112,7 +142,7 @@ pub fn load_or_generate_secret_key(path: &Path) -> io::Result<SecretKey> {
 
 async fn serve_one(
     incoming: iroh::endpoint::Incoming,
-    snapshot_bytes: Arc<Vec<u8>>,
+    provider: SnapshotProvider,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let connection = incoming.await?;
     let (mut send, mut recv) = connection.accept_bi().await?;
@@ -126,6 +156,14 @@ async fn serve_one(
         return Ok(());
     }
 
+    // Snapshot the current bytes (cheap Arc clone) so an update mid-transfer
+    // doesn't tear this stream's payload out from under it.
+    let snapshot_bytes = {
+        let guard = provider
+            .read()
+            .map_err(|_| io::Error::other("snapshot provider lock poisoned"))?;
+        guard.clone()
+    };
     let len = snapshot_bytes.len() as u64;
     send.write_all(&len.to_be_bytes()).await?;
     send.write_all(&snapshot_bytes).await?;

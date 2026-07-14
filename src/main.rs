@@ -9232,8 +9232,21 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     // --serve-iroh-snapshot and fully guarded: any failure just logs and the
     // node continues. Held for the node's lifetime so the endpoint stays up;
     // its EndpointId is printed for advertising in the manifest 'iroh' field.
+    // A fresh node: try a one-shot snapshot bootstrap over iroh before IBD.
+    let iroh_bootstrap_config_path = network_config_arg
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(network.default_network_config_path()));
+    maybe_bootstrap_from_iroh(
+        chain_storage_outer.as_ref(),
+        &chain_id,
+        network,
+        &iroh_bootstrap_config_path,
+        use_network_config && !has_flag(args, "--no-iroh-bootstrap"),
+    )
+    .await;
     let _iroh_snapshot_endpoint = maybe_serve_iroh_snapshot(
-        chain_storage_outer.as_deref(),
+        chain_storage_outer.as_ref(),
         &chain_id,
         has_flag(args, "--serve-iroh-snapshot"),
     )
@@ -15016,12 +15029,145 @@ fn cmd_snapshot_import(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Bind an iroh endpoint that serves this node's current chain as a snapshot,
-/// so fresh nodes can bootstrap over iroh. Opt-in and fully guarded: on any
-/// error it logs and returns None, never blocking node startup. The returned
-/// endpoint must be held for as long as serving should continue.
+/// Export the current chain as serialized snapshot bytes plus its head height.
+fn export_snapshot_bytes(storage: &RocksDbStorage, chain_id: &str) -> Result<(Vec<u8>, u64), String> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let snapshot = zoka::snapshot::export_from_storage(storage, chain_id, timestamp)
+        .map_err(|e| format!("export failed: {e}"))?;
+    let height = snapshot.header.head_height;
+    let bytes = zoka::snapshot::serialize(&snapshot).map_err(|e| format!("serialize failed: {e}"))?;
+    Ok((bytes, height))
+}
+
+/// True if `snapshot` carries a valid signature from one of the manifest's
+/// trusted `snapshot_signers`. A network-fetched snapshot must clear this
+/// before import so a peer can't feed a fresh node an alternate chain; block
+/// re-validation on import already blocks *invalid* chains, this blocks
+/// *unauthorized valid* ones.
+fn snapshot_signed_by_trusted(
+    snapshot: &zoka::snapshot::ChainSnapshotV1,
+    chain_id: &str,
+    signers: &[String],
+) -> bool {
+    for signer_hex in signers {
+        let Ok(decoded) = hex::decode(signer_hex.trim()) else {
+            continue;
+        };
+        if decoded.len() != 32 {
+            continue;
+        }
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(&decoded);
+        let opts = zoka::snapshot::VerifyOptions {
+            expected_chain_id: chain_id,
+            require_signature: true,
+            expected_pubkey: Some(&pubkey),
+        };
+        if zoka::snapshot::verify(snapshot, &opts).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// If this is a fresh node (empty chain) and the manifest advertises iroh
+/// snapshot seeds, pull a signed snapshot over iroh and import it before IBD --
+/// catching up in one transfer instead of crawling block-by-block. Fully
+/// guarded: any failure logs and the node falls through to normal IBD. Inert
+/// (no-op) until a seed's EndpointId is listed in the manifest and the
+/// snapshot is signed by a trusted snapshot_signer.
+async fn maybe_bootstrap_from_iroh(
+    storage: Option<&Arc<RocksDbStorage>>,
+    chain_id: &str,
+    network: NetworkProfile,
+    config_path: &Path,
+    enabled: bool,
+) {
+    if !enabled {
+        return;
+    }
+    let Some(storage) = storage else {
+        return;
+    };
+    if storage.get_chain_height().unwrap_or(0) > 0 {
+        // Only bootstrap a genuinely empty node; anything with a chain uses
+        // the local-snapshot path or normal IBD.
+        return;
+    }
+    let config = match load_network_config_for(config_path, network) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(target: "zoka.iroh", error = %e, "iroh bootstrap skipped: network config load failed");
+            return;
+        }
+    };
+    let seed_ids = config.iroh_snapshot_seed_ids();
+    if seed_ids.is_empty() {
+        return;
+    }
+    if config.snapshot_signers.is_empty() {
+        tracing::warn!(target: "zoka.iroh", "iroh bootstrap skipped: manifest lists iroh seeds but no snapshot_signers to verify against");
+        return;
+    }
+    for id_str in &seed_ids {
+        let endpoint_id: iroh::EndpointId = match id_str.parse() {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(target: "zoka.iroh", id = %id_str, error = %e, "skipping invalid iroh seed id");
+                continue;
+            }
+        };
+        println!("Bootstrapping chain from iroh snapshot seed {endpoint_id} ...");
+        let bytes = match zoka::network::iroh_snapshot_transfer::fetch_snapshot(
+            endpoint_id.into(),
+            iroh::endpoint::presets::N0,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(target: "zoka.iroh", error = %e, "iroh snapshot fetch failed; trying next seed");
+                continue;
+            }
+        };
+        let snapshot = match zoka::snapshot::deserialize(&bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(target: "zoka.iroh", error = %e, "fetched iroh snapshot failed to parse");
+                continue;
+            }
+        };
+        if !snapshot_signed_by_trusted(&snapshot, chain_id, &config.snapshot_signers) {
+            tracing::warn!(target: "zoka.iroh", "iroh snapshot rejected: not signed by a trusted snapshot_signer");
+            continue;
+        }
+        match zoka::snapshot::import_into_storage(storage, chain_id, &snapshot) {
+            Ok(applied) => {
+                println!(
+                    "iroh bootstrap complete: imported {applied} blocks up to height {} (IBD will take it from here).",
+                    snapshot.header.head_height
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(target: "zoka.iroh", error = %e, "iroh snapshot import failed; trying next seed");
+                continue;
+            }
+        }
+    }
+}
+
+/// Bind an iroh endpoint that serves this node's chain as a snapshot so fresh
+/// nodes can bootstrap over iroh, and spawn a background task that re-exports
+/// periodically as the chain grows (via an updatable provider, no rebind).
+/// Opt-in and fully guarded: on any error it logs and returns None, never
+/// blocking node startup. The returned endpoint must be held for as long as
+/// serving should continue.
 async fn maybe_serve_iroh_snapshot(
-    storage: Option<&RocksDbStorage>,
+    storage: Option<&Arc<RocksDbStorage>>,
     chain_id: &str,
     enabled: bool,
 ) -> Option<iroh::Endpoint> {
@@ -15040,44 +15186,52 @@ async fn maybe_serve_iroh_snapshot(
             return None;
         }
     };
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let snapshot = match zoka::snapshot::export_from_storage(storage, chain_id, timestamp) {
-        Ok(s) => s,
+    let (bytes, height) = match export_snapshot_bytes(storage, chain_id) {
+        Ok(v) => v,
         Err(e) => {
-            tracing::warn!(target: "zoka.iroh", error = %e, "iroh snapshot seed disabled: export failed");
+            tracing::warn!(target: "zoka.iroh", error = %e, "iroh snapshot seed disabled");
             return None;
         }
     };
-    let height = snapshot.header.head_height;
-    let bytes = match zoka::snapshot::serialize(&snapshot) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(target: "zoka.iroh", error = %e, "iroh snapshot seed disabled: serialize failed");
-            return None;
-        }
-    };
-    match zoka::network::iroh_snapshot_transfer::serve_snapshot_with_key(
-        Arc::new(bytes),
+    let provider = zoka::network::iroh_snapshot_transfer::provider_from_arc(Arc::new(bytes));
+    let endpoint = match zoka::network::iroh_snapshot_transfer::serve_snapshot_provider(
+        provider.clone(),
         key,
         iroh::endpoint::presets::N0,
     )
     .await
     {
-        Ok(endpoint) => {
-            println!(
-                "iroh snapshot seed live at height {height}; EndpointId = {} (advertise this in the manifest 'iroh' field)",
-                endpoint.id()
-            );
-            Some(endpoint)
-        }
+        Ok(endpoint) => endpoint,
         Err(e) => {
             tracing::warn!(target: "zoka.iroh", error = %e, "iroh snapshot serve failed");
-            None
+            return None;
         }
-    }
+    };
+    println!(
+        "iroh snapshot seed live at height {height}; EndpointId = {} (advertise this in the manifest 'iroh' field)",
+        endpoint.id()
+    );
+
+    // Refresh the served snapshot as the chain grows so late-joining nodes
+    // don't have to IBD a long tail. Runs for the endpoint's lifetime.
+    let storage_bg = storage.clone();
+    let chain_id_bg = chain_id.to_string();
+    tokio::spawn(async move {
+        const REEXPORT_INTERVAL: Duration = Duration::from_secs(300);
+        loop {
+            tokio::time::sleep(REEXPORT_INTERVAL).await;
+            match export_snapshot_bytes(&storage_bg, &chain_id_bg) {
+                Ok((bytes, new_height)) => {
+                    zoka::network::iroh_snapshot_transfer::update_provider(&provider, bytes);
+                    tracing::debug!(target: "zoka.iroh", height = new_height, "iroh snapshot refreshed");
+                }
+                Err(e) => {
+                    tracing::warn!(target: "zoka.iroh", error = %e, "iroh snapshot re-export failed; keeping previous");
+                }
+            }
+        }
+    });
+    Some(endpoint)
 }
 
 /// `zoka snapshot-fetch-iroh --iroh-id <endpoint-id> [--db <path>]
