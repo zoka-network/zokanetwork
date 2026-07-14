@@ -9226,6 +9226,18 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             headers_response_from_storage(&header_storage, request)
         });
     }
+    // Optionally also serve this node's chain as an iroh snapshot so fresh
+    // nodes can bootstrap in a single transfer (QUIC + n0 hole-punching, no
+    // open port, no Tor) instead of block-by-block IBD. Opt-in via
+    // --serve-iroh-snapshot and fully guarded: any failure just logs and the
+    // node continues. Held for the node's lifetime so the endpoint stays up;
+    // its EndpointId is printed for advertising in the manifest 'iroh' field.
+    let _iroh_snapshot_endpoint = maybe_serve_iroh_snapshot(
+        chain_storage_outer.as_deref(),
+        &chain_id,
+        has_flag(args, "--serve-iroh-snapshot"),
+    )
+    .await;
     node.listen(&listen_addr).await.map_err(|e| {
         zoka::api::global_startup_status().mark_failed(Some(format!("listen error: {e}")));
         format!("listen error: {e}")
@@ -15002,6 +15014,70 @@ fn cmd_snapshot_import(args: &[String]) -> Result<(), String> {
         storage.get_chain_height().unwrap_or(0)
     );
     Ok(())
+}
+
+/// Bind an iroh endpoint that serves this node's current chain as a snapshot,
+/// so fresh nodes can bootstrap over iroh. Opt-in and fully guarded: on any
+/// error it logs and returns None, never blocking node startup. The returned
+/// endpoint must be held for as long as serving should continue.
+async fn maybe_serve_iroh_snapshot(
+    storage: Option<&RocksDbStorage>,
+    chain_id: &str,
+    enabled: bool,
+) -> Option<iroh::Endpoint> {
+    if !enabled {
+        return None;
+    }
+    let Some(storage) = storage else {
+        tracing::warn!(target: "zoka.iroh", "iroh snapshot seed skipped: no chain DB configured");
+        return None;
+    };
+    let key_path = zoka_home().join("iroh_key");
+    let key = match zoka::network::iroh_snapshot_transfer::load_or_generate_secret_key(&key_path) {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::warn!(target: "zoka.iroh", error = %e, "iroh snapshot seed disabled: identity key load failed");
+            return None;
+        }
+    };
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let snapshot = match zoka::snapshot::export_from_storage(storage, chain_id, timestamp) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(target: "zoka.iroh", error = %e, "iroh snapshot seed disabled: export failed");
+            return None;
+        }
+    };
+    let height = snapshot.header.head_height;
+    let bytes = match zoka::snapshot::serialize(&snapshot) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(target: "zoka.iroh", error = %e, "iroh snapshot seed disabled: serialize failed");
+            return None;
+        }
+    };
+    match zoka::network::iroh_snapshot_transfer::serve_snapshot_with_key(
+        Arc::new(bytes),
+        key,
+        iroh::endpoint::presets::N0,
+    )
+    .await
+    {
+        Ok(endpoint) => {
+            println!(
+                "iroh snapshot seed live at height {height}; EndpointId = {} (advertise this in the manifest 'iroh' field)",
+                endpoint.id()
+            );
+            Some(endpoint)
+        }
+        Err(e) => {
+            tracing::warn!(target: "zoka.iroh", error = %e, "iroh snapshot serve failed");
+            None
+        }
+    }
 }
 
 /// `zoka snapshot-fetch-iroh --iroh-id <endpoint-id> [--db <path>]
