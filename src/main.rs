@@ -9243,6 +9243,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         network,
         &iroh_bootstrap_config_path,
         use_network_config && !has_flag(args, "--no-iroh-bootstrap"),
+        has_flag(args, "--iroh-require-signed-snapshot"),
     )
     .await;
     let _iroh_snapshot_endpoint = maybe_serve_iroh_snapshot(
@@ -15086,6 +15087,7 @@ async fn maybe_bootstrap_from_iroh(
     network: NetworkProfile,
     config_path: &Path,
     enabled: bool,
+    require_signed_snapshot: bool,
 ) {
     if !enabled {
         return;
@@ -15109,10 +15111,14 @@ async fn maybe_bootstrap_from_iroh(
     if seed_ids.is_empty() {
         return;
     }
-    if config.snapshot_signers.is_empty() {
-        tracing::warn!(target: "zoka.iroh", "iroh bootstrap skipped: manifest lists iroh seeds but no snapshot_signers to verify against");
-        return;
-    }
+    // The iroh EndpointId in the trusted manifest is itself the authorization:
+    // to serve from EndpointId X you must hold X's secret key, so a
+    // manifest-listed id cryptographically authenticates the source (the same
+    // trust the snapshot signature provides). We therefore don't also require
+    // the snapshot's own signature on this path -- and the import re-validates
+    // every block against consensus from genesis regardless. Opt in to extra
+    // signature enforcement with --iroh-require-signed-snapshot.
+    let require_signature = require_signed_snapshot;
     for id_str in &seed_ids {
         let endpoint_id: iroh::EndpointId = match id_str.parse() {
             Ok(id) => id,
@@ -15141,7 +15147,9 @@ async fn maybe_bootstrap_from_iroh(
                 continue;
             }
         };
-        if !snapshot_signed_by_trusted(&snapshot, chain_id, &config.snapshot_signers) {
+        if require_signature
+            && !snapshot_signed_by_trusted(&snapshot, chain_id, &config.snapshot_signers)
+        {
             tracing::warn!(target: "zoka.iroh", "iroh snapshot rejected: not signed by a trusted snapshot_signer");
             continue;
         }

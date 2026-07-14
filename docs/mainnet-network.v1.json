@@ -17,6 +17,7 @@
       "multiaddr": "/dns4/seed1.zoka.network/tcp/28080",
       "onion": "/onion3/d5pk3nhesk5wlvz4f5unbhcozxgtj7u6mhagauyprjrxndzpwbaoeiid:28080",
       "i2p": null,
+      "iroh": "ca7721e29d60af28dda8406191f6d7a98e146b95cd456392d0c2d2b996639f99",
       "role": "seed",
       "status": "active",
       "note": "Primary bootstrap, hybrid: reachable over clearnet TCP (DNS, needs the operator's port 28080 open) and over Tor v3 onion (needs no open port; nodes started with --tor-proxy dial it). Nodes without a Tor proxy skip the onion and use the TCP address."
