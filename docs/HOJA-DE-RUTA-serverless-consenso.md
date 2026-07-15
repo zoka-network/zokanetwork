@@ -69,20 +69,28 @@ El **motor del nodo se queda en 1.7.3** (para no romper el protocol-freeze libp2
    - Remover `seed2`.
    - `seed1`: dejar **onion + iroh**; el clearnet `/dns4/.../tcp/28080` es inalcanzable por NAT (evaluar dejarlo o nullear).
    - Efecto: para el churn/ruido de dials muertos que confunde en los logs.
-3. *(Opcional)* Tuning de gossipsub para red chica (mesh_n bajo / flood-publish explícito) → baja `gossip_publish_err`.
-- **Criterio de éxito:** conexión host↔VM estable por horas, sin flapping; `gossip_publish_err` no crece.
+3. **Purgar el peerstore de IPs muertas:** el peerstore persistente tiene cacheadas las viejas IPs de DigitalOcean (`157.230.5.103`, `159.223.110.216`) y las sigue discando → timeouts/churn en el log. Purgar entradas clearnet muertas / expirarlas más rápido.
+4. *(Opcional)* Tuning de gossipsub para red chica (mesh_n bajo / flood-publish explícito) → baja `gossip_publish_err`.
+- **Criterio de éxito:** conexión host↔VM estable por horas, sin flapping; `gossip_publish_err` no crece; log sin dials a IPs muertas.
 
 ---
 
 ## FASE 2b — Dificultad (salud de red) **[IMPORTANTE — bloquea el test]**
 
-Difficulty **23** quedó calibrada para cuando había más hashrate. Hoy con ~1 minero es desproporcionada: bloques de **horas** → bloquea la prueba de propagación y hace la red casi inusable.
-- El **fast-mode de 1.7.4** ayuda (665 → ~5-8k H/s), pero sigue lento a diff 23.
-- [ ] Confirmar que el fast mode arrancó en el host (leer hashrate al minar; light≈665, fast≈miles).
-- **Opciones:**
-  - (a) Dejar que el **retarget** baje sola la dificultad (lento; se acelera con fast mode).
-  - (b) **Reset coordinado de dificultad** — cambio de consenso, con cuidado + backup + rollout coordinado.
-- [ ] Decidir con el usuario: esperar retarget vs. reset.
+Difficulty **23** quedó calibrada para cuando había más hashrate. Hoy con ~1 minero (~682 H/s) es desproporcionada: **~3,4 h/bloque** → red prácticamente estancada.
+
+**Datos del código:**
+- `TARGET_BLOCK_TIME_SECS = 120` (2 min objetivo). `POW_MIN_DIFFICULTY_BITS = 12`.
+- Equilibrio para 682 H/s ≈ **16 bits** (682 × 120 ≈ 2¹⁶). Diff 23 está ~128× alta.
+- **`retarget_from_solve_time` solo mueve ±1 bit por bloque** (baja si el bloque tardó >240s). De 23 a 16 = **7 bloques**; el primero (diff 23) tarda ~3,4h en light → auto-corrección total **~7h**.
+- **El fast mode NO arranca en el host**: free RAM = 1,64 GB (la VM se come la RAM); el dataset de 2GB no aloca → cae a light (682 H/s). En una PC sin VM sí arrancaría (~5-8k H/s → primer bloque ~28min, auto-corrección ~1h).
+- **Precedente en el código:** `apply_mainnet_emergency_difficulty_cap` (economics.rs) ya capó la dificultad a 14 bits para alturas 0-360. **Un reset por cap de emergencia es un mecanismo ya soportado.**
+
+**Opciones (decisión del usuario):**
+- **(A)** Liberar RAM en el host (cerrar VM/apps) → fast mode → dejar que el retarget baje sola (~1h). Sin cambio de consenso.
+- **(B)** Esperar ~7h minando en light. Sin cambio de consenso.
+- **(C)** **Reset coordinado de dificultad** vía nuevo cap de emergencia (p.ej. desde altura 3128, cap ~16 bits). Usable YA, pero cambio de consenso → todos actualizan. **Se puede bundlear con la Fase 3 (checkpoint), ambos son consenso.**
+- [ ] Decidir A / B / C.
 
 ---
 
