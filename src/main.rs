@@ -9955,6 +9955,21 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut heartbeat_last_status_log = HashMap::<String, bool>::new();
     let mut heartbeat_recent_failures: VecDeque<(String, String)> = VecDeque::with_capacity(8);
     let mut last_runtime_mining_enabled = auto_mine;
+    // Incremental iroh tail-sync: keep this node current from the manifest's
+    // iroh seeds even with no live libp2p link to the miner (both behind NAT).
+    // iroh's n0-relay hole-punching is the transport we already know crosses
+    // NAT here (it's how snapshot bootstrap works); this reuses it for the
+    // steady-state block tail. Empty when running without the network manifest.
+    let iroh_tail_sync_seed_ids: Vec<String> = if use_network_config {
+        load_network_config_for(&iroh_bootstrap_config_path, network)
+            .map(|c| c.iroh_snapshot_seed_ids())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let iroh_own_endpoint_id: Option<String> =
+        _iroh_snapshot_endpoint.as_ref().map(|e| e.id().to_string());
+    let mut next_iroh_tail_sync_at = tokio::time::Instant::now() + Duration::from_secs(20);
     let mut mining_task: Option<tokio::task::JoinHandle<Result<MiningBatchSummary, String>>> = None;
     loop {
         if let Some(deadline) = maybe_deadline {
@@ -10268,6 +10283,36 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 last_event = rpc_rebroadcast_event;
             }
             next_block_rebroadcast_at = tokio::time::Instant::now() + Duration::from_secs(120);
+        }
+
+        // Incremental iroh tail-sync. Only for a non-mining follower (a miner is
+        // producing the tip, and gating on `!mining_active` also avoids applying
+        // a seed's block concurrently with the mining task writing the same DB).
+        // This is what actually propagates new blocks to a NAT'd node when there
+        // is no live libp2p link to whoever mined them.
+        if !mining_active
+            && !iroh_tail_sync_seed_ids.is_empty()
+            && tokio::time::Instant::now() >= next_iroh_tail_sync_at
+        {
+            next_iroh_tail_sync_at = tokio::time::Instant::now() + Duration::from_secs(20);
+            if let Some(storage) = chain_storage_outer.as_ref() {
+                if let Some(event) = maybe_iroh_head_sync(
+                    storage,
+                    &chain_id,
+                    &iroh_tail_sync_seed_ids,
+                    iroh_own_endpoint_id.as_deref(),
+                )
+                .await
+                {
+                    // Re-announce the new head to any libp2p peers we do have.
+                    let announced =
+                        publish_local_sync_state(&mut node, chain_storage_outer.as_deref())?;
+                    last_event = match announced {
+                        Some(sync_event) => format!("{event} {sync_event}"),
+                        None => event,
+                    };
+                }
+            }
         }
 
         // Drain private tx sidecars from the normal fullnode loop, not only
@@ -15184,6 +15229,127 @@ async fn maybe_bootstrap_from_iroh(
     println!("iroh bootstrap: no snapshot seed could be reached; using normal block-by-block IBD.");
 }
 
+/// Live chain view served over iroh (see [`ChainServe`]). Head height and
+/// individual blocks are read straight from storage so followers always get
+/// the current tip; `snapshot` is the periodically re-exported blob that backs
+/// `SNP1` fresh-bootstrap pulls.
+struct StorageChainServe {
+    storage: Arc<RocksDbStorage>,
+    snapshot: zoka::network::iroh_snapshot_transfer::SnapshotProvider,
+}
+
+impl zoka::network::iroh_snapshot_transfer::ChainServe for StorageChainServe {
+    fn head_height(&self) -> u64 {
+        self.storage.get_chain_height().unwrap_or(0)
+    }
+
+    fn snapshot_bytes(&self) -> Arc<Vec<u8>> {
+        self.snapshot
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| Arc::new(Vec::new()))
+    }
+
+    fn block_bytes(&self, height: u64) -> Option<Vec<u8>> {
+        let block = self.storage.get_block_by_height(height).ok().flatten()?;
+        let encoded = serde_json::to_vec(&block).ok()?;
+        // Ship a full BlockResponseMessage so the follower applies it through
+        // the exact same validated path as a gossiped/RPC-synced block. Bodies
+        // are left empty: they are not needed for consensus apply (they are
+        // persisted separately for wallet scanning and backfill via the normal
+        // body-fetch path), and mined tip blocks are typically coinbase-only.
+        let response = zoka::network::message::BlockResponseMessage {
+            block_height: block.header.block_height,
+            encrypted_block: encoded,
+            block_hash: block.header.hash.clone(),
+            difficulty_bits: None,
+            private_tx_bodies: Vec::new(),
+            timestamp: block.header.timestamp,
+        };
+        serde_json::to_vec(&response).ok()
+    }
+}
+
+/// Client side of the incremental iroh sync: probe each manifest iroh seed's
+/// head height and, if it is ahead of us, pull the missing blocks over iroh and
+/// apply them through the standard validated sync path. This is what keeps a
+/// NAT'd node current when there is no live libp2p link to the miner — the same
+/// n0-relay hole-punching that makes snapshot bootstrap work, reused for the
+/// steady-state tail. Fully guarded and bounded by timeouts; any failure just
+/// logs and the node keeps relying on libp2p/RPC. Returns a short event string
+/// when it advanced the chain.
+async fn maybe_iroh_head_sync(
+    storage: &Arc<RocksDbStorage>,
+    chain_id: &str,
+    seed_ids: &[String],
+    own_endpoint_id: Option<&str>,
+) -> Option<String> {
+    // How many blocks to pull per tick, so one catch-up can't hog the loop.
+    const MAX_BLOCKS_PER_TICK: u32 = 64;
+    let local_height = storage.get_chain_height().unwrap_or(0);
+
+    for id_str in seed_ids {
+        let id_str = id_str.trim();
+        if id_str.is_empty() || own_endpoint_id == Some(id_str) {
+            continue;
+        }
+        let endpoint_id: iroh::EndpointId = match id_str.parse() {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+
+        // Cheap staleness probe first.
+        let head_fut = zoka::network::iroh_snapshot_transfer::fetch_head(
+            endpoint_id.into(),
+            iroh::endpoint::presets::N0,
+        );
+        let seed_head = match tokio::time::timeout(Duration::from_secs(8), head_fut).await {
+            Ok(Ok(h)) => h,
+            _ => continue, // unreachable seed / timeout -> try next
+        };
+        if seed_head <= local_height {
+            continue; // this seed has nothing newer
+        }
+
+        let want = ((seed_head - local_height).min(MAX_BLOCKS_PER_TICK as u64)) as u32;
+        let blocks_fut = zoka::network::iroh_snapshot_transfer::fetch_block_range(
+            endpoint_id.into(),
+            iroh::endpoint::presets::N0,
+            local_height + 1,
+            want,
+        );
+        let block_msgs = match tokio::time::timeout(Duration::from_secs(30), blocks_fut).await {
+            Ok(Ok(b)) if !b.is_empty() => b,
+            _ => continue,
+        };
+
+        // Apply in order; each apply advances the head by one so the next block
+        // is exactly head+1 (avoids the GapAhead guard).
+        let mut applied = 0u64;
+        for raw in &block_msgs {
+            let response: zoka::network::message::BlockResponseMessage =
+                match serde_json::from_slice(raw) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+            match zoka::state::sync::try_apply_synced_block_payload(storage, chain_id, &response) {
+                zoka::state::sync::SyncOutcome::Applied(_) => applied += 1,
+                zoka::state::sync::SyncOutcome::AlreadyKnown { .. } => continue,
+                // Anything else (bad payload, gap, sibling) -> stop this batch;
+                // the next tick re-probes from the new local height.
+                _ => break,
+            }
+        }
+        if applied > 0 {
+            let new_height = storage.get_chain_height().unwrap_or(local_height);
+            return Some(format!(
+                "iroh tail-sync: pulled {applied} block(s) from seed {endpoint_id}; now at height {new_height}."
+            ));
+        }
+    }
+    None
+}
+
 /// Bind an iroh endpoint that serves this node's chain as a snapshot so fresh
 /// nodes can bootstrap over iroh, and spawn a background task that re-exports
 /// periodically as the chain grows (via an updatable provider, no rebind).
@@ -15218,8 +15384,18 @@ async fn maybe_serve_iroh_snapshot(
         }
     };
     let provider = zoka::network::iroh_snapshot_transfer::provider_from_arc(Arc::new(bytes));
-    let endpoint = match zoka::network::iroh_snapshot_transfer::serve_snapshot_provider(
-        provider.clone(),
+    // Serve the live chain (not just a static snapshot blob): the same endpoint
+    // now answers head-height probes and incremental block-range pulls, so a
+    // NAT'd follower can stay current over iroh without a live libp2p mesh. The
+    // snapshot provider (refreshed below) still backs SNP1 fresh-bootstrap; head
+    // and blocks come straight from live storage.
+    let source: Arc<dyn zoka::network::iroh_snapshot_transfer::ChainServe> =
+        Arc::new(StorageChainServe {
+            storage: storage.clone(),
+            snapshot: provider.clone(),
+        });
+    let endpoint = match zoka::network::iroh_snapshot_transfer::serve_chain(
+        source,
         key,
         iroh::endpoint::presets::N0,
     )

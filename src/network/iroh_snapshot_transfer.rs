@@ -49,9 +49,29 @@ pub const ZOKA_SNAPSHOT_ALPN: &[u8] = b"/zoka/snapshot-pull/1";
 /// a breaking change.
 const REQUEST_SNAPSHOT_TAG: &[u8; 4] = b"SNP1";
 
+/// Request tag: "what is your current chain head height?" — a cheap staleness
+/// probe (8-byte reply) a NAT'd follower polls periodically so it can catch up
+/// over iroh without a live libp2p link, and without re-pulling the whole
+/// snapshot just to learn it's already current.
+const REQUEST_HEAD_TAG: &[u8; 4] = b"HED1";
+
+/// Request tag: "send me up to N consecutive blocks starting at height H."
+/// Followed by start-height (u64 BE) + count (u32 BE). Lets a follower pull
+/// only the blocks it is missing instead of the entire snapshot.
+const REQUEST_BLOCKS_TAG: &[u8; 4] = b"BLK1";
+
 /// Hard ceiling on an in-memory fetch, guarding [`fetch_snapshot`] against a
 /// malicious/oversized length prefix. Large snapshots should stream to disk.
 const MAX_IN_MEMORY_SNAPSHOT: u64 = 512 * 1024 * 1024;
+
+/// Max blocks a single [`REQUEST_BLOCKS_TAG`] request may return, bounding the
+/// response size / abuse. A follower that is further behind pulls across
+/// several requests.
+const MAX_BLOCKS_PER_REQUEST: u32 = 256;
+
+/// Per-block size ceiling for the incremental block fetch, guarding against a
+/// malicious length prefix (mirrors [`MAX_IN_MEMORY_SNAPSHOT`] for one block).
+const MAX_SINGLE_BLOCK_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Bind an endpoint that serves `snapshot_bytes` to any peer that connects with
 /// [`ZOKA_SNAPSHOT_ALPN`], and return it so the caller can publish its
@@ -174,6 +194,105 @@ async fn serve_one(
     Ok(())
 }
 
+/// Live chain data source for the seed side of the pull protocol. Lets a
+/// single iroh endpoint answer all three request kinds: the full snapshot
+/// (`SNP1`, fresh bootstrap), the current head height (`HED1`, cheap staleness
+/// probe), and a range of individual blocks (`BLK1`, incremental catch-up).
+///
+/// Implemented outside this module (over the node's chain storage) so the
+/// network layer stays storage-agnostic.
+pub trait ChainServe: Send + Sync {
+    /// Current chain head height.
+    fn head_height(&self) -> u64;
+    /// Full serialized snapshot bytes for `SNP1` fresh bootstrap.
+    fn snapshot_bytes(&self) -> Arc<Vec<u8>>;
+    /// Serialized bytes of the block at `height`, or `None` if absent.
+    fn block_bytes(&self, height: u64) -> Option<Vec<u8>>;
+}
+
+/// Like [`serve_snapshot_provider`] but backed by a live [`ChainServe`] so the
+/// same endpoint also answers head-height probes and incremental block-range
+/// pulls, not just full-snapshot requests. This is what a seed uses so NAT'd
+/// followers can stay current over iroh without a live libp2p mesh.
+pub async fn serve_chain(
+    source: Arc<dyn ChainServe>,
+    secret_key: SecretKey,
+    preset: impl presets::Preset,
+) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
+    let endpoint = Endpoint::builder(preset)
+        .secret_key(secret_key)
+        .alpns(vec![ZOKA_SNAPSHOT_ALPN.to_vec()])
+        .bind()
+        .await?;
+    let accept_endpoint = endpoint.clone();
+    tokio::spawn(async move {
+        while let Some(incoming) = accept_endpoint.accept().await {
+            let source = source.clone();
+            tokio::spawn(async move {
+                if let Err(err) = serve_chain_one(incoming, source).await {
+                    tracing::warn!(target: "zoka.iroh", error = %err, "chain serve connection failed");
+                }
+            });
+        }
+    });
+    Ok(endpoint)
+}
+
+async fn serve_chain_one(
+    incoming: iroh::endpoint::Incoming,
+    source: Arc<dyn ChainServe>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let connection = incoming.await?;
+    let (mut send, mut recv) = connection.accept_bi().await?;
+
+    let mut tag = [0u8; 4];
+    recv.read_exact(&mut tag).await?;
+
+    if &tag == REQUEST_SNAPSHOT_TAG {
+        let bytes = source.snapshot_bytes();
+        let len = bytes.len() as u64;
+        send.write_all(&len.to_be_bytes()).await?;
+        send.write_all(&bytes).await?;
+        send.finish()?;
+        connection.closed().await;
+    } else if &tag == REQUEST_HEAD_TAG {
+        let height = source.head_height();
+        send.write_all(&height.to_be_bytes()).await?;
+        send.finish()?;
+        connection.closed().await;
+    } else if &tag == REQUEST_BLOCKS_TAG {
+        let mut start_bytes = [0u8; 8];
+        recv.read_exact(&mut start_bytes).await?;
+        let mut count_bytes = [0u8; 4];
+        recv.read_exact(&mut count_bytes).await?;
+        let start = u64::from_be_bytes(start_bytes);
+        let count = u32::from_be_bytes(count_bytes).min(MAX_BLOCKS_PER_REQUEST);
+
+        // Gather consecutive blocks from `start`, stopping at the first gap so
+        // the client always receives a contiguous run it can apply in order.
+        let mut blocks: Vec<Vec<u8>> = Vec::new();
+        for i in 0..count as u64 {
+            match source.block_bytes(start + i) {
+                Some(b) => blocks.push(b),
+                None => break,
+            }
+        }
+        let n = blocks.len() as u32;
+        send.write_all(&n.to_be_bytes()).await?;
+        for b in &blocks {
+            let len = b.len() as u64;
+            send.write_all(&len.to_be_bytes()).await?;
+            send.write_all(b).await?;
+        }
+        send.finish()?;
+        connection.closed().await;
+    } else {
+        // Unknown request: close the stream without a body.
+        send.finish()?;
+    }
+    Ok(())
+}
+
 /// Connect to `addr`, pull the snapshot, and return it in memory. Fails if the
 /// advertised length exceeds [`MAX_IN_MEMORY_SNAPSHOT`]; use
 /// [`fetch_snapshot_streaming`] for large chains.
@@ -227,6 +346,63 @@ pub async fn fetch_snapshot_streaming(
     connection.close(0u32.into(), b"done");
     endpoint.close().await;
     Ok(len)
+}
+
+/// Ask a seed for its current chain head height — a cheap staleness probe a
+/// follower polls before deciding whether it needs to pull any blocks.
+pub async fn fetch_head(
+    addr: EndpointAddr,
+    preset: impl presets::Preset,
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    let (endpoint, connection) = open_pull(addr, preset).await?;
+    let (mut send, mut recv) = connection.open_bi().await?;
+    send.write_all(REQUEST_HEAD_TAG).await?;
+    send.finish()?;
+
+    let mut height_bytes = [0u8; 8];
+    recv.read_exact(&mut height_bytes).await?;
+    connection.close(0u32.into(), b"done");
+    endpoint.close().await;
+    Ok(u64::from_be_bytes(height_bytes))
+}
+
+/// Pull up to `count` consecutive serialized blocks starting at `start`. The
+/// seed returns as many as it holds contiguously from `start` (possibly fewer
+/// than requested, e.g. if `start` is past its head); each element is the
+/// serialized bytes of one block, ready to apply in order.
+pub async fn fetch_block_range(
+    addr: EndpointAddr,
+    preset: impl presets::Preset,
+    start: u64,
+    count: u32,
+) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    let (endpoint, connection) = open_pull(addr, preset).await?;
+    let (mut send, mut recv) = connection.open_bi().await?;
+    send.write_all(REQUEST_BLOCKS_TAG).await?;
+    send.write_all(&start.to_be_bytes()).await?;
+    let capped = count.min(MAX_BLOCKS_PER_REQUEST);
+    send.write_all(&capped.to_be_bytes()).await?;
+    send.finish()?;
+
+    let mut n_bytes = [0u8; 4];
+    recv.read_exact(&mut n_bytes).await?;
+    let n = u32::from_be_bytes(n_bytes).min(MAX_BLOCKS_PER_REQUEST);
+    let mut blocks = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let len = read_len(&mut recv).await?;
+        if len > MAX_SINGLE_BLOCK_BYTES {
+            return Err(format!(
+                "block advertised {len} bytes, over the {MAX_SINGLE_BLOCK_BYTES}-byte limit"
+            )
+            .into());
+        }
+        let mut buf = vec![0u8; len as usize];
+        recv.read_exact(&mut buf).await?;
+        blocks.push(buf);
+    }
+    connection.close(0u32.into(), b"done");
+    endpoint.close().await;
+    Ok(blocks)
 }
 
 async fn open_pull(
@@ -306,6 +482,67 @@ mod tests {
             .await
             .expect("fetch");
         assert_eq!(fetched, payload);
+        server.close().await;
+    }
+
+    // Exercises the incremental tail-sync protocol end to end over iroh: a
+    // ChainServe answers head-height probes and contiguous block-range pulls,
+    // including the "requested past the head" clamp. This is what keeps a NAT'd
+    // follower current without a live libp2p link.
+    #[tokio::test]
+    async fn iroh_head_and_block_range_round_trip() {
+        struct MockChain {
+            blocks: Vec<Vec<u8>>,
+            snapshot: Arc<Vec<u8>>,
+        }
+        impl ChainServe for MockChain {
+            fn head_height(&self) -> u64 {
+                self.blocks.len() as u64
+            }
+            fn snapshot_bytes(&self) -> Arc<Vec<u8>> {
+                self.snapshot.clone()
+            }
+            fn block_bytes(&self, height: u64) -> Option<Vec<u8>> {
+                if height == 0 || height > self.blocks.len() as u64 {
+                    return None;
+                }
+                Some(self.blocks[(height - 1) as usize].clone())
+            }
+        }
+
+        let blocks: Vec<Vec<u8>> = (1..=5u64)
+            .map(|h| format!("block-{h}").into_bytes())
+            .collect();
+        let source: Arc<dyn ChainServe> = Arc::new(MockChain {
+            blocks: blocks.clone(),
+            snapshot: Arc::new(b"snapshot-bytes".to_vec()),
+        });
+        let key = SecretKey::from_bytes(&rand::random::<[u8; 32]>());
+        let server = serve_chain(source, key, presets::Minimal)
+            .await
+            .expect("chain serve binds");
+
+        // Head probe.
+        let head = fetch_head(server.addr(), presets::Minimal)
+            .await
+            .expect("head fetch");
+        assert_eq!(head, 5, "head must be the number of blocks");
+
+        // Contiguous range in the middle (heights 2,3,4).
+        let mid = fetch_block_range(server.addr(), presets::Minimal, 2, 3)
+            .await
+            .expect("range fetch");
+        assert_eq!(mid.len(), 3);
+        assert_eq!(mid[0], b"block-2");
+        assert_eq!(mid[2], b"block-4");
+
+        // Requesting past the head returns only what exists (heights 4,5).
+        let tail = fetch_block_range(server.addr(), presets::Minimal, 4, 10)
+            .await
+            .expect("tail fetch");
+        assert_eq!(tail.len(), 2, "server clamps to available blocks");
+        assert_eq!(tail[1], b"block-5");
+
         server.close().await;
     }
 }
