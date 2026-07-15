@@ -3649,6 +3649,30 @@ impl Node {
             .collect()
     }
 
+    /// For each *currently connected* peer, its id plus a representative
+    /// observed address, for the `/peers` observability endpoint. Prefers a
+    /// Tor onion address when we know one so the transport (Tor vs clearnet)
+    /// is visible; falls back to any known address, or `None` if we have not
+    /// learned one via Identify yet.
+    pub fn connected_peer_addr_pairs(&self) -> Vec<(String, Option<String>)> {
+        self.swarm
+            .connected_peers()
+            .copied()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|peer_id| {
+                let addr = self.observed_peer_addrs.get(&peer_id).and_then(|addrs| {
+                    addrs
+                        .iter()
+                        .find(|a| a.contains("/onion3/"))
+                        .or_else(|| addrs.iter().next())
+                        .cloned()
+                });
+                (peer_id.to_string(), addr)
+            })
+            .collect()
+    }
+
     /// Return peer addresses and protocol metadata learned through Identify.
     pub fn observed_peer_records(&self) -> Vec<ObservedPeerRecord> {
         self.observed_peer_addrs

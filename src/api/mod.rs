@@ -359,6 +359,33 @@ pub struct MinerHeartbeatRecord {
     pub last_seen: u64,
 }
 
+/// One currently-connected p2p peer, as reported by `/peers`. Serverless
+/// nodes have no central directory of the network, so this is the local
+/// node's own mesh view — who it is actually talking to and over which
+/// transport.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerSummary {
+    /// libp2p PeerId (base58).
+    pub peer_id: String,
+    /// "tor" (onion), "direct" (clearnet ip/dns), or "unknown" when no
+    /// address has been learned via Identify yet.
+    pub transport: String,
+    /// A representative observed multiaddr, if known.
+    pub address: Option<String>,
+}
+
+/// Classify a peer's transport from a representative multiaddr. Tor onion
+/// dials carry `/onion3/`; clearnet peers use `/ip4|/ip6|/dns*`. Anything we
+/// have not learned an address for yet is "unknown".
+fn classify_transport(addr: Option<&str>) -> &'static str {
+    match addr {
+        Some(a) if a.contains("/onion3/") || a.contains("/onion/") => "tor",
+        Some(a) if a.contains("/ip4/") || a.contains("/ip6/") || a.contains("/dns") => "direct",
+        Some(_) => "other",
+        None => "unknown",
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NetworkRuntimeSnapshot {
     pub connected_peers: u64,
@@ -638,6 +665,11 @@ pub struct NetworkRuntimeState {
     sync_last_event: RwLock<Option<String>>,
     sync_last_error: RwLock<Option<String>>,
     miner_heartbeats: RwLock<HashMap<String, MinerHeartbeatRecord>>,
+    /// (peer_id, representative observed address) for each currently connected
+    /// p2p peer, published by the node loop for the serverless `/peers`
+    /// endpoint. Serverless nodes have no bootstrap RPC to ask "who's on the
+    /// network", so this is the local mesh view.
+    connected_peer_addrs: RwLock<Vec<(String, Option<String>)>>,
 }
 
 fn normalize_client_version(raw: Option<String>) -> Option<String> {
@@ -690,6 +722,27 @@ fn legacy_peer_id_for_heartbeat(heartbeat: &MinerHeartbeatRequest) -> String {
 impl NetworkRuntimeState {
     pub fn set_connected_peers(&self, peers: usize) {
         self.connected_peers.store(peers as u64, Ordering::Relaxed);
+    }
+
+    /// Publish the local mesh view (connected peers + a representative address
+    /// each) for the `/peers` endpoint. Called every loop tick by the node.
+    pub async fn set_connected_peer_addrs(&self, pairs: Vec<(String, Option<String>)>) {
+        let mut guard = self.connected_peer_addrs.write().await;
+        *guard = pairs;
+    }
+
+    /// Build the serializable peer summaries for `/peers`, classifying each
+    /// peer's transport from its observed address.
+    pub async fn peer_summaries(&self) -> Vec<PeerSummary> {
+        let guard = self.connected_peer_addrs.read().await;
+        guard
+            .iter()
+            .map(|(peer_id, addr)| PeerSummary {
+                peer_id: peer_id.clone(),
+                transport: classify_transport(addr.as_deref()).to_string(),
+                address: addr.clone(),
+            })
+            .collect()
     }
 
     pub fn set_gossip_stats(&self, stats: crate::network::p2p::GossipStats) {
@@ -1398,6 +1451,7 @@ fn rate_limit_bucket(method: &str, path: &str) -> &'static str {
         && (path == "/chain/height"
             || path == "/stats"
             || path == "/sync/status"
+            || path == "/peers"
             || path == "/network/runtime"
             || path.starts_with("/blocks")
             || path.starts_with("/mempool")
@@ -2664,6 +2718,29 @@ async fn get_sync_status(State(app_state): State<Arc<AppState>>) -> Json<SyncSta
             .sync_status_snapshot(local_height, last_block_at)
             .await,
     )
+}
+
+/// GET /peers — the local node's live mesh view: which p2p peers it is
+/// connected to and over which transport (Tor onion / direct / iroh). This is
+/// the serverless replacement for asking a central bootstrap RPC "who's on the
+/// network" — a node only knows the peers it is actually talking to.
+async fn get_peers() -> Json<serde_json::Value> {
+    let peers = global_network_runtime().peer_summaries().await;
+    let mut tor = 0u64;
+    let mut direct = 0u64;
+    let mut other = 0u64;
+    for p in &peers {
+        match p.transport.as_str() {
+            "tor" => tor += 1,
+            "direct" => direct += 1,
+            _ => other += 1,
+        }
+    }
+    Json(serde_json::json!({
+        "connected_peers": peers.len(),
+        "by_transport": { "tor": tor, "direct": direct, "other": other },
+        "peers": peers,
+    }))
 }
 
 async fn post_miner_heartbeat(
@@ -5149,6 +5226,7 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
     let mut router = Router::new()
         .route("/stats", get(get_stats))
         .route("/sync/status", get(get_sync_status))
+        .route("/peers", get(get_peers))
         .route("/network/runtime", get(get_network_runtime))
         .route("/network/miners", get(get_network_miners))
         .route("/network/miners/heartbeat", post(post_miner_heartbeat))

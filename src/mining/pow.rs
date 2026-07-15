@@ -340,24 +340,46 @@ mod randomx_backend {
         }
     }
 
-    /// Build the best resources for `seed`: full mode when ≥ 2.5 GB free,
-    /// light mode otherwise.
+    /// Build the best resources for `seed`: full ("fast") mode when the box
+    /// can spare ~2 GB for the RandomX dataset, light mode otherwise.
+    ///
+    /// Light and full mode compute *identical* RandomX hashes — this only
+    /// changes speed (full mode is ≈10× faster), never consensus validity.
     fn build_resources(seed: &[u8]) -> Result<ResourceCache, PowError> {
         let base = RandomXFlag::get_recommended_flags();
 
-        if free_ram_bytes() >= 2_500 * 1024 * 1024 {
+        if should_use_full_mode() {
             let full_flags = base | RandomXFlag::FLAG_FULL_MEM;
             let rx_cache = RandomXCache::new(full_flags, seed)
                 .map_err(|e| PowError::Runtime(format!("randomx cache init failed: {e:?}")))?;
             match RandomXDataset::new(full_flags, rx_cache, 0) {
                 Ok(dataset) => {
+                    tracing::info!(
+                        "RandomX: full/fast mode (dataset ~2 GB, {} total / {} free RAM)",
+                        human_bytes(total_ram_bytes()),
+                        human_bytes(free_ram_bytes())
+                    );
                     return Ok(ResourceCache {
                         seed: seed.to_vec(),
                         mode: CachedMode::Full(dataset),
                     });
                 }
-                Err(_) => {} // fall through to light mode
+                // Allocation genuinely failed (Windows won't overcommit, so a
+                // 2 GB request that can't be backed fails here rather than
+                // OOM-killing the desktop) — fall through to light mode.
+                Err(e) => {
+                    tracing::warn!(
+                        "RandomX: full-mode dataset alloc failed ({e:?}); using light mode"
+                    );
+                }
             }
+        } else {
+            tracing::info!(
+                "RandomX: light mode ({} total / {} free RAM below full-mode threshold; \
+                 set ZOKA_RANDOMX_MODE=full to force)",
+                human_bytes(total_ram_bytes()),
+                human_bytes(free_ram_bytes())
+            );
         }
 
         // Light mode: keep the initialized cache so new_pool can hand the
@@ -368,6 +390,49 @@ mod randomx_backend {
             seed: seed.to_vec(),
             mode: CachedMode::Light(rx_cache),
         })
+    }
+
+    /// Decide whether to build the ~2 GB full-memory RandomX dataset.
+    ///
+    /// The old heuristic looked only at momentary *free* RAM (≥ 2.5 GB). That
+    /// silently forced light mode on ordinary desktops: Windows reports the
+    /// large reclaimable file cache as "used", so a 16 GB machine routinely
+    /// shows < 2.5 GB free and mined ≈10× too slow for no good reason.
+    ///
+    /// We now decide on *total* RAM (a box with ≥ 4 GB can spare 2 GB for the
+    /// dataset — the OS reclaims cache on demand) with only a small free-RAM
+    /// floor so we don't force paging on a machine that is genuinely tight
+    /// right now. If the allocation still fails, `build_resources` falls back
+    /// to light mode, so being optimistic here is safe.
+    fn should_use_full_mode() -> bool {
+        match std::env::var("ZOKA_RANDOMX_MODE")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("full") | Some("fast") => return true,
+            Some("light") => return false,
+            _ => {}
+        }
+        const GB: u64 = 1024 * 1024 * 1024;
+        let total = total_ram_bytes();
+        let free = free_ram_bytes();
+        // total==0 means detection failed → stay on the safe light path.
+        total >= 4 * GB && free >= GB
+    }
+
+    /// Total physical RAM in bytes (best-effort; 0 on failure).
+    fn total_ram_bytes() -> u64 {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        sys.total_memory()
+    }
+
+    fn human_bytes(bytes: u64) -> String {
+        if bytes == 0 {
+            return "unknown".to_string();
+        }
+        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
     }
 
     /// Best-effort free physical RAM in bytes, cross-platform (Linux,

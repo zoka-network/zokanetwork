@@ -9997,6 +9997,9 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             .and_then(|storage| storage.get_chain_height().ok())
             .unwrap_or(runtime_mining_state.chain_height);
         zoka::api::global_network_runtime().set_connected_peers(node.connected_peer_count());
+        zoka::api::global_network_runtime()
+            .set_connected_peer_addrs(node.connected_peer_addr_pairs())
+            .await;
         zoka::api::global_network_runtime().set_gossip_stats(node.gossip_stats());
         zoka::api::global_network_runtime()
             .set_block_request_response_stats(node.block_request_response_stats());
