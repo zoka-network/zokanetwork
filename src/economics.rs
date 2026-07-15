@@ -38,6 +38,15 @@ pub const MAINNET_RECOVERY_CHECKPOINT_298_HASH: &str =
 pub const MAINNET_UPGRADE_CHECKPOINT_1460_HEIGHT: u64 = 1460;
 pub const MAINNET_UPGRADE_CHECKPOINT_1460_HASH: &str =
     "39e45d515c49a54420922d1fa258391cfabed01a94948dbaabe312025c0fb314";
+/// Canonical anchor for the serverless difficulty reset (1.7.5). By ship time
+/// the network had drifted to difficulty 23 (~3.4h/block for the ~1 remaining
+/// home miner), effectively stalling the chain. This pin fixes the canonical
+/// head at 3127 so the reset difficulty cap below only applies on the real
+/// chain, and upgraded nodes never reorg onto a divergent 3127. Verified live
+/// on both the host and the follower before pinning.
+pub const MAINNET_UPGRADE_CHECKPOINT_3127_HEIGHT: u64 = 3127;
+pub const MAINNET_UPGRADE_CHECKPOINT_3127_HASH: &str =
+    "b5c20cfbdc9e2f56bb143334c03f7bcc9df60fbd7c2c7ed553b61ee2dd9740df";
 pub const MAINNET_EMERGENCY_CHECKPOINTS: &[(u64, &str)] = &[
     (
         MAINNET_EMERGENCY_CHECKPOINT_HEIGHT,
@@ -55,6 +64,10 @@ pub const MAINNET_EMERGENCY_CHECKPOINTS: &[(u64, &str)] = &[
         MAINNET_UPGRADE_CHECKPOINT_1460_HEIGHT,
         MAINNET_UPGRADE_CHECKPOINT_1460_HASH,
     ),
+    (
+        MAINNET_UPGRADE_CHECKPOINT_3127_HEIGHT,
+        MAINNET_UPGRADE_CHECKPOINT_3127_HASH,
+    ),
 ];
 /// Temporary one-miner recovery window after the 1.4.x checkpoint. The cap is
 /// only applied when the local canonical chain contains the checkpoint above.
@@ -62,6 +75,17 @@ pub const MAINNET_EMERGENCY_DIFFICULTY_CAP_FROM_HEIGHT: u64 =
     MAINNET_EMERGENCY_CHECKPOINT_HEIGHT + 1;
 pub const MAINNET_EMERGENCY_DIFFICULTY_CAP_UNTIL_HEIGHT: u64 = 360;
 pub const MAINNET_EMERGENCY_DIFFICULTY_MAX_BITS: u32 = 14;
+
+/// Serverless difficulty reset (1.7.5). The per-block retarget only moves ±1
+/// bit, so after the hashrate collapsed to a single home miner it left the
+/// network stuck at difficulty 23 (~3.4h/block). Gated on the 3127 checkpoint,
+/// this window drops difficulty to a sane 16 bits (~2 min/block at ~700 H/s)
+/// from 3128 onward so the chain can move again; the normal retarget still
+/// operates *below* the cap, and floats freely again after the window.
+pub const MAINNET_RESET_DIFFICULTY_CAP_FROM_HEIGHT: u64 =
+    MAINNET_UPGRADE_CHECKPOINT_3127_HEIGHT + 1;
+pub const MAINNET_RESET_DIFFICULTY_CAP_UNTIL_HEIGHT: u64 = 10_000;
+pub const MAINNET_RESET_DIFFICULTY_MAX_BITS: u32 = 16;
 
 pub const ZKA_DECIMALS: u32 = 6;
 pub const ATOMS_PER_ZKA: u64 = 1_000_000;

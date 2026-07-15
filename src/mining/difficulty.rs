@@ -93,20 +93,31 @@ pub fn apply_mainnet_emergency_difficulty_cap(
     next_height: u64,
     difficulty_bits: u32,
 ) -> Result<u32, String> {
-    if next_height < economics::MAINNET_EMERGENCY_DIFFICULTY_CAP_FROM_HEIGHT
-        || next_height > economics::MAINNET_EMERGENCY_DIFFICULTY_CAP_UNTIL_HEIGHT
+    // Original one-miner recovery window (gated on the post-296 checkpoint).
+    if next_height >= economics::MAINNET_EMERGENCY_DIFFICULTY_CAP_FROM_HEIGHT
+        && next_height <= economics::MAINNET_EMERGENCY_DIFFICULTY_CAP_UNTIL_HEIGHT
     {
-        return Ok(difficulty_bits);
+        let checkpoint_hash = storage
+            .get_canonical_block_hash_at_height(economics::MAINNET_EMERGENCY_CHECKPOINT_HEIGHT)
+            .map_err(|e| format!("read emergency checkpoint failed: {e:?}"))?;
+        if checkpoint_hash.as_deref() == Some(economics::MAINNET_EMERGENCY_CHECKPOINT_HASH) {
+            return Ok(difficulty_bits.min(economics::MAINNET_EMERGENCY_DIFFICULTY_MAX_BITS));
+        }
     }
 
-    let checkpoint_hash = storage
-        .get_canonical_block_hash_at_height(economics::MAINNET_EMERGENCY_CHECKPOINT_HEIGHT)
-        .map_err(|e| format!("read emergency checkpoint failed: {e:?}"))?;
-    if checkpoint_hash.as_deref() != Some(economics::MAINNET_EMERGENCY_CHECKPOINT_HASH) {
-        return Ok(difficulty_bits);
+    // Serverless difficulty reset window (gated on the 3127 checkpoint, 1.7.5).
+    if next_height >= economics::MAINNET_RESET_DIFFICULTY_CAP_FROM_HEIGHT
+        && next_height <= economics::MAINNET_RESET_DIFFICULTY_CAP_UNTIL_HEIGHT
+    {
+        let checkpoint_hash = storage
+            .get_canonical_block_hash_at_height(economics::MAINNET_UPGRADE_CHECKPOINT_3127_HEIGHT)
+            .map_err(|e| format!("read reset checkpoint failed: {e:?}"))?;
+        if checkpoint_hash.as_deref() == Some(economics::MAINNET_UPGRADE_CHECKPOINT_3127_HASH) {
+            return Ok(difficulty_bits.min(economics::MAINNET_RESET_DIFFICULTY_MAX_BITS));
+        }
     }
 
-    Ok(difficulty_bits.min(economics::MAINNET_EMERGENCY_DIFFICULTY_MAX_BITS))
+    Ok(difficulty_bits)
 }
 
 /// Pure step function used by `expected_for_next_block`. Exposed for

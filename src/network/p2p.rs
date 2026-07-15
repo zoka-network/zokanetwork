@@ -725,6 +725,11 @@ pub struct NodeBehaviour {
     header_request_response: request_response::Behaviour<HeaderRequestResponseCodec>,
     /// Snapshot manifest discovery.
     snapshot_request_response: request_response::Behaviour<SnapshotRequestResponseCodec>,
+    /// Liveness keepalive. Without it, a quiet connection over Tor idles until
+    /// the circuit is torn down (tor.log: "assuming established circuits no
+    /// longer work"), dropping the only peer link between two NAT'd home nodes.
+    /// Periodic pings keep the connection — and its Tor circuit — warm.
+    ping: libp2p::ping::Behaviour,
 }
 
 impl Node {
@@ -1605,6 +1610,10 @@ impl Node {
                     private_tx_request_response,
                     header_request_response,
                     snapshot_request_response,
+                    // Default: ping every 15s, 20s timeout. Well under the
+                    // libp2p idle timeout (300s) and Tor's circuit idle window,
+                    // so the peer link stays up between sparse block gossip.
+                    ping: libp2p::ping::Behaviour::new(libp2p::ping::Config::new()),
                 })
             })?
             .with_swarm_config(|cfg| {

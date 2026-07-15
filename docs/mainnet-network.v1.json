@@ -20,32 +20,10 @@
       "iroh": "ca7721e29d60af28dda8406191f6d7a98e146b95cd456392d0c2d2b996639f99",
       "role": "seed",
       "status": "active",
-      "note": "Primary bootstrap, hybrid: reachable over clearnet TCP (DNS, needs the operator's port 28080 open) and over Tor v3 onion (needs no open port; nodes started with --tor-proxy dial it). Nodes without a Tor proxy skip the onion and use the TCP address."
-    },
-    {
-      "label": "seed2",
-      "operator": "zoka-core",
-      "region": "community",
-      "multiaddr": "/dns4/seed2.zoka.network/tcp/28080",
-      "onion": null,
-      "i2p": null,
-      "role": "seed",
-      "status": "active",
-      "note": "Secondary bootstrap - fallback peer discovery if seed1 is unreachable."
+      "note": "Primary bootstrap. Serverless: reachable over Tor v3 onion (no open port) and over iroh (QUIC + n0 hole-punching, for snapshot + tail-sync). The clearnet DNS/TCP address is a best-effort extra and may be unreachable behind NAT; onion + iroh are the real paths."
     }
   ],
-  "public_rpc": [
-    {
-      "label": "rpc1",
-      "operator": "zoka-core",
-      "region": "community",
-      "url": "http://rpc.zoka.network:3000",
-      "onion": null,
-      "i2p": null,
-      "status": "active",
-      "logging_policy": "no-wallet-secrets-no-private-keys"
-    }
-  ],
+  "public_rpc": [],
   "desktop": {
     "local_rpc_url": "http://127.0.0.1:3000"
   },
@@ -102,10 +80,9 @@
     "4c9f0ab16d1400cd69123a02738399498b0b5edf6f56ae45f3c96e01864216af"
   ],
   "notes": [
-    "Community-run bootstrap: seeds are DNS names (seed1/seed2.zoka.network) so hosts can rotate without shipping new binaries.",
-    "Wallet secrets and private keys must remain local; public RPC is read-only chain status.",
-    "Open mining network: anyone can run a node or miner and earn block rewards.",
-    "Want to help decentralize? Run a node with port 28080 reachable and ask to be added as a seed.",
-    "Tor/I2P endpoints are not active yet."
+    "Serverless: no central RPC. The old DigitalOcean bootstrap (rpc.zoka.network) was decommissioned 2026-07-09; nodes read all state from their own local node over the p2p mesh.",
+    "Reachability without open ports: every node has a Tor v3 onion, and iroh (QUIC + n0 hole-punching) handles snapshot bootstrap and incremental tail-sync across NAT.",
+    "Wallet secrets and private keys must remain local.",
+    "Open mining network: anyone can run a node or miner and earn block rewards directly (no pool)."
   ]
 }
