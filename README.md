@@ -69,6 +69,27 @@ zoka wallets --network testnet
 - ZKA uses 6 decimal places: `1 ZKA = 1,000,000 atoms`.
 - Coinbase maturity is 60 blocks.
 
+## Canonical Chain
+
+The canonical ZOKA mainnet is anchored at **block 3127**:
+
+```text
+height 3127  hash b5c20cfbdc9e2f56bb143334c03f7bcc9df60fbd7c2c7ed553b61ee2dd9740df
+```
+
+From 1.8.0 on, every node enforces this checkpoint. A node whose block at
+height 3127 does **not** match this hash is on a different chain and its blocks
+are rejected — it is **not** part of ZOKA network. Any such branch is a *side
+chain*: typically a fork built by a node that was mining in isolation
+(disconnected from the mesh) and drifted onto its own history. The network
+follows the chain that contains block 3127 above; everything else is discarded.
+
+This checkpoint also anchors the serverless difficulty reset: from **block
+3128** onward, difficulty is capped to a sane target (after the hashrate
+collapse had pushed it far too high for the remaining miners), so the chain
+keeps producing blocks at a healthy pace. Both rules apply only on the chain
+that carries the 3127 anchor.
+
 ## Repository Layout
 
 ```text
