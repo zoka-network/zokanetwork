@@ -15254,16 +15254,17 @@ impl zoka::network::iroh_snapshot_transfer::ChainServe for StorageChainServe {
         let block = self.storage.get_block_by_height(height).ok().flatten()?;
         let encoded = serde_json::to_vec(&block).ok()?;
         // Ship a full BlockResponseMessage so the follower applies it through
-        // the exact same validated path as a gossiped/RPC-synced block. Bodies
-        // are left empty: they are not needed for consensus apply (they are
-        // persisted separately for wallet scanning and backfill via the normal
-        // body-fetch path), and mined tip blocks are typically coinbase-only.
+        // the exact same validated path as a gossiped/RPC-synced block, and
+        // include the private-tx bodies so a node catching up over iroh (e.g.
+        // after a disconnect) can still recover private transfers it received
+        // while offline -- not just the block header/commitments.
+        let private_tx_bodies = collect_private_tx_bodies_from_storage(&self.storage, &block);
         let response = zoka::network::message::BlockResponseMessage {
             block_height: block.header.block_height,
             encrypted_block: encoded,
             block_hash: block.header.hash.clone(),
             difficulty_bits: None,
-            private_tx_bodies: Vec::new(),
+            private_tx_bodies,
             timestamp: block.header.timestamp,
         };
         serde_json::to_vec(&response).ok()

@@ -7127,7 +7127,7 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zoka"
-version = "1.7.5"
+version = "1.8.0"
 dependencies = [
  "aes-gcm",
  "argon2",
