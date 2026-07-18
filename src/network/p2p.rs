@@ -988,6 +988,23 @@ impl Node {
         kad::RecordKey::new(&key)
     }
 
+    /// Peers currently held in the Kademlia routing table.
+    ///
+    /// Worth surfacing separately from the connected-peer count: for a long
+    /// time this was silently zero on every node (nothing ever populated the
+    /// table), and the node still looked perfectly healthy because peers were
+    /// arriving from the seed dial, gossipsub and the peerstore instead. A
+    /// count that stays at zero while peers are connected means DHT discovery
+    /// is dead again.
+    pub fn kademlia_routing_peer_count(&mut self) -> u64 {
+        self.swarm
+            .behaviour_mut()
+            .kademlia
+            .kbuckets()
+            .map(|bucket| bucket.num_entries() as u64)
+            .sum()
+    }
+
     pub fn connected_peer_ids(&self) -> Vec<PeerId> {
         self.swarm.connected_peers().copied().collect()
     }

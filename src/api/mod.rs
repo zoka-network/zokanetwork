@@ -408,6 +408,7 @@ pub struct NetworkRuntimeSnapshot {
     /// peers with gossipsub support) - lets an operator tell a healthy mesh
     /// apart from one that's empty and silently relying on flood-publish.
     pub gossip_mesh_peer_count: u64,
+    pub kademlia_routing_peers: u64,
     pub direct_block_requests_outbound_sent: u64,
     pub direct_block_requests_outbound_responses: u64,
     pub direct_block_requests_outbound_failures: u64,
@@ -649,6 +650,7 @@ pub struct NetworkRuntimeState {
     gossip_publish_err: AtomicU64,
     gossip_last_rx_block_at: AtomicU64,
     gossip_mesh_peer_count: AtomicU64,
+    kademlia_routing_peers: AtomicU64,
     direct_block_requests_outbound_sent: AtomicU64,
     direct_block_requests_outbound_responses: AtomicU64,
     direct_block_requests_outbound_failures: AtomicU64,
@@ -758,6 +760,12 @@ impl NetworkRuntimeState {
             .store(stats.last_rx_block_at, Ordering::Relaxed);
         self.gossip_mesh_peer_count
             .store(stats.mesh_peer_count, Ordering::Relaxed);
+    }
+
+    /// Size of the Kademlia routing table. Zero while peers are connected
+    /// means DHT discovery is not working.
+    pub fn set_kademlia_routing_peers(&self, peers: u64) {
+        self.kademlia_routing_peers.store(peers, Ordering::Relaxed);
     }
 
     pub fn set_block_request_response_stats(
@@ -1015,6 +1023,7 @@ impl NetworkRuntimeState {
             gossip_publish_err: self.gossip_publish_err.load(Ordering::Relaxed),
             gossip_last_rx_block_at: self.gossip_last_rx_block_at.load(Ordering::Relaxed),
             gossip_mesh_peer_count: self.gossip_mesh_peer_count.load(Ordering::Relaxed),
+            kademlia_routing_peers: self.kademlia_routing_peers.load(Ordering::Relaxed),
             direct_block_requests_outbound_sent: self
                 .direct_block_requests_outbound_sent
                 .load(Ordering::Relaxed),

@@ -10255,6 +10255,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             .await;
         zoka::api::global_network_runtime().set_gossip_stats(node.gossip_stats());
         zoka::api::global_network_runtime()
+            .set_kademlia_routing_peers(node.kademlia_routing_peer_count());
+        zoka::api::global_network_runtime()
             .set_block_request_response_stats(node.block_request_response_stats());
         zoka::api::global_network_runtime()
             .set_local_miner(
