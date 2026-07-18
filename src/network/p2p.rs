@@ -4688,6 +4688,77 @@ mod tests {
         assert!(Node::kademlia_peer_from_multiaddr(&without_peer).is_none());
     }
 
+    fn identify_info_for(protocols: &[&'static str], listen_addrs: &[&str]) -> identify::Info {
+        identify::Info {
+            public_key: libp2p::identity::Keypair::generate_ed25519().public(),
+            protocol_version: PROTOCOL_FREEZE_ID.to_string(),
+            agent_version: "zoka-test".to_string(),
+            listen_addrs: listen_addrs
+                .iter()
+                .map(|a| a.parse().expect("listen addr"))
+                .collect(),
+            protocols: protocols
+                .iter()
+                .map(|p| libp2p::StreamProtocol::new(p))
+                .collect(),
+            observed_addr: "/ip4/203.0.113.9/tcp/1".parse().expect("observed addr"),
+        }
+    }
+
+    fn kademlia_knows(node: &mut Node, peer: &PeerId) -> bool {
+        node.swarm
+            .behaviour_mut()
+            .kademlia
+            .kbuckets()
+            .any(|bucket| bucket.iter().any(|entry| entry.node.key.preimage() == peer))
+    }
+
+    /// Regression: the routing table was empty on every node in the network.
+    /// The only code path that added addresses required the multiaddr to carry
+    /// an explicit `/p2p/<peer-id>`, which the network manifest's seed entries
+    /// don't, so DHT discovery never worked at all and peer-finding fell back
+    /// entirely to the seed dial, gossipsub and the persisted peerstore.
+    #[tokio::test]
+    async fn identify_populates_kademlia_routing_table_without_p2p_suffix() {
+        let mut node = Node::new(0).await.expect("node");
+        let peer = PeerId::random();
+        let info = identify_info_for(&["/ipfs/kad/1.0.0"], &["/ip4/203.0.113.5/tcp/28080"]);
+
+        node.record_identify_peer(peer, &info);
+
+        assert!(
+            kademlia_knows(&mut node, &peer),
+            "a peer identified over a live connection must enter the routing table \
+             even though its announced address carries no /p2p/ suffix"
+        );
+    }
+
+    #[tokio::test]
+    async fn identify_skips_kademlia_for_peers_that_do_not_speak_it() {
+        // Adding a non-Kademlia peer would put an entry in the table that can
+        // never answer a query.
+        let mut node = Node::new(0).await.expect("node");
+        let peer = PeerId::random();
+        let info = identify_info_for(&["/zoka/messages/v1"], &["/ip4/203.0.113.6/tcp/28080"]);
+
+        node.record_identify_peer(peer, &info);
+
+        assert!(!kademlia_knows(&mut node, &peer));
+    }
+
+    #[tokio::test]
+    async fn identify_does_not_route_unreachable_private_addresses() {
+        // A seed announcing a datacenter-internal interface must not have that
+        // address propagated through the DHT to everyone else.
+        let mut node = Node::new(0).await.expect("node");
+        let peer = PeerId::random();
+        let info = identify_info_for(&["/ipfs/kad/1.0.0"], &["/ip4/10.10.0.5/tcp/28080"]);
+
+        node.record_identify_peer(peer, &info);
+
+        assert!(!kademlia_knows(&mut node, &peer));
+    }
+
     #[tokio::test]
     async fn test_probe_anonymous_route_uses_tor_proxy() {
         let (proxy_endpoint, proxy_task) = spawn_mock_socks5_proxy().await;
