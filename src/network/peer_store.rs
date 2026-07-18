@@ -236,17 +236,24 @@ impl PeerStore {
     /// (e.g. a network blip) shouldn't outweigh recent proven usefulness.
     pub fn prune(&mut self) {
         const MAX_ENTRIES: usize = 500;
-        const STALE_FAILURE_AGE_SECS: u64 = 14 * 24 * 3600;
         const STALE_FAILURE_THRESHOLD: u32 = 10;
         const SUCCESS_GRACE_SECS: u64 = 30 * 24 * 3600;
 
         let now = now_secs();
         self.file.peers.retain(|entry| {
-            let stale_failed = entry.failures >= STALE_FAILURE_THRESHOLD
-                && now.saturating_sub(entry.last_failed_at) >= STALE_FAILURE_AGE_SECS;
-            let recently_useful = entry.last_connected_at > 0
-                && now.saturating_sub(entry.last_connected_at) < SUCCESS_GRACE_SECS;
-            !(stale_failed && !recently_useful)
+            // Staleness is measured from the last *success*, not the last
+            // failure. Keying it off the last failure made dead addresses
+            // permanently unprunable: the node keeps retrying them, every
+            // retry refreshes `last_failed_at`, so "failed long ago" was
+            // never true for exactly the addresses we most wanted gone. That
+            // is why decommissioned bootstrap IPs kept being dialed for
+            // weeks after the servers were destroyed. What earns an address
+            // its place is having been useful, not having been tried.
+            let failing_badly = entry.failures >= STALE_FAILURE_THRESHOLD;
+            let never_useful = entry.last_connected_at == 0;
+            let long_since_useful = entry.last_connected_at > 0
+                && now.saturating_sub(entry.last_connected_at) >= SUCCESS_GRACE_SECS;
+            !(failing_badly && (never_useful || long_since_useful))
         });
 
         if self.file.peers.len() > MAX_ENTRIES {
@@ -324,6 +331,70 @@ mod tests {
 
         let addrs = store.dial_addrs(8);
         assert_eq!(addrs, vec!["/ip4/203.0.113.9/tcp/28080".to_string()]);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn prune_drops_addresses_that_keep_failing_and_never_connected() {
+        // Regression: decommissioned bootstrap servers kept being dialed for
+        // weeks after being destroyed. Staleness used to be measured from the
+        // last *failure*, but the node retries these addresses constantly and
+        // every retry refreshed that timestamp, so "failed long ago" was never
+        // true and they could never age out.
+        let path = std::env::temp_dir().join(format!(
+            "zoka-peer-store-test-deadip-{}.json",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let mut store = PeerStore::load_or_default(&path).unwrap();
+
+        let dead = "/ip4/159.223.119.216/tcp/28080";
+        let alive = "/ip4/203.0.113.7/tcp/28080";
+        store.upsert_addr(dead, "seed");
+        store.upsert_addr(alive, "seed");
+        store.mark_identified(alive, Some("peer-alive"), None, &[], "identify");
+
+        // Dead host: fails on every dial attempt, right up to this moment.
+        for _ in 0..12 {
+            store.mark_failed(dead);
+        }
+
+        store.prune();
+        let addrs = store.dial_addrs(8);
+        assert!(
+            !addrs.iter().any(|a| a == dead),
+            "a host that has failed 12 times and never once connected must be dropped, got {addrs:?}"
+        );
+        assert!(
+            addrs.iter().any(|a| a == alive),
+            "a peer that did connect must be kept, got {addrs:?}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn prune_keeps_a_peer_that_failed_a_lot_but_connected_recently() {
+        // The flip side: a peer having a bad night is not the same as a peer
+        // that no longer exists.
+        let path = std::env::temp_dir().join(format!(
+            "zoka-peer-store-test-flaky-{}.json",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let mut store = PeerStore::load_or_default(&path).unwrap();
+
+        let flaky = "/ip4/203.0.113.8/tcp/28080";
+        store.upsert_addr(flaky, "seed");
+        for _ in 0..15 {
+            store.mark_failed(flaky);
+        }
+        store.mark_identified(flaky, Some("peer-flaky"), None, &[], "identify");
+
+        store.prune();
+        assert!(
+            store.dial_addrs(8).iter().any(|a| a == flaky),
+            "recent proven usefulness must outweigh past failures"
+        );
         let _ = fs::remove_file(&path);
     }
 
