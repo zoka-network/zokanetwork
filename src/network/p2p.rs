@@ -988,7 +988,7 @@ impl Node {
         kad::RecordKey::new(&key)
     }
 
-    fn connected_peer_ids(&self) -> Vec<PeerId> {
+    pub fn connected_peer_ids(&self) -> Vec<PeerId> {
         self.swarm.connected_peers().copied().collect()
     }
 
@@ -1699,14 +1699,45 @@ impl Node {
         if info.listen_addrs.is_empty() {
             return;
         }
+
+        // Does this peer actually speak Kademlia? Adding a peer that doesn't
+        // pollutes the routing table with entries that can never answer a
+        // query. Matched on substring rather than an exact constant so a
+        // libp2p version bump to the protocol string doesn't silently turn
+        // discovery back off.
+        let speaks_kademlia = info
+            .protocols
+            .iter()
+            .any(|protocol| protocol.as_ref().contains("/kad/"));
+
+        let mut dialable = Vec::new();
         let addrs = self.observed_peer_addrs.entry(peer_id).or_default();
         for addr in &info.listen_addrs {
-            let addr = addr.to_string();
+            let addr_str = addr.to_string();
             // Drop unreachable private/loopback/link-local addresses a peer
             // announces (e.g. a seed's datacenter-internal 10.x interface), so
             // they never enter the dial/reconnect pool.
-            if discovered_addr_is_publicly_dialable(&addr) {
-                addrs.insert(addr);
+            if discovered_addr_is_publicly_dialable(&addr_str) {
+                addrs.insert(addr_str);
+                dialable.push(addr.clone());
+            }
+        }
+
+        // Feed the Kademlia routing table from identify.
+        //
+        // This used to be the *only* thing missing for DHT discovery to work
+        // at all: the sole other `add_address` caller requires the multiaddr
+        // to carry an explicit `/p2p/<peer-id>`, and the network manifest's
+        // seed addresses don't, so in practice no node ever populated its
+        // routing table and peer discovery fell back entirely to the seed
+        // dial, gossipsub and the persisted peerstore. Here the peer id is
+        // authenticated by the connection itself, so no suffix is needed.
+        if speaks_kademlia {
+            for addr in dialable {
+                self.swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .add_address(&peer_id, addr);
             }
         }
     }

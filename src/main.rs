@@ -6494,8 +6494,192 @@ fn serve_pending_header_requests(
     }
 }
 
+/// How far behind a node must fall before catching up block-by-block stops
+/// being worth it and it pulls a whole snapshot from a peer instead. Well
+/// above normal gossip jitter so a node a few blocks behind just syncs
+/// normally.
+const PEER_SNAPSHOT_PULL_MIN_GAP: u64 = 1_000;
+
+/// Peers asked per discovery round. Small: the responses are tiny, and any
+/// honest peer's answer is enough to find the heaviest chain on offer.
+const PEER_SNAPSHOT_MANIFEST_FANOUT: usize = 4;
+
+/// Ask connected peers what chain they can serve. Returns how many were asked.
+fn request_snapshot_manifests_from_peers(
+    node: &mut zoka::network::p2p::Node,
+    chain_id: &str,
+) -> usize {
+    use zoka::network::snapshot_request_response::GetSnapshotManifests;
+
+    let peers: Vec<_> = node
+        .connected_peer_ids()
+        .into_iter()
+        .take(PEER_SNAPSHOT_MANIFEST_FANOUT)
+        .collect();
+    let mut sent = 0usize;
+    for peer in peers {
+        let request = GetSnapshotManifests {
+            chain_id: chain_id.to_string(),
+            max_height: None,
+        };
+        if node.send_snapshot_manifest_request(&peer, request).is_some() {
+            sent = sent.saturating_add(1);
+        }
+    }
+    sent
+}
+
+/// Drain peer replies and pick the heaviest chain we could actually pull.
+///
+/// Selection is by cumulative work, the same rule consensus uses to compare
+/// chains — not by height, which a peer could inflate by mining a long low
+/// difficulty branch. Nothing here is trusted: an offer only decides *who we
+/// ask*, and every block is re-validated against consensus (including the
+/// canonical 3127 checkpoint) on import, so a dishonest offer costs bandwidth
+/// and nothing else.
+fn best_peer_snapshot_offer(
+    node: &mut zoka::network::p2p::Node,
+    chain_id: &str,
+    local_height: u64,
+) -> Option<zoka::network::snapshot_request_response::SnapshotManifest> {
+    use zoka::network::snapshot_request_response::SnapshotManifestsResponse;
+
+    let mut offers = Vec::new();
+    while let Some(received) = node.take_received_snapshot_manifests() {
+        if let SnapshotManifestsResponse::Manifests { manifests } = received.response {
+            offers.extend(manifests);
+        }
+    }
+    choose_best_snapshot_offer(offers, chain_id, local_height)
+}
+
+/// Selection rule for [`best_peer_snapshot_offer`], split out so it can be
+/// tested without a live swarm.
+fn choose_best_snapshot_offer(
+    offers: impl IntoIterator<Item = zoka::network::snapshot_request_response::SnapshotManifest>,
+    chain_id: &str,
+    local_height: u64,
+) -> Option<zoka::network::snapshot_request_response::SnapshotManifest> {
+    use zoka::network::snapshot_request_response::SnapshotManifest;
+
+    let mut best: Option<SnapshotManifest> = None;
+    for manifest in offers {
+        if manifest.chain_id != chain_id {
+            continue;
+        }
+        // Older peers advertise no endpoint id; there's no way to pull from
+        // them, so their offers are informational only.
+        if manifest.iroh_endpoint_id.is_none() {
+            continue;
+        }
+        if manifest.head_height <= local_height.saturating_add(PEER_SNAPSHOT_PULL_MIN_GAP) {
+            continue;
+        }
+        if best
+            .as_ref()
+            .map_or(true, |b| manifest.cumulative_work > b.cumulative_work)
+        {
+            best = Some(manifest);
+        }
+    }
+    best
+}
+
+/// Pull a snapshot from a peer's iroh endpoint. Runs off the main loop: the
+/// transfer is slow and purely network-bound, and stalling the loop on it
+/// would drop gossip and peer keepalives.
+async fn fetch_peer_snapshot(endpoint_id: iroh::EndpointId) -> Result<(String, Vec<u8>), String> {
+    let fetch = zoka::network::iroh_snapshot_transfer::fetch_snapshot(
+        endpoint_id.into(),
+        iroh::endpoint::presets::N0,
+    );
+    match tokio::time::timeout(Duration::from_secs(180), fetch).await {
+        Ok(Ok(bytes)) => Ok((endpoint_id.to_string(), bytes)),
+        Ok(Err(e)) => Err(format!("transfer from {endpoint_id} failed: {e}")),
+        Err(_) => Err(format!(
+            "transfer from {endpoint_id} timed out after 180s (relay/hole-punch unreachable)"
+        )),
+    }
+}
+
+/// Import a snapshot that came from an arbitrary peer.
+///
+/// Deliberately does *not* require a trusted signature, unlike the
+/// manifest-seed bootstrap path. That path uses the signature to authorize a
+/// specific operator-run seed; here the whole point is that *any* peer can be
+/// the source, so authorization can't come from an allowlist. Safety comes
+/// from `import_into_storage` replaying every block through the full consensus
+/// apply path — proof of work, difficulty, and the canonical 3127 checkpoint —
+/// so a hostile peer cannot introduce an invalid or side-branch chain. The
+/// worst it can do is waste our bandwidth.
+fn import_peer_snapshot_bytes(
+    storage: &Arc<RocksDbStorage>,
+    chain_id: &str,
+    bytes: &[u8],
+) -> Result<u64, String> {
+    let snapshot = zoka::snapshot::deserialize(bytes).map_err(|e| format!("parse failed: {e}"))?;
+    if snapshot.header.chain_id != chain_id {
+        return Err(format!(
+            "snapshot is for chain {}, not {chain_id}",
+            snapshot.header.chain_id
+        ));
+    }
+    zoka::snapshot::import_into_storage(storage, chain_id, &snapshot)
+        .map_err(|e| format!("import rejected by consensus: {e}"))
+}
+
+/// Describe the chain this node can serve over iroh *right now*, so peers can
+/// pull from us without us having exported a snapshot file first.
+///
+/// `size_bytes` and `sha256_hex` are deliberately empty: the snapshot is built
+/// on demand, so neither exists until the transfer happens. They are advisory
+/// fields only — selection uses cumulative work, and correctness comes from
+/// re-validating every block on import.
+fn live_chain_manifest(
+    storage: &Arc<RocksDbStorage>,
+    chain_id: &str,
+    iroh_endpoint_id: &str,
+) -> Result<zoka::network::snapshot_request_response::SnapshotManifest, String> {
+    use zoka::network::snapshot_request_response::SnapshotManifest;
+
+    let head_height = storage
+        .get_chain_height()
+        .map_err(|e| format!("chain height: {e}"))?;
+    if head_height == 0 {
+        return Err("chain is empty; nothing to advertise".to_string());
+    }
+    let head_hash = storage
+        .get_last_block_hash()
+        .map_err(|e| format!("head hash: {e}"))?;
+    let cumulative_work = storage
+        .get_cumulative_work()
+        .map_err(|e| format!("cumulative work: {e}"))?;
+
+    Ok(SnapshotManifest {
+        chain_id: chain_id.to_string(),
+        schema: zoka::snapshot::SNAPSHOT_SCHEMA_ID.to_string(),
+        head_height,
+        head_hash,
+        cumulative_work,
+        block_count: head_height,
+        generated_unix_secs: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        size_bytes: 0,
+        sha256_hex: String::new(),
+        download_urls: Vec::new(),
+        iroh_endpoint_id: Some(iroh_endpoint_id.to_string()),
+        signature_hex: None,
+        signer_pubkey_hex: None,
+    })
+}
+
 fn serve_pending_snapshot_manifest_requests(
     node: &mut zoka::network::p2p::Node,
+    storage: Option<&Arc<RocksDbStorage>>,
+    our_chain_id: &str,
+    iroh_endpoint_id: Option<&str>,
 ) -> Result<Option<String>, String> {
     use zoka::network::snapshot_request_response::{SnapshotManifest, SnapshotManifestsResponse};
 
@@ -6507,7 +6691,7 @@ fn serve_pending_snapshot_manifest_requests(
         let chain_id = &pending.request.chain_id;
         let max_height = pending.request.max_height;
 
-        let network_manifests: Vec<SnapshotManifest> = file_manifests
+        let mut network_manifests: Vec<SnapshotManifest> = file_manifests
             .into_iter()
             .filter(|m| m.chain_id == *chain_id && max_height.map_or(true, |h| m.head_height <= h))
             .map(|m| SnapshotManifest {
@@ -6521,10 +6705,38 @@ fn serve_pending_snapshot_manifest_requests(
                 size_bytes: m.size_bytes,
                 sha256_hex: m.sha256_hex,
                 download_urls: m.download_urls,
+                // Snapshot *files* on disk aren't what the iroh endpoint
+                // serves (it serves the live chain, advertised separately
+                // below), so they carry no endpoint id.
+                iroh_endpoint_id: None,
                 signature_hex: m.signature_hex,
                 signer_pubkey_hex: m.signer_pubkey_hex,
             })
             .collect();
+
+        // Advertise the live chain we serve over iroh. This is what makes the
+        // mesh self-healing: every ZSilent node already runs an iroh endpoint
+        // (`--serve-iroh-snapshot`), so once each one says "I'm at height H,
+        // pull from endpoint X", a node that falls behind can bootstrap from
+        // whichever peer is furthest ahead instead of depending on a seed.
+        //
+        // size_bytes/sha256 are left empty on purpose: this snapshot is
+        // generated on demand, so neither is known until it's transferred.
+        // Nothing trusts them — the receiver picks by cumulative work and then
+        // re-validates every block against consensus on import.
+        if let (Some(storage), Some(endpoint_id)) = (storage, iroh_endpoint_id) {
+            if chain_id == our_chain_id {
+                match live_chain_manifest(storage, chain_id, endpoint_id) {
+                    Ok(live) if max_height.map_or(true, |h| live.head_height <= h) => {
+                        network_manifests.push(live)
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::debug!(target: "zoka.snapshot", error = %e, "live chain manifest unavailable")
+                    }
+                }
+            }
+        }
 
         let response = if network_manifests.is_empty() {
             SnapshotManifestsResponse::NotAvailable {
@@ -9970,6 +10182,13 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let iroh_own_endpoint_id: Option<String> =
         _iroh_snapshot_endpoint.as_ref().map(|e| e.id().to_string());
     let mut next_iroh_tail_sync_at = tokio::time::Instant::now() + Duration::from_secs(20);
+    // Peer-to-peer snapshot discovery. The transfer runs off-loop (it is slow
+    // and purely network-bound); the *import* is done back on the loop so we
+    // never have two writers on the same RocksDB.
+    let mut peer_snapshot_fetch: Option<
+        tokio::task::JoinHandle<Result<(String, Vec<u8>), String>>,
+    > = None;
+    let mut next_peer_snapshot_probe_at = tokio::time::Instant::now() + Duration::from_secs(45);
     let mut mining_task: Option<tokio::task::JoinHandle<Result<MiningBatchSummary, String>>> = None;
     loop {
         if let Some(deadline) = maybe_deadline {
@@ -10058,7 +10277,12 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         {
             last_event = header_event;
         }
-        if let Some(snapshot_event) = serve_pending_snapshot_manifest_requests(&mut node)? {
+        if let Some(snapshot_event) = serve_pending_snapshot_manifest_requests(
+            &mut node,
+            chain_storage_outer.as_ref(),
+            &chain_id,
+            iroh_own_endpoint_id.as_deref(),
+        )? {
             last_event = snapshot_event;
         }
 
@@ -10311,6 +10535,89 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                         Some(sync_event) => format!("{event} {sync_event}"),
                         None => event,
                     };
+                }
+            }
+        }
+
+        // Peer-to-peer snapshot recovery: when this node has fallen far behind
+        // the network, pull a snapshot straight from whichever *peer* offers
+        // the heaviest chain instead of depending on a configured seed. Every
+        // ZSilent node already serves its chain over iroh, so any of them can
+        // be the source -- the network heals itself as long as anyone is up.
+        //
+        // Skipped while mining for the same reason as tail-sync above: the
+        // mining task is writing the same DB.
+        if !mining_active {
+            if let Some(storage) = chain_storage_outer.as_ref() {
+                // A transfer we started earlier has landed -> verify + import.
+                let finished = peer_snapshot_fetch
+                    .as_ref()
+                    .map_or(false, |handle| handle.is_finished());
+                if finished {
+                    if let Some(handle) = peer_snapshot_fetch.take() {
+                        match handle.await {
+                            Ok(Ok((source, bytes))) => {
+                                match import_peer_snapshot_bytes(storage, &chain_id, &bytes) {
+                                    Ok(applied) => {
+                                        last_event = format!(
+                                            "Peer snapshot from {source}: imported {applied} block(s); now at height {}.",
+                                            storage.get_chain_height().unwrap_or(0)
+                                        );
+                                        println!("{last_event}");
+                                        let _ = publish_local_sync_state(
+                                            &mut node,
+                                            chain_storage_outer.as_deref(),
+                                        )?;
+                                    }
+                                    Err(e) => {
+                                        println!("Peer snapshot from {source} rejected: {e}");
+                                    }
+                                }
+                            }
+                            Ok(Err(e)) => println!("Peer snapshot fetch failed: {e}"),
+                            Err(e) => println!("Peer snapshot fetch task panicked: {e}"),
+                        }
+                    }
+                } else if peer_snapshot_fetch.is_none()
+                    && tokio::time::Instant::now() >= next_peer_snapshot_probe_at
+                {
+                    next_peer_snapshot_probe_at =
+                        tokio::time::Instant::now() + Duration::from_secs(60);
+                    let local_height = storage.get_chain_height().unwrap_or(0);
+
+                    // Act on the previous round's replies first.
+                    if let Some(offer) = best_peer_snapshot_offer(&mut node, &chain_id, local_height)
+                    {
+                        if let Some(id_str) = offer.iroh_endpoint_id.clone() {
+                            match id_str.parse::<iroh::EndpointId>() {
+                                Ok(endpoint_id) => {
+                                    println!(
+                                        "Peer snapshot: {} offers height {} (we are at {}); pulling over iroh from {endpoint_id} ...",
+                                        endpoint_id, offer.head_height, local_height
+                                    );
+                                    peer_snapshot_fetch =
+                                        Some(tokio::spawn(fetch_peer_snapshot(endpoint_id)));
+                                }
+                                Err(e) => {
+                                    tracing::debug!(target: "zoka.snapshot", id = %id_str, error = %e, "peer advertised an unparseable iroh id")
+                                }
+                            }
+                        }
+                    } else if peer_chain_view.perceived_max_height
+                        > local_height.saturating_add(PEER_SNAPSHOT_PULL_MIN_GAP)
+                    {
+                        // We're far behind and hold no usable offer yet: ask.
+                        let asked = request_snapshot_manifests_from_peers(&mut node, &chain_id);
+                        if asked > 0 {
+                            tracing::debug!(
+                                target: "zoka.snapshot",
+                                asked,
+                                local_height,
+                                network_height = peer_chain_view.perceived_max_height,
+                                "asked peers for snapshot offers"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -15829,6 +16136,91 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("temp db dir");
         let db = tmp.path().join("chain.db");
         (tmp, db.to_string_lossy().to_string())
+    }
+
+    fn offer(
+        chain_id: &str,
+        head_height: u64,
+        cumulative_work: u128,
+        iroh: Option<&str>,
+    ) -> zoka::network::snapshot_request_response::SnapshotManifest {
+        zoka::network::snapshot_request_response::SnapshotManifest {
+            chain_id: chain_id.to_string(),
+            schema: zoka::snapshot::SNAPSHOT_SCHEMA_ID.to_string(),
+            head_height,
+            head_hash: format!("hash-{head_height}"),
+            cumulative_work,
+            block_count: head_height,
+            generated_unix_secs: 0,
+            size_bytes: 0,
+            sha256_hex: String::new(),
+            download_urls: Vec::new(),
+            iroh_endpoint_id: iroh.map(|s| s.to_string()),
+            signature_hex: None,
+            signer_pubkey_hex: None,
+        }
+    }
+
+    #[test]
+    fn snapshot_offer_selection_prefers_most_cumulative_work_not_height() {
+        // A peer can cheaply mine a long low-difficulty branch, so height is
+        // not a safe ranking signal; cumulative work is what consensus uses.
+        let chosen = choose_best_snapshot_offer(
+            vec![
+                offer("zoka", 90_000, 10, Some("tall-but-light")),
+                offer("zoka", 20_000, 999, Some("short-but-heavy")),
+            ],
+            "zoka",
+            0,
+        )
+        .expect("an offer should be chosen");
+        assert_eq!(chosen.iroh_endpoint_id.as_deref(), Some("short-but-heavy"));
+    }
+
+    #[test]
+    fn snapshot_offer_selection_skips_peers_without_an_iroh_id() {
+        // Pre-1.8.1 peers advertise no endpoint, so there is nothing to pull
+        // from even when they claim the heaviest chain.
+        assert!(choose_best_snapshot_offer(
+            vec![offer("zoka", 90_000, 999, None)],
+            "zoka",
+            0
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn snapshot_offer_selection_ignores_other_chains() {
+        assert!(choose_best_snapshot_offer(
+            vec![offer("some-other-chain", 90_000, 999, Some("id"))],
+            "zoka",
+            0
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn snapshot_offer_selection_ignores_offers_within_normal_sync_range() {
+        // Only a genuinely stranded node should snapshot-jump; a small gap is
+        // what ordinary block-by-block sync is for.
+        let local = 10_000u64;
+        assert!(choose_best_snapshot_offer(
+            vec![offer("zoka", local + PEER_SNAPSHOT_PULL_MIN_GAP, 999, Some("id"))],
+            "zoka",
+            local
+        )
+        .is_none());
+        assert!(choose_best_snapshot_offer(
+            vec![offer(
+                "zoka",
+                local + PEER_SNAPSHOT_PULL_MIN_GAP + 1,
+                999,
+                Some("id")
+            )],
+            "zoka",
+            local
+        )
+        .is_some());
     }
 
     #[test]

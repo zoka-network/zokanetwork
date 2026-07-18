@@ -435,6 +435,138 @@ mod randomx_backend {
         format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
     }
 
+    #[cfg(test)]
+    mod mode_diagnostics {
+        use super::*;
+
+        /// Operator diagnostic (not a correctness assertion): prints what the
+        /// full/light decision sees on THIS machine and whether the ~2 GB
+        /// dataset can actually be allocated. Run with:
+        ///   cargo test --features randomx mode_diagnostics -- --nocapture
+        #[test]
+        fn report_randomx_mode_selection() {
+            let total = total_ram_bytes();
+            let free = free_ram_bytes();
+            println!("--- RandomX mode diagnostics ---");
+            println!("sysinfo total_memory   : {}", human_bytes(total));
+            println!("sysinfo available_memory: {}", human_bytes(free));
+            println!("should_use_full_mode()  : {}", should_use_full_mode());
+
+            let seed = b"zoka-randomx-mode-diagnostic";
+            let base = RandomXFlag::get_recommended_flags();
+            println!("recommended flags       : {base:?}");
+            let full_flags = base | RandomXFlag::FLAG_FULL_MEM;
+            match RandomXCache::new(full_flags, seed) {
+                Ok(cache) => match RandomXDataset::new(full_flags, cache, 0) {
+                    Ok(_) => println!("FULL dataset alloc      : OK  -> fast mode IS viable here"),
+                    Err(e) => println!("FULL dataset alloc      : FAILED -> {e:?}"),
+                },
+                Err(e) => println!("FULL cache init         : FAILED -> {e:?}"),
+            }
+        }
+
+        /// Replicates the exact path the node takes when it starts mining
+        /// (`engine_pool_for` with the mainnet chain id at a live height) and
+        /// measures the resulting per-thread hashrate, so we can tell whether
+        /// the node really ended up in light or full mode.
+        /// Run with: cargo test --release --features randomx mode_diagnostics -- --nocapture
+        #[test]
+        fn report_node_path_hashrate() {
+            use std::time::Instant;
+            let chain_id = crate::economics::MAINNET_CHAIN_ID;
+            let height = 10_314u64;
+            println!("--- node-path pool build ({chain_id} @ {height}) ---");
+            let build_started = Instant::now();
+            let pool = match crate::mining::pow::engine_pool_for(chain_id, height, 1) {
+                Ok(p) => p,
+                Err(e) => {
+                    println!("engine_pool_for FAILED: {e:?}");
+                    return;
+                }
+            };
+            println!("pool build took         : {:.1}s", build_started.elapsed().as_secs_f64());
+            let engine = &pool[0];
+
+            let input = crate::mining::pow::build_pow_input(
+                chain_id, "diagnostic-prev-hash", "diagnostic-addr", height, 0, 0,
+            );
+            // warm up, then measure
+            let _ = engine.calculate_hash(&input);
+            let started = Instant::now();
+            let mut hashes = 0u64;
+            while started.elapsed().as_secs_f64() < 3.0 {
+                let _ = engine.calculate_hash(&input);
+                hashes += 1;
+            }
+            let hps = hashes as f64 / started.elapsed().as_secs_f64();
+            println!("single-thread hashrate  : {hps:.0} H/s");
+            // Read the mode the pool actually built rather than inferring it
+            // from the hashrate: a slow full-mode VM (e.g. no JIT / no large
+            // pages) otherwise looks exactly like light mode and sends you
+            // chasing the wrong bug.
+            let actual_mode = RESOURCE_CACHE
+                .get()
+                .and_then(|cell| cell.lock().ok().map(|g| match g.as_ref().map(|c| &c.mode) {
+                    Some(CachedMode::Full(_)) => "FULL (2 GB dataset)",
+                    Some(CachedMode::Light(_)) => "LIGHT (256 MB cache)",
+                    None => "none cached",
+                }))
+                .unwrap_or("cache unavailable");
+            println!("actual mode built       : {actual_mode}");
+        }
+
+        /// Decisive A/B: measures light and full mode back to back on this
+        /// machine, printing the real RandomX flags. This is what tells us
+        /// whether full mode is worth engaging at all here, separately from
+        /// whether the selection logic picks it.
+        #[test]
+        fn report_light_vs_full_hashrate() {
+            use std::time::Instant;
+
+            fn measure(engine: &RandomXVM, input: &[u8]) -> f64 {
+                let _ = engine.calculate_hash(input);
+                let started = Instant::now();
+                let mut hashes = 0u64;
+                while started.elapsed().as_secs_f64() < 3.0 {
+                    let _ = engine.calculate_hash(input);
+                    hashes += 1;
+                }
+                hashes as f64 / started.elapsed().as_secs_f64()
+            }
+
+            let seed = b"zoka-randomx-ab-diagnostic";
+            let input = b"zoka-randomx-ab-input";
+            let base = RandomXFlag::get_recommended_flags();
+            println!("--- light vs full A/B ---");
+            println!("recommended flags       : {base:?}");
+            println!("  JIT                   : {}", base.contains(RandomXFlag::FLAG_JIT));
+            println!("  HARD_AES              : {}", base.contains(RandomXFlag::FLAG_HARD_AES));
+            println!("  LARGE_PAGES           : {}", base.contains(RandomXFlag::FLAG_LARGE_PAGES));
+
+            match RandomXCache::new(base, seed)
+                .and_then(|c| RandomXVM::new(base, Some(c), None))
+            {
+                Ok(vm) => println!("light hashrate          : {:.0} H/s", measure(&vm, input)),
+                Err(e) => println!("light VM init FAILED    : {e:?}"),
+            }
+
+            let full_flags = base | RandomXFlag::FLAG_FULL_MEM;
+            let built = Instant::now();
+            match RandomXCache::new(full_flags, seed)
+                .and_then(|c| RandomXDataset::new(full_flags, c, 0))
+            {
+                Ok(dataset) => {
+                    println!("full dataset build      : {:.1}s", built.elapsed().as_secs_f64());
+                    match RandomXVM::new(full_flags, None, Some(dataset)) {
+                        Ok(vm) => println!("full hashrate           : {:.0} H/s", measure(&vm, input)),
+                        Err(e) => println!("full VM init FAILED     : {e:?}"),
+                    }
+                }
+                Err(e) => println!("full dataset FAILED     : {e:?}"),
+            }
+        }
+    }
+
     /// Best-effort free physical RAM in bytes, cross-platform (Linux,
     /// Windows, macOS) via `sysinfo`. Returns 0 on failure, forcing light
     /// mode - same fail-safe behavior as before. This used to only read

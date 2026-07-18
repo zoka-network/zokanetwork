@@ -25,6 +25,16 @@ pub struct SnapshotManifest {
     /// publicly accessible via HTTP.
     #[serde(default)]
     pub download_urls: Vec<String>,
+    /// iroh EndpointId this peer serves the snapshot from (QUIC + n0 relay
+    /// hole-punching, so it works behind NAT with no open port).
+    ///
+    /// This is what lets the network heal itself without a privileged seed: a
+    /// node that has fallen behind asks its peers what they hold, picks the
+    /// heaviest chain on offer, and pulls the snapshot straight from whoever
+    /// is furthest ahead. Older peers omit the field and are simply skipped as
+    /// a pull source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iroh_endpoint_id: Option<String>,
     /// Hex-encoded ed25519 signature over canonical header fields.
     #[serde(default)]
     pub signature_hex: Option<String>,
