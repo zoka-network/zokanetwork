@@ -6494,11 +6494,30 @@ fn serve_pending_header_requests(
     }
 }
 
-/// How far behind a node must fall before catching up block-by-block stops
-/// being worth it and it pulls a whole snapshot from a peer instead. Well
-/// above normal gossip jitter so a node a few blocks behind just syncs
-/// normally.
+/// Absolute floor before a snapshot pull is even considered, so a node a few
+/// blocks behind never does anything but sync normally.
 const PEER_SNAPSHOT_PULL_MIN_GAP: u64 = 1_000;
+
+/// A snapshot carries the *whole* chain, so pulling one to close a partial gap
+/// wastes bandwidth: measured on mainnet a snapshot runs ~14 KB per block, so
+/// closing a 1 000-block gap costs ~143 MB as a snapshot versus ~15 MB fetched
+/// incrementally -- ten times the traffic for the same result. It only pays off
+/// when we're missing most of the chain anyway, which is the case this feature
+/// actually exists for: letting a fresh node bootstrap from any peer instead of
+/// depending on a seed being reachable.
+///
+/// So require the offer to be at least this multiple of our own height. At 2,
+/// a node holding less than half the chain snapshots; anything further along
+/// stays on incremental sync.
+const PEER_SNAPSHOT_PULL_MIN_HEIGHT_RATIO: u64 = 2;
+
+/// Whether pulling a whole snapshot beats syncing the difference. Used both to
+/// decide if it's worth asking peers at all and to filter the offers they send
+/// back, so the two can't drift apart.
+fn peer_snapshot_would_help(local_height: u64, network_height: u64) -> bool {
+    network_height > local_height.saturating_add(PEER_SNAPSHOT_PULL_MIN_GAP)
+        && network_height >= local_height.saturating_mul(PEER_SNAPSHOT_PULL_MIN_HEIGHT_RATIO)
+}
 
 /// Peers asked per discovery round. Small: the responses are tiny, and any
 /// honest peer's answer is enough to find the heaviest chain on offer.
@@ -6572,7 +6591,7 @@ fn choose_best_snapshot_offer(
         if manifest.iroh_endpoint_id.is_none() {
             continue;
         }
-        if manifest.head_height <= local_height.saturating_add(PEER_SNAPSHOT_PULL_MIN_GAP) {
+        if !peer_snapshot_would_help(local_height, manifest.head_height) {
             continue;
         }
         if best
@@ -10603,9 +10622,10 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                                 }
                             }
                         }
-                    } else if peer_chain_view.perceived_max_height
-                        > local_height.saturating_add(PEER_SNAPSHOT_PULL_MIN_GAP)
-                    {
+                    } else if peer_snapshot_would_help(
+                        local_height,
+                        peer_chain_view.perceived_max_height,
+                    ) {
                         // We're far behind and hold no usable offer yet: ask.
                         let asked = request_snapshot_manifests_from_peers(&mut node, &chain_id);
                         if asked > 0 {
@@ -16201,8 +16221,7 @@ mod tests {
 
     #[test]
     fn snapshot_offer_selection_ignores_offers_within_normal_sync_range() {
-        // Only a genuinely stranded node should snapshot-jump; a small gap is
-        // what ordinary block-by-block sync is for.
+        // A small gap is what ordinary block-by-block sync is for.
         let local = 10_000u64;
         assert!(choose_best_snapshot_offer(
             vec![offer("zoka", local + PEER_SNAPSHOT_PULL_MIN_GAP, 999, Some("id"))],
@@ -16210,17 +16229,34 @@ mod tests {
             local
         )
         .is_none());
-        assert!(choose_best_snapshot_offer(
-            vec![offer(
-                "zoka",
-                local + PEER_SNAPSHOT_PULL_MIN_GAP + 1,
-                999,
-                Some("id")
-            )],
-            "zoka",
-            local
-        )
-        .is_some());
+    }
+
+    #[test]
+    fn snapshot_offer_is_declined_when_incremental_sync_is_cheaper() {
+        // Observed on mainnet: a node at 9300 with the network at 10377. The
+        // gap clears the absolute floor, but a snapshot ships the entire chain
+        // (~143 MB at ~14 KB/block) to deliver ~1 000 blocks that incremental
+        // sync fetches in ~15 MB. Taking the snapshot here would be a ten-fold
+        // waste, so the node must decline and keep syncing normally.
+        assert!(
+            choose_best_snapshot_offer(vec![offer("zoka", 10_377, 999, Some("id"))], "zoka", 9_300)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn snapshot_offer_is_taken_when_most_of_the_chain_is_missing() {
+        // The case this feature exists for: a fresh (or nearly fresh) node
+        // that would otherwise crawl the whole chain block by block, and which
+        // must be able to bootstrap from any peer rather than needing a seed.
+        assert!(
+            choose_best_snapshot_offer(vec![offer("zoka", 10_377, 999, Some("id"))], "zoka", 0)
+                .is_some()
+        );
+        assert!(
+            choose_best_snapshot_offer(vec![offer("zoka", 10_377, 999, Some("id"))], "zoka", 4_000)
+                .is_some()
+        );
     }
 
     #[test]
