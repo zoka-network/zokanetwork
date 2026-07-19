@@ -43,6 +43,16 @@ HISTORY_CHUNK = 1000
 RECENT_BLOCKS = 5
 PRIVATE_ACTIVITY_LOOKBACK = 64
 
+# How many recent heights to publish those anchored windows for.
+#
+# The explorer derives the URLs from the height it holds, and that height can
+# lag: the browser and the CDN both cache, so a page can still be working from
+# the previous publish. Writing only the exact current window means every one
+# of those requests 404s until the client happens to refetch — a race that
+# repeats on every publish. Covering a span of recent heights costs a handful
+# of small files and removes the race entirely.
+RECENT_HEIGHT_SPAN = 30
+
 
 class NodeError(RuntimeError):
     pass
@@ -184,18 +194,21 @@ def publish(node: str, out_dir: Path) -> dict:
         if payload is not None:
             written[path] = write_json(out_dir, path, payload)
 
-    # Windows anchored to the current height, for the dashboard's newest-blocks
-    # list and its recent-activity feed.
-    recent_from = max(1, height - RECENT_BLOCKS + 1)
-    activity_from = max(1, height - PRIVATE_ACTIVITY_LOOKBACK + 1)
-    for rel in (
-        f"/blocks/range/{recent_from}/{height}",
-        f"/blocks/range/{recent_from}/{height}/private_tx_hashes",
-        f"/blocks/range/{activity_from}/{height}/private_tx_hashes",
-    ):
-        payload = fetch_optional(node, rel)
-        if payload is not None:
-            written[rel] = write_json(out_dir, rel, payload)
+    # Windows anchored to a height, for the dashboard's newest-blocks list and
+    # its recent-activity feed. Published for a span of recent heights, not just
+    # the current one, because a client working from a cached height would
+    # otherwise ask for a window that was never written.
+    for anchor in range(max(1, height - RECENT_HEIGHT_SPAN + 1), height + 1):
+        recent_from = max(1, anchor - RECENT_BLOCKS + 1)
+        activity_from = max(1, anchor - PRIVATE_ACTIVITY_LOOKBACK + 1)
+        for rel in (
+            f"/blocks/range/{recent_from}/{anchor}",
+            f"/blocks/range/{recent_from}/{anchor}/private_tx_hashes",
+            f"/blocks/range/{activity_from}/{anchor}/private_tx_hashes",
+        ):
+            payload = fetch_optional(node, rel)
+            if payload is not None:
+                written[rel] = write_json(out_dir, rel, payload)
 
     return {"height": height, "published_at": published_at, "written": written}
 
