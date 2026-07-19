@@ -74,18 +74,33 @@ jobs:
       # A node that is still catching up would publish the past as though it
       # were the present. The publisher refuses to write in that case, so wait
       # for the tip rather than letting the run fail.
+      #
+      # A cold start does not answer the API at all for the length of the
+      # import: replaying ten thousand blocks through consensus is heavy
+      # synchronous work and it starves the request handler, so the node looks
+      # dead while it is in fact busy. Watch the log for progress rather than
+      # trusting the API's silence, and allow enough time for a first run — the
+      # cached database makes every later run quick.
       - name: Wait until caught up
         run: |
-          for i in $(seq 1 80); do
+          for i in $(seq 1 150); do
             status=$(curl -s --max-time 10 http://127.0.0.1:3000/sync/status || echo '{}')
             state=$(echo "$status" | python3 -c "import sys,json;print(json.load(sys.stdin).get('status','?'))" 2>/dev/null || echo '?')
             height=$(echo "$status" | python3 -c "import sys,json;print(json.load(sys.stdin).get('local_height',0))" 2>/dev/null || echo 0)
-            echo "[$i] status=$state height=$height"
-            [ "$state" = "caught_up" ] && [ "$height" -gt 0 ] && exit 0
+            if [ "$state" = "caught_up" ] && [ "$height" -gt 0 ]; then
+              echo "[$i] caught up at height $height"
+              exit 0
+            fi
+            # Every couple of minutes, say what the node is actually doing, so a
+            # silent API reads as "importing" rather than "hung".
+            if [ $((i % 8)) -eq 0 ]; then
+              echo "[$i] api=$state height=$height — last log line:"
+              tail -1 node.log 2>/dev/null || true
+            fi
             sleep 15
           done
           echo "node never reached the chain tip"
-          tail -40 node.log
+          tail -60 node.log
           exit 1
 
       - name: Publish
