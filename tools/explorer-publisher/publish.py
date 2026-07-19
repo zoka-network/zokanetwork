@@ -27,17 +27,17 @@ from pathlib import Path
 DEFAULT_NODE = "http://127.0.0.1:3000"
 TIMEOUT_SECS = 20
 
-# The node rate-limits its own API, and publishing the whole chain is thousands
-# of requests — enough to trip it after roughly five hundred. A 429 is the node
-# asking to be asked more slowly, so it is waited out rather than counted as a
-# failure; without this the publish stopped at block 550 and still reported
-# success.
 # How many missing private transaction bodies to check before concluding this
 # node simply does not have them. A node that bootstrapped from a snapshot never
 # receives bodies — the snapshot carries blocks only — so retrying all of them
 # every run is pure waste.
 PRIVATE_TX_MISSING_GIVE_UP = 5
 
+# The node rate-limits its own API, and publishing the whole chain is thousands
+# of requests — enough to trip it after roughly five hundred. A 429 is the node
+# asking to be asked more slowly, so it is waited out rather than counted as a
+# failure; without this the publish stopped at block 550 and still reported
+# success.
 RATE_LIMIT_RETRIES = 12
 RATE_LIMIT_BACKOFF_SECS = 2
 RATE_LIMIT_MAX_BACKOFF_SECS = 60
