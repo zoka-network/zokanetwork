@@ -82,6 +82,15 @@ jobs:
           restore-keys: zoka-chain-
 
       - name: Start the node
+        # Force RandomX light mode. Full mode builds a ~2 GB dataset that takes
+        # about a minute, and rebuilds it on every epoch change — importing ten
+        # thousand blocks crosses several epochs, so a publisher that only ever
+        # *verifies* one hash per block spent minutes building datasets it
+        # gains nothing from. Light mode initialises in seconds and computes
+        # identical hashes; the difference is mining speed, which is irrelevant
+        # here because this node never mines.
+        env:
+          ZOKA_RANDOMX_MODE: light
         run: |
           mkdir -p out
           cp docs/mainnet-network.v1.json .
