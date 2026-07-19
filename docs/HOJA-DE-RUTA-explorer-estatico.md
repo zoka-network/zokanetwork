@@ -166,6 +166,58 @@ tramos históricos no cambian nunca, así que se escriben una sola vez.
 
 ---
 
+## El interruptor ya existe: `zoka-network.json`
+
+El explorer **no tiene la URL de datos hardcodeada**. La lee en tiempo de
+ejecución de `public/zoka-network.json`:
+
+```json
+{"active_network": "mainnet", "networks": [{"id": "mainnet",
+ "version": "v1.6.1", "rpc_url": "/rpc", "rpc_url_fallback": "/rpc2"}]}
+```
+
+`/rpc` y `/rpc2` son las funciones serverless muertas. Cambiar ese archivo por la
+URL pública de R2 **cambia la fuente de datos sin tocar código**, y además ya
+existe `fetchJsonWithFailover`, o sea que soporta un segundo origen de respaldo
+(útil el día que publique más de un nodo).
+
+Esto abarata mucho la migración: si el publicador escribe los objetos con rutas
+que espejen las del API (`chain/height`, `stats`, …), buena parte del front
+funciona sin modificarse.
+
+- [ ] Actualizar `version` — dice `v1.6.1`, la red va por 1.8.2
+
+---
+
+## Lo que falta cubrir (huecos detectados)
+
+Sin esto, la Fase 2 no arranca:
+
+- [ ] **CORS en R2.** El navegador va a pedir los JSON desde otro origen. Sin
+      cabeceras CORS el explorer falla entero, y el error no es obvio.
+- [ ] **Acceso público del bucket.** Los buckets de R2 son privados por defecto.
+      Hay que exponerlo por su dominio `r2.dev` o, mejor, por un subdominio
+      propio.
+- [ ] **DNS de `explorer.zoka.network`.** Falta el CNAME al proyecto de Pages.
+      Ahora que la zona está en Cloudflare es un registro más.
+
+Decisiones de diseño pendientes:
+
+- [ ] **`/private/pending` (mempool).** El dashboard muestra transacciones
+      privadas pendientes. Eso es dato **vivo**: un archivo regenerado cada N
+      minutos va a mostrar pendientes que ya se confirmaron. Opciones: sacarlo
+      del dashboard, o mostrarlo con su marca de tiempo y aceptar que va
+      atrasado. No hay forma estática de que sea instantáneo.
+- [ ] **Cadencia del publicador.** Los bloques salen cada 120 s. Cada 5 minutos
+      es un punto razonable de partida.
+- [ ] **Reorganizaciones de cadena.** Si la red reorganiza, un trozo histórico ya
+      publicado queda mal. El publicador debería comparar el hash del último
+      bloque de cada trozo antes de darlo por definitivo, y reescribir el que no
+      coincida. Con el ancla del bloque 3127 una reorg profunda es improbable,
+      pero el publicador no debería asumirlo.
+
+---
+
 ## Fase 1 — El publicador
 
 Un proceso que corre junto al nodo, lee su API local y escribe JSON a R2.
