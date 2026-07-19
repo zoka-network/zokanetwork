@@ -38,6 +38,14 @@ jobs:
     # left nothing behind for the next one.
     timeout-minutes: 120
 
+    env:
+      # Pin the node's data directory into the workspace. Without this it lives
+      # at $HOME/.local/share/zoka on Linux, while the cache steps were saving
+      # and restoring `.zoka` in the workspace — a directory that never existed.
+      # The chain was therefore re-imported from scratch on every run, and the
+      # cache silently held nothing.
+      ZOKA_HOME: ${{ github.workspace }}/.zoka
+
     steps:
       - name: Check out
         uses: actions/checkout@v4
