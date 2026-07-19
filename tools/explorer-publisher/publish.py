@@ -32,6 +32,12 @@ TIMEOUT_SECS = 20
 # asking to be asked more slowly, so it is waited out rather than counted as a
 # failure; without this the publish stopped at block 550 and still reported
 # success.
+# How many missing private transaction bodies to check before concluding this
+# node simply does not have them. A node that bootstrapped from a snapshot never
+# receives bodies — the snapshot carries blocks only — so retrying all of them
+# every run is pure waste.
+PRIVATE_TX_MISSING_GIVE_UP = 5
+
 RATE_LIMIT_RETRIES = 12
 RATE_LIMIT_BACKOFF_SECS = 2
 RATE_LIMIT_MAX_BACKOFF_SECS = 60
@@ -277,6 +283,7 @@ def publish(node: str, out_dir: Path) -> dict:
 
     tx_written = 0
     tx_cached = 0
+    tx_missing = 0
     tx_failed = 0
     tx_first_failure = None
     for tx_hash in sorted(tx_hashes):
@@ -287,6 +294,16 @@ def publish(node: str, out_dir: Path) -> dict:
         try:
             payload = fetch(node, rel)
         except NodeError as exc:
+            # A 404 here is expected, not a failure: a node that bootstrapped
+            # from a snapshot holds the blocks and therefore the transaction
+            # hashes, but ChainSnapshotV1 carries no private transaction
+            # bodies, so it never had them to serve. Stop after enough of them
+            # to be sure rather than retrying the whole set every run.
+            if "404" in str(exc):
+                tx_missing += 1
+                if tx_missing >= PRIVATE_TX_MISSING_GIVE_UP:
+                    break
+                continue
             tx_failed += 1
             if tx_first_failure is None:
                 tx_first_failure = str(exc)
@@ -295,17 +312,23 @@ def publish(node: str, out_dir: Path) -> dict:
         tx_written += 1
 
     # Reported, not swallowed. Using the forgiving fetch here hid a complete
-    # failure: all 250 lookups were exhausted by the rate limiter after the
-    # block sweep, and the publish announced "new=0" as though there had simply
-    # been nothing to do. Silence is how every gap in this publisher went
-    # unnoticed.
+    # failure once already: the publish announced "new=0" as though there had
+    # simply been nothing to do.
     if tx_failed:
         print(
             f"warning: {tx_failed} private tx lookup(s) failed; first was {tx_first_failure}",
             file=sys.stderr,
         )
+    if tx_missing:
+        print(
+            f"note: private transaction bodies are not available from this node "
+            f"({tx_missing} checked); it bootstrapped from a snapshot, which "
+            f"carries blocks but not bodies. Coinbase records are unaffected.",
+            file=sys.stderr,
+        )
     written[
-        f"/private/tx/* (new={tx_written} cached={tx_cached} failed={tx_failed})"
+        f"/private/tx/* (new={tx_written} cached={tx_cached} "
+        f"unavailable={tx_missing} failed={tx_failed})"
     ] = tx_written
 
     # Mempool counts. Bare numbers — no amounts, no parties. These are live
