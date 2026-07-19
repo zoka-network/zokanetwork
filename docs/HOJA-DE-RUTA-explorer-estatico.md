@@ -81,6 +81,48 @@ pierde la mitad de su razón de ser.
 **Recomendación: B.** Empezar por el dashboard (Fase 2) y agregar la navegación
 por trozos (Fase 3) una vez que el circuito funcione punta a punta.
 
+> La Opción C queda descartada de hecho por el buscador de scan key: ese sí
+> necesita el historial completo. Ver abajo.
+
+---
+
+## El buscador por scan key manda sobre el diseño
+
+`ViewScanDetail` deja pegar una scan key para encontrar los pagos propios. Está
+implementado bien y **hay que conservarlo exactamente así**:
+
+```js
+await ensureScanWasm();                       // la criptografía corre en WASM local
+address = derive_payment_address(cleanKey);   // la clave nunca sale del navegador
+if (cb.recipient_commitment === address) {…}  // la comparación es local
+```
+
+La clave solo se guarda en `sessionStorage`, así que no sobrevive al cierre de la
+pestaña. **Nunca** hay que mover esto al publicador ni a una función: una scan key
+entregada a un servidor le da visibilidad permanente sobre todo lo que esa
+persona reciba.
+
+La consecuencia para el diseño estático es fuerte. El escaneo recorre la cadena
+entera de a 1.000 bloques:
+
+```js
+const CHUNK = 1000;
+for (let from = 1; from <= height; from += CHUNK) {
+  const coinbases = await fetchCoinbaseRecords(from, to);
+```
+
+Es decir, el publicador **debe exportar todo el historial**, no solo lo reciente:
+
+- [ ] `coinbases/000001-001000.json` … para toda la cadena (recompensas de minería)
+- [ ] `private-tx-hashes/…` con la misma partición
+
+Sin eso, el buscador por scan key deja de funcionar — y es lo más útil que tiene
+el explorer para un minero, porque es cómo verifica que cobró.
+
+Estimación: ~10.500 bloques con registros chicos dan pocos MB en total. Los
+trozos históricos **no cambian nunca**, así que se suben una vez y solo se
+reescribe el último. Encaja sin problema en R2.
+
 ---
 
 ## Fase 1 — El publicador
