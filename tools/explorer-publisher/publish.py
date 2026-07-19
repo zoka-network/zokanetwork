@@ -27,6 +27,10 @@ from pathlib import Path
 DEFAULT_NODE = "http://127.0.0.1:3000"
 TIMEOUT_SECS = 20
 
+# The explorer walks history in 1 000-block windows and builds the URLs itself,
+# so this has to match its CHUNK exactly or the files it asks for won't exist.
+HISTORY_CHUNK = 1000
+
 
 class NodeError(RuntimeError):
     pass
@@ -41,6 +45,18 @@ def fetch(node: str, path: str):
         raise NodeError(f"{path}: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise NodeError(f"{path}: response was not JSON ({exc})") from exc
+
+
+def fetch_optional(node: str, path: str):
+    """Fetch an endpoint that an older node may not serve.
+
+    Returns None instead of raising so one missing endpoint degrades a single
+    page rather than aborting the whole publish.
+    """
+    try:
+        return fetch(node, path)
+    except NodeError:
+        return None
 
 
 def write_json(out_dir: Path, rel_path: str, payload) -> int:
@@ -97,6 +113,30 @@ def publish(node: str, out_dir: Path) -> dict:
         "published_at": published_at,
     }
     written["/network-status.json"] = write_json(out_dir, "/network-status.json", status)
+
+    # History, in the exact 1 000-block windows the explorer asks for.
+    #
+    # This is what the scan-key search needs. That search walks the whole chain
+    # in the browser, deriving the payment address locally and comparing it
+    # against public coinbase records — the key never leaves the machine — so
+    # the full history has to exist as files or the search silently stops
+    # working. For a miner it is the thing that proves they were paid, which
+    # makes it the most useful page on the site.
+    #
+    # Paths mirror the API exactly, because the explorer builds these URLs
+    # itself from the height it just read.
+    for from_h in range(1, height + 1, HISTORY_CHUNK):
+        to_h = min(from_h + HISTORY_CHUNK - 1, height)
+
+        coinbases = fetch_optional(node, f"/private/coinbases/range/{from_h}/{to_h}")
+        if coinbases is not None:
+            rel = f"/private/coinbases/range/{from_h}/{to_h}"
+            written[rel] = write_json(out_dir, rel, coinbases)
+
+        hashes = fetch_optional(node, f"/blocks/range/{from_h}/{to_h}/private_tx_hashes")
+        if hashes is not None:
+            rel = f"/blocks/range/{from_h}/{to_h}/private_tx_hashes"
+            written[rel] = write_json(out_dir, rel, hashes)
 
     return {"height": height, "published_at": published_at, "written": written}
 
