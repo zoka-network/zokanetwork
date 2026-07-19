@@ -12,9 +12,14 @@ name: Publish explorer data
 
 on:
   schedule:
-    # Every 30 minutes. Blocks are 120 s, so the view is at most ~30 min old and
-    # every payload carries published_at for the explorer to show its age.
-    - cron: "*/30 * * * *"
+    # Every two hours. A cold start has to build the node and replay the whole
+    # chain, which is far longer than the old half-hourly schedule allowed — the
+    # runs stacked up and were killed by the timeout before they could cache
+    # anything, so each one started from scratch and died the same way. Slow and
+    # finishing beats frequent and never completing; the explorer shows the age
+    # of what it has, so being a couple of hours behind is visible, not
+    # misleading.
+    - cron: "0 */2 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -28,14 +33,18 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # A cold start builds the node and replays ten thousand blocks. The previous
+    # 45 minutes was not enough for either, so every run was killed partway and
+    # left nothing behind for the next one.
+    timeout-minutes: 120
 
     steps:
       - name: Check out
         uses: actions/checkout@v4
 
-      - name: Cache cargo registry and build
-        uses: actions/cache@v4
+      - name: Restore build cache
+        id: build-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -46,6 +55,20 @@ jobs:
 
       - name: Build the node
         run: cargo build --release --features randomx --bin zoka
+
+      # Saved here, not at the end. actions/cache writes in a post-job step,
+      # which a timeout never reaches — so the build was recompiled from
+      # scratch on every run and every run died the same way. Saving the moment
+      # the artifact exists breaks that loop even if a later step overruns.
+      - name: Save build cache
+        if: steps.build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: zoka-build-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
       # Keeping the chain between runs is what makes this cheap. A cold start
       # pulls a full snapshot over iroh and re-validates every block, which is
