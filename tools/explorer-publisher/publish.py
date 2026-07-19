@@ -27,6 +27,15 @@ from pathlib import Path
 DEFAULT_NODE = "http://127.0.0.1:3000"
 TIMEOUT_SECS = 20
 
+# The node rate-limits its own API, and publishing the whole chain is thousands
+# of requests — enough to trip it after roughly five hundred. A 429 is the node
+# asking to be asked more slowly, so it is waited out rather than counted as a
+# failure; without this the publish stopped at block 550 and still reported
+# success.
+RATE_LIMIT_RETRIES = 8
+RATE_LIMIT_BACKOFF_SECS = 2
+RATE_LIMIT_MAX_BACKOFF_SECS = 30
+
 # The explorer walks history in 1 000-block windows and builds the URLs itself,
 # so this has to match its CHUNK exactly or the files it asks for won't exist.
 HISTORY_CHUNK = 1000
@@ -59,14 +68,30 @@ class NodeError(RuntimeError):
 
 
 def fetch(node: str, path: str):
+    """Read one endpoint, waiting out the node's rate limiter.
+
+    Publishing the whole chain means thousands of requests, which trips the
+    node's own rate limit — and a 429 is not a failure, it is the node asking
+    to be asked more slowly. Backing off and retrying is the difference between
+    a complete chain and one that stops at block 550.
+    """
     url = f"{node.rstrip('/')}{path}"
-    try:
-        with urllib.request.urlopen(url, timeout=TIMEOUT_SECS) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.URLError as exc:
-        raise NodeError(f"{path}: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise NodeError(f"{path}: response was not JSON ({exc})") from exc
+    delay = RATE_LIMIT_BACKOFF_SECS
+    for attempt in range(RATE_LIMIT_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=TIMEOUT_SECS) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429 and attempt < RATE_LIMIT_RETRIES:
+                time.sleep(delay)
+                delay = min(delay * 2, RATE_LIMIT_MAX_BACKOFF_SECS)
+                continue
+            raise NodeError(f"{path}: {exc}") from exc
+        except urllib.error.URLError as exc:
+            raise NodeError(f"{path}: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise NodeError(f"{path}: response was not JSON ({exc})") from exc
+    raise NodeError(f"{path}: still rate limited after {RATE_LIMIT_RETRIES} retries")
 
 
 def fetch_optional(node: str, path: str):
@@ -184,6 +209,82 @@ def publish(node: str, out_dir: Path) -> dict:
         if hashes is not None:
             rel = f"/blocks/range/{from_h}/{to_h}/private_tx_hashes"
             written[rel] = write_json(out_dir, rel, hashes)
+
+    # Individual blocks, so a visitor can actually open one.
+    #
+    # Without these the dashboard works but every block is a dead link, which
+    # is not really an explorer. Measured on mainnet: ~450 bytes per block and
+    # ~140 for its transaction list, so the whole chain is about 6 MB.
+    #
+    # Written incrementally. A block, once written, never changes — its content
+    # is fixed by consensus — so re-fetching twenty thousand of them every run
+    # would be pure waste. Only what is missing gets fetched, which after the
+    # first run is just the new tail.
+    fetched = 0
+    skipped = 0
+    failed = 0
+    first_failure = None
+    for h in range(1, height + 1):
+        rel = f"/blocks/{h}"
+        target = out_dir / rel.lstrip("/")
+        if target.exists() or (target / "index.html").exists():
+            skipped += 1
+            continue
+        try:
+            block = fetch(node, rel)
+        except NodeError as exc:
+            failed += 1
+            if first_failure is None:
+                first_failure = f"{rel}: {exc}"
+            continue
+        write_json(out_dir, rel, block)
+        txs = fetch_optional(node, f"/blocks/{h}/transactions")
+        if txs is not None:
+            write_json(out_dir, f"/blocks/{h}/transactions", txs)
+        fetched += 1
+
+    # Report, rather than swallow. A silent skip here means blocks a visitor
+    # can never open, and the publish would still look successful — which is
+    # exactly how the earlier gaps went unnoticed.
+    if failed:
+        print(
+            f"warning: {failed} block(s) could not be fetched; first was {first_failure}",
+            file=sys.stderr,
+        )
+    written[f"/blocks/* (new={fetched} cached={skipped} failed={failed})"] = fetched
+
+    # Private transactions by hash, for the scan-key search and the record
+    # lookup. Hashes only identify a transaction; they reveal neither parties
+    # nor amounts, which stay encrypted on the chain itself.
+    #
+    # Collected from the per-block hash lists already published above, so this
+    # covers exactly what the explorer can ask about. Measured on mainnet:
+    # around 250 across the whole chain, so this is cheap.
+    tx_hashes = set()
+    for from_h in range(1, height + 1, HISTORY_CHUNK):
+        to_h = min(from_h + HISTORY_CHUNK - 1, height)
+        window = out_dir / f"blocks/range/{from_h}/{to_h}/private_tx_hashes"
+        if not window.is_file():
+            continue
+        try:
+            data = json.loads(window.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for block in data.get("blocks", []) or []:
+            for tx_hash in block.get("private_tx_hashes", []) or []:
+                if tx_hash:
+                    tx_hashes.add(tx_hash)
+
+    tx_written = 0
+    for tx_hash in sorted(tx_hashes):
+        rel = f"/private/tx/{tx_hash}"
+        if (out_dir / rel.lstrip("/")).exists():
+            continue
+        payload = fetch_optional(node, rel)
+        if payload is not None:
+            write_json(out_dir, rel, payload)
+            tx_written += 1
+    written[f"/private/tx/* (new={tx_written} total={len(tx_hashes)})"] = tx_written
 
     # Mempool counts. Bare numbers — no amounts, no parties. These are live
     # figures being served from a periodic snapshot, so they are the most

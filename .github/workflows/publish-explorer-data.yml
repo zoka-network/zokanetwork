@@ -12,14 +12,12 @@ name: Publish explorer data
 
 on:
   schedule:
-    # Every two hours. A cold start has to build the node and replay the whole
-    # chain, which is far longer than the old half-hourly schedule allowed — the
-    # runs stacked up and were killed by the timeout before they could cache
-    # anything, so each one started from scratch and died the same way. Slow and
-    # finishing beats frequent and never completing; the explorer shows the age
-    # of what it has, so being a couple of hours behind is visible, not
-    # misleading.
-    - cron: "0 */2 * * *"
+    # Every twenty minutes. This was two hours while runs were still failing —
+    # slow and finishing beat frequent and never completing. Now that the build
+    # and chain are cached a run is a few minutes, so the view can be kept much
+    # fresher, which matters: the explorer shows its age, and "published 13
+    # minutes ago" reads very differently from "published 2 hours ago".
+    - cron: "*/20 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -161,6 +159,21 @@ jobs:
           echo "node never reached the chain tip"
           tail -60 node.log
           exit 1
+
+      # Start from what is already published so the publisher only has to fetch
+      # what is missing. Blocks never change once written — their content is
+      # fixed by consensus — so re-fetching twenty thousand of them every run
+      # would be pure waste.
+      - name: Seed from the published branch
+        run: |
+          mkdir -p out
+          if git ls-remote --exit-code --heads origin chain-data >/dev/null 2>&1; then
+            git fetch -q --depth 1 origin chain-data
+            git --work-tree=out checkout FETCH_HEAD -- . 2>/dev/null || true
+            echo "seeded with $(find out -type f | wc -l) existing files"
+          else
+            echo "no published branch yet; starting from empty"
+          fi
 
       - name: Publish
         run: python3 tools/explorer-publisher/publish.py --out ./out
