@@ -1,0 +1,123 @@
+name: Publish explorer data
+
+# Publishes a static, read-only view of the chain for the web explorer.
+#
+# The explorer used to read the chain through a serverless proxy pointing at a
+# central RPC host. That host is gone and the proxy is what exhausted the
+# hosting plan. This job replaces both: it runs a real ZOKA node, lets it sync
+# like any other participant, and writes plain JSON files.
+#
+# It is a scheduled publishing job, not hosted infrastructure: it syncs,
+# publishes and exits. Nothing listens for inbound connections.
+
+on:
+  schedule:
+    # Every 30 minutes. Blocks are 120 s, so the view is at most ~30 min old and
+    # every payload carries published_at for the explorer to show its age.
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  # Never let two runs sync the same cached database at once.
+  group: publish-explorer-data
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: zoka-build-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: zoka-build-${{ runner.os }}-
+
+      - name: Build the node
+        run: cargo build --release --features randomx --bin zoka
+
+      # Keeping the chain between runs is what makes this cheap. A cold start
+      # pulls a full snapshot over iroh and re-validates every block, which is
+      # minutes of work; a warm start only has to fetch the new tail.
+      - name: Restore chain database
+        id: chain-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .zoka
+          key: zoka-chain-${{ github.run_id }}
+          restore-keys: zoka-chain-
+
+      - name: Start the node
+        run: |
+          mkdir -p out
+          cp docs/mainnet-network.v1.json .
+          nohup ./target/release/zoka fullnode \
+            --network mainnet \
+            --network-config mainnet-network.v1.json \
+            --no-mine \
+            --allow-isolated-start \
+            --password "${{ secrets.NODE_PASSWORD || 'zoka-publisher-ci' }}" \
+            > node.log 2>&1 &
+          echo "started"
+
+      # A node that is still catching up would publish the past as though it
+      # were the present. The publisher refuses to write in that case, so wait
+      # for the tip rather than letting the run fail.
+      - name: Wait until caught up
+        run: |
+          for i in $(seq 1 80); do
+            status=$(curl -s --max-time 10 http://127.0.0.1:3000/sync/status || echo '{}')
+            state=$(echo "$status" | python3 -c "import sys,json;print(json.load(sys.stdin).get('status','?'))" 2>/dev/null || echo '?')
+            height=$(echo "$status" | python3 -c "import sys,json;print(json.load(sys.stdin).get('local_height',0))" 2>/dev/null || echo 0)
+            echo "[$i] status=$state height=$height"
+            [ "$state" = "caught_up" ] && [ "$height" -gt 0 ] && exit 0
+            sleep 15
+          done
+          echo "node never reached the chain tip"
+          tail -40 node.log
+          exit 1
+
+      - name: Publish
+        run: python3 tools/explorer-publisher/publish.py --out ./out
+
+      - name: Stop the node
+        if: always()
+        run: pkill -f 'zoka fullnode' || true
+
+      - name: Save chain database
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .zoka
+          key: zoka-chain-${{ github.run_id }}
+
+      # Force-pushed as a single commit: this branch is a snapshot of current
+      # state, not a history, and a commit every 30 minutes would bloat the
+      # repository within weeks.
+      - name: Publish to the data branch
+        run: |
+          cd out
+          git init -q
+          git config user.name "zoka-publisher"
+          git config user.email "noreply@zoka.network"
+          git checkout -q -b chain-data
+          git add -A
+          git commit -q -m "chain data at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push -q --force \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+            chain-data
+
+      - name: Node log on failure
+        if: failure()
+        run: tail -60 node.log || true
