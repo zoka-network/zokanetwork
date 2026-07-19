@@ -31,6 +31,18 @@ TIMEOUT_SECS = 20
 # so this has to match its CHUNK exactly or the files it asks for won't exist.
 HISTORY_CHUNK = 1000
 
+# The dashboard also asks for windows anchored to the *current* height rather
+# than to a fixed grid: the newest few blocks, and a longer look-back for recent
+# private activity. Those URLs change with every block, so they are generated
+# from the height being published — which is the same height the explorer reads
+# from /chain/height, so the two agree.
+#
+# These mirror getRecentBlocks(count) and getRecentPrivateActivity's lookback in
+# the explorer. If either changes there, it has to change here too, or the
+# dashboard asks for files nobody wrote.
+RECENT_BLOCKS = 5
+PRIVATE_ACTIVITY_LOOKBACK = 64
+
 
 class NodeError(RuntimeError):
     pass
@@ -61,9 +73,34 @@ def fetch_optional(node: str, path: str):
 
 def write_json(out_dir: Path, rel_path: str, payload) -> int:
     """Write one object. `rel_path` mirrors the node's API path exactly, so the
-    explorer only has to swap its base URL."""
+    explorer only has to swap its base URL.
+
+    One wrinkle: the API has paths that are both a resource and a prefix —
+    `/blocks/range/A/B` returns blocks, while `/blocks/range/A/B/private_tx_hashes`
+    also exists. A filesystem cannot have `B` be a file and a directory at once,
+    so when that collision comes up the payload goes to `B/index.html`, which is
+    what a web server returns for a request to `B` anyway.
+    """
     target = out_dir / rel_path.lstrip("/")
+
+    # Any ancestor already written as a file has to become a directory holding
+    # its own payload as index.html. Done before mkdir, because mkdir is what
+    # fails when the collision is already on disk.
+    ancestors = []
+    node_path = target.parent
+    while node_path != out_dir and node_path != node_path.parent:
+        ancestors.append(node_path)
+        node_path = node_path.parent
+    for ancestor in reversed(ancestors):
+        if ancestor.is_file():
+            existing = ancestor.read_bytes()
+            ancestor.unlink()
+            ancestor.mkdir(parents=True, exist_ok=True)
+            (ancestor / "index.html").write_bytes(existing)
+
     target.parent.mkdir(parents=True, exist_ok=True)
+    if target.is_dir():
+        target = target / "index.html"
     body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     target.write_text(body, encoding="utf-8")
     return len(body)
@@ -137,6 +174,28 @@ def publish(node: str, out_dir: Path) -> dict:
         if hashes is not None:
             rel = f"/blocks/range/{from_h}/{to_h}/private_tx_hashes"
             written[rel] = write_json(out_dir, rel, hashes)
+
+    # Mempool counts. Bare numbers — no amounts, no parties. These are live
+    # figures being served from a periodic snapshot, so they are the most
+    # approximate thing here; the published_at timestamp is what makes that
+    # legible rather than misleading.
+    for path in ("/mempool/metrics", "/private/pending"):
+        payload = fetch_optional(node, path)
+        if payload is not None:
+            written[path] = write_json(out_dir, path, payload)
+
+    # Windows anchored to the current height, for the dashboard's newest-blocks
+    # list and its recent-activity feed.
+    recent_from = max(1, height - RECENT_BLOCKS + 1)
+    activity_from = max(1, height - PRIVATE_ACTIVITY_LOOKBACK + 1)
+    for rel in (
+        f"/blocks/range/{recent_from}/{height}",
+        f"/blocks/range/{recent_from}/{height}/private_tx_hashes",
+        f"/blocks/range/{activity_from}/{height}/private_tx_hashes",
+    ):
+        payload = fetch_optional(node, rel)
+        if payload is not None:
+            written[rel] = write_json(out_dir, rel, payload)
 
     return {"height": height, "published_at": published_at, "written": written}
 
