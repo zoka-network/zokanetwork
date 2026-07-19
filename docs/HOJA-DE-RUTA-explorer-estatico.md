@@ -125,6 +125,47 @@ reescribe el último. Encaja sin problema en R2.
 
 ---
 
+## Las cinco búsquedas del buscador
+
+`Index.tsx` enruta lo que se escribe a cinco destinos. Todas se pueden conservar
+sin servidor:
+
+| Entrada | Página | Cómo resuelve hoy | En estático |
+|---|---|---|---|
+| scan key | `/view-scan` | WASM local sobre toda la cadena | historial completo exportado |
+| altura | `/block/N` | `getBlock(n)` | trozo que contiene `N` |
+| hash de tx | `/tx/H` | `getTransaction(h)` | índice hash → altura |
+| record | `/record/{kind}/{id}` | `/private/tx/{id}`, prueba de existencia | mismo índice |
+| dirección | `/address/A` | **deshabilitada** | decidir (ver abajo) |
+
+### La búsqueda por dirección ya está apagada, y con razón
+
+`scanPrivateAddress` lleva este comentario en el código:
+
+```js
+// Privacy: never send a view/scan key to the server. The server-side scan is
+// disabled; the client-side (in-browser) scan is being built.
+```
+
+Alguien prefirió apagar la función antes que filtrar claves al servidor. Fue la
+decisión correcta. Y el "client-side scan" que estaba por construirse **ya
+existe**: es `ViewScanDetail`. O sea que `AddressDetail` quedó huérfana.
+
+- [ ] Decidir: retirar `/address` del buscador, o dejar que redirija a
+      `/view-scan` explicando que en una cadena privada un saldo solo se
+      consulta con la clave propia, en el navegador
+
+No hay una tercera opción honesta: mostrar saldos por dirección exigiría que la
+cadena los exponga, que es exactamente lo que ZOKA no hace.
+
+### Índice hash → altura
+
+Lo necesitan `/tx` y `/record`. Un solo archivo mientras sea chico; si crece,
+particionar por los primeros caracteres del hash (`tx-index/ab.json`). Los
+tramos históricos no cambian nunca, así que se escriben una sola vez.
+
+---
+
 ## Fase 1 — El publicador
 
 Un proceso que corre junto al nodo, lee su API local y escribe JSON a R2.
