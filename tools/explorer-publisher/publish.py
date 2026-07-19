@@ -32,9 +32,9 @@ TIMEOUT_SECS = 20
 # asking to be asked more slowly, so it is waited out rather than counted as a
 # failure; without this the publish stopped at block 550 and still reported
 # success.
-RATE_LIMIT_RETRIES = 8
+RATE_LIMIT_RETRIES = 12
 RATE_LIMIT_BACKOFF_SECS = 2
-RATE_LIMIT_MAX_BACKOFF_SECS = 30
+RATE_LIMIT_MAX_BACKOFF_SECS = 60
 
 # The explorer walks history in 1 000-block windows and builds the URLs itself,
 # so this has to match its CHUNK exactly or the files it asks for won't exist.
@@ -276,15 +276,37 @@ def publish(node: str, out_dir: Path) -> dict:
                     tx_hashes.add(tx_hash)
 
     tx_written = 0
+    tx_cached = 0
+    tx_failed = 0
+    tx_first_failure = None
     for tx_hash in sorted(tx_hashes):
         rel = f"/private/tx/{tx_hash}"
         if (out_dir / rel.lstrip("/")).exists():
+            tx_cached += 1
             continue
-        payload = fetch_optional(node, rel)
-        if payload is not None:
-            write_json(out_dir, rel, payload)
-            tx_written += 1
-    written[f"/private/tx/* (new={tx_written} total={len(tx_hashes)})"] = tx_written
+        try:
+            payload = fetch(node, rel)
+        except NodeError as exc:
+            tx_failed += 1
+            if tx_first_failure is None:
+                tx_first_failure = str(exc)
+            continue
+        write_json(out_dir, rel, payload)
+        tx_written += 1
+
+    # Reported, not swallowed. Using the forgiving fetch here hid a complete
+    # failure: all 250 lookups were exhausted by the rate limiter after the
+    # block sweep, and the publish announced "new=0" as though there had simply
+    # been nothing to do. Silence is how every gap in this publisher went
+    # unnoticed.
+    if tx_failed:
+        print(
+            f"warning: {tx_failed} private tx lookup(s) failed; first was {tx_first_failure}",
+            file=sys.stderr,
+        )
+    written[
+        f"/private/tx/* (new={tx_written} cached={tx_cached} failed={tx_failed})"
+    ] = tx_written
 
     # Mempool counts. Bare numbers — no amounts, no parties. These are live
     # figures being served from a periodic snapshot, so they are the most
