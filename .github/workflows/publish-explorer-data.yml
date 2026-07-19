@@ -95,9 +95,15 @@ jobs:
           mkdir -p out
           cp docs/mainnet-network.v1.json .
           free -m || true
+          # Absolute path on purpose. The node calls setup_zoka_home() at
+          # startup, which changes the working directory to its data folder, so
+          # a relative --network-config stops resolving the moment it is
+          # actually needed — the node bootstrapped fine and then exited with
+          # "mainnet network config file not found", several minutes in and
+          # long after the path was accepted.
           nohup ./target/release/zoka fullnode \
             --network mainnet \
-            --network-config mainnet-network.v1.json \
+            --network-config "$GITHUB_WORKSPACE/docs/mainnet-network.v1.json" \
             --no-mine \
             --allow-isolated-start \
             --password "${{ secrets.NODE_PASSWORD || 'zoka-publisher-ci' }}" \
