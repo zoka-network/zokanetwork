@@ -94,6 +94,7 @@ jobs:
         run: |
           mkdir -p out
           cp docs/mainnet-network.v1.json .
+          free -m || true
           nohup ./target/release/zoka fullnode \
             --network mainnet \
             --network-config mainnet-network.v1.json \
@@ -101,6 +102,7 @@ jobs:
             --allow-isolated-start \
             --password "${{ secrets.NODE_PASSWORD || 'zoka-publisher-ci' }}" \
             > node.log 2>&1 &
+          echo "NODE_PID=$!" >> "$GITHUB_ENV"
           echo "started"
 
       # A node that is still catching up would publish the past as though it
@@ -116,6 +118,17 @@ jobs:
       - name: Wait until caught up
         run: |
           for i in $(seq 1 150); do
+            # A dead node answers exactly like a busy one: not at all. The
+            # previous run spent thirty-five minutes polling a process that had
+            # already exited, then reported a timeout — which sent the
+            # investigation after slowness instead of after the crash. Check
+            # the process itself so a death is reported as a death.
+            if ! kill -0 "$NODE_PID" 2>/dev/null; then
+              echo "the node process exited after $i checks"
+              free -m || true
+              tail -40 node.log
+              exit 1
+            fi
             status=$(curl -s --max-time 10 http://127.0.0.1:3000/sync/status || echo '{}')
             state=$(echo "$status" | python3 -c "import sys,json;print(json.load(sys.stdin).get('status','?'))" 2>/dev/null || echo '?')
             height=$(echo "$status" | python3 -c "import sys,json;print(json.load(sys.stdin).get('local_height',0))" 2>/dev/null || echo 0)
