@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Publish a static, read-only view of the chain for the web explorer.
+
+The explorer used to reach the chain through a serverless proxy pointing at a
+central RPC host. That host no longer exists, and the proxy is what exhausted
+the hosting plan. This script replaces it: it reads the operator's own node and
+writes plain JSON files whose paths mirror the node's API, so the explorer can
+be pointed at a bucket instead of a server by editing one config value.
+
+What this is NOT: an authority. Nothing here is trusted by the network. It is a
+published view, and the explorer shows how old it is so a stalled publisher
+looks stalled instead of looking live.
+
+Usage:
+    python publish.py --out ./out
+    python publish.py --out ./out --node http://127.0.0.1:3000
+"""
+
+import argparse
+import json
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+DEFAULT_NODE = "http://127.0.0.1:3000"
+TIMEOUT_SECS = 20
+
+
+class NodeError(RuntimeError):
+    pass
+
+
+def fetch(node: str, path: str):
+    url = f"{node.rstrip('/')}{path}"
+    try:
+        with urllib.request.urlopen(url, timeout=TIMEOUT_SECS) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        raise NodeError(f"{path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise NodeError(f"{path}: response was not JSON ({exc})") from exc
+
+
+def write_json(out_dir: Path, rel_path: str, payload) -> int:
+    """Write one object. `rel_path` mirrors the node's API path exactly, so the
+    explorer only has to swap its base URL."""
+    target = out_dir / rel_path.lstrip("/")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    target.write_text(body, encoding="utf-8")
+    return len(body)
+
+
+def publish(node: str, out_dir: Path) -> dict:
+    published_at = int(time.time())
+
+    stats = fetch(node, "/stats")
+    sync = fetch(node, "/sync/status")
+
+    height = int(stats.get("height") or sync.get("local_height") or 0)
+    if height <= 0:
+        raise NodeError("node reported height 0; refusing to publish an empty view")
+
+    # Only publish a node that is actually on the network's tip. A node that is
+    # still syncing would otherwise publish a view of the past as if it were
+    # current, which is worse than publishing nothing.
+    lag = int(sync.get("lag") or 0)
+    if sync.get("status") != "caught_up" or lag > 2:
+        raise NodeError(
+            f"node is not caught up (status={sync.get('status')}, lag={lag}); "
+            "refusing to publish a stale view"
+        )
+
+    written = {}
+
+    # Mirror the API paths the explorer already calls.
+    written["/chain/height"] = write_json(out_dir, "/chain/height", {"height": height})
+
+    stats_payload = dict(stats)
+    stats_payload["published_at"] = published_at
+    written["/stats"] = write_json(out_dir, "/stats", stats_payload)
+
+    # Dashboard summary. Carries its own timestamp so the explorer can say how
+    # old this is rather than implying it is live.
+    status = {
+        "network": "zoka-mainnet-zenith-v1",
+        "height": height,
+        "difficulty": stats.get("difficulty"),
+        "emission_zka": stats.get("emission_zka"),
+        "hashrate_hs": stats.get("hashrate_hs"),
+        "connected_peers": stats.get("connected_peers"),
+        "miners_online": stats.get("miners_online"),
+        "network_version": stats.get("network_version"),
+        "last_block_time": stats.get("last_block_time"),
+        "published_at": published_at,
+    }
+    written["/network-status.json"] = write_json(out_dir, "/network-status.json", status)
+
+    return {"height": height, "published_at": published_at, "written": written}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--node", default=DEFAULT_NODE, help="local node API base URL")
+    parser.add_argument("--out", required=True, help="output directory")
+    args = parser.parse_args()
+
+    out_dir = Path(args.out)
+    try:
+        result = publish(args.node, out_dir)
+    except NodeError as exc:
+        print(f"publish failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"published height {result['height']} to {out_dir}")
+    for path, size in sorted(result["written"].items()):
+        print(f"  {path:28} {size:>7} B")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
