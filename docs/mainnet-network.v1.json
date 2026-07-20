@@ -1,9 +1,33 @@
 {
   "schema": "zoka-mainnet-network-v1",
-  "status": "active",
+  "status": "release-candidate",
   "chain_id": "zoka-mainnet-zenith-v1",
-  "protocol_freeze_id": "/zoka/1.6.0-mainnet-zenith",
-  "minimum_client_version": "1.6.0",
+  "protocol_freeze_id": "/zoka/1.9.0-mainnet-recovery",
+  "minimum_client_version": "1.9.0",
+  "recovery": {
+    "policy_version": "zoka-mainnet-recovery-v1",
+    "checkpoint": {
+      "status": "compiled-release-candidate",
+      "height": 10887,
+      "hash": "d30c20100f6405424d32e5c204799bc10a1197ff5cdc1fe0b04c2c538b11086e"
+    },
+    "release_gate": {
+      "status": "blocked",
+      "allow_publish": false,
+      "minimum_confirmations": 120,
+      "minimum_head_height": 11007,
+      "observed_head_height": null,
+      "minimum_independent_observations": 2,
+      "independent_observations": [],
+      "require_release_artifact_sha256": true,
+      "release_artifact_sha256": null
+    },
+    "mismatch_action": "quarantine",
+    "recovery_action": "validated-checkpoint-reorg",
+    "automatic_db_deletion": false,
+    "signed_snapshot_recommended": true,
+    "operator_note": "Do not publish 1.9.0 until every release gate is independently verified. A mismatched node stays online for sync, cannot mine, and may atomically promote only a fully validated branch containing the compiled checkpoint."
+  },
   "transport_policy": {
     "anonymous_transport_preferred": false,
     "clearnet_requires_explicit_operator_choice": false,

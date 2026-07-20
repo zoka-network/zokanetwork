@@ -221,6 +221,119 @@ fn canonical_hash_at_height(
     Ok(Some(hash))
 }
 
+/// Verify every compiled checkpoint that the local canonical height has
+/// already crossed. This is intentionally read-only: callers use the error to
+/// quarantine mining while normal block ingestion continues collecting the
+/// checkpoint-valid recovery branch.
+pub fn validate_mainnet_checkpoint_history(
+    storage: &RocksDbStorage,
+    chain_id: &str,
+) -> Result<(), ChainError> {
+    if chain_id != crate::economics::MAINNET_CHAIN_ID {
+        return Ok(());
+    }
+
+    let head_height = storage.get_chain_height()?;
+    for (height, expected) in crate::economics::MAINNET_EMERGENCY_CHECKPOINTS {
+        if head_height < *height {
+            continue;
+        }
+        let actual = canonical_hash_at_height(storage, *height)?
+            .unwrap_or_else(|| "missing canonical checkpoint index".to_string());
+        if actual != *expected {
+            return Err(ChainError::MainnetCheckpointMismatch {
+                height: *height,
+                expected: (*expected).to_string(),
+                actual,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Resolve an ancestor on `candidate`'s branch. Once the walk reaches a block
+/// already indexed as canonical, older ancestry can be answered from the
+/// canonical height index without re-reading thousands of block bodies.
+fn candidate_ancestor_hash_at_height(
+    storage: &RocksDbStorage,
+    candidate: &Block,
+    target_height: u64,
+) -> Result<Option<String>, ChainError> {
+    if candidate.header.block_height < target_height {
+        return Ok(None);
+    }
+
+    let mut cursor = candidate.clone();
+    loop {
+        if cursor.header.block_height == target_height {
+            return Ok(Some(cursor.header.hash));
+        }
+        if cursor.header.block_height < target_height {
+            return Ok(None);
+        }
+
+        if canonical_hash_at_height(storage, cursor.header.block_height)?.as_deref()
+            == Some(cursor.header.hash.as_str())
+        {
+            return canonical_hash_at_height(storage, target_height);
+        }
+
+        cursor = storage
+            .get_block(&cursor.header.prev_hash)?
+            .ok_or_else(|| ChainError::DoesNotExtendHead {
+                head: cursor.header.prev_hash.clone(),
+                candidate: candidate.header.hash.clone(),
+            })?;
+    }
+}
+
+fn validate_candidate_mainnet_checkpoints(
+    storage: &RocksDbStorage,
+    chain_id: &str,
+    candidate: &Block,
+) -> Result<(), ChainError> {
+    if chain_id != crate::economics::MAINNET_CHAIN_ID {
+        return Ok(());
+    }
+
+    for (height, expected) in crate::economics::MAINNET_EMERGENCY_CHECKPOINTS {
+        if candidate.header.block_height < *height {
+            continue;
+        }
+        let actual = candidate_ancestor_hash_at_height(storage, candidate, *height)?
+            .unwrap_or_else(|| "missing checkpoint ancestor".to_string());
+        if actual != *expected {
+            return Err(ChainError::MainnetCheckpointMismatch {
+                height: *height,
+                expected: (*expected).to_string(),
+                actual,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Consensus migration used by 1.9.0: work alone cannot recover a node whose
+/// invalid local fork is already longer. Such a node may switch to lower work
+/// only after the incoming, fully validated branch proves the compiled
+/// checkpoint that its local canonical history violates.
+fn checkpoint_forced_reorg_required(
+    storage: &RocksDbStorage,
+    chain_id: &str,
+    candidate: &Block,
+) -> Result<bool, ChainError> {
+    let mismatch_height = match validate_mainnet_checkpoint_history(storage, chain_id) {
+        Ok(()) => return Ok(false),
+        Err(ChainError::MainnetCheckpointMismatch { height, .. }) => height,
+        Err(other) => return Err(other),
+    };
+    if candidate.header.block_height < mismatch_height {
+        return Ok(false);
+    }
+    validate_candidate_mainnet_checkpoints(storage, chain_id, candidate)?;
+    Ok(true)
+}
+
 fn genesis_meta() -> BlockChainMeta {
     BlockChainMeta {
         height: 0,
@@ -345,6 +458,16 @@ fn promote_branch_to_canonical(
 ) -> Result<ChainHead, ChainError> {
     let old_height = storage.get_chain_height()?;
     let branch = collect_branch_to_common_ancestor(storage, candidate)?;
+    let mut old_canonical = Vec::new();
+    if let Some(first) = branch.first() {
+        for height in first.header.block_height..=old_height {
+            if let Some(hash) = canonical_hash_at_height(storage, height)? {
+                if let Some(old_block) = storage.get_block(&hash)? {
+                    old_canonical.push(old_block);
+                }
+            }
+        }
+    }
     // Double-spend validation for the incoming branch, against what the
     // chain will look like AFTER the reorg — and before mutating anything.
     // Side-branch blocks skip the global-index nullifier check at store time
@@ -358,17 +481,13 @@ fn promote_branch_to_canonical(
     // incoming branch itself, is a double-spend — those abort the promotion
     // with the canonical head untouched.
     if let Some(first) = branch.first() {
-        let branch_point = first.header.block_height;
+        let _branch_point = first.header.block_height;
         let mut freed_by_reorg = std::collections::HashSet::new();
-        for height in branch_point..=old_height {
-            if let Some(hash) = canonical_hash_at_height(storage, height)? {
-                if let Some(old_block) = storage.get_block(&hash)? {
-                    for nullifier in &old_block.private_nullifiers {
-                        let nullifier = nullifier.trim();
-                        if !nullifier.is_empty() {
-                            freed_by_reorg.insert(nullifier.to_string());
-                        }
-                    }
+        for old_block in &old_canonical {
+            for nullifier in &old_block.private_nullifiers {
+                let nullifier = nullifier.trim();
+                if !nullifier.is_empty() {
+                    freed_by_reorg.insert(nullifier.to_string());
                 }
             }
         }
@@ -400,28 +519,16 @@ fn promote_branch_to_canonical(
     // canonical branch claims its own. Order matters — de-index the outgoing
     // blocks before indexing the incoming branch so a nullifier reused across
     // both branches ends up owned by the new chain.
-    if let Some(first) = branch.first() {
-        let branch_point = first.header.block_height;
-        for height in branch_point..=old_height {
-            if let Some(hash) = canonical_hash_at_height(storage, height)? {
-                if let Some(old_block) = storage.get_block(&hash)? {
-                    deindex_block_nullifiers(storage, &old_block)?;
-                }
-            }
-        }
-    }
-    for block in &branch {
-        storage.set_block_hash_at_height(block.header.block_height, &block.header.hash)?;
-        index_block_nullifiers(storage, block)?;
-    }
-    for height in meta.height.saturating_add(1)..=old_height {
-        storage.delete_block_hash_at_height(height)?;
-    }
-    storage.set_chain_height(meta.height)?;
-    storage.set_last_block_hash(&candidate.header.hash)?;
-    storage.set_total_supply_emitted(meta.total_supply_emitted)?;
-    storage.set_cumulative_work(meta.cumulative_work)?;
-    storage.set_current_difficulty_bits(meta.difficulty_bits)?;
+    storage.promote_canonical_branch_atomically(
+        &old_canonical,
+        &branch,
+        old_height,
+        meta.height,
+        &candidate.header.hash,
+        meta.total_supply_emitted,
+        meta.cumulative_work,
+        meta.difficulty_bits,
+    )?;
     Ok(ChainHead {
         height: meta.height,
         hash: candidate.header.hash.clone(),
@@ -432,6 +539,7 @@ fn promote_branch_to_canonical(
 
 fn maybe_promote_known_side_branch(
     storage: &RocksDbStorage,
+    chain_id: &str,
     candidate: &Block,
     head: Option<&ChainHead>,
 ) -> Result<Option<ChainHead>, ChainError> {
@@ -445,7 +553,8 @@ fn maybe_promote_known_side_branch(
         return Ok(None);
     };
     let head_work = head.map(|h| h.cumulative_work).unwrap_or(0);
-    if meta.cumulative_work > head_work {
+    let checkpoint_forced = checkpoint_forced_reorg_required(storage, chain_id, candidate)?;
+    if meta.cumulative_work > head_work || checkpoint_forced {
         return Ok(Some(promote_branch_to_canonical(
             storage, candidate, &meta,
         )?));
@@ -534,81 +643,8 @@ fn enforce_mainnet_emergency_checkpoint(
     storage: &RocksDbStorage,
     chain_id: &str,
     candidate: &Block,
-    parent: &Block,
-    extends_head: bool,
 ) -> Result<(), ChainError> {
-    if chain_id != crate::economics::MAINNET_CHAIN_ID {
-        return Ok(());
-    }
-
-    for (checkpoint_height, checkpoint_hash) in crate::economics::MAINNET_EMERGENCY_CHECKPOINTS {
-        enforce_mainnet_checkpoint_at(
-            storage,
-            candidate,
-            parent,
-            extends_head,
-            *checkpoint_height,
-            checkpoint_hash,
-        )?;
-    }
-    Ok(())
-}
-
-fn enforce_mainnet_checkpoint_at(
-    storage: &RocksDbStorage,
-    candidate: &Block,
-    parent: &Block,
-    extends_head: bool,
-    checkpoint_height: u64,
-    checkpoint_hash: &str,
-) -> Result<(), ChainError> {
-    let candidate_height = candidate.header.block_height;
-
-    if candidate_height < checkpoint_height {
-        return Ok(());
-    }
-
-    if candidate_height == checkpoint_height {
-        if candidate.header.hash == checkpoint_hash {
-            return Ok(());
-        }
-        return Err(ChainError::MainnetCheckpointMismatch {
-            height: checkpoint_height,
-            expected: checkpoint_hash.to_string(),
-            actual: candidate.header.hash.clone(),
-        });
-    }
-
-    if extends_head
-        && canonical_hash_at_height(storage, checkpoint_height)?.as_deref() == Some(checkpoint_hash)
-    {
-        return Ok(());
-    }
-
-    let mut cursor = parent.clone();
-    while cursor.header.block_height > checkpoint_height {
-        cursor = storage
-            .get_block(&cursor.header.prev_hash)?
-            .ok_or_else(|| ChainError::DoesNotExtendHead {
-                head: cursor.header.prev_hash.clone(),
-                candidate: candidate.header.hash.clone(),
-            })?;
-    }
-
-    if cursor.header.block_height == checkpoint_height && cursor.header.hash == checkpoint_hash {
-        return Ok(());
-    }
-
-    let actual = if cursor.header.block_height == checkpoint_height {
-        cursor.header.hash
-    } else {
-        format!("missing checkpoint ancestor before height {candidate_height}")
-    };
-    Err(ChainError::MainnetCheckpointMismatch {
-        height: checkpoint_height,
-        expected: checkpoint_hash.to_string(),
-        actual,
-    })
+    validate_candidate_mainnet_checkpoints(storage, chain_id, candidate)
 }
 
 /// Persist every nullifier committed in `block` into the global spent index,
@@ -627,22 +663,6 @@ fn index_block_nullifiers(storage: &RocksDbStorage, block: &Block) -> Result<(),
     Ok(())
 }
 
-/// Remove every nullifier committed in `block` from the global spent index.
-/// Call this when a block leaves the canonical chain (reorg) so the note can
-/// be respent on the new canonical branch.
-fn deindex_block_nullifiers(storage: &RocksDbStorage, block: &Block) -> Result<(), ChainError> {
-    for nullifier in &block.private_nullifiers {
-        let nullifier = nullifier.trim();
-        if nullifier.is_empty() {
-            continue;
-        }
-        storage
-            .delete_spent_nullifier(nullifier)
-            .map_err(|e| ChainError::Storage(format!("{e:?}")))?;
-    }
-    Ok(())
-}
-
 fn apply_block_inner(
     storage: &RocksDbStorage,
     chain_id: &str,
@@ -656,7 +676,8 @@ fn apply_block_inner(
 
     let head = read_chain_head(storage)?;
     if storage.block_exists(&candidate.header.hash)? {
-        if let Some(promoted) = maybe_promote_known_side_branch(storage, candidate, head.as_ref())?
+        if let Some(promoted) =
+            maybe_promote_known_side_branch(storage, chain_id, candidate, head.as_ref())?
         {
             return Ok(promoted);
         }
@@ -691,7 +712,7 @@ fn apply_block_inner(
     };
     let extends_head = candidate.header.prev_hash == expected_prev_hash
         && candidate.header.block_height == parent_height.saturating_add(1);
-    enforce_mainnet_emergency_checkpoint(storage, chain_id, candidate, &parent, extends_head)?;
+    enforce_mainnet_emergency_checkpoint(storage, chain_id, candidate)?;
 
     let effective_expected_difficulty = if force_expected_difficulty || extends_head {
         expected_difficulty_bits
@@ -749,7 +770,8 @@ fn apply_block_inner(
     storage.save_block_body(candidate)?;
     save_block_meta(storage, &candidate.header.hash, &new_meta)?;
     let head_work = head.as_ref().map(|h| h.cumulative_work).unwrap_or(0);
-    if new_meta.cumulative_work > head_work {
+    let checkpoint_forced = checkpoint_forced_reorg_required(storage, chain_id, candidate)?;
+    if new_meta.cumulative_work > head_work || checkpoint_forced {
         return promote_branch_to_canonical(storage, candidate, &new_meta);
     }
 
@@ -781,6 +803,7 @@ pub fn next_block_metadata(
     storage: &Arc<RocksDbStorage>,
     chain_id: &str,
 ) -> Result<(u64, String, u64), ChainError> {
+    validate_mainnet_checkpoint_history(storage, chain_id)?;
     let head = read_chain_head(storage)?;
     Ok(match head {
         Some(h) => (h.height.saturating_add(1), h.hash, h.total_supply_emitted),
@@ -805,8 +828,8 @@ pub struct PruneReport {
     /// Chain head height at the moment the pruner ran. Pruning never
     /// touches the head or any block at height >= `retained_from_height`.
     pub head_height: u64,
-    /// Lowest height that REMAINS on disk after the prune. Blocks at
-    /// heights `[1, retained_from_height)` were removed.
+    /// Lowest height in the recent contiguous retention window. Compiled
+    /// checkpoint blocks below this height are retained as sparse anchors.
     pub retained_from_height: u64,
     /// How many block bodies were deleted (or would be deleted in
     /// dry-run).
@@ -828,8 +851,8 @@ pub struct PruneReport {
 /// 1. `keep_last` is clamped at the floor [`PRUNE_MIN_RETAINED_BLOCKS`].
 ///    Any caller asking for fewer is upgraded silently to the minimum;
 ///    you cannot accidentally cripple difficulty retarget.
-/// 2. Heights `[max(1, head - keep_last + 1) .. head]` are NEVER
-///    touched.
+/// 2. Heights `[max(1, head - keep_last + 1) .. head]` and every compiled
+///    mainnet checkpoint are NEVER touched.
 /// 3. The chain head metadata (`chain:height`, `chain:last_hash`,
 ///    `chain:total_supply_emitted`, `chain:cumulative_work`,
 ///    `chain:current_difficulty_bits`, `chain:genesis:digest`) is
@@ -880,6 +903,12 @@ pub fn prune_below_head(
     let mut metas_pruned = 0u64;
 
     for height in 1..retained_from {
+        if crate::economics::MAINNET_EMERGENCY_CHECKPOINTS
+            .iter()
+            .any(|(checkpoint_height, _)| *checkpoint_height == height)
+        {
+            continue;
+        }
         let block = match storage.get_block_by_height(height)? {
             Some(b) => b,
             None => continue,
@@ -982,6 +1011,265 @@ mod tests {
         block.header.merkle_root = block.compute_merkle_root();
         block.header.hash = block.compute_hash();
         block
+    }
+
+    fn recovery_fixture_block(
+        height: u64,
+        hash: &str,
+        prev_hash: &str,
+        nullifiers: Vec<String>,
+    ) -> Block {
+        Block {
+            header: BlockHeader {
+                hash: hash.to_string(),
+                prev_hash: prev_hash.to_string(),
+                merkle_root: "fixture".to_string(),
+                state_root: "fixture".to_string(),
+                timestamp: 1_700_000_000 + height,
+                nonce: 0,
+                block_height: height,
+                validator: PublicKey(Vec::new()),
+                seal: Signature(Vec::new()),
+            },
+            transactions: Vec::new(),
+            private_tx_hashes: Vec::new(),
+            private_tx_bodies: Vec::new(),
+            private_nullifiers: nullifiers,
+            private_fee_claims: Vec::new(),
+            private_coinbase: None,
+        }
+    }
+
+    /// Seed a long, high-work canonical fork that violates the 1.9 checkpoint,
+    /// plus a previously validated lower-work side block carrying the correct
+    /// checkpoint. Earlier anchors are represented by their canonical indices;
+    /// the common parent lets ancestry validation safely reuse those indices.
+    fn seed_mainnet_recovery_fixture(
+        storage: &RocksDbStorage,
+        common_nullifiers: Vec<String>,
+        candidate_nullifiers: Vec<String>,
+    ) -> (String, Block) {
+        for (height, hash) in economics::MAINNET_EMERGENCY_CHECKPOINTS {
+            if *height < economics::MAINNET_RECOVERY_CHECKPOINT_10887_HEIGHT {
+                storage
+                    .set_block_hash_at_height(*height, hash)
+                    .expect("seed earlier checkpoint index");
+            }
+        }
+
+        let common = recovery_fixture_block(
+            economics::MAINNET_RECOVERY_CHECKPOINT_10887_HEIGHT - 1,
+            "common-10886",
+            "common-10885",
+            common_nullifiers.clone(),
+        );
+        let wrong_checkpoint = recovery_fixture_block(
+            economics::MAINNET_RECOVERY_CHECKPOINT_10887_HEIGHT,
+            "wrong-fork-10887",
+            &common.header.hash,
+            Vec::new(),
+        );
+        let wrong_head = recovery_fixture_block(
+            economics::MAINNET_RECOVERY_CHECKPOINT_10887_HEIGHT + 1,
+            "wrong-fork-10888",
+            &wrong_checkpoint.header.hash,
+            Vec::new(),
+        );
+        for block in [&common, &wrong_checkpoint, &wrong_head] {
+            storage
+                .save_block_body(block)
+                .expect("seed canonical fixture body");
+            storage
+                .set_block_hash_at_height(block.header.block_height, &block.header.hash)
+                .expect("seed canonical fixture index");
+        }
+        for nullifier in common_nullifiers {
+            storage
+                .save_spent_nullifier(&nullifier, common.header.block_height)
+                .expect("seed spent nullifier");
+        }
+        storage
+            .set_chain_height(wrong_head.header.block_height)
+            .expect("seed height");
+        storage
+            .set_last_block_hash(&wrong_head.header.hash)
+            .expect("seed head hash");
+        storage.set_total_supply_emitted(99).expect("seed supply");
+        storage.set_cumulative_work(50_000).expect("seed work");
+        storage
+            .set_current_difficulty_bits(economics::POW_INITIAL_DIFFICULTY_BITS)
+            .expect("seed difficulty");
+
+        let candidate = recovery_fixture_block(
+            economics::MAINNET_RECOVERY_CHECKPOINT_10887_HEIGHT,
+            economics::MAINNET_RECOVERY_CHECKPOINT_10887_HASH,
+            &common.header.hash,
+            candidate_nullifiers,
+        );
+        storage
+            .save_block_body(&candidate)
+            .expect("seed validated side body");
+        save_block_meta(
+            storage,
+            &candidate.header.hash,
+            &BlockChainMeta {
+                height: candidate.header.block_height,
+                total_supply_emitted: 88,
+                cumulative_work: 10,
+                difficulty_bits: economics::POW_INITIAL_DIFFICULTY_BITS,
+            },
+        )
+        .expect("seed validated side metadata");
+
+        (wrong_head.header.hash, candidate)
+    }
+
+    #[test]
+    fn mismatched_mainnet_db_cannot_mine_but_promotes_valid_checkpoint_branch() {
+        let (storage, _dir) = open_temp_storage();
+        let storage = Arc::new(storage);
+        let (old_head_hash, candidate) =
+            seed_mainnet_recovery_fixture(&storage, Vec::new(), Vec::new());
+
+        let mining_err = next_block_metadata(&storage, economics::MAINNET_CHAIN_ID)
+            .expect_err("mismatched DB must be quarantined from mining");
+        assert!(matches!(
+            mining_err,
+            ChainError::MainnetCheckpointMismatch {
+                height: economics::MAINNET_RECOVERY_CHECKPOINT_10887_HEIGHT,
+                ..
+            }
+        ));
+
+        let old_head = read_chain_head(&storage)
+            .expect("read old head")
+            .expect("old head exists");
+        assert_eq!(old_head.hash, old_head_hash);
+        assert!(old_head.cumulative_work > 10);
+
+        let promoted = maybe_promote_known_side_branch(
+            &storage,
+            economics::MAINNET_CHAIN_ID,
+            &candidate,
+            Some(&old_head),
+        )
+        .expect("checkpoint branch remains ingestible")
+        .expect("checkpoint must override higher work on the invalid fork");
+
+        assert_eq!(promoted.height, candidate.header.block_height);
+        assert_eq!(promoted.hash, candidate.header.hash);
+        assert_eq!(promoted.cumulative_work, 10);
+        assert_eq!(
+            canonical_hash_at_height(
+                &storage,
+                economics::MAINNET_RECOVERY_CHECKPOINT_10887_HEIGHT
+            )
+            .expect("checkpoint index"),
+            Some(economics::MAINNET_RECOVERY_CHECKPOINT_10887_HASH.to_string())
+        );
+        assert_eq!(
+            canonical_hash_at_height(
+                &storage,
+                economics::MAINNET_RECOVERY_CHECKPOINT_10887_HEIGHT + 1
+            )
+            .expect("old height index removed"),
+            None
+        );
+        assert!(storage
+            .block_exists(&old_head_hash)
+            .expect("old body lookup"));
+        validate_mainnet_checkpoint_history(&storage, economics::MAINNET_CHAIN_ID)
+            .expect("promoted history satisfies all checkpoints");
+    }
+
+    #[test]
+    fn failed_checkpoint_forced_reorg_keeps_the_old_canonical_view() {
+        let (storage, _dir) = open_temp_storage();
+        let (old_head_hash, candidate) = seed_mainnet_recovery_fixture(
+            &storage,
+            vec!["spent-below-branch".to_string()],
+            vec!["spent-below-branch".to_string()],
+        );
+        let old_head = read_chain_head(&storage)
+            .expect("read old head")
+            .expect("old head exists");
+
+        let err = maybe_promote_known_side_branch(
+            &storage,
+            economics::MAINNET_CHAIN_ID,
+            &candidate,
+            Some(&old_head),
+        )
+        .expect_err("invalid recovery branch must fail before atomic commit");
+        assert!(matches!(
+            err,
+            ChainError::PrivateNullifierDoubleSpend { .. }
+        ));
+
+        let after = read_chain_head(&storage)
+            .expect("read head after error")
+            .expect("head remains");
+        assert_eq!(after.hash, old_head_hash);
+        assert_eq!(after.height, old_head.height);
+        assert_eq!(after.cumulative_work, old_head.cumulative_work);
+        assert_eq!(
+            canonical_hash_at_height(
+                &storage,
+                economics::MAINNET_RECOVERY_CHECKPOINT_10887_HEIGHT
+            )
+            .expect("old checkpoint index"),
+            Some("wrong-fork-10887".to_string())
+        );
+        assert!(storage
+            .is_nullifier_spent("spent-below-branch")
+            .expect("spent index survives"));
+    }
+
+    #[test]
+    fn lower_work_branch_without_the_checkpoint_is_never_force_promoted() {
+        let (storage, _dir) = open_temp_storage();
+        let (old_head_hash, mut candidate) =
+            seed_mainnet_recovery_fixture(&storage, Vec::new(), Vec::new());
+        candidate.header.hash = "different-fork-10887".to_string();
+        storage
+            .save_block_body(&candidate)
+            .expect("seed invalid side body");
+        save_block_meta(
+            &storage,
+            &candidate.header.hash,
+            &BlockChainMeta {
+                height: candidate.header.block_height,
+                total_supply_emitted: 88,
+                cumulative_work: 10,
+                difficulty_bits: economics::POW_INITIAL_DIFFICULTY_BITS,
+            },
+        )
+        .expect("seed invalid side metadata");
+        let old_head = read_chain_head(&storage)
+            .expect("read old head")
+            .expect("old head exists");
+
+        let err = maybe_promote_known_side_branch(
+            &storage,
+            economics::MAINNET_CHAIN_ID,
+            &candidate,
+            Some(&old_head),
+        )
+        .expect_err("branch without checkpoint must be rejected");
+        assert!(matches!(
+            err,
+            ChainError::MainnetCheckpointMismatch {
+                height: economics::MAINNET_RECOVERY_CHECKPOINT_10887_HEIGHT,
+                ..
+            }
+        ));
+        assert_eq!(
+            read_chain_head(&storage)
+                .expect("read head after rejection")
+                .expect("head remains")
+                .hash,
+            old_head_hash
+        );
     }
 
     #[test]

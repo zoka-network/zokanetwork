@@ -54,7 +54,9 @@ pub type PrivateTxBroadcastSender =
     tokio::sync::mpsc::UnboundedSender<crate::private_wallet::PrivateTransaction>;
 
 const MINER_HEARTBEAT_TTL_SECS: u64 = 90;
-const NETWORK_MIN_CLIENT_VERSION: &str = "1.6.0";
+/// Old clients remain on the pre-recovery protocol and must not be counted as
+/// current miners by public status endpoints.
+pub const NETWORK_MIN_CLIENT_VERSION: &str = "1.9.0";
 
 #[derive(Clone, Debug)]
 pub struct ApiSecurityConfig {
@@ -392,6 +394,7 @@ pub struct NetworkRuntimeSnapshot {
     pub miners_online: u64,
     pub remote_miners_online: u64,
     pub local_mining: bool,
+    pub checkpoint_quarantined: bool,
     pub local_chain_height: u64,
     pub local_peer_id: Option<String>,
     pub total_reported_hashrate_hps: u64,
@@ -638,6 +641,7 @@ pub fn global_local_mining_control() -> &'static LocalMiningControlState {
 pub struct NetworkRuntimeState {
     connected_peers: AtomicU64,
     local_mining: AtomicU64,
+    checkpoint_quarantined: AtomicU64,
     local_hashrate_hps: AtomicU64,
     local_chain_height: AtomicU64,
     sync_target_height: AtomicU64,
@@ -891,6 +895,18 @@ impl NetworkRuntimeState {
         self.local_chain_height.load(Ordering::Relaxed)
     }
 
+    pub fn set_checkpoint_quarantined(&self, quarantined: bool) {
+        self.checkpoint_quarantined
+            .store(if quarantined { 1 } else { 0 }, Ordering::Relaxed);
+        if quarantined {
+            self.local_mining.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub fn checkpoint_quarantined(&self) -> bool {
+        self.checkpoint_quarantined.load(Ordering::Relaxed) == 1
+    }
+
     pub async fn set_local_miner(
         &self,
         peer_id: String,
@@ -1010,6 +1026,7 @@ impl NetworkRuntimeState {
             miners_online: miner_ids.len() as u64,
             remote_miners_online: remote_miners,
             local_mining,
+            checkpoint_quarantined: self.checkpoint_quarantined(),
             local_chain_height: self.local_chain_height.load(Ordering::Relaxed),
             local_peer_id,
             total_reported_hashrate_hps: total_hashrate,
@@ -2799,8 +2816,17 @@ async fn get_local_mining_control() -> Json<LocalMiningControlSnapshot> {
 
 async fn post_local_mining_start(
     Json(request): Json<LocalMiningControlRequest>,
-) -> Json<LocalMiningControlSnapshot> {
-    Json(global_local_mining_control().enable(request.threads.max(1)))
+) -> Result<Json<LocalMiningControlSnapshot>, (StatusCode, String)> {
+    if global_network_runtime().checkpoint_quarantined() {
+        return Err((
+            StatusCode::CONFLICT,
+            "mining is quarantined: local canonical history does not match the compiled mainnet checkpoint; synchronization remains enabled"
+                .to_string(),
+        ));
+    }
+    Ok(Json(
+        global_local_mining_control().enable(request.threads.max(1)),
+    ))
 }
 
 async fn post_local_mining_stop() -> Json<LocalMiningControlSnapshot> {
@@ -5126,6 +5152,7 @@ async fn post_block_submit(
         SyncOutcome::GapAhead {
             local_head,
             candidate,
+            ..
         } => {
             // Deliberately don't echo local_head/candidate back to the caller:
             // this endpoint has no protocol-version gate, so it's an easy

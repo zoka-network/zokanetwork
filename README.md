@@ -50,6 +50,7 @@ zoka wallets --network testnet
 | Deploy on Fly.io | [docs/fly-bootstrap.md](docs/fly-bootstrap.md) |
 | CLI commands | [docs/user-cli-reference.md](docs/user-cli-reference.md) |
 | Verify releases | [docs/release-verification.md](docs/release-verification.md) |
+| Mainnet 1.9.0 recovery | [docs/mainnet-recovery-runbook.md](docs/mainnet-recovery-runbook.md) |
 | Protocol overview | [docs/protocol-overview.md](docs/protocol-overview.md) |
 | Troubleshooting | [docs/troubleshooting.md](docs/troubleshooting.md) |
 
@@ -90,6 +91,14 @@ This checkpoint also anchors the serverless difficulty reset: from **block
 collapse had pushed it far too high for the remaining miners), so the chain
 keeps producing blocks at a healthy pace. Both rules apply only on the chain
 that carries the 3127 anchor.
+
+The 1.9.0 recovery adds a second canonical anchor at **block 10887**
+(`d30c20100f6405424d32e5c204799bc10a1197ff5cdc1fe0b04c2c538b11086e`)
+to resolve the fork observed around that height. A node on a side branch stops
+mining and converges back to the canonical chain automatically; databases are
+never deleted and wallet balances are preserved. Every node must run 1.9.0 to
+stay on the network — the recovery protocol does not talk to older clients. The
+network confirms forward above the anchor as hashrate returns.
 
 ## Repository Layout
 

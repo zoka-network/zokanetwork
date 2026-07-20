@@ -19,9 +19,10 @@
 //! function so the consensus rules can be exercised without a libp2p
 //! swarm.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use libp2p::PeerId;
 use serde::Deserialize;
 use tracing::info;
 
@@ -37,6 +38,25 @@ const MAX_PENDING_BLOCK_RESPONSES: usize = 256;
 const MAX_PENDING_BLOCKS_PER_HEIGHT: usize = 4;
 const MAX_PENDING_BLOCK_AHEAD: u64 = 512;
 const MAX_BRANCH_BACKFILL_REQUEST_FAILURES: u8 = 4;
+
+#[derive(Debug, Clone)]
+struct PeerChainTip {
+    height: u64,
+    block_hash: Option<String>,
+    cumulative_work: Option<u128>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingBlockResponse {
+    source: Option<PeerId>,
+    response: BlockResponseMessage,
+}
+
+#[derive(Debug, Clone)]
+struct PerceivedHeight {
+    height: u64,
+    observed_at: Instant,
+}
 
 /// `observe()` records a peer-announced height (from an unvalidated
 /// `BlockResponse.block_height` or `SyncState.last_height`) before the
@@ -55,11 +75,19 @@ const PERCEIVED_HEIGHT_STALE_AFTER: Duration = Duration::from_secs(300);
 pub struct PeerChainView {
     pub perceived_max_height: u64,
     perceived_max_height_observed_at: Option<Instant>,
+    unattributed_perceived_height: Option<PerceivedHeight>,
+    source_perceived_heights: HashMap<PeerId, PerceivedHeight>,
     pub branch_backfill_height: Option<u64>,
     pub branch_backfill_ceiling: Option<u64>,
     pub branch_expected_hashes: BTreeMap<u64, String>,
+    branch_source: Option<PeerId>,
+    branch_tip_hash: Option<String>,
+    branch_cumulative_work: Option<u128>,
     branch_backfill_request_failures: u8,
-    pending_block_responses: BTreeMap<u64, BTreeMap<String, BlockResponseMessage>>,
+    recovery_mode: bool,
+    peer_tips: HashMap<PeerId, PeerChainTip>,
+    rejected_sources: HashSet<PeerId>,
+    pending_block_responses: BTreeMap<u64, BTreeMap<String, PendingBlockResponse>>,
 }
 
 impl PeerChainView {
@@ -74,12 +102,21 @@ impl PeerChainView {
     /// candidate is worth caching at all, so a height this implausible was
     /// never going to be actionable anyway.
     pub fn observe(&mut self, height: u64, local_height: u64) {
-        if height > self.perceived_max_height
-            && height <= local_height.saturating_add(MAX_PENDING_BLOCK_AHEAD)
-        {
-            self.perceived_max_height = height;
-            self.perceived_max_height_observed_at = Some(Instant::now());
+        if height <= local_height.saturating_add(MAX_PENDING_BLOCK_AHEAD) {
+            self.observe_unattributed_height(height);
         }
+    }
+
+    /// Source-aware form of [`Self::observe`]. Invalid consensus data can
+    /// quarantine one author without leaving that author's advertised height
+    /// behind as the global sync target.
+    pub fn observe_from(&mut self, source: PeerId, height: u64, local_height: u64) {
+        if self.rejected_sources.contains(&source)
+            || height > local_height.saturating_add(MAX_PENDING_BLOCK_AHEAD)
+        {
+            return;
+        }
+        self.observe_source_height(source, height);
     }
 
     /// Record a sync-target height that is trusted enough to sit far ahead of
@@ -92,13 +129,136 @@ impl PeerChainView {
     /// payloads are still fetched and fully validated before any state is
     /// committed, so a dishonest height only wastes bounded fetch attempts.
     pub fn observe_trusted_height(&mut self, height: u64) {
-        if height > self.perceived_max_height {
-            self.perceived_max_height = height;
-            self.perceived_max_height_observed_at = Some(Instant::now());
+        self.observe_unattributed_height(height);
+    }
+
+    /// Record a directly-connected peer's declared tip without collapsing the
+    /// source into the global perceived height. Keeping the peer association is
+    /// what lets IBD continue asking one coherent branch for subsequent blocks.
+    pub fn observe_trusted_height_from(&mut self, source: PeerId, height: u64) {
+        if self.rejected_sources.contains(&source) {
+            return;
         }
+        let tip = self.peer_tips.entry(source).or_insert(PeerChainTip {
+            height,
+            block_hash: None,
+            cumulative_work: None,
+        });
+        if height > tip.height {
+            tip.height = height;
+            tip.block_hash = None;
+            // Keep an older cumulative-work observation as a conservative
+            // lower bound until this peer publishes a newer BlockAnnounce.
+        }
+        self.observe_source_height(source, height);
+    }
+
+    /// Record a peer's block tip and advertised cumulative work. Work is only
+    /// a branch-selection hint; every downloaded block still goes through full
+    /// consensus validation before storage or reorg.
+    pub fn observe_block_announce_from(
+        &mut self,
+        source: PeerId,
+        height: u64,
+        block_hash: &str,
+        cumulative_work: Option<u128>,
+        local_height: u64,
+    ) {
+        if self.rejected_sources.contains(&source) {
+            return;
+        }
+        if height <= local_height.saturating_add(MAX_PENDING_BLOCK_AHEAD) {
+            self.observe_source_height(source, height);
+        }
+
+        let existing = self.peer_tips.get(&source).cloned();
+        let should_replace = existing.as_ref().is_none_or(|tip| {
+            cumulative_work > tip.cumulative_work
+                || (cumulative_work == tip.cumulative_work && height >= tip.height)
+        });
+        if should_replace {
+            let inherited_work =
+                cumulative_work.or_else(|| existing.as_ref().and_then(|tip| tip.cumulative_work));
+            self.peer_tips.insert(
+                source,
+                PeerChainTip {
+                    height,
+                    block_hash: Some(block_hash.to_string()),
+                    cumulative_work: inherited_work,
+                },
+            );
+        }
+
+        // Do not mutate an in-flight branch. Newer/higher-work observations
+        // remain candidates for the next selection after completion/failure.
+    }
+
+    pub fn active_branch_source(&self) -> Option<PeerId> {
+        self.branch_source
+    }
+
+    pub fn active_branch_cumulative_work(&self) -> Option<u128> {
+        self.branch_cumulative_work
+    }
+
+    /// While a hash-pinned branch is being reconstructed, discard unrelated
+    /// block bodies before consensus/storage work. Exact hashes may be served
+    /// by any relay; an as-yet-unpinned forward height must come from the
+    /// selected branch source.
+    pub fn should_process_block_candidate(
+        &self,
+        source: Option<&PeerId>,
+        height: u64,
+        hash: &str,
+    ) -> bool {
+        if !self.has_active_branch_backfill() {
+            return true;
+        }
+        if let Some(expected) = self.branch_expected_hashes.get(&height) {
+            return expected == hash;
+        }
+        self.branch_backfill_height == Some(height) && self.branch_source.as_ref() == source
+    }
+
+    /// Permit checkpoint recovery to walk backward even when the candidate is
+    /// below the current (quarantined) local tip. Normal sync keeps rejecting
+    /// such stale side-branch traffic.
+    pub fn set_recovery_mode(&mut self, enabled: bool) {
+        self.recovery_mode = enabled;
+    }
+
+    pub fn recovery_mode(&self) -> bool {
+        self.recovery_mode
+    }
+
+    /// Prefer a peer that has explicitly advertised enough chain and, when
+    /// available, the most cumulative work. Height is only a tie-breaker.
+    pub fn preferred_peer_for_height(&self, height: u64) -> Option<PeerId> {
+        self.peer_tips
+            .iter()
+            .filter(|(peer, _)| !self.rejected_sources.contains(peer))
+            .filter(|(_, tip)| tip.height >= height)
+            .max_by(|(left_peer, left_tip), (right_peer, right_tip)| {
+                left_tip
+                    .cumulative_work
+                    .cmp(&right_tip.cumulative_work)
+                    .then_with(|| left_tip.height.cmp(&right_tip.height))
+                    .then_with(|| left_peer.to_string().cmp(&right_peer.to_string()))
+            })
+            .map(|(peer, _)| *peer)
     }
 
     pub fn record_sync_outcome(&mut self, outcome: &SyncOutcome) {
+        self.record_sync_outcome_from(None, outcome);
+    }
+
+    pub fn record_sync_outcome_from(&mut self, source: Option<PeerId>, outcome: &SyncOutcome) {
+        if source
+            .as_ref()
+            .is_some_and(|peer| self.rejected_sources.contains(peer))
+        {
+            return;
+        }
         // Diagnostic for an intermittent resync stall seen on follower
         // (--seed configured) nodes: a growing height gap with no error in
         // the dashboard log. Applied/AlreadyKnown are the normal steady
@@ -112,12 +272,12 @@ impl PeerChainView {
         }
         match outcome {
             SyncOutcome::Applied(head) => {
-                if self.matches_or_learns_branch_hash(head.height, &head.hash) {
+                if self.matches_or_learns_branch_hash(head.height, &head.hash, source.as_ref()) {
                     self.advance_branch_backfill(head.height);
                 }
             }
             SyncOutcome::AlreadyKnown { height, hash } => {
-                if self.matches_or_learns_branch_hash(*height, hash) {
+                if self.matches_or_learns_branch_hash(*height, hash, source.as_ref()) {
                     self.advance_branch_backfill(*height);
                 }
             }
@@ -126,26 +286,79 @@ impl PeerChainView {
                 candidate_hash,
                 ..
             } => {
-                if self.matches_or_learns_branch_hash(*candidate, candidate_hash) {
+                if self.matches_or_learns_branch_hash(*candidate, candidate_hash, source.as_ref()) {
                     self.advance_branch_backfill(*candidate)
                 }
             }
-            SyncOutcome::GapAhead { .. } => {}
+            SyncOutcome::GapAhead {
+                local_head,
+                candidate,
+                candidate_hash,
+                parent_hash,
+            } => {
+                // A recent, source-attributed block is enough to recover even
+                // when peers have pruned local_head + 1: pin its immutable
+                // parent hash and walk backward until a known ancestor is
+                // found. Unsourced callers retain the conservative forward
+                // IBD behaviour.
+                if source.is_some() {
+                    self.record_branch_parent(
+                        *local_head,
+                        *candidate,
+                        candidate_hash,
+                        parent_hash,
+                        source,
+                    );
+                }
+            }
             SyncOutcome::MissingParent {
                 local_head,
                 candidate,
                 candidate_hash,
                 parent_hash,
             } => {
-                let continuing_expected_branch = self.branch_backfill_ceiling.is_some()
-                    && self.matches_or_learns_branch_hash(*candidate, candidate_hash);
-                if *candidate > *local_head || continuing_expected_branch {
-                    self.backfill_before(*candidate, candidate_hash, parent_hash);
+                let replaying_validated_side_block = self.has_active_branch_backfill()
+                    && self.branch_backfill_height == Some(*candidate)
+                    && self
+                        .branch_expected_hashes
+                        .get(candidate)
+                        .is_some_and(|expected| expected == candidate_hash)
+                    && candidate.checked_sub(1).is_some_and(|parent_height| {
+                        self.branch_expected_hashes
+                            .get(&parent_height)
+                            .is_some_and(|expected| expected == parent_hash)
+                    });
+                if replaying_validated_side_block {
+                    // The known side block was fully validated when its metadata
+                    // was first stored, and its pinned parent has just been
+                    // replayed. Continue forward instead of walking back over
+                    // the same ancestry forever.
+                    self.advance_branch_backfill(*candidate);
+                } else {
+                    self.record_branch_parent(
+                        *local_head,
+                        *candidate,
+                        candidate_hash,
+                        parent_hash,
+                        source,
+                    );
                 }
             }
             SyncOutcome::BadPayload(_)
             | SyncOutcome::AnnouncedHashMismatch { .. }
-            | SyncOutcome::Rejected(_) => {}
+            | SyncOutcome::Rejected(_) => {
+                if let Some(source) = source.as_ref() {
+                    self.rejected_sources.insert(*source);
+                    self.peer_tips.remove(source);
+                    self.source_perceived_heights.remove(source);
+                    self.recompute_perceived_height();
+                }
+                if self.has_active_branch_backfill()
+                    && self.branch_source.as_ref() == source.as_ref()
+                {
+                    self.abandon_branch_backfill();
+                }
+            }
         }
     }
 
@@ -154,11 +367,22 @@ impl PeerChainView {
         outcome: &SyncOutcome,
         response: &BlockResponseMessage,
     ) {
+        self.remember_block_response_from(None, outcome, response);
+    }
+
+    pub fn remember_block_response_from(
+        &mut self,
+        source: Option<PeerId>,
+        outcome: &SyncOutcome,
+        response: &BlockResponseMessage,
+    ) {
         let (local_head, candidate, candidate_hash) = match outcome {
             SyncOutcome::GapAhead {
                 local_head,
                 candidate,
-            } => (*local_head, *candidate, response.block_hash.as_str()),
+                candidate_hash,
+                ..
+            } => (*local_head, *candidate, candidate_hash.as_str()),
             SyncOutcome::MissingParent {
                 local_head,
                 candidate,
@@ -182,7 +406,13 @@ impl PeerChainView {
                 responses_at_height.remove(&oldest_hash);
             }
         }
-        responses_at_height.insert(candidate_hash.to_string(), response.clone());
+        responses_at_height.insert(
+            candidate_hash.to_string(),
+            PendingBlockResponse {
+                source,
+                response: response.clone(),
+            },
+        );
         self.trim_pending_block_responses();
     }
 
@@ -190,19 +420,38 @@ impl PeerChainView {
         &mut self,
         request: &SyncRequest,
     ) -> Option<BlockResponseMessage> {
+        self.take_pending_sourced_block_response(request)
+            .map(|(_, response)| response)
+    }
+
+    pub fn take_pending_sourced_block_response(
+        &mut self,
+        request: &SyncRequest,
+    ) -> Option<(Option<PeerId>, BlockResponseMessage)> {
         let responses_at_height = self.pending_block_responses.get_mut(&request.height)?;
-        let response = match request.expected_hash.as_deref() {
+        let pending = match request.expected_hash.as_deref() {
             Some(expected_hash) => responses_at_height.remove(expected_hash),
-            None => responses_at_height
-                .keys()
-                .next()
-                .cloned()
-                .and_then(|hash| responses_at_height.remove(&hash)),
+            None => {
+                let selected_hash = request
+                    .preferred_peer
+                    .as_ref()
+                    .and_then(|preferred| {
+                        responses_at_height.iter().find_map(|(hash, pending)| {
+                            (pending.source.as_ref() == Some(preferred)).then(|| hash.clone())
+                        })
+                    })
+                    .or_else(|| {
+                        (!request.strict_peer_affinity)
+                            .then(|| responses_at_height.keys().next().cloned())
+                            .flatten()
+                    });
+                selected_hash.and_then(|hash| responses_at_height.remove(&hash))
+            }
         };
         if responses_at_height.is_empty() {
             self.pending_block_responses.remove(&request.height);
         }
-        response
+        pending.map(|pending| (pending.source, pending.response))
     }
 
     /// Stash a block body fetched via IBD prefetch pipelining (Fase 4:
@@ -214,6 +463,19 @@ impl PeerChainView {
     /// height observed when the batch of requests was fired.
     pub fn stash_prefetched_block_response(
         &mut self,
+        local_head: u64,
+        response: BlockResponseMessage,
+    ) {
+        self.stash_prefetched_block_response_from(None, local_head, response);
+    }
+
+    /// Source-aware form of [`Self::stash_prefetched_block_response`]. The
+    /// parallel IBD path must not erase responder identity, otherwise a
+    /// missing-parent result can start an unpinned branch and mix subsequent
+    /// heights from unrelated forks.
+    pub fn stash_prefetched_block_response_from(
+        &mut self,
+        source: Option<PeerId>,
         local_head: u64,
         response: BlockResponseMessage,
     ) {
@@ -231,7 +493,7 @@ impl PeerChainView {
                 responses_at_height.remove(&oldest_hash);
             }
         }
-        responses_at_height.insert(candidate_hash, response);
+        responses_at_height.insert(candidate_hash, PendingBlockResponse { source, response });
         self.trim_pending_block_responses();
     }
 
@@ -257,6 +519,9 @@ impl PeerChainView {
         self.branch_backfill_height = None;
         self.branch_backfill_ceiling = None;
         self.branch_expected_hashes.clear();
+        self.branch_source = None;
+        self.branch_tip_hash = None;
+        self.branch_cumulative_work = None;
         self.branch_backfill_request_failures = 0;
         was_active
     }
@@ -292,8 +557,62 @@ impl PeerChainView {
             .perceived_max_height_observed_at
             .is_some_and(|seen_at| seen_at.elapsed() >= PERCEIVED_HEIGHT_STALE_AFTER);
         if stale && self.perceived_max_height > local_height {
+            self.unattributed_perceived_height = None;
+            self.source_perceived_heights.clear();
             self.perceived_max_height = local_height;
             self.perceived_max_height_observed_at = None;
+        }
+    }
+
+    fn observe_unattributed_height(&mut self, height: u64) {
+        let should_replace = self
+            .unattributed_perceived_height
+            .as_ref()
+            .is_none_or(|observed| height > observed.height);
+        if should_replace {
+            self.unattributed_perceived_height = Some(PerceivedHeight {
+                height,
+                observed_at: Instant::now(),
+            });
+            self.recompute_perceived_height();
+        }
+    }
+
+    fn observe_source_height(&mut self, source: PeerId, height: u64) {
+        if self.rejected_sources.contains(&source) {
+            return;
+        }
+        let should_replace = self
+            .source_perceived_heights
+            .get(&source)
+            .is_none_or(|observed| height > observed.height);
+        if should_replace {
+            self.source_perceived_heights.insert(
+                source,
+                PerceivedHeight {
+                    height,
+                    observed_at: Instant::now(),
+                },
+            );
+            self.recompute_perceived_height();
+        }
+    }
+
+    fn recompute_perceived_height(&mut self) {
+        let best = self
+            .unattributed_perceived_height
+            .iter()
+            .chain(self.source_perceived_heights.values())
+            .max_by_key(|observed| observed.height);
+        match best {
+            Some(observed) => {
+                self.perceived_max_height = observed.height;
+                self.perceived_max_height_observed_at = Some(observed.observed_at);
+            }
+            None => {
+                self.perceived_max_height = 0;
+                self.perceived_max_height_observed_at = None;
+            }
         }
     }
 
@@ -310,29 +629,105 @@ impl PeerChainView {
         }
     }
 
-    fn matches_or_learns_branch_hash(&mut self, height: u64, hash: &str) -> bool {
+    fn matches_or_learns_branch_hash(
+        &mut self,
+        height: u64,
+        hash: &str,
+        source: Option<&PeerId>,
+    ) -> bool {
         if self.branch_backfill_ceiling.is_none() {
             return true;
         }
         if let Some(expected) = self.branch_expected_hashes.get(&height) {
             return expected == hash;
         }
-        if self.branch_backfill_height == Some(height) {
+        if self.branch_backfill_height == Some(height) && self.branch_source.as_ref() == source {
             self.branch_expected_hashes.insert(height, hash.to_string());
             return true;
         }
         false
     }
 
-    fn backfill_before(&mut self, candidate_height: u64, candidate_hash: &str, parent_hash: &str) {
-        if candidate_height <= 1 {
+    fn record_branch_parent(
+        &mut self,
+        local_head: u64,
+        candidate: u64,
+        candidate_hash: &str,
+        parent_hash: &str,
+        source: Option<PeerId>,
+    ) {
+        if candidate <= local_head && !self.has_active_branch_backfill() && !self.recovery_mode {
             return;
         }
+
+        if self.has_active_branch_backfill() {
+            let expected_matches = self
+                .branch_expected_hashes
+                .get(&candidate)
+                .is_some_and(|expected| expected == candidate_hash);
+            let same_source = self.branch_source.as_ref() == source.as_ref();
+            if !expected_matches && !same_source {
+                // An active branch is immutable. Higher advertised work can
+                // influence the next selection only after this branch
+                // completes or exhausts its bounded retries.
+                return;
+            } else if self
+                .branch_expected_hashes
+                .get(&candidate)
+                .is_some_and(|expected| expected != candidate_hash)
+                || (!expected_matches && self.branch_backfill_height != Some(candidate))
+            {
+                return;
+            }
+        }
+
+        let _ = self.backfill_before(candidate, candidate_hash, parent_hash, source);
+    }
+
+    fn backfill_before(
+        &mut self,
+        candidate_height: u64,
+        candidate_hash: &str,
+        parent_hash: &str,
+        source: Option<PeerId>,
+    ) -> bool {
+        if candidate_height <= 1 {
+            return false;
+        }
+        let next_height = candidate_height.saturating_sub(1);
+        if self
+            .branch_expected_hashes
+            .get(&candidate_height)
+            .is_some_and(|expected| expected != candidate_hash)
+            || self
+                .branch_expected_hashes
+                .get(&next_height)
+                .is_some_and(|expected| expected != parent_hash)
+        {
+            return false;
+        }
+
+        let starting_branch = self.branch_backfill_ceiling.is_none();
+        if starting_branch {
+            self.branch_source = source;
+            if let Some(source) = self.branch_source.as_ref() {
+                if let Some(tip) = self.peer_tips.get(source) {
+                    self.branch_tip_hash = tip.block_hash.clone();
+                    self.branch_cumulative_work = tip.cumulative_work;
+                }
+            }
+        }
+        let source_ceiling = self
+            .branch_source
+            .as_ref()
+            .and_then(|source| self.peer_tips.get(source))
+            .map(|tip| tip.height)
+            .unwrap_or(candidate_height);
         let ceiling = self
             .branch_backfill_ceiling
             .unwrap_or(candidate_height)
-            .max(candidate_height);
-        let next_height = candidate_height.saturating_sub(1);
+            .max(candidate_height)
+            .max(source_ceiling);
         self.branch_backfill_ceiling = Some(ceiling);
         self.branch_backfill_height = Some(match self.branch_backfill_height {
             Some(current) => current.min(next_height),
@@ -343,6 +738,7 @@ impl PeerChainView {
         self.branch_expected_hashes
             .insert(next_height, parent_hash.to_string());
         self.branch_backfill_request_failures = 0;
+        true
     }
 
     fn advance_branch_backfill(&mut self, applied_or_known_height: u64) {
@@ -352,17 +748,8 @@ impl PeerChainView {
         self.branch_backfill_request_failures = 0;
         if applied_or_known_height < ceiling {
             self.branch_backfill_height = Some(applied_or_known_height.saturating_add(1));
-        } else if self.perceived_max_height > applied_or_known_height {
-            let next_height = applied_or_known_height.saturating_add(1);
-            self.branch_backfill_height = Some(next_height);
-            self.branch_backfill_ceiling = Some(self.perceived_max_height);
-            self.branch_expected_hashes
-                .retain(|height, _| *height >= applied_or_known_height);
         } else {
-            self.branch_backfill_height = None;
-            self.branch_backfill_ceiling = None;
-            self.branch_expected_hashes.clear();
-            self.branch_backfill_request_failures = 0;
+            self.abandon_branch_backfill();
         }
     }
 
@@ -392,6 +779,8 @@ impl PeerChainView {
 pub struct SyncRequest {
     pub height: u64,
     pub expected_hash: Option<String>,
+    pub preferred_peer: Option<PeerId>,
+    pub strict_peer_affinity: bool,
 }
 
 /// Outcome of feeding a `BlockResponse` payload into the chain. Each
@@ -405,7 +794,12 @@ pub enum SyncOutcome {
     AlreadyKnown { height: u64, hash: String },
     /// Block is at a height beyond `local_head + 1`. The local node has
     /// to fetch missing intermediate blocks before this one will fit.
-    GapAhead { local_head: u64, candidate: u64 },
+    GapAhead {
+        local_head: u64,
+        candidate: u64,
+        candidate_hash: String,
+        parent_hash: String,
+    },
     /// Block is at a height already covered by the local chain and was
     /// not heavy enough to replace the current canonical head.
     BehindOrSibling {
@@ -484,10 +878,18 @@ fn try_apply_synced_block_payload_inner(
 
     let candidate_height = block.header.block_height;
     let candidate_known = storage.block_exists(&block.header.hash).unwrap_or(false);
-    if candidate_height > local_height.saturating_add(1) && !candidate_known {
+    let candidate_parent_known = storage
+        .block_exists(&block.header.prev_hash)
+        .unwrap_or(false);
+    if candidate_height > local_height.saturating_add(1)
+        && !candidate_known
+        && !candidate_parent_known
+    {
         return SyncOutcome::GapAhead {
             local_head: local_height,
             candidate: candidate_height,
+            candidate_hash: block.header.hash,
+            parent_hash: block.header.prev_hash,
         };
     }
     let resolved_expected_difficulty_bits = expected_difficulty_bits.or(response.difficulty_bits);
@@ -505,9 +907,20 @@ fn try_apply_synced_block_payload_inner(
             // node that synced the block header earlier (without bodies)
             // backfill bodies the next time the same block re-circulates.
             persist_available_private_tx_bodies(storage, &block, &response.private_tx_bodies);
-            SyncOutcome::AlreadyKnown {
-                height: candidate_height,
-                hash,
+            match storage.get_canonical_block_hash_at_height(candidate_height) {
+                Ok(Some(canonical_hash)) if canonical_hash == hash => SyncOutcome::AlreadyKnown {
+                    height: candidate_height,
+                    hash,
+                },
+                Ok(_) => SyncOutcome::MissingParent {
+                    local_head: local_height,
+                    candidate: candidate_height,
+                    candidate_hash: block.header.hash,
+                    parent_hash: block.header.prev_hash,
+                },
+                Err(err) => SyncOutcome::Rejected(format!(
+                    "read canonical hash at height {candidate_height} failed: {err:?}"
+                )),
             }
         }
         Err(ChainError::SideBranchNotHeavier { .. }) => SyncOutcome::BehindOrSibling {
@@ -531,11 +944,37 @@ pub fn next_required_block(
 ) -> Result<Option<SyncRequest>, String> {
     if let Some(height) = peer_view.branch_backfill_height {
         if height > 0 {
+            let expected_hash = peer_view.branch_expected_hashes.get(&height).cloned();
             return Ok(Some(SyncRequest {
                 height,
-                expected_hash: peer_view.branch_expected_hashes.get(&height).cloned(),
+                // The hash already makes a backward request branch-immutable.
+                // A gossipsub source may only be the relay, not the node that
+                // stores the parent, so let any connected peer serve an exact
+                // hash. Forward discovery without a known hash remains pinned
+                // to the branch source.
+                strict_peer_affinity: peer_view.active_branch_source().is_some()
+                    && expected_hash.is_none(),
+                expected_hash,
+                preferred_peer: peer_view.active_branch_source(),
             }));
         }
+    }
+
+    // A quarantined node may already be hundreds of blocks above the recovery
+    // checkpoint on an incompatible fork. Asking for local_height + 1 can
+    // merely extend that bad fork forever. Bootstrap recovery by requesting
+    // the compiled checkpoint by exact hash; once received, MissingParent
+    // walks its ancestry backward with strict peer/hash affinity.
+    if peer_view.recovery_mode() {
+        let height = crate::economics::MAINNET_RECOVERY_CHECKPOINT_10887_HEIGHT;
+        return Ok(Some(SyncRequest {
+            height,
+            expected_hash: Some(
+                crate::economics::MAINNET_RECOVERY_CHECKPOINT_10887_HASH.to_string(),
+            ),
+            preferred_peer: peer_view.preferred_peer_for_height(height),
+            strict_peer_affinity: false,
+        }));
     }
 
     let local_height = storage
@@ -544,9 +983,13 @@ pub fn next_required_block(
     if local_height >= peer_view.perceived_max_height {
         return Ok(None);
     }
+    let next_height = local_height.saturating_add(1);
+    let preferred_peer = peer_view.preferred_peer_for_height(next_height);
     Ok(Some(SyncRequest {
-        height: local_height.saturating_add(1),
+        height: next_height,
         expected_hash: None,
+        strict_peer_affinity: preferred_peer.is_some(),
+        preferred_peer,
     }))
 }
 
@@ -1293,9 +1736,13 @@ mod tests {
             SyncOutcome::GapAhead {
                 local_head,
                 candidate,
+                candidate_hash,
+                parent_hash,
             } => {
                 assert_eq!(local_head, 0);
                 assert_eq!(candidate, 3);
+                assert_eq!(candidate_hash, block.header.hash);
+                assert_eq!(parent_hash, block.header.prev_hash);
             }
             other => panic!("expected GapAhead, got: {other:?}"),
         }
@@ -1373,6 +1820,189 @@ mod tests {
     }
 
     #[test]
+    fn try_apply_known_noncanonical_block_requests_branch_backfill() {
+        let chain_id = "zoka-test-net";
+        let (storage, _dir) = open_temp_storage();
+        let canonical_1 = mine_test_block(
+            chain_id,
+            &genesis_parent_for(chain_id).header.hash,
+            0,
+            0,
+            &"zka1miner".to_string(),
+            4,
+            1_700_000_000,
+        );
+        apply_block_with_expected_difficulty(&storage, chain_id, &canonical_1, 4)
+            .expect("apply canonical 1");
+        let canonical_2 = mine_test_block(
+            chain_id,
+            &canonical_1.header.hash,
+            1,
+            economics::block_reward_for_height(1, 0),
+            &"zka1miner".to_string(),
+            4,
+            1_700_000_120,
+        );
+        apply_block_with_expected_difficulty(&storage, chain_id, &canonical_2, 4)
+            .expect("apply canonical 2");
+
+        let side_1 = mine_test_block(
+            chain_id,
+            &genesis_parent_for(chain_id).header.hash,
+            0,
+            0,
+            &"zka1miner".to_string(),
+            4,
+            1_700_000_777,
+        );
+        assert!(matches!(
+            apply_block_with_expected_difficulty(&storage, chain_id, &side_1, 4),
+            Err(ChainError::SideBranchNotHeavier { .. })
+        ));
+        let side_2 = mine_test_block(
+            chain_id,
+            &side_1.header.hash,
+            1,
+            economics::block_reward_for_height(1, 0),
+            &"zka1miner".to_string(),
+            4,
+            1_700_000_897,
+        );
+        assert!(matches!(
+            apply_block_with_expected_difficulty(&storage, chain_id, &side_2, 4),
+            Err(ChainError::SideBranchNotHeavier { .. })
+        ));
+
+        match try_apply_synced_block_payload_with_expected_difficulty(
+            &storage,
+            chain_id,
+            &response_for(&side_2),
+            4,
+        ) {
+            SyncOutcome::MissingParent {
+                local_head,
+                candidate,
+                candidate_hash,
+                parent_hash,
+            } => {
+                assert_eq!(local_head, 2);
+                assert_eq!(candidate, 2);
+                assert_eq!(candidate_hash, side_2.header.hash);
+                assert_eq!(parent_hash, side_1.header.hash);
+            }
+            other => panic!("expected known side branch backfill, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_apply_far_ahead_block_with_known_parent_reaches_consensus_path() {
+        let chain_id = "zoka-test-net";
+        let (storage, _dir) = open_temp_storage();
+        let miner = "zka1miner".to_string();
+
+        let canonical_1 = mine_test_block(
+            chain_id,
+            &genesis_parent_for(chain_id).header.hash,
+            0,
+            0,
+            &miner,
+            4,
+            1_700_000_000,
+        );
+        apply_block_with_expected_difficulty(&storage, chain_id, &canonical_1, 4)
+            .expect("apply canonical 1");
+        let canonical_1_supply = canonical_1.transactions[0].amount;
+        let canonical_2 = mine_test_block(
+            chain_id,
+            &canonical_1.header.hash,
+            1,
+            canonical_1_supply,
+            &miner,
+            4,
+            1_700_000_120,
+        );
+        apply_block_with_expected_difficulty(&storage, chain_id, &canonical_2, 4)
+            .expect("apply canonical 2");
+
+        // Keep the validated side branch non-canonical while building a
+        // parent two heights beyond the local head.
+        storage
+            .set_cumulative_work(u128::MAX)
+            .expect("raise canonical work for fixture");
+        let side_1 = mine_test_block(
+            chain_id,
+            &genesis_parent_for(chain_id).header.hash,
+            0,
+            0,
+            &miner,
+            4,
+            1_700_000_777,
+        );
+        assert!(matches!(
+            apply_block_with_expected_difficulty(&storage, chain_id, &side_1, 4),
+            Err(ChainError::SideBranchNotHeavier { .. })
+        ));
+        let side_1_supply = side_1.transactions[0].amount;
+        let side_2 = mine_test_block(
+            chain_id,
+            &side_1.header.hash,
+            1,
+            side_1_supply,
+            &miner,
+            4,
+            1_700_000_897,
+        );
+        assert!(matches!(
+            apply_block_with_expected_difficulty(&storage, chain_id, &side_2, 4),
+            Err(ChainError::SideBranchNotHeavier { .. })
+        ));
+        let side_2_supply = side_1_supply.saturating_add(side_2.transactions[0].amount);
+        let side_3 = mine_test_block(
+            chain_id,
+            &side_2.header.hash,
+            2,
+            side_2_supply,
+            &miner,
+            4,
+            1_700_001_017,
+        );
+        assert!(matches!(
+            apply_block_with_expected_difficulty(&storage, chain_id, &side_3, 4),
+            Err(ChainError::SideBranchNotHeavier { .. })
+        ));
+        assert!(storage
+            .block_exists(&side_3.header.hash)
+            .expect("known side parent"));
+
+        let side_3_supply = side_2_supply.saturating_add(side_3.transactions[0].amount);
+        let side_4 = mine_test_block(
+            chain_id,
+            &side_3.header.hash,
+            3,
+            side_3_supply,
+            &miner,
+            4,
+            1_700_001_137,
+        );
+        match try_apply_synced_block_payload_with_expected_difficulty(
+            &storage,
+            chain_id,
+            &response_for(&side_4),
+            4,
+        ) {
+            SyncOutcome::BehindOrSibling {
+                candidate,
+                candidate_hash,
+                ..
+            } => {
+                assert_eq!(candidate, 4);
+                assert_eq!(candidate_hash, side_4.header.hash);
+            }
+            other => panic!("known-parent side tip must reach consensus path, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn try_apply_marks_behind_when_block_height_is_below_local() {
         let chain_id = "zoka-test-net";
         let (storage, _dir) = open_temp_storage();
@@ -1441,6 +2071,22 @@ mod tests {
         view.observe(5, 0);
         let next = next_required_height(&storage, &view).expect("query");
         assert_eq!(next, Some(1));
+    }
+
+    #[test]
+    fn normal_forward_request_is_affined_to_preferred_peer() {
+        let (storage, _dir) = open_temp_storage();
+        let mut view = PeerChainView::default();
+        let source = PeerId::random();
+        view.observe_trusted_height_from(source, 5);
+
+        let request = next_required_block(&storage, &view)
+            .expect("query")
+            .expect("forward request");
+        assert_eq!(request.height, 1);
+        assert_eq!(request.expected_hash, None);
+        assert_eq!(request.preferred_peer, Some(source));
+        assert!(request.strict_peer_affinity);
     }
 
     #[test]
@@ -1544,15 +2190,209 @@ mod tests {
     }
 
     #[test]
-    fn peer_chain_view_does_not_backfill_simple_gap_ahead() {
+    fn known_side_blocks_advance_when_replayed_after_their_pinned_parent() {
+        let mut view = PeerChainView::default();
+        let source = PeerId::random();
+        view.record_sync_outcome_from(
+            Some(source),
+            &SyncOutcome::MissingParent {
+                local_head: 10,
+                candidate: 12,
+                candidate_hash: "side-12".to_string(),
+                parent_hash: "side-11".to_string(),
+            },
+        );
+        view.record_sync_outcome_from(
+            Some(source),
+            &SyncOutcome::MissingParent {
+                local_head: 10,
+                candidate: 11,
+                candidate_hash: "side-11".to_string(),
+                parent_hash: "side-10".to_string(),
+            },
+        );
+        view.record_sync_outcome_from(
+            Some(source),
+            &SyncOutcome::AlreadyKnown {
+                height: 10,
+                hash: "side-10".to_string(),
+            },
+        );
+        assert_eq!(view.branch_backfill_height, Some(11));
+
+        view.record_sync_outcome_from(
+            Some(source),
+            &SyncOutcome::MissingParent {
+                local_head: 10,
+                candidate: 11,
+                candidate_hash: "side-11".to_string(),
+                parent_hash: "side-10".to_string(),
+            },
+        );
+        assert_eq!(view.branch_backfill_height, Some(12));
+        view.record_sync_outcome_from(
+            Some(source),
+            &SyncOutcome::MissingParent {
+                local_head: 10,
+                candidate: 12,
+                candidate_hash: "side-12".to_string(),
+                parent_hash: "side-11".to_string(),
+            },
+        );
+        assert!(!view.has_active_branch_backfill());
+    }
+
+    #[test]
+    fn peer_chain_view_does_not_backfill_unsourced_gap_ahead() {
         let mut view = PeerChainView::default();
         view.record_sync_outcome(&SyncOutcome::GapAhead {
             local_head: 0,
             candidate: 5,
+            candidate_hash: "h5".to_string(),
+            parent_hash: "h4".to_string(),
         });
 
         assert_eq!(view.branch_backfill_height, None);
         assert_eq!(view.branch_backfill_ceiling, None);
+    }
+
+    #[test]
+    fn sourced_gap_ahead_starts_hash_pinned_parent_backfill() {
+        let (storage, _dir) = open_temp_storage();
+        let mut view = PeerChainView::default();
+        let source = PeerId::random();
+        view.observe_trusted_height_from(source, 5);
+
+        view.record_sync_outcome_from(
+            Some(source),
+            &SyncOutcome::GapAhead {
+                local_head: 2,
+                candidate: 5,
+                candidate_hash: "h5".to_string(),
+                parent_hash: "h4".to_string(),
+            },
+        );
+
+        assert_eq!(view.active_branch_source(), Some(source));
+        assert_eq!(view.branch_backfill_height, Some(4));
+        assert_eq!(view.branch_backfill_ceiling, Some(5));
+        let request = next_required_block(&storage, &view)
+            .expect("request query")
+            .expect("backfill request");
+        assert_eq!(request.height, 4);
+        assert_eq!(request.expected_hash.as_deref(), Some("h4"));
+        assert_eq!(request.preferred_peer, Some(source));
+        assert!(!request.strict_peer_affinity);
+    }
+
+    #[test]
+    fn branch_forward_discovery_stays_source_affined_after_hash_backfill() {
+        let (storage, _dir) = open_temp_storage();
+        let mut view = PeerChainView::default();
+        let source = PeerId::random();
+        view.observe_trusted_height_from(source, 7);
+        view.record_sync_outcome_from(
+            Some(source),
+            &SyncOutcome::GapAhead {
+                local_head: 3,
+                candidate: 5,
+                candidate_hash: "h5".to_string(),
+                parent_hash: "h4".to_string(),
+            },
+        );
+        view.record_sync_outcome_from(
+            Some(PeerId::random()),
+            &SyncOutcome::BehindOrSibling {
+                local_head: 3,
+                candidate: 4,
+                candidate_hash: "h4".to_string(),
+            },
+        );
+        view.record_sync_outcome_from(
+            Some(PeerId::random()),
+            &SyncOutcome::AlreadyKnown {
+                height: 5,
+                hash: "h5".to_string(),
+            },
+        );
+
+        let request = next_required_block(&storage, &view)
+            .expect("request query")
+            .expect("forward branch request");
+        assert_eq!(request.height, 6);
+        assert_eq!(request.expected_hash, None);
+        assert_eq!(request.preferred_peer, Some(source));
+        assert!(request.strict_peer_affinity);
+    }
+
+    #[test]
+    fn competing_sourced_gap_cannot_overwrite_active_branch() {
+        let mut view = PeerChainView::default();
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+        view.observe_trusted_height_from(peer_a, 12);
+        view.observe_trusted_height_from(peer_b, 12);
+
+        view.record_sync_outcome_from(
+            Some(peer_a),
+            &SyncOutcome::GapAhead {
+                local_head: 10,
+                candidate: 12,
+                candidate_hash: "a-12".to_string(),
+                parent_hash: "a-11".to_string(),
+            },
+        );
+        view.record_sync_outcome_from(
+            Some(peer_b),
+            &SyncOutcome::GapAhead {
+                local_head: 10,
+                candidate: 12,
+                candidate_hash: "b-12".to_string(),
+                parent_hash: "b-11".to_string(),
+            },
+        );
+
+        assert_eq!(view.active_branch_source(), Some(peer_a));
+        assert_eq!(view.branch_backfill_height, Some(11));
+        assert_eq!(
+            view.branch_expected_hashes.get(&12).map(String::as_str),
+            Some("a-12")
+        );
+        assert_eq!(
+            view.branch_expected_hashes.get(&11).map(String::as_str),
+            Some("a-11")
+        );
+    }
+
+    #[test]
+    fn rejected_source_cannot_drive_later_branch_selection() {
+        let mut view = PeerChainView::default();
+        let rejected = PeerId::random();
+        let healthy = PeerId::random();
+        view.observe_trusted_height_from(rejected, 20);
+        view.observe_trusted_height_from(healthy, 18);
+        assert_eq!(view.perceived_max_height, 20);
+
+        view.record_sync_outcome_from(
+            Some(rejected),
+            &SyncOutcome::Rejected("checkpoint mismatch".to_string()),
+        );
+        assert_eq!(view.perceived_max_height, 18);
+        view.observe_trusted_height_from(rejected, 30);
+        view.observe_from(rejected, 31, 10);
+        view.record_sync_outcome_from(
+            Some(rejected),
+            &SyncOutcome::GapAhead {
+                local_head: 10,
+                candidate: 12,
+                candidate_hash: "rejected-12".to_string(),
+                parent_hash: "rejected-11".to_string(),
+            },
+        );
+
+        assert_eq!(view.preferred_peer_for_height(12), Some(healthy));
+        assert_eq!(view.perceived_max_height, 18);
+        assert!(!view.has_active_branch_backfill());
     }
 
     #[test]
@@ -1569,6 +2409,8 @@ mod tests {
         let outcome = SyncOutcome::GapAhead {
             local_head: 2,
             candidate: 5,
+            candidate_hash: "h5".to_string(),
+            parent_hash: "h4".to_string(),
         };
 
         view.remember_block_response(&outcome, &response);
@@ -1578,6 +2420,8 @@ mod tests {
             .take_pending_block_response(&SyncRequest {
                 height: 5,
                 expected_hash: Some("h5".to_string()),
+                preferred_peer: None,
+                strict_peer_affinity: false,
             })
             .expect("cached response");
         assert_eq!(replayed.block_hash, "h5");
@@ -1600,6 +2444,8 @@ mod tests {
         let outcome = SyncOutcome::GapAhead {
             local_head: 0,
             candidate: future_height,
+            candidate_hash: "too-far".to_string(),
+            parent_hash: "parent".to_string(),
         };
 
         view.remember_block_response(&outcome, &response);
@@ -1700,41 +2546,254 @@ mod tests {
     #[test]
     fn peer_chain_view_continues_forward_side_branch_until_peer_tip() {
         let mut view = PeerChainView::default();
-        view.observe(6, 0);
-        view.record_sync_outcome(&SyncOutcome::MissingParent {
-            local_head: 1,
-            candidate: 2,
-            candidate_hash: "peer-2".to_string(),
-            parent_hash: "peer-1".to_string(),
-        });
+        let source = PeerId::random();
+        view.observe_trusted_height_from(source, 6);
+        view.record_sync_outcome_from(
+            Some(source),
+            &SyncOutcome::MissingParent {
+                local_head: 1,
+                candidate: 2,
+                candidate_hash: "peer-2".to_string(),
+                parent_hash: "peer-1".to_string(),
+            },
+        );
         assert_eq!(view.branch_backfill_height, Some(1));
-        assert_eq!(view.branch_backfill_ceiling, Some(2));
+        assert_eq!(view.branch_backfill_ceiling, Some(6));
 
-        view.record_sync_outcome(&SyncOutcome::BehindOrSibling {
-            local_head: 1,
-            candidate: 1,
-            candidate_hash: "peer-1".to_string(),
-        });
+        view.record_sync_outcome_from(
+            Some(source),
+            &SyncOutcome::BehindOrSibling {
+                local_head: 1,
+                candidate: 1,
+                candidate_hash: "peer-1".to_string(),
+            },
+        );
         assert_eq!(view.branch_backfill_height, Some(2));
 
-        view.record_sync_outcome(&SyncOutcome::BehindOrSibling {
-            local_head: 1,
-            candidate: 2,
-            candidate_hash: "peer-2".to_string(),
-        });
+        view.record_sync_outcome_from(
+            Some(source),
+            &SyncOutcome::BehindOrSibling {
+                local_head: 1,
+                candidate: 2,
+                candidate_hash: "peer-2".to_string(),
+            },
+        );
         assert_eq!(view.branch_backfill_height, Some(3));
         assert_eq!(view.branch_backfill_ceiling, Some(6));
         assert!(!view.branch_expected_hashes.contains_key(&3));
 
-        view.record_sync_outcome(&SyncOutcome::BehindOrSibling {
-            local_head: 1,
-            candidate: 3,
-            candidate_hash: "peer-3".to_string(),
-        });
+        view.record_sync_outcome_from(
+            Some(source),
+            &SyncOutcome::BehindOrSibling {
+                local_head: 1,
+                candidate: 3,
+                candidate_hash: "peer-3".to_string(),
+            },
+        );
         assert_eq!(view.branch_backfill_height, Some(4));
         assert_eq!(
             view.branch_expected_hashes.get(&3).map(String::as_str),
             Some("peer-3")
         );
+    }
+
+    #[test]
+    fn active_branch_cannot_be_overwritten_by_stronger_competing_peer() {
+        let mut view = PeerChainView::default();
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+        view.observe_block_announce_from(peer_a, 12, "a-12", Some(100), 10);
+        view.observe_block_announce_from(peer_b, 12, "b-12", Some(500), 10);
+
+        view.record_sync_outcome_from(
+            Some(peer_a),
+            &SyncOutcome::MissingParent {
+                local_head: 10,
+                candidate: 12,
+                candidate_hash: "a-12".to_string(),
+                parent_hash: "a-11".to_string(),
+            },
+        );
+        assert_eq!(view.active_branch_source(), Some(peer_a));
+        assert_eq!(view.active_branch_cumulative_work(), Some(100));
+
+        view.record_sync_outcome_from(
+            Some(peer_b),
+            &SyncOutcome::MissingParent {
+                local_head: 10,
+                candidate: 12,
+                candidate_hash: "b-12".to_string(),
+                parent_hash: "b-11".to_string(),
+            },
+        );
+
+        assert_eq!(view.active_branch_source(), Some(peer_a));
+        assert_eq!(view.branch_backfill_height, Some(11));
+        assert_eq!(view.branch_backfill_ceiling, Some(12));
+        assert_eq!(
+            view.branch_expected_hashes.get(&12).map(String::as_str),
+            Some("a-12")
+        );
+        assert_eq!(
+            view.branch_expected_hashes.get(&11).map(String::as_str),
+            Some("a-11")
+        );
+    }
+
+    #[test]
+    fn active_branch_filters_unrelated_bodies_before_consensus_work() {
+        let mut view = PeerChainView::default();
+        let branch_peer = PeerId::random();
+        let relay = PeerId::random();
+        view.record_sync_outcome_from(
+            Some(branch_peer),
+            &SyncOutcome::MissingParent {
+                local_head: 10,
+                candidate: 12,
+                candidate_hash: "winner-12".to_string(),
+                parent_hash: "winner-11".to_string(),
+            },
+        );
+
+        assert!(view.should_process_block_candidate(Some(&relay), 11, "winner-11"));
+        assert!(!view.should_process_block_candidate(Some(&relay), 11, "other-11"));
+        assert!(!view.should_process_block_candidate(Some(&relay), 10, "unrelated-10"));
+
+        view.branch_backfill_height = Some(13);
+        assert!(view.should_process_block_candidate(Some(&branch_peer), 13, "winner-13"));
+        assert!(!view.should_process_block_candidate(Some(&relay), 13, "winner-13"));
+    }
+
+    #[test]
+    fn rejected_active_branch_is_abandoned_for_next_candidate() {
+        let mut view = PeerChainView::default();
+        let invalid_peer = PeerId::random();
+        let recovery_peer = PeerId::random();
+        view.observe_block_announce_from(invalid_peer, 12, "invalid-12", Some(500), 10);
+        view.observe_block_announce_from(recovery_peer, 12, "valid-12", Some(400), 10);
+        view.record_sync_outcome_from(
+            Some(invalid_peer),
+            &SyncOutcome::MissingParent {
+                local_head: 10,
+                candidate: 12,
+                candidate_hash: "invalid-12".to_string(),
+                parent_hash: "invalid-11".to_string(),
+            },
+        );
+        assert_eq!(view.active_branch_source(), Some(invalid_peer));
+
+        view.record_sync_outcome_from(
+            Some(invalid_peer),
+            &SyncOutcome::Rejected("checkpoint mismatch".to_string()),
+        );
+        assert!(!view.has_active_branch_backfill());
+
+        view.record_sync_outcome_from(
+            Some(recovery_peer),
+            &SyncOutcome::MissingParent {
+                local_head: 10,
+                candidate: 12,
+                candidate_hash: "valid-12".to_string(),
+                parent_hash: "valid-11".to_string(),
+            },
+        );
+        assert_eq!(view.active_branch_source(), Some(recovery_peer));
+        assert_eq!(
+            view.branch_expected_hashes.get(&12).map(String::as_str),
+            Some("valid-12")
+        );
+    }
+
+    #[test]
+    fn branch_ceiling_comes_from_its_source_not_global_height() {
+        let mut view = PeerChainView::default();
+        let branch_peer = PeerId::random();
+        let taller_other_peer = PeerId::random();
+        view.observe_trusted_height_from(branch_peer, 20);
+        view.observe_trusted_height_from(taller_other_peer, 50);
+
+        view.record_sync_outcome_from(
+            Some(branch_peer),
+            &SyncOutcome::MissingParent {
+                local_head: 10,
+                candidate: 12,
+                candidate_hash: "branch-12".to_string(),
+                parent_hash: "branch-11".to_string(),
+            },
+        );
+
+        assert_eq!(view.perceived_max_height, 50);
+        assert_eq!(view.branch_backfill_ceiling, Some(20));
+        assert_eq!(view.active_branch_source(), Some(branch_peer));
+    }
+
+    #[test]
+    fn preferred_peer_uses_work_before_height() {
+        let mut view = PeerChainView::default();
+        let stronger = PeerId::random();
+        let taller = PeerId::random();
+        view.observe_block_announce_from(stronger, 20, "strong-20", Some(1_000), 0);
+        view.observe_block_announce_from(taller, 30, "tall-30", Some(900), 0);
+
+        assert_eq!(view.preferred_peer_for_height(10), Some(stronger));
+        assert_eq!(view.preferred_peer_for_height(25), Some(taller));
+    }
+
+    #[test]
+    fn checkpoint_recovery_can_backfill_below_quarantined_local_tip() {
+        let mut view = PeerChainView::default();
+        let recovery_peer = PeerId::random();
+        view.set_recovery_mode(true);
+        view.observe_block_announce_from(
+            recovery_peer,
+            10_887,
+            "checkpoint-valid-10887",
+            Some(50_000),
+            11_051,
+        );
+
+        view.record_sync_outcome_from(
+            Some(recovery_peer),
+            &SyncOutcome::MissingParent {
+                local_head: 11_051,
+                candidate: 10_887,
+                candidate_hash: "checkpoint-valid-10887".to_string(),
+                parent_hash: "checkpoint-valid-10886".to_string(),
+            },
+        );
+
+        assert_eq!(view.active_branch_source(), Some(recovery_peer));
+        assert_eq!(view.branch_backfill_height, Some(10_886));
+        assert_eq!(
+            view.branch_expected_hashes.get(&10_887).map(String::as_str),
+            Some("checkpoint-valid-10887")
+        );
+    }
+
+    #[test]
+    fn checkpoint_recovery_bootstraps_from_the_compiled_anchor_not_local_tip() {
+        let (storage, _dir) = open_temp_storage();
+        storage
+            .set_chain_height(11_051)
+            .expect("seed quarantined local height");
+        let mut view = PeerChainView::default();
+        let recovery_peer = PeerId::random();
+        view.set_recovery_mode(true);
+        view.observe_trusted_height_from(recovery_peer, 11_200);
+
+        let request = next_required_block(&storage, &view)
+            .expect("recovery request")
+            .expect("compiled checkpoint must be requested");
+
+        assert_eq!(
+            request.height,
+            crate::economics::MAINNET_RECOVERY_CHECKPOINT_10887_HEIGHT
+        );
+        assert_eq!(
+            request.expected_hash.as_deref(),
+            Some(crate::economics::MAINNET_RECOVERY_CHECKPOINT_10887_HASH)
+        );
+        assert_eq!(request.preferred_peer, Some(recovery_peer));
+        assert!(!request.strict_peer_affinity);
     }
 }

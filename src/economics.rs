@@ -47,6 +47,24 @@ pub const MAINNET_UPGRADE_CHECKPOINT_1460_HASH: &str =
 pub const MAINNET_UPGRADE_CHECKPOINT_3127_HEIGHT: u64 = 3127;
 pub const MAINNET_UPGRADE_CHECKPOINT_3127_HASH: &str =
     "b5c20cfbdc9e2f56bb143334c03f7bcc9df60fbd7c2c7ed553b61ee2dd9740df";
+/// Recovery anchor for the 1.9.0 fork-alignment release. Live inspection found
+/// three incompatible histories at this height. This block was verified on
+/// the canonical seed; a node on any other history is quarantined from mining
+/// while it ingests the branch containing this anchor.
+pub const MAINNET_RECOVERY_CHECKPOINT_10887_HEIGHT: u64 = 10_887;
+pub const MAINNET_RECOVERY_CHECKPOINT_10887_HASH: &str =
+    "d30c20100f6405424d32e5c204799bc10a1197ff5cdc1fe0b04c2c538b11086e";
+
+/// Evidence gates for publishing the 1.9.0 recovery release. The checkpoint
+/// is compiled now so candidate binaries can be exercised, but release
+/// artifacts must remain blocked until all thresholds are independently met.
+pub const MAINNET_RECOVERY_MIN_CONFIRMATIONS: u64 = 120;
+pub const MAINNET_RECOVERY_MIN_RELEASE_HEAD_HEIGHT: u64 =
+    MAINNET_RECOVERY_CHECKPOINT_10887_HEIGHT + MAINNET_RECOVERY_MIN_CONFIRMATIONS;
+pub const MAINNET_RECOVERY_MIN_INDEPENDENT_OBSERVATIONS: usize = 2;
+pub const MAINNET_RECOVERY_REQUIRE_RELEASE_ARTIFACT_SHA256: bool = true;
+pub const MAINNET_RECOVERY_AUTOMATIC_DB_DELETION: bool = false;
+pub const MAINNET_RECOVERY_MISMATCH_ACTION: &str = "quarantine";
 pub const MAINNET_EMERGENCY_CHECKPOINTS: &[(u64, &str)] = &[
     (
         MAINNET_EMERGENCY_CHECKPOINT_HEIGHT,
@@ -67,6 +85,10 @@ pub const MAINNET_EMERGENCY_CHECKPOINTS: &[(u64, &str)] = &[
     (
         MAINNET_UPGRADE_CHECKPOINT_3127_HEIGHT,
         MAINNET_UPGRADE_CHECKPOINT_3127_HASH,
+    ),
+    (
+        MAINNET_RECOVERY_CHECKPOINT_10887_HEIGHT,
+        MAINNET_RECOVERY_CHECKPOINT_10887_HASH,
     ),
 ];
 /// Temporary one-miner recovery window after the 1.4.x checkpoint. The cap is
@@ -353,6 +375,34 @@ mod tests {
         assert_eq!(HALVING_INTERVAL_BLOCKS, 1_051_200);
         assert_eq!(TARGET_BLOCK_TIME_SECS, 120);
         assert_eq!(COINBASE_MATURITY_BLOCKS, 60);
+    }
+
+    #[test]
+    fn mainnet_1_9_recovery_anchor_and_release_gates_are_frozen() {
+        assert_eq!(MAINNET_RECOVERY_CHECKPOINT_10887_HEIGHT, 10_887);
+        assert_eq!(
+            MAINNET_RECOVERY_CHECKPOINT_10887_HASH,
+            "d30c20100f6405424d32e5c204799bc10a1197ff5cdc1fe0b04c2c538b11086e"
+        );
+        assert!(MAINNET_EMERGENCY_CHECKPOINTS.contains(&(
+            MAINNET_RECOVERY_CHECKPOINT_10887_HEIGHT,
+            MAINNET_RECOVERY_CHECKPOINT_10887_HASH,
+        )));
+        assert_eq!(MAINNET_RECOVERY_MIN_CONFIRMATIONS, 120);
+        assert_eq!(MAINNET_RECOVERY_MIN_RELEASE_HEAD_HEIGHT, 11_007);
+        assert_eq!(MAINNET_RECOVERY_MIN_INDEPENDENT_OBSERVATIONS, 2);
+        assert!(MAINNET_RECOVERY_REQUIRE_RELEASE_ARTIFACT_SHA256);
+        assert!(!MAINNET_RECOVERY_AUTOMATIC_DB_DELETION);
+        assert_eq!(MAINNET_RECOVERY_MISMATCH_ACTION, "quarantine");
+
+        assert!(MAINNET_EMERGENCY_CHECKPOINTS
+            .windows(2)
+            .all(|pair| pair[0].0 < pair[1].0));
+        assert!(MAINNET_EMERGENCY_CHECKPOINTS
+            .iter()
+            .all(|(_, hash)| hash.len() == 64
+                && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && !hash.bytes().any(|byte| byte.is_ascii_uppercase())));
     }
 
     #[test]

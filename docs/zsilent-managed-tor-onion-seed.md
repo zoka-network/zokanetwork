@@ -28,17 +28,17 @@ The helper script downloads the bundle, checksum-verifies it against a pinned
 SHA256, optionally verifies the `.asc` signature with GPG, and extracts it into
 `third_party/tor/windows-x86_64`.
 
-Pinned bundle (Tor Expert Bundle 15.0.17, tor 0.4.9.11):
+Pinned bundle (Tor Expert Bundle 15.0.18, tor 0.4.9.11):
 
-- URL: `https://archive.torproject.org/tor-package-archive/torbrowser/15.0.17/tor-expert-bundle-windows-x86_64-15.0.17.tar.gz`
-- SHA256: `5f91e9426bf641dfe539dc28029088c72bed0b1d8f1c79104a0f89273cb3ebe1`
-- Signature: `https://archive.torproject.org/tor-package-archive/torbrowser/15.0.17/tor-expert-bundle-windows-x86_64-15.0.17.tar.gz.asc`
+- URL: `https://archive.torproject.org/tor-package-archive/torbrowser/15.0.18/tor-expert-bundle-windows-x86_64-15.0.18.tar.gz`
+- SHA256: `6ac067402c7b4a3dc37887ed3754b3914b67fdc220c966190683e9ccf91abf0f`
+- Signature: `https://archive.torproject.org/tor-package-archive/torbrowser/15.0.18/tor-expert-bundle-windows-x86_64-15.0.18.tar.gz.asc`
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File zsilent-core/scripts/prepare-tor-expert-bundle-windows.ps1 `
-  -Url "https://archive.torproject.org/tor-package-archive/torbrowser/15.0.17/tor-expert-bundle-windows-x86_64-15.0.17.tar.gz" `
-  -Sha256 "5f91e9426bf641dfe539dc28029088c72bed0b1d8f1c79104a0f89273cb3ebe1" `
-  -AscUrl "https://archive.torproject.org/tor-package-archive/torbrowser/15.0.17/tor-expert-bundle-windows-x86_64-15.0.17.tar.gz.asc" `
+  -Url "https://archive.torproject.org/tor-package-archive/torbrowser/15.0.18/tor-expert-bundle-windows-x86_64-15.0.18.tar.gz" `
+  -Sha256 "6ac067402c7b4a3dc37887ed3754b3914b67fdc220c966190683e9ccf91abf0f" `
+  -AscUrl "https://archive.torproject.org/tor-package-archive/torbrowser/15.0.18/tor-expert-bundle-windows-x86_64-15.0.18.tar.gz.asc" `
   -VerifySignature
 ```
 

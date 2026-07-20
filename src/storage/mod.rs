@@ -413,6 +413,95 @@ impl RocksDbStorage {
             .map_err(|e| StorageError::DatabaseError(e.to_string()))
     }
 
+    /// Atomically replace the canonical height index and chain-head metadata
+    /// after `state::chain` has fully validated a side branch. Block bodies and
+    /// per-block metadata are deliberately left intact on both branches; this
+    /// operation only changes which already-validated branch is canonical.
+    ///
+    /// Keeping the nullifier changes and head switch in one RocksDB batch is
+    /// important for recovery reorgs: a process or disk failure must expose
+    /// either the complete old view or the complete new view, never a mixture.
+    pub(crate) fn promote_canonical_branch_atomically(
+        &self,
+        old_canonical: &[Block],
+        new_branch: &[Block],
+        old_height: u64,
+        new_height: u64,
+        new_hash: &str,
+        total_supply_emitted: u64,
+        cumulative_work: u128,
+        difficulty_bits: u32,
+    ) -> Result<(), StorageError> {
+        let Some(tip) = new_branch.last() else {
+            return Err(StorageError::SerializationError(
+                "canonical promotion requires a non-empty branch".to_string(),
+            ));
+        };
+        if tip.header.block_height != new_height || tip.header.hash != new_hash {
+            return Err(StorageError::SerializationError(
+                "canonical promotion tip does not match requested head".to_string(),
+            ));
+        }
+        for pair in new_branch.windows(2) {
+            if pair[1].header.block_height != pair[0].header.block_height.saturating_add(1)
+                || pair[1].header.prev_hash != pair[0].header.hash
+            {
+                return Err(StorageError::SerializationError(
+                    "canonical promotion branch is not contiguous".to_string(),
+                ));
+            }
+        }
+
+        let mut batch = WriteBatch::default();
+
+        // Deletes are queued before puts so a nullifier shared by the outgoing
+        // and incoming branches remains spent by the incoming canonical block.
+        for block in old_canonical {
+            for nullifier in &block.private_nullifiers {
+                let nullifier = nullifier.trim();
+                if !nullifier.is_empty() {
+                    let key = format!("{SPENT_NULLIFIER_PREFIX}{nullifier}");
+                    batch.delete(key.as_bytes());
+                }
+            }
+        }
+
+        for block in new_branch {
+            let height_key = format!("chain:block_height:{}", block.header.block_height);
+            batch.put(height_key.as_bytes(), block.header.hash.as_bytes());
+            for nullifier in &block.private_nullifiers {
+                let nullifier = nullifier.trim();
+                if !nullifier.is_empty() {
+                    let key = format!("{SPENT_NULLIFIER_PREFIX}{nullifier}");
+                    batch.put(key.as_bytes(), block.header.block_height.to_le_bytes());
+                }
+            }
+        }
+
+        for height in new_height.saturating_add(1)..=old_height {
+            let height_key = format!("chain:block_height:{height}");
+            batch.delete(height_key.as_bytes());
+        }
+        batch.put("chain:height".as_bytes(), new_height.to_string().as_bytes());
+        batch.put("chain:last_hash".as_bytes(), new_hash.as_bytes());
+        batch.put(
+            "chain:total_supply_emitted".as_bytes(),
+            total_supply_emitted.to_string().as_bytes(),
+        );
+        batch.put(
+            "chain:cumulative_work".as_bytes(),
+            cumulative_work.to_string().as_bytes(),
+        );
+        batch.put(
+            "chain:current_difficulty_bits".as_bytes(),
+            difficulty_bits.to_string().as_bytes(),
+        );
+
+        self.db
+            .write(batch)
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))
+    }
+
     /// Iterate `(nullifier, height)` pairs in the spent index, for
     /// diagnostics and rebuilds.
     pub fn iterate_spent_nullifiers(&self) -> Result<Vec<(String, u64)>, StorageError> {

@@ -190,11 +190,9 @@ fn prompt_required(prompt: &str) -> Result<String, String> {
                 println!("Value is required.");
             }
             None => {
-                return Err(
-                    "no input available on stdin (non-interactive session); \
+                return Err("no input available on stdin (non-interactive session); \
                      provide the value via a flag or the config file instead"
-                        .to_string(),
-                );
+                    .to_string());
             }
         }
     }
@@ -301,6 +299,11 @@ struct MainnetNetworkConfig {
     _joining: Option<serde_json::Value>,
     #[serde(default, rename = "trusted_setup")]
     _trusted_setup: Option<serde_json::Value>,
+    /// Release-coordination metadata. Consensus enforces the compiled
+    /// checkpoint; this document section records the independent publication
+    /// gate and operator recovery policy without changing runtime consensus.
+    #[serde(default, rename = "recovery")]
+    _recovery: Option<serde_json::Value>,
     #[serde(default)]
     snapshot_signers: Vec<String>,
     #[serde(default)]
@@ -527,6 +530,13 @@ impl MainnetNetworkConfig {
         self.public_rpc
             .iter()
             .filter(|rpc| rpc.status.eq_ignore_ascii_case("active"))
+            .count()
+    }
+
+    fn active_seed_node_count(&self) -> usize {
+        self.seed_nodes
+            .iter()
+            .filter(|seed| seed.status.eq_ignore_ascii_case("active"))
             .count()
     }
 
@@ -2549,6 +2559,12 @@ fn solve_pow_nonce(
                         found.store(true, Ordering::Relaxed);
                         return Err(format!(
                             "stale parent: chain advanced past height {height} during PoW solve"
+                        ));
+                    }
+                    if zoka::api::global_network_runtime().checkpoint_quarantined() {
+                        found.store(true, Ordering::Relaxed);
+                        return Err(format!(
+                            "mining stopped: checkpoint quarantine activated during PoW solve at height {height}"
                         ));
                     }
                     // The user switched mining off (POST /local/mining/stop)
@@ -5438,6 +5454,15 @@ fn run_mining_batch_with_progress(
             MAINNET_MINING_MODE, TESTNET_MINING_MODE
         ));
     }
+    if let Some(path) = config.chain_db_path.as_deref() {
+        let storage = open_storage(path)?;
+        zoka::state::chain::validate_mainnet_checkpoint_history(&storage, &config.chain_id)
+            .map_err(|err| {
+                format!(
+                    "mining quarantined: canonical history failed checkpoint validation ({err}); synchronize the recovery branch before mining"
+                )
+            })?;
+    }
 
     mining_log(&format!(
         "batch starting (chain={}, threads={}, blocks={})",
@@ -5536,6 +5561,21 @@ fn run_mining_batch_with_progress(
         })?;
     }
     for _ in 0..config.blocks {
+        if zoka::api::global_network_runtime().checkpoint_quarantined() {
+            return Err(
+                "mining stopped: mainnet checkpoint quarantine is active; synchronization remains enabled"
+                    .to_string(),
+            );
+        }
+        if let Some(path) = config.chain_db_path.as_deref() {
+            let storage = open_storage(path)?;
+            zoka::state::chain::validate_mainnet_checkpoint_history(&storage, &config.chain_id)
+                .map_err(|err| {
+                    format!(
+                        "mining stopped: canonical history failed checkpoint validation ({err})"
+                    )
+                })?;
+        }
         // Import any private txs queued in the sidecar directory by other
         // processes that could not write to the DB while we held the lock.
         if let Some(path) = config.chain_db_path.as_deref() {
@@ -6007,6 +6047,7 @@ fn run_mining_batch_with_progress(
 fn handle_inbound_block_message(
     node: &mut Node,
     message: &zoka::network::message::ZokaMessage,
+    source: Option<libp2p::PeerId>,
     chain_id: &str,
     // Reuse the node's already-open chain storage. This is the client-side
     // IBD apply path -- it runs for every block a syncing node receives.
@@ -6032,8 +6073,17 @@ fn handle_inbound_block_message(
             ));
         }
     };
+    if !peer_view.should_process_block_candidate(source.as_ref(), height, &response.block_hash) {
+        return Some(format!(
+            "Deferred unrelated block body @ height {height} while recovering a pinned branch."
+        ));
+    }
     let local_height = storage.get_chain_height().unwrap_or(0);
-    peer_view.observe(height, local_height);
+    if let Some(source) = source {
+        peer_view.observe_from(source, height, local_height);
+    } else {
+        peer_view.observe(height, local_height);
+    }
 
     let outcome = match unsafe_rehearsal_difficulty_bits {
         Some(bits) => zoka::state::sync::try_apply_synced_block_payload_with_expected_difficulty(
@@ -6041,8 +6091,18 @@ fn handle_inbound_block_message(
         ),
         None => zoka::state::sync::try_apply_synced_block_payload(storage, chain_id, response),
     };
-    peer_view.record_sync_outcome(&outcome);
-    peer_view.remember_block_response(&outcome, response);
+    if matches!(
+        &outcome,
+        zoka::state::sync::SyncOutcome::BadPayload(_)
+            | zoka::state::sync::SyncOutcome::AnnouncedHashMismatch { .. }
+            | zoka::state::sync::SyncOutcome::Rejected(_)
+    ) {
+        if let Some(source) = source {
+            node.penalize_block_sync_peer(source);
+        }
+    }
+    peer_view.record_sync_outcome_from(source, &outcome);
+    peer_view.remember_block_response_from(source, &outcome, response);
     if let zoka::state::sync::SyncOutcome::Applied(head) = &outcome {
         if let Err(err) = node.publish_block_announce(
             head.height,
@@ -6064,6 +6124,7 @@ fn handle_inbound_block_message(
 fn handle_block_announce(
     node: &mut Node,
     announce: &zoka::network::message::BlockAnnounceMessage,
+    source: Option<libp2p::PeerId>,
     // Reuse the node's already-open chain storage instead of opening a fresh
     // RocksDbStorage per gossiped announce.
     storage: Option<&RocksDbStorage>,
@@ -6076,25 +6137,37 @@ fn handle_block_announce(
     }
 
     let announced_work = announce.cumulative_work.parse::<u128>().ok();
-    let local_head = storage
-        .and_then(|storage| zoka::state::chain::read_chain_head(storage).ok().flatten());
+    let local_head =
+        storage.and_then(|storage| zoka::state::chain::read_chain_head(storage).ok().flatten());
     let local_height = local_head.as_ref().map(|head| head.height).unwrap_or(0);
-    peer_view.observe(height, local_height);
+    if let Some(source) = source {
+        peer_view.observe_block_announce_from(source, height, hash, announced_work, local_height);
+    } else {
+        peer_view.observe(height, local_height);
+    }
 
-    if let Some(head) = &local_head {
-        if head.height >= height {
-            if head.height == height && head.hash == hash {
-                return Some(format!(
-                    "Block announce @ height {height} already matches local head."
-                ));
-            }
-            if announced_work
-                .map(|work| work <= head.cumulative_work)
-                .unwrap_or(height <= head.height)
-            {
-                return Some(format!(
+    if !peer_view.should_process_block_candidate(source.as_ref(), height, hash) {
+        return Some(format!(
+            "Deferred unrelated block announce @ height {height} while recovering a pinned branch."
+        ));
+    }
+
+    if !peer_view.recovery_mode() {
+        if let Some(head) = &local_head {
+            if head.height >= height {
+                if head.height == height && head.hash == hash {
+                    return Some(format!(
+                        "Block announce @ height {height} already matches local head."
+                    ));
+                }
+                if announced_work
+                    .map(|work| work <= head.cumulative_work)
+                    .unwrap_or(height <= head.height)
+                {
+                    return Some(format!(
                     "Ignored block announce @ height {height}: local chain has equal or stronger work."
                 ));
+                }
             }
         }
     }
@@ -6122,7 +6195,14 @@ async fn sweep_block_announce_retries(
     node: &mut Node,
     chain_id: &str,
     chain_db_path: Option<&str>,
+    peer_view: &mut zoka::state::sync::PeerChainView,
 ) -> Option<String> {
+    // A hash-pinned ancestry walk is the only operation that can close an IBD
+    // gap when intermediate canonical bodies were pruned. Announcement retry
+    // requests can each consume two Tor timeouts and used to starve that walk.
+    if peer_view.has_active_branch_backfill() {
+        return None;
+    }
     let due = node.due_block_announce_retries();
     if due.is_empty() {
         return None;
@@ -6130,9 +6210,11 @@ async fn sweep_block_announce_retries(
     let path = chain_db_path?;
     let storage = RocksDbStorage::new(path).ok()?;
     let mut last_event = None;
-    for (height, hash, attempts) in due {
+    // Process at most one opportunistic retry per sweep so normal IBD always
+    // gets another scheduling turn, even through a slow onion circuit.
+    for (height, hash, attempts) in due.into_iter().take(1) {
         let local_height = storage.get_chain_height().unwrap_or(0);
-        if local_height >= height {
+        if local_height >= height && !peer_view.recovery_mode() {
             node.forget_block_announce_retry(height, &hash);
             continue;
         }
@@ -6142,13 +6224,37 @@ async fn sweep_block_announce_retries(
             ));
             continue;
         }
+        let preferred_peer = peer_view.preferred_peer_for_height(height);
         match node
-            .request_block_with_retry(height, Some(hash.clone()), 2, Duration::from_secs(10))
+            .request_block_with_affinity(
+                height,
+                Some(hash.clone()),
+                preferred_peer,
+                false,
+                2,
+                Duration::from_secs(10),
+            )
             .await
         {
-            Ok(response) => {
+            Ok(sourced) => {
                 let outcome = zoka::state::sync::try_apply_synced_block_payload(
-                    &storage, chain_id, &response,
+                    &storage,
+                    chain_id,
+                    &sourced.response,
+                );
+                if matches!(
+                    &outcome,
+                    zoka::state::sync::SyncOutcome::BadPayload(_)
+                        | zoka::state::sync::SyncOutcome::AnnouncedHashMismatch { .. }
+                        | zoka::state::sync::SyncOutcome::Rejected(_)
+                ) {
+                    node.penalize_block_sync_peer(sourced.source);
+                }
+                peer_view.record_sync_outcome_from(Some(sourced.source), &outcome);
+                peer_view.remember_block_response_from(
+                    Some(sourced.source),
+                    &outcome,
+                    &sourced.response,
                 );
                 if matches!(outcome, zoka::state::sync::SyncOutcome::Applied(_)) {
                     node.forget_block_announce_retry(height, &hash);
@@ -6336,10 +6442,12 @@ fn serve_pending_private_tx_body_requests(
         } else {
             match storage {
                 Some(storage) => private_tx_body_response_from_storage(storage, &pending.request),
-                None => zoka::network::private_tx_request_response::PrivateTxBodyResponse::NotFound {
-                    tx_hash,
-                    reason: "no chain DB configured".to_string(),
-                },
+                None => {
+                    zoka::network::private_tx_request_response::PrivateTxBodyResponse::NotFound {
+                        tx_hash,
+                        reason: "no chain DB configured".to_string(),
+                    }
+                }
             }
         };
         match node.respond_private_tx_body_request(pending, response) {
@@ -6541,7 +6649,10 @@ fn request_snapshot_manifests_from_peers(
             chain_id: chain_id.to_string(),
             max_height: None,
         };
-        if node.send_snapshot_manifest_request(&peer, request).is_some() {
+        if node
+            .send_snapshot_manifest_request(&peer, request)
+            .is_some()
+        {
             sent = sent.saturating_add(1);
         }
     }
@@ -6784,6 +6895,7 @@ fn serve_pending_snapshot_manifest_requests(
 async fn handle_fullnode_network_message(
     node: &mut Node,
     message: &zoka::network::message::ZokaMessage,
+    source: Option<libp2p::PeerId>,
     chain_id: &str,
     chain_db_path: Option<&str>,
     storage: Option<&RocksDbStorage>,
@@ -6794,13 +6906,14 @@ async fn handle_fullnode_network_message(
         zoka::network::message::ZokaMessage::BlockResponse(_) => handle_inbound_block_message(
             node,
             message,
+            source,
             chain_id,
             storage,
             peer_view,
             unsafe_rehearsal_difficulty_bits,
         ),
         zoka::network::message::ZokaMessage::BlockAnnounce(announce) => {
-            handle_block_announce(node, announce, storage, peer_view)
+            handle_block_announce(node, announce, source, storage, peer_view)
         }
         zoka::network::message::ZokaMessage::PrivateTxAnnounce(announce) => {
             let hash = announce.tx_hash.trim();
@@ -6920,7 +7033,11 @@ async fn handle_fullnode_network_message(
             // a dishonest height only wastes bounded fetch attempts. (This
             // used to open a throwaway RocksDbStorage just to read local
             // height for the cap; the trusted path needs neither.)
-            peer_view.observe_trusted_height(sync.last_height);
+            if let Some(source) = source {
+                peer_view.observe_trusted_height_from(source, sync.last_height);
+            } else {
+                peer_view.observe_trusted_height(sync.last_height);
+            }
             Some(format!(
                 "Observed peer sync state at height {}.",
                 sync.last_height
@@ -7500,6 +7617,7 @@ fn sync_outcome_to_event(outcome: zoka::state::sync::SyncOutcome) -> String {
         zoka::state::sync::SyncOutcome::GapAhead {
             local_head,
             candidate,
+            ..
         } => format!(
             "Peer is ahead at height {candidate}; local head is {local_head}. IBD will request missing blocks."
         ),
@@ -7582,8 +7700,12 @@ async fn run_ibd_body_prefetch_step(
     let requested = heights.len();
     let mut fetched = 0u64;
     for (_, result) in results {
-        if let Ok(response) = result {
-            peer_view.stash_prefetched_block_response(local_height, response);
+        if let Ok(sourced) = result {
+            peer_view.stash_prefetched_block_response_from(
+                Some(sourced.source),
+                local_height,
+                sourced.response,
+            );
             fetched = fetched.saturating_add(1);
         }
     }
@@ -7634,21 +7756,25 @@ async fn run_sync_step(
             zoka::state::sync::SyncRequest {
                 height: local_height.saturating_add(1).max(1),
                 expected_hash: None,
+                preferred_peer: None,
+                strict_peer_affinity: false,
             }
         }
         None => return Ok(None),
     };
     let next_height = next_request.height;
 
-    let (response, response_source) = if let Some(cached) =
-        peer_view.take_pending_block_response(&next_request)
+    let (response, response_peer, response_source) = if let Some((source, cached)) =
+        peer_view.take_pending_sourced_block_response(&next_request)
     {
-        (cached, "cached")
+        (cached, source, "cached".to_string())
     } else {
         match node
-            .request_block_with_retry(
+            .request_block_with_affinity(
                 next_height,
                 next_request.expected_hash.clone(),
+                next_request.preferred_peer,
+                next_request.strict_peer_affinity,
                 3,
                 // 20s/attempt (was 8s): sized for Tor onion round trips so IBD
                 // block fetches don't spuriously time out and re-request the
@@ -7658,7 +7784,10 @@ async fn run_sync_step(
             )
             .await
         {
-            Ok(response) => (response, "peer"),
+            Ok(sourced) => {
+                let source_label = format!("peer {}", sourced.source);
+                (sourced.response, Some(sourced.source), source_label)
+            }
             Err(err) => {
                 let reset_note = if next_request.expected_hash.is_some()
                     && peer_view.record_branch_backfill_request_failure()
@@ -7686,8 +7815,18 @@ async fn run_sync_step(
         ),
         None => zoka::state::sync::try_apply_synced_block_payload(&storage, chain_id, &response),
     };
-    peer_view.record_sync_outcome(&outcome);
-    peer_view.remember_block_response(&outcome, &response);
+    if matches!(
+        &outcome,
+        zoka::state::sync::SyncOutcome::BadPayload(_)
+            | zoka::state::sync::SyncOutcome::AnnouncedHashMismatch { .. }
+            | zoka::state::sync::SyncOutcome::Rejected(_)
+    ) {
+        if let Some(source) = response_peer {
+            node.penalize_block_sync_peer(source);
+        }
+    }
+    peer_view.record_sync_outcome_from(response_peer, &outcome);
+    peer_view.remember_block_response_from(response_peer, &outcome, &response);
     if matches!(
         &outcome,
         zoka::state::sync::SyncOutcome::BadPayload(_)
@@ -7697,7 +7836,7 @@ async fn run_sync_step(
         tracing::warn!(
             target: "zoka.sync",
             height = next_height,
-            source = response_source,
+            source = response_source.as_str(),
             outcome = ?outcome,
             "IBD block apply rejected"
         );
@@ -8591,8 +8730,9 @@ async fn connect_and_warmup(
     connect_timeout: Duration,
 ) -> Result<(), String> {
     tracing::info!(target: "zoka.network", peer = %dial_addr, "seed dial started");
-    node.connect_to_peer(dial_addr)
+    timeout(connect_timeout, node.connect_to_peer(dial_addr))
         .await
+        .map_err(|_| format!("dial timeout after {}s", connect_timeout.as_secs()))?
         .map_err(|e| format!("dial error: {e}"))?;
     timeout(connect_timeout, node.wait_for_any_connection())
         .await
@@ -8605,11 +8745,20 @@ async fn connect_and_warmup(
     Ok(())
 }
 
+fn seed_connection_target(unique_seed_nodes: usize, reconnect_addr_count: usize) -> usize {
+    if reconnect_addr_count == 0 {
+        return 0;
+    }
+    unique_seed_nodes.max(1).min(3)
+}
+
 async fn maintain_seed_connections(
     node: &mut Node,
     seed_addrs: &[String],
     target_peers: usize,
 ) -> Option<String> {
+    const MAX_DIAL_ATTEMPTS_PER_SWEEP: usize = 2;
+
     if seed_addrs.is_empty() {
         return None;
     }
@@ -8622,11 +8771,29 @@ async fn maintain_seed_connections(
     let mut failures = Vec::new();
     let mut attempted = 0usize;
     let shuffled_seed_addrs = shuffled_peer_addrs(seed_addrs);
-    for seed in &shuffled_seed_addrs {
+    // A peerstore may contain dozens of old onion addresses. Never walk the
+    // entire set in one maintenance call: even bounded per-address timeouts
+    // would add up and starve the libp2p event loop long enough to lose the
+    // healthy connections we are trying to supplement.
+    for seed in shuffled_seed_addrs.iter().take(MAX_DIAL_ATTEMPTS_PER_SWEEP) {
         attempted += 1;
         let before = node.connected_peer_count();
-        match node.connect_to_peer(seed).await {
-            Ok(()) => {
+        // A dead onion endpoint can otherwise hold the single fullnode event
+        // loop inside the SOCKS handshake for roughly a minute. While blocked,
+        // existing libp2p connections are not pumped and healthy peers time
+        // out as collateral damage. Keep every maintenance dial bounded.
+        match timeout(Duration::from_secs(6), node.connect_to_peer(seed)).await {
+            Err(_) => {
+                let err = "dial timeout after 6s";
+                tracing::warn!(
+                    target: "zoka.network",
+                    peer = %seed,
+                    error = err,
+                    "seed reconnect dial timed out"
+                );
+                failures.push(format!("{seed}: {err}"));
+            }
+            Ok(Ok(())) => {
                 let next_floor = before.saturating_add(1).min(target_peers).max(1);
                 match node
                     .wait_for_min_connected_peers(next_floor, Duration::from_secs(4))
@@ -8658,7 +8825,7 @@ async fn maintain_seed_connections(
                     }
                 }
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 tracing::warn!(
                     target: "zoka.network",
                     peer = %seed,
@@ -8946,7 +9113,11 @@ fn expand_node_config_into_args(args: &[String]) -> Result<Vec<String>, String> 
         push(&mut cfg_args, "--address", &v);
     }
     if let Some(v) = non_empty(&cfg.network_config) {
-        push(&mut cfg_args, "--network-config", &resolve_relative_path(&v));
+        push(
+            &mut cfg_args,
+            "--network-config",
+            &resolve_relative_path(&v),
+        );
     }
     if let Some(v) = non_empty(&cfg.power) {
         push(&mut cfg_args, "--power", &v);
@@ -9118,8 +9289,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     // when blocks arrive). Pass --dashboard (or ZOKA_DASHBOARD=1) to opt back
     // into the old full-screen view; --mining-console/ZOKA_MINING_CONSOLE=1
     // are still accepted for explicitness/back-compat but no longer needed.
-    let mining_console = !has_flag(args, "--dashboard")
-        && std::env::var("ZOKA_DASHBOARD").as_deref() != Ok("1");
+    let mining_console =
+        !has_flag(args, "--dashboard") && std::env::var("ZOKA_DASHBOARD").as_deref() != Ok("1");
     if mining_console {
         println!(
             "{}",
@@ -9215,6 +9386,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         tokio::sync::mpsc::UnboundedReceiver<zoka::private_wallet::PrivateTransaction>,
     > = None;
     let mut chain_storage_outer: Option<Arc<RocksDbStorage>> = None;
+    let mut checkpoint_quarantine = false;
 
     if let Some(db) = db_path.as_ref() {
         if let Some(genesis_file) = genesis_path.as_ref() {
@@ -9347,6 +9519,27 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             }
         }
 
+        match zoka::state::chain::validate_mainnet_checkpoint_history(&storage, &chain_id) {
+            Ok(()) => {}
+            Err(zoka::state::chain::ChainError::MainnetCheckpointMismatch {
+                height,
+                expected,
+                actual,
+            }) => {
+                checkpoint_quarantine = true;
+                zoka::api::global_local_mining_control().disable();
+                startup_notes.push(format!(
+                    "CHECKPOINT QUARANTINE: canonical block {height} is {actual}, expected {expected}. Mining disabled; P2P recovery sync remains active."
+                ));
+            }
+            Err(err) => {
+                return Err(format!(
+                    "failed to validate mainnet checkpoint history: {err}"
+                ));
+            }
+        }
+        zoka::api::global_network_runtime().set_checkpoint_quarantined(checkpoint_quarantine);
+
         let manager = Arc::new(StateManager::new(storage));
         chain_storage_outer = Some(manager.raw_storage());
         let api_mempool = Arc::new(zoka::mempool::Mempool::new(10_000));
@@ -9430,10 +9623,12 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
 
     zoka::api::global_startup_status()
         .set_phase("starting_p2p", Some("starting libp2p node".to_string()));
-    let mut node = Node::new_with_tor_proxy(0, tor_proxy.clone()).await.map_err(|e| {
-        zoka::api::global_startup_status().mark_failed(Some(format!("node init error: {e}")));
-        format!("node init error: {e}")
-    })?;
+    let mut node = Node::new_with_tor_proxy(0, tor_proxy.clone())
+        .await
+        .map_err(|e| {
+            zoka::api::global_startup_status().mark_failed(Some(format!("node init error: {e}")));
+            format!("node init error: {e}")
+        })?;
     if let Some(proxy) = tor_proxy.as_ref() {
         node.configure_tor_proxy(proxy.clone(), tor_only);
         startup_notes.push(if tor_only {
@@ -9544,6 +9739,10 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
 
     let mut seed_peer_display = None::<String>;
     let mut reconnect_seed_peers = manual_seed_peers.clone();
+    // Count logical seed operators/nodes, not transport addresses. A single
+    // manifest seed commonly contributes DNS + onion addresses but can still
+    // establish only one PeerId connection.
+    let mut configured_seed_nodes = manual_seed_peers.len();
     let mut rpc_sync_endpoints = Vec::<String>::new();
     let peer_store_path = zoka::network::peer_store::default_peer_store_path();
     let mut peer_store =
@@ -9583,6 +9782,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 .unwrap_or_else(|| PathBuf::from(network.default_network_config_path()));
             if config_path.exists() {
                 let network_config = load_network_config_for(&config_path, network)?;
+                configured_seed_nodes =
+                    configured_seed_nodes.max(network_config.active_seed_node_count());
                 rpc_sync_endpoints = network_config
                     .public_rpc
                     .iter()
@@ -9699,6 +9900,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             .unwrap_or_else(|| PathBuf::from(network.default_network_config_path()));
         if config_path.exists() {
             let network_config = load_network_config_for(&config_path, network)?;
+            configured_seed_nodes = network_config.active_seed_node_count();
             let seed_candidates = network_config.active_seed_candidates(allow_clearnet_seeds);
             for seed in &seed_candidates {
                 peer_store.upsert_addr(&seed.address, "manifest_seed");
@@ -9834,6 +10036,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut session_mined_rewards = 0u64;
     let mut last_event = startup_notes.join(" ");
     let mut peer_chain_view = zoka::state::sync::PeerChainView::default();
+    peer_chain_view.set_recovery_mode(checkpoint_quarantine);
     let mut last_sync_source: Option<String> = None;
     let mut last_sync_event: Option<String> = None;
     let mut last_sync_error: Option<String> = None;
@@ -9867,7 +10070,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     while tokio::time::Instant::now() < warmup_deadline {
         let mut now = tokio::time::Instant::now();
         if now >= next_warmup_seed_reconnect_at {
-            let target_seed_peers = reconnect_seed_peers.len().min(3).max(1);
+            let target_seed_peers =
+                seed_connection_target(configured_seed_nodes, reconnect_seed_peers.len());
             if let Some(reconnect_event) =
                 maintain_seed_connections(&mut node, &reconnect_seed_peers, target_seed_peers).await
             {
@@ -9943,11 +10147,13 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 &last_event,
             )?;
         }
-        match timeout(Duration::from_millis(500), node.next_message()).await {
-            Ok(Ok(message)) => {
+        match timeout(Duration::from_millis(500), node.next_sourced_message()).await {
+            Ok(Ok(sourced)) => {
+                let message = sourced.message;
                 last_event = if let Some(verdict) = handle_fullnode_network_message(
                     &mut node,
                     &message,
+                    sourced.source,
                     &chain_id,
                     db_path.as_deref(),
                     chain_storage_outer.as_deref(),
@@ -10217,9 +10423,49 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             }
         }
 
+        if let Some(storage) = chain_storage_outer.as_deref() {
+            match zoka::state::chain::validate_mainnet_checkpoint_history(storage, &chain_id) {
+                Ok(()) if checkpoint_quarantine => {
+                    checkpoint_quarantine = false;
+                    peer_chain_view.set_recovery_mode(false);
+                    zoka::api::global_network_runtime().set_checkpoint_quarantined(false);
+                    last_event =
+                        "Checkpoint recovery complete; canonical history validated.".to_string();
+                }
+                Ok(()) => {}
+                Err(zoka::state::chain::ChainError::MainnetCheckpointMismatch {
+                    height,
+                    expected,
+                    actual,
+                }) => {
+                    if !checkpoint_quarantine {
+                        last_event = format!(
+                            "Checkpoint quarantine at {height}: local {actual}, expected {expected}; mining disabled while sync recovers."
+                        );
+                    }
+                    checkpoint_quarantine = true;
+                    peer_chain_view.set_recovery_mode(true);
+                    zoka::api::global_local_mining_control().disable();
+                    zoka::api::global_network_runtime().set_checkpoint_quarantined(true);
+                }
+                Err(err) => {
+                    if !checkpoint_quarantine {
+                        last_event = format!(
+                            "Checkpoint validation unavailable ({err}); mining quarantined, sync remains active."
+                        );
+                    }
+                    checkpoint_quarantine = true;
+                    peer_chain_view.set_recovery_mode(true);
+                    zoka::api::global_local_mining_control().disable();
+                    zoka::api::global_network_runtime().set_checkpoint_quarantined(true);
+                }
+            }
+        }
+
         let mining_active = mining_task.is_some();
         let mining_control = zoka::api::global_local_mining_control().snapshot();
-        let runtime_mining_enabled = auto_mine || mining_control.enabled;
+        let runtime_mining_enabled =
+            !checkpoint_quarantine && (auto_mine || mining_control.enabled);
         let runtime_mining_threads = if mining_control.threads > 0 {
             mining_control.threads.clamp(1, 128) as usize
         } else {
@@ -10350,13 +10596,20 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         }
 
         if tokio::time::Instant::now() >= next_block_announce_retry_sweep_at {
-            next_block_announce_retry_sweep_at =
-                tokio::time::Instant::now() + Duration::from_secs(2);
-            if let Some(retry_event) =
-                sweep_block_announce_retries(&mut node, &chain_id, db_path.as_deref()).await
+            if let Some(retry_event) = sweep_block_announce_retries(
+                &mut node,
+                &chain_id,
+                db_path.as_deref(),
+                &mut peer_chain_view,
+            )
+            .await
             {
                 last_event = retry_event;
             }
+            // Schedule from completion, not from the start of a potentially
+            // slow Tor round trip, otherwise every loop is immediately due.
+            next_block_announce_retry_sweep_at =
+                tokio::time::Instant::now() + Duration::from_secs(2);
         }
 
         if runtime_mining_enabled && tokio::time::Instant::now() >= next_miner_heartbeat_at {
@@ -10475,7 +10728,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         }
 
         if tokio::time::Instant::now() >= next_seed_reconnect_at {
-            let target_seed_peers = reconnect_seed_peers.len().min(3).max(1);
+            let target_seed_peers =
+                seed_connection_target(configured_seed_nodes, reconnect_seed_peers.len());
             if let Some(reconnect_event) =
                 maintain_seed_connections(&mut node, &reconnect_seed_peers, target_seed_peers).await
             {
@@ -10497,7 +10751,9 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         if tokio::time::Instant::now() >= next_sync_state_at {
             // Always broadcast local height so peers behind us can discover
             // they need to catch up — even while this node is actively mining.
-            if let Some(sync_event) = publish_local_sync_state(&mut node, chain_storage_outer.as_deref())? {
+            if let Some(sync_event) =
+                publish_local_sync_state(&mut node, chain_storage_outer.as_deref())?
+            {
                 last_event = sync_event;
             }
             if let Some(announce_event) =
@@ -10607,7 +10863,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     let local_height = storage.get_chain_height().unwrap_or(0);
 
                     // Act on the previous round's replies first.
-                    if let Some(offer) = best_peer_snapshot_offer(&mut node, &chain_id, local_height)
+                    if let Some(offer) =
+                        best_peer_snapshot_offer(&mut node, &chain_id, local_height)
                     {
                         if let Some(id_str) = offer.iroh_endpoint_id.clone() {
                             match id_str.parse::<iroh::EndpointId>() {
@@ -10864,7 +11121,9 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     "{last_event} RPC autopush had {rpc_submit_failures} endpoint failure(s); announce/request sync will keep peers aware of the new head."
                 );
             }
-            if let Some(sync_event) = publish_local_sync_state(&mut node, chain_storage_outer.as_deref())? {
+            if let Some(sync_event) =
+                publish_local_sync_state(&mut node, chain_storage_outer.as_deref())?
+            {
                 last_event = format!("{last_event} {sync_event}");
             }
             if let Some(announce_event) =
@@ -11075,7 +11334,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     .as_ref()
                     .ok()
                     .map(|snapshot| snapshot.total_balance);
-                let wallet_balance_error = wallet_snapshot_result.as_ref().err().map(String::as_str);
+                let wallet_balance_error =
+                    wallet_snapshot_result.as_ref().err().map(String::as_str);
                 print_mining_console_status(
                     &wallet_address,
                     runtime_chain_height,
@@ -11178,11 +11438,13 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             }
         }
 
-        match timeout(Duration::from_millis(800), node.next_message()).await {
-            Ok(Ok(message)) => {
+        match timeout(Duration::from_millis(800), node.next_sourced_message()).await {
+            Ok(Ok(sourced)) => {
+                let message = sourced.message;
                 last_event = match handle_fullnode_network_message(
                     &mut node,
                     &message,
+                    sourced.source,
                     &chain_id,
                     db_path.as_deref(),
                     chain_storage_outer.as_deref(),
@@ -15409,7 +15671,10 @@ fn cmd_snapshot_import(args: &[String]) -> Result<(), String> {
 }
 
 /// Export the current chain as serialized snapshot bytes plus its head height.
-fn export_snapshot_bytes(storage: &RocksDbStorage, chain_id: &str) -> Result<(Vec<u8>, u64), String> {
+fn export_snapshot_bytes(
+    storage: &RocksDbStorage,
+    chain_id: &str,
+) -> Result<(Vec<u8>, u64), String> {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -15417,7 +15682,8 @@ fn export_snapshot_bytes(storage: &RocksDbStorage, chain_id: &str) -> Result<(Ve
     let snapshot = zoka::snapshot::export_from_storage(storage, chain_id, timestamp)
         .map_err(|e| format!("export failed: {e}"))?;
     let height = snapshot.header.head_height;
-    let bytes = zoka::snapshot::serialize(&snapshot).map_err(|e| format!("serialize failed: {e}"))?;
+    let bytes =
+        zoka::snapshot::serialize(&snapshot).map_err(|e| format!("serialize failed: {e}"))?;
     Ok((bytes, height))
 }
 
@@ -15508,7 +15774,9 @@ async fn maybe_bootstrap_from_iroh(
         // log panel, which only captures the child's stdout. Bound the fetch
         // with a timeout so an unreachable relay/hole-punch can't hang node
         // startup (this runs before node.listen) -- it falls back to IBD.
-        println!("iroh bootstrap: connecting to snapshot seed {endpoint_id} over iroh (n0 relay) ...");
+        println!(
+            "iroh bootstrap: connecting to snapshot seed {endpoint_id} over iroh (n0 relay) ..."
+        );
         let fetch = zoka::network::iroh_snapshot_transfer::fetch_snapshot(
             endpoint_id.into(),
             iroh::endpoint::presets::N0,
@@ -15531,7 +15799,9 @@ async fn maybe_bootstrap_from_iroh(
         let snapshot = match zoka::snapshot::deserialize(&bytes) {
             Ok(s) => s,
             Err(e) => {
-                println!("iroh bootstrap: fetched snapshot failed to parse: {e}. Falling back to IBD.");
+                println!(
+                    "iroh bootstrap: fetched snapshot failed to parse: {e}. Falling back to IBD."
+                );
                 continue;
             }
         };
@@ -16184,6 +16454,15 @@ mod tests {
     }
 
     #[test]
+    fn seed_connection_target_counts_logical_nodes_not_transport_addresses() {
+        // One seed exposed over DNS and onion still resolves to one PeerId.
+        assert_eq!(seed_connection_target(1, 2), 1);
+        assert_eq!(seed_connection_target(3, 6), 3);
+        assert_eq!(seed_connection_target(0, 4), 1);
+        assert_eq!(seed_connection_target(1, 0), 0);
+    }
+
+    #[test]
     fn snapshot_offer_selection_prefers_most_cumulative_work_not_height() {
         // A peer can cheaply mine a long low-difficulty branch, so height is
         // not a safe ranking signal; cumulative work is what consensus uses.
@@ -16203,12 +16482,9 @@ mod tests {
     fn snapshot_offer_selection_skips_peers_without_an_iroh_id() {
         // Pre-1.8.1 peers advertise no endpoint, so there is nothing to pull
         // from even when they claim the heaviest chain.
-        assert!(choose_best_snapshot_offer(
-            vec![offer("zoka", 90_000, 999, None)],
-            "zoka",
-            0
-        )
-        .is_none());
+        assert!(
+            choose_best_snapshot_offer(vec![offer("zoka", 90_000, 999, None)], "zoka", 0).is_none()
+        );
     }
 
     #[test]
@@ -16226,7 +16502,12 @@ mod tests {
         // A small gap is what ordinary block-by-block sync is for.
         let local = 10_000u64;
         assert!(choose_best_snapshot_offer(
-            vec![offer("zoka", local + PEER_SNAPSHOT_PULL_MIN_GAP, 999, Some("id"))],
+            vec![offer(
+                "zoka",
+                local + PEER_SNAPSHOT_PULL_MIN_GAP,
+                999,
+                Some("id")
+            )],
             "zoka",
             local
         )
@@ -16240,10 +16521,12 @@ mod tests {
         // (~143 MB at ~14 KB/block) to deliver ~1 000 blocks that incremental
         // sync fetches in ~15 MB. Taking the snapshot here would be a ten-fold
         // waste, so the node must decline and keep syncing normally.
-        assert!(
-            choose_best_snapshot_offer(vec![offer("zoka", 10_377, 999, Some("id"))], "zoka", 9_300)
-                .is_none()
-        );
+        assert!(choose_best_snapshot_offer(
+            vec![offer("zoka", 10_377, 999, Some("id"))],
+            "zoka",
+            9_300
+        )
+        .is_none());
     }
 
     #[test]
@@ -16251,14 +16534,18 @@ mod tests {
         // The case this feature exists for: a fresh (or nearly fresh) node
         // that would otherwise crawl the whole chain block by block, and which
         // must be able to bootstrap from any peer rather than needing a seed.
-        assert!(
-            choose_best_snapshot_offer(vec![offer("zoka", 10_377, 999, Some("id"))], "zoka", 0)
-                .is_some()
-        );
-        assert!(
-            choose_best_snapshot_offer(vec![offer("zoka", 10_377, 999, Some("id"))], "zoka", 4_000)
-                .is_some()
-        );
+        assert!(choose_best_snapshot_offer(
+            vec![offer("zoka", 10_377, 999, Some("id"))],
+            "zoka",
+            0
+        )
+        .is_some());
+        assert!(choose_best_snapshot_offer(
+            vec![offer("zoka", 10_377, 999, Some("id"))],
+            "zoka",
+            4_000
+        )
+        .is_some());
     }
 
     #[test]
@@ -17231,7 +17518,7 @@ mod tests {
           "schema": "zoka-mainnet-network-v1",
           "status": "prelaunch-template",
           "chain_id": "zoka-mainnet-zenith-v1",
-          "protocol_freeze_id": "/zoka/1.6.0-mainnet-zenith",
+          "protocol_freeze_id": "/zoka/1.9.0-mainnet-recovery",
           "transport_policy": {
             "anonymous_transport_preferred": true,
             "clearnet_requires_explicit_operator_choice": true,
@@ -17262,7 +17549,7 @@ mod tests {
           "schema": "zoka-mainnet-network-v1",
           "status": "launch-ready",
           "chain_id": "zoka-mainnet-zenith-v1",
-          "protocol_freeze_id": "/zoka/1.6.0-mainnet-zenith",
+          "protocol_freeze_id": "/zoka/1.9.0-mainnet-recovery",
           "transport_policy": {
             "anonymous_transport_preferred": true,
             "clearnet_requires_explicit_operator_choice": true,
@@ -17333,7 +17620,7 @@ mod tests {
           "schema": "zoka-mainnet-network-v1",
           "status": "bad",
           "chain_id": "zoka-test-net",
-          "protocol_freeze_id": "/zoka/1.6.0-mainnet-zenith",
+          "protocol_freeze_id": "/zoka/1.9.0-mainnet-recovery",
           "transport_policy": {
             "anonymous_transport_preferred": true,
             "clearnet_requires_explicit_operator_choice": true,
@@ -17354,7 +17641,7 @@ mod tests {
           "schema": "zoka-mainnet-network-v1",
           "status": "candidate",
           "chain_id": "zoka-mainnet-zenith-v1",
-          "protocol_freeze_id": "/zoka/1.6.0-mainnet-zenith",
+          "protocol_freeze_id": "/zoka/1.9.0-mainnet-recovery",
           "transport_policy": {
             "anonymous_transport_preferred": true,
             "clearnet_requires_explicit_operator_choice": true,
