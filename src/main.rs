@@ -4208,6 +4208,16 @@ fn wallet_sync_rpc_urls(network: NetworkProfile) -> Vec<String> {
 
 fn private_tx_archive_rpc_urls(network: NetworkProfile) -> Vec<String> {
     let mut urls = Vec::new();
+    // Try the local node first when one is configured (e.g. a wallet CLI
+    // shelled out to by a desktop app with a node already running
+    // alongside it). It's usually reachable, it's the same node that will
+    // gossip/mine the tx, and unlike the public bootstrap list it can't be
+    // silently pointing at decommissioned infrastructure — a sender whose
+    // only public RPC endpoints are all down would otherwise have no way
+    // to hand this tx to anyone at all.
+    if let Some(local) = configured_local_rpc_url(network) {
+        push_unique_rpc_url(&mut urls, local);
+    }
     if let Ok(active) = active_rpc_endpoints_from_config(&[], network) {
         for rpc in active {
             push_unique_rpc_url(&mut urls, rpc.url);
@@ -7775,7 +7785,13 @@ async fn run_sync_step(
                 next_request.expected_hash.clone(),
                 next_request.preferred_peer,
                 next_request.strict_peer_affinity,
-                3,
+                // Race every connected peer for this one missing height, not a
+                // fixed 3 — with only 1-2 blocks left to fetch there is no
+                // batching to parallelize across heights, so peer fan-out is
+                // the only lever. `take(max_attempts)` inside the direct-request
+                // path already bounds this to however many peers actually are
+                // connected, so this never over-requests.
+                node.connected_peer_count().max(3) as u32,
                 // 20s/attempt (was 8s): sized for Tor onion round trips so IBD
                 // block fetches don't spuriously time out and re-request the
                 // same height forever. Bounded by the 30s request/response
@@ -10378,7 +10394,26 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     // addresses, but if nothing new surfaces through that path the routing
     // table never refreshes on its own. This fires unconditionally on a
     // slow cadence regardless of whether new addresses were seen.
-    let mut next_kad_rebootstrap_at = tokio::time::Instant::now() + Duration::from_secs(900);
+    //
+    // The cadence is adaptive: a node sitting on very few peers (the
+    // reactive path above has nothing to react to) used to wait the full
+    // 15 minutes for this backstop, so a single flaky connection could
+    // leave it running on one peer for that whole window. Below the
+    // healthy-peer threshold it retries every 45s instead; once
+    // well-connected it falls back to the slow cadence so a healthy node
+    // isn't spamming DHT queries it doesn't need.
+    fn kademlia_rebootstrap_interval(connected_peers: usize) -> Duration {
+        const LOW_PEER_THRESHOLD: usize = 4;
+        const LOW_PEER_INTERVAL: Duration = Duration::from_secs(45);
+        const HEALTHY_INTERVAL: Duration = Duration::from_secs(900);
+        if connected_peers < LOW_PEER_THRESHOLD {
+            LOW_PEER_INTERVAL
+        } else {
+            HEALTHY_INTERVAL
+        }
+    }
+    let mut next_kad_rebootstrap_at =
+        tokio::time::Instant::now() + kademlia_rebootstrap_interval(node.connected_peer_count());
     let mut next_block_announce_retry_sweep_at =
         tokio::time::Instant::now() + Duration::from_secs(2);
     // Periodic RPC pull of pending private txs from public peers. This is the
@@ -10585,7 +10620,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         }
 
         if tokio::time::Instant::now() >= next_kad_rebootstrap_at {
-            next_kad_rebootstrap_at = tokio::time::Instant::now() + Duration::from_secs(900);
+            next_kad_rebootstrap_at = tokio::time::Instant::now()
+                + kademlia_rebootstrap_interval(node.connected_peer_count());
             if let Err(err) = node.bootstrap_kademlia() {
                 tracing::warn!(
                     target: "zoka.network",
