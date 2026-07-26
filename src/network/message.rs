@@ -911,4 +911,71 @@ mod tests {
         changed.updated_at = 101;
         assert_ne!(digest_a, changed.digest());
     }
+
+    // ── Forward compatibility ────────────────────────────────────────────
+    //
+    // Before the P2P Exchange work can add an `OfferAnnounce` variant, it has
+    // to be settled what today's nodes do when one reaches them. Most of the
+    // network still runs older clients, so a variant that made them panic or
+    // drop the sender would break the live network the moment a single
+    // upgraded node published one.
+    //
+    // These tests pin the answer: an unknown variant is a plain decode error.
+    // Every `from_bytes` call site in p2p.rs treats that the same way — log a
+    // warning and continue — so the message is dropped and the peer is kept.
+    // Nothing marks the sender incompatible either: that only happens through
+    // `mark_peer_protocol_version`, which reads the identify protocol string
+    // and never looks at message payloads.
+
+    #[test]
+    fn unknown_message_variant_from_a_newer_node_is_a_clean_decode_error() {
+        // Shaped like the OfferAnnounce that Etapa 2 will add.
+        let future_variant = json!({
+            "OfferAnnounce": {
+                "id": "offer-1",
+                "seller_address": "zka1seller",
+                "zka_amount": 1000u64,
+                "usdt_amount": "25.00",
+                "usdt_receive_address": "TRC20address",
+                "created_at": 1_751_000_000u64
+            }
+        });
+
+        let bytes = serde_json::to_vec(&future_variant).unwrap();
+        let decoded = ZokaMessage::from_bytes(&bytes);
+
+        // Err, not panic: serde rejects the unknown variant and the caller
+        // discards the message.
+        assert!(
+            decoded.is_err(),
+            "an unknown variant must fail to decode rather than resolve to something else"
+        );
+    }
+
+    #[test]
+    fn a_known_variant_still_decodes_after_an_unknown_one() {
+        let unknown = serde_json::to_vec(&json!({ "SomeFutureVariant": { "x": 1 } })).unwrap();
+        assert!(ZokaMessage::from_bytes(&unknown).is_err());
+
+        // The decoder is stateless, so a bad message cannot poison the ones
+        // that follow it on the same topic.
+        let ping = ZokaMessage::Ping(PingMessage {
+            nonce: 42,
+            timestamp: 1_751_000_001,
+        });
+        let bytes = ping.to_bytes().unwrap();
+
+        assert!(matches!(
+            ZokaMessage::from_bytes(&bytes).unwrap(),
+            ZokaMessage::Ping(_)
+        ));
+    }
+
+    #[test]
+    fn malformed_and_empty_payloads_are_errors_not_panics() {
+        assert!(ZokaMessage::from_bytes(b"").is_err());
+        assert!(ZokaMessage::from_bytes(b"not json at all").is_err());
+        assert!(ZokaMessage::from_bytes(b"{}").is_err());
+        assert!(ZokaMessage::from_bytes(b"{\"Ping\":{}}").is_err());
+    }
 }
