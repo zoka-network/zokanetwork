@@ -148,6 +148,17 @@ impl MessageHandler for DefaultMessageHandler {
                 let mut stats = self.stats.write().await;
                 stats.transactions += 1;
             }
+            // Offers are held by the offer store on the seller's node, not by
+            // this stats handler, so there is nothing to count here.
+            ZokaMessage::OfferAnnounce(announce) => {
+                info!("Offer announce received: {}", announce.offer.id);
+            }
+            ZokaMessage::OfferStatusUpdate(update) => {
+                info!(
+                    "Offer status update received: {} -> {:?}",
+                    update.offer_id, update.status
+                );
+            }
         }
 
         let mut count = self.processed_count.write().await;

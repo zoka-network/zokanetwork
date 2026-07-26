@@ -67,6 +67,15 @@ pub enum ZokaMessage {
     UserQuery {
         username: String,
     },
+    /// Anuncio de una oferta ZKA → USDT.
+    ///
+    /// Viaja por su propio tópico gossipsub, no por el general: los nodos
+    /// viejos no conocen esta variante y la descartarían con un `warn!` por
+    /// cada oferta, llenando sus logs. Con tópico propio ni se suscriben.
+    OfferAnnounce(OfferAnnounceMessage),
+    /// Cambio de estado de una oferta ya anunciada (tomada, expirada,
+    /// cancelada, liberada).
+    OfferStatusUpdate(OfferStatusUpdateMessage),
     /// Respuesta de consulta (sin exponer metadata sensible)
     UserQueryResponse {
         username: String,
@@ -77,6 +86,38 @@ pub enum ZokaMessage {
         #[serde(default)]
         updated_at: u64,
     },
+}
+
+/// Anuncio de oferta ZKA → USDT.
+///
+/// El nodo receptor valida `offer` antes de retransmitir. La firma es del
+/// vendedor sobre el id de la oferta: sin ella cualquiera podría publicar
+/// ofertas a nombre ajeno o cancelar las de otro.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OfferAnnounceMessage {
+    pub offer: crate::p2p_exchange::Offer,
+    #[serde(default)]
+    pub signature: Vec<u8>,
+    pub timestamp: u64,
+}
+
+/// Cambio de estado de una oferta ya conocida.
+///
+/// Lleva solo el id y el estado nuevo en vez de la oferta entera: el receptor
+/// ya tiene el cuerpo del `OfferAnnounce`, y reenviarlo permitiría a un peer
+/// alterar montos o direcciones camuflados en una actualización de estado.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OfferStatusUpdateMessage {
+    pub offer_id: String,
+    pub seller_address: String,
+    pub status: crate::p2p_exchange::OfferStatus,
+    #[serde(default)]
+    pub claimed_by: Option<String>,
+    #[serde(default)]
+    pub claim_expires_at: Option<u64>,
+    #[serde(default)]
+    pub signature: Vec<u8>,
+    pub timestamp: u64,
 }
 
 /// Mensaje de transacción privada
@@ -397,6 +438,8 @@ impl ZokaMessage {
                 PbftNetworkMessage::ViewChange(inner) => inner.timestamp_ms,
                 PbftNetworkMessage::NewView(inner) => inner.timestamp_ms,
             },
+            ZokaMessage::OfferAnnounce(msg) => msg.timestamp,
+            ZokaMessage::OfferStatusUpdate(msg) => msg.timestamp,
             ZokaMessage::UserRegistry { .. } => 0,
             ZokaMessage::UserQuery { .. } => 0,
             ZokaMessage::UserQueryResponse { .. } => 0,
@@ -969,6 +1012,84 @@ mod tests {
             ZokaMessage::from_bytes(&bytes).unwrap(),
             ZokaMessage::Ping(_)
         ));
+    }
+
+    #[test]
+    fn offer_messages_survive_a_gossip_round_trip() {
+        use crate::p2p_exchange::{Offer, OfferStatus};
+
+        let announce = ZokaMessage::OfferAnnounce(OfferAnnounceMessage {
+            offer: Offer {
+                id: "offer-1".to_string(),
+                seller_address: "zka1seller".to_string(),
+                zka_atoms: 100 * crate::economics::ATOMS_PER_ZKA,
+                micro_usdt: 25_000_000,
+                usdt_receive_address: "TQ5NMqJjW8dWvJf3zJ8xYqL2mNpR4sT6uV".to_string(),
+                status: OfferStatus::Open,
+                created_at: 1_751_000_000,
+                claim_expires_at: None,
+                claimed_by: None,
+                reserved_note_ids: vec!["note-a".to_string()],
+            },
+            signature: vec![1, 2, 3],
+            timestamp: 1_751_000_000,
+        });
+
+        let bytes = announce.to_bytes().unwrap();
+        let restored = ZokaMessage::from_bytes(&bytes).unwrap();
+        match restored {
+            ZokaMessage::OfferAnnounce(msg) => {
+                assert_eq!(msg.offer.id, "offer-1");
+                assert_eq!(msg.offer.micro_usdt, 25_000_000);
+                assert_eq!(msg.offer.status, OfferStatus::Open);
+            }
+            other => panic!("expected OfferAnnounce, got {other:?}"),
+        }
+
+        let update = ZokaMessage::OfferStatusUpdate(OfferStatusUpdateMessage {
+            offer_id: "offer-1".to_string(),
+            seller_address: "zka1seller".to_string(),
+            status: OfferStatus::Claimed,
+            claimed_by: Some("zka1buyer".to_string()),
+            claim_expires_at: Some(1_751_002_700),
+            signature: vec![4, 5, 6],
+            timestamp: 1_751_000_100,
+        });
+
+        let bytes = update.to_bytes().unwrap();
+        match ZokaMessage::from_bytes(&bytes).unwrap() {
+            ZokaMessage::OfferStatusUpdate(msg) => {
+                assert_eq!(msg.status, OfferStatus::Claimed);
+                assert_eq!(msg.claimed_by.as_deref(), Some("zka1buyer"));
+            }
+            other => panic!("expected OfferStatusUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn offer_timestamps_are_reported_for_relay_ordering() {
+        use crate::p2p_exchange::{Offer, OfferStatus};
+
+        let msg = ZokaMessage::OfferAnnounce(OfferAnnounceMessage {
+            offer: Offer {
+                id: "offer-2".to_string(),
+                seller_address: "zka1seller".to_string(),
+                zka_atoms: 10 * crate::economics::ATOMS_PER_ZKA,
+                micro_usdt: 5_000_000,
+                usdt_receive_address: "TQ5NMqJjW8dWvJf3zJ8xYqL2mNpR4sT6uV".to_string(),
+                status: OfferStatus::Open,
+                created_at: 1_751_000_000,
+                claim_expires_at: None,
+                claimed_by: None,
+                reserved_note_ids: Vec::new(),
+            },
+            signature: Vec::new(),
+            timestamp: 1_751_000_555,
+        });
+
+        // Offers must not fall back to the zero timestamp used by messages
+        // that carry none, or relay ordering treats every offer as ancient.
+        assert_eq!(msg.timestamp(), 1_751_000_555);
     }
 
     #[test]
