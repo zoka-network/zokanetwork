@@ -18,6 +18,10 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod store;
+
+pub use store::{OfferStore, ReconcileReport, StoreError};
+
 /// Micro-USDT per USDT. TRC-20 USDT carries six decimals, so amounts are held
 /// as integers — a float would silently round prices and, worse, make two
 /// nodes disagree about whether a payment matched.
