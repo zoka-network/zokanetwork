@@ -234,6 +234,33 @@ impl Offer {
         }
     }
 
+    /// Canonical bytes a seller signs to authorise this offer.
+    ///
+    /// Built field by field with explicit separators rather than by serialising
+    /// the struct: JSON key order is not guaranteed, so signing the encoded
+    /// form would let two nodes derive different preimages for the same offer
+    /// and reject each other's valid signatures.
+    ///
+    /// Covers everything a forger would want to alter — amounts, the payout
+    /// address, and the seller's own identity. Mutable lifecycle fields
+    /// (`status`, `claimed_by`, `claim_expires_at`) are excluded: they change
+    /// legitimately after publication, so including them would invalidate the
+    /// signature the moment a buyer claimed.
+    pub fn signing_preimage(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"zoka:offer:v1\n");
+        out.extend_from_slice(self.id.as_bytes());
+        out.push(b'\n');
+        out.extend_from_slice(self.seller_address.as_bytes());
+        out.push(b'\n');
+        out.extend_from_slice(self.zka_atoms.to_be_bytes().as_slice());
+        out.extend_from_slice(self.micro_usdt.to_be_bytes().as_slice());
+        out.extend_from_slice(self.usdt_receive_address.as_bytes());
+        out.push(b'\n');
+        out.extend_from_slice(self.created_at.to_be_bytes().as_slice());
+        out
+    }
+
     /// Price expressed as micro-USDT per whole ZKA, for display and sorting.
     /// Returns `None` for a zero-amount offer rather than dividing by zero.
     pub fn micro_usdt_per_zka(&self) -> Option<u64> {
@@ -452,5 +479,64 @@ mod tests {
     #[test]
     fn the_claim_window_is_45_minutes() {
         assert_eq!(CLAIM_WINDOW_SECONDS, 2_700);
+    }
+
+    #[test]
+    fn the_signing_preimage_is_stable_for_the_same_offer() {
+        let offer = valid_offer();
+        assert_eq!(offer.signing_preimage(), offer.signing_preimage());
+    }
+
+    #[test]
+    fn changing_anything_a_forger_would_target_changes_the_preimage() {
+        let base = valid_offer().signing_preimage();
+
+        let mut cheaper = valid_offer();
+        cheaper.micro_usdt = 1_000_000;
+        assert_ne!(base, cheaper.signing_preimage(), "price must be signed");
+
+        let mut bigger = valid_offer();
+        bigger.zka_atoms += 1;
+        assert_ne!(base, bigger.signing_preimage(), "ZKA amount must be signed");
+
+        // The payout address is the field an attacker most wants to swap: it
+        // is where the buyer's USDT lands.
+        let mut redirected = valid_offer();
+        redirected.usdt_receive_address = "TXYZNMqJjW8dWvJf3zJ8xYqL2mNpR4sT6u".to_string();
+        assert_ne!(base, redirected.signing_preimage(), "payout address must be signed");
+
+        let mut impostor = valid_offer();
+        impostor.seller_address = "zka1someoneelse".to_string();
+        assert_ne!(base, impostor.signing_preimage(), "seller must be signed");
+    }
+
+    #[test]
+    fn lifecycle_changes_do_not_invalidate_the_signature() {
+        // A claim legitimately mutates status, buyer and deadline. Covering
+        // them would break the seller's signature the instant someone claimed.
+        let base = valid_offer().signing_preimage();
+
+        let mut claimed = valid_offer();
+        claimed.status = OfferStatus::Claimed;
+        claimed.claimed_by = Some("zka1buyer".to_string());
+        claimed.claim_expires_at = Some(1_751_002_700);
+
+        assert_eq!(base, claimed.signing_preimage());
+    }
+
+    #[test]
+    fn adjacent_fields_cannot_be_confused_by_shifting_bytes() {
+        // Without separators, moving a character between id and seller would
+        // produce the same byte run and let two different offers share a
+        // signature.
+        let mut a = valid_offer();
+        a.id = "ab".to_string();
+        a.seller_address = "cd".to_string();
+
+        let mut b = valid_offer();
+        b.id = "a".to_string();
+        b.seller_address = "bcd".to_string();
+
+        assert_ne!(a.signing_preimage(), b.signing_preimage());
     }
 }
