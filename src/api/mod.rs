@@ -1338,6 +1338,11 @@ pub struct AppState {
     /// libp2p so any connected miner can include it in the next block.
     /// `None` in tests / non-fullnode setups.
     pub private_tx_broadcaster: Option<PrivateTxBroadcastSender>,
+    /// Offers this node published or learned from peers. `None` on nodes that
+    /// run without the exchange (and in tests), which is what makes the
+    /// endpoints answer 404 — a client can then tell "this node does not do
+    /// exchange" apart from "there are no offers".
+    pub offer_store: Option<Arc<tokio::sync::Mutex<crate::p2p_exchange::OfferStore>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4517,6 +4522,137 @@ async fn get_mempool_metrics(State(app_state): State<Arc<AppState>>) -> Json<ser
 }
 
 /// Get a specific transaction from mempool by hash
+// ── P2P exchange ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateOfferRequest {
+    pub zka_atoms: u64,
+    pub micro_usdt: u64,
+    pub usdt_receive_address: String,
+    /// Seller's ZKA address. Optional so a node with a single wallet can fill
+    /// it in; rejected below when neither side supplies one.
+    #[serde(default)]
+    pub seller_address: String,
+}
+
+/// Resolves the offer store, or reports that this node has no exchange.
+///
+/// 404 rather than an empty list: a client must be able to tell "this node
+/// does not do exchange" from "nobody is offering anything", because the
+/// second is a claim about the network a user would act on.
+fn offer_store_or_404(
+    app_state: &Arc<AppState>,
+) -> Result<&Arc<tokio::sync::Mutex<crate::p2p_exchange::OfferStore>>, (StatusCode, String)> {
+    app_state.offer_store.as_ref().ok_or((
+        StatusCode::NOT_FOUND,
+        "this node does not run the P2P exchange".to_string(),
+    ))
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+async fn list_exchange_offers(
+    State(app_state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = offer_store_or_404(&app_state)?;
+    let mut guard = store.lock().await;
+    // Sweep lapsed claims before answering, so a caller never sees an offer
+    // advertised as claimable when its window has already closed.
+    let _ = guard.expire_due(now_secs());
+    let offers: Vec<_> = guard.open_offers().into_iter().cloned().collect();
+    Ok(Json(serde_json::json!({ "offers": offers })))
+}
+
+async fn create_exchange_offer(
+    State(app_state): State<Arc<AppState>>,
+    Json(req): Json<CreateOfferRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = offer_store_or_404(&app_state)?;
+    if req.seller_address.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "seller_address is required".to_string(),
+        ));
+    }
+
+    let now = now_secs();
+    let offer = crate::p2p_exchange::Offer {
+        id: format!("{}-{}", req.seller_address.trim(), now),
+        seller_address: req.seller_address.trim().to_string(),
+        zka_atoms: req.zka_atoms,
+        micro_usdt: req.micro_usdt,
+        usdt_receive_address: req.usdt_receive_address.trim().to_string(),
+        status: crate::p2p_exchange::OfferStatus::Open,
+        created_at: now,
+        claim_expires_at: None,
+        claimed_by: None,
+        // Reserving the seller's notes is wired with the wallet integration;
+        // until then an offer carries no lock and must not be presented as if
+        // it did.
+        reserved_note_ids: Vec::new(),
+    };
+
+    let mut guard = store.lock().await;
+    guard.insert_local(offer.clone()).map_err(|e| {
+        let message = match e {
+            crate::p2p_exchange::StoreError::Invalid(reason) => reason.to_string(),
+            crate::p2p_exchange::StoreError::TooManyOpenOffers => {
+                "you already have the maximum number of open offers".to_string()
+            }
+            crate::p2p_exchange::StoreError::DuplicateOfferId => {
+                "an offer with that id already exists".to_string()
+            }
+            other => format!("{other:?}"),
+        };
+        (StatusCode::BAD_REQUEST, message)
+    })?;
+
+    Ok(Json(serde_json::to_value(&offer).unwrap_or_default()))
+}
+
+async fn claim_exchange_offer(
+    State(app_state): State<Arc<AppState>>,
+    Path(offer_id): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = offer_store_or_404(&app_state)?;
+    let buyer = req
+        .get("buyer_address")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if buyer.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "buyer_address is required".to_string(),
+        ));
+    }
+
+    let mut guard = store.lock().await;
+    let now = now_secs();
+    let _ = guard.expire_due(now);
+    let claimed = guard.claim(&offer_id, &buyer, now).map_err(|e| match e {
+        crate::p2p_exchange::StoreError::UnknownOffer => {
+            (StatusCode::NOT_FOUND, "no such offer".to_string())
+        }
+        // Conflict, not a bad request: the caller did nothing wrong, someone
+        // else simply got there first.
+        crate::p2p_exchange::StoreError::NotClaimable => (
+            StatusCode::CONFLICT,
+            "this offer is no longer available".to_string(),
+        ),
+        other => (StatusCode::BAD_REQUEST, format!("{other:?}")),
+    })?;
+
+    Ok(Json(serde_json::to_value(&claimed).unwrap_or_default()))
+}
+
 async fn get_mempool_transaction(
     State(app_state): State<Arc<AppState>>,
     Path(hash): Path<String>,
@@ -5320,6 +5456,13 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         .route("/mempool/pending", get(get_mempool_pending))
         .route("/mempool/metrics", get(get_mempool_metrics))
         .route("/mempool/tx/:hash", get(get_mempool_transaction))
+        // One call per path: registering the same path twice panics Axum at
+        // startup with an overlapping-method route.
+        .route(
+            "/p2p-exchange/offers",
+            get(list_exchange_offers).post(create_exchange_offer),
+        )
+        .route("/p2p-exchange/offers/:id/claim", post(claim_exchange_offer))
         .route("/state/snapshot", post(create_snapshot))
         .route("/state/snapshots", get(list_snapshots))
         .route("/state/restore/:height", post(restore_snapshot))
@@ -5749,6 +5892,7 @@ pub async fn start_api_with_config_on_bind(
         pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
         private_wallet_manager: None,
         private_tx_broadcaster,
+        offer_store: None,
     });
 
     let listener = tokio::net::TcpListener::bind(&bind_addr)
@@ -5802,7 +5946,58 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         }
+    }
+
+    /// A node without the exchange must 404 rather than return an empty list.
+    ///
+    /// The two look alike to a caller but mean opposite things: "this node
+    /// cannot answer" versus "the network has nothing on offer". Only the
+    /// second is a fact about the network, and it is the one a user would act
+    /// on, so conflating them would have the client state something it never
+    /// checked.
+    #[tokio::test]
+    async fn exchange_endpoints_404_when_the_node_has_no_offer_store() {
+        let dir = format!("./test_db_exchange_absent_{}", std::process::id());
+        let app_state = Arc::new(test_app_state(&dir));
+        assert!(app_state.offer_store.is_none());
+
+        let result = list_exchange_offers(State(app_state)).await;
+        match result {
+            Err((status, _)) => assert_eq!(status, StatusCode::NOT_FOUND),
+            Ok(_) => panic!("a node without an offer store must not report offers"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn creating_an_offer_without_a_seller_is_rejected() {
+        let dir = format!("./test_db_exchange_seller_{}", std::process::id());
+        let mut state = test_app_state(&dir);
+        let store_path = std::env::temp_dir().join(format!("offers-{}.json", std::process::id()));
+        state.offer_store = Some(Arc::new(tokio::sync::Mutex::new(
+            crate::p2p_exchange::OfferStore::open(&store_path).unwrap(),
+        )));
+        let app_state = Arc::new(state);
+
+        let result = create_exchange_offer(
+            State(app_state),
+            Json(CreateOfferRequest {
+                zka_atoms: 100 * crate::economics::ATOMS_PER_ZKA,
+                micro_usdt: 25_000_000,
+                usdt_receive_address: "TQ5NMqJjW8dWvJf3zJ8xYqL2mNpR4sT6uV".to_string(),
+                seller_address: "   ".to_string(),
+            }),
+        )
+        .await;
+
+        match result {
+            Err((status, _)) => assert_eq!(status, StatusCode::BAD_REQUEST),
+            Ok(_) => panic!("an offer with no seller must not be stored"),
+        }
+        let _ = std::fs::remove_file(&store_path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5992,6 +6187,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         });
 
         let _router = create_router(state);
@@ -6023,6 +6219,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         });
 
         let root_resp = get_state_root(State(app_state.clone())).await;
@@ -6097,6 +6294,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         });
 
         let resp = get_block_by_height(State(app_state), Path(0)).await;
@@ -6137,6 +6335,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         });
 
         let resp = get_block_by_hash(State(app_state), Path(block_hash.clone())).await;
@@ -6183,6 +6382,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         });
 
         let resp = get_blocks_range(State(app_state), Path((1u64, 3u64))).await;
@@ -6230,6 +6430,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         });
 
         // Check initial height
@@ -7239,6 +7440,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         });
 
         let req = SubscribeRequest {
@@ -7275,6 +7477,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         });
 
         // First subscribe
@@ -7321,6 +7524,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         });
 
         // Add some connections
@@ -7360,6 +7564,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         });
 
         let req = SubscribeRequest {
@@ -7400,6 +7605,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         });
 
         let _router = create_router(app_state);
@@ -7427,6 +7633,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         });
 
         let req = PbftStartRequest {
@@ -7469,6 +7676,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         });
 
         // First start consensus
@@ -7513,6 +7721,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         });
 
         // First start consensus
@@ -7581,6 +7790,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         });
 
         // First start consensus
@@ -7672,6 +7882,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         });
 
         let req = PbftMessageRequest {
@@ -7710,6 +7921,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         });
 
         let req = PbftMessageRequest {
@@ -7746,6 +7958,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         });
 
         let req = PbftStartRequest {
@@ -7779,6 +7992,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         });
 
         let resp =
@@ -7809,6 +8023,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         });
 
         // Create snapshot first
@@ -7846,6 +8061,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         });
 
         let filter = AdvancedEventFilter {
@@ -7888,6 +8104,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         });
 
         let resp = list_profiles(State(app_state)).await;
@@ -7922,6 +8139,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         });
 
         let res = get_private_tx_by_hash(State(app_state), Path("deadbeef".to_string())).await;
@@ -7954,6 +8172,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         });
 
         let req = ProfileManagementRequest {
@@ -7978,6 +8197,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
+            offer_store: None,
         })))
         .await
         .unwrap();
