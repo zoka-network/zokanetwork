@@ -78,6 +78,15 @@ pub enum ZokaMessage {
     OfferStatusUpdate(OfferStatusUpdateMessage),
     /// Public evidence of a paid trade the seller did not release.
     OfferPaymentFailure(crate::p2p_exchange::PaymentFailureReport),
+    /// Heartbeat and discovery record for a non-custodial mining team.
+    TeamAdvertise(crate::team_mining::TeamAdvertise),
+    /// A member asks to join or leave a discovered team.
+    TeamJoin(crate::team_mining::TeamMembership),
+    /// Partial or full PoW solution submitted to the team's coordinator.
+    ShareSubmit(crate::team_mining::SubmittedShare),
+    /// Authoritative membership, share counters, payout turn and candidate
+    /// template. The backup persists this so failover does not erase work.
+    TurnUpdate(crate::team_mining::TeamTurnUpdate),
     /// Respuesta de consulta (sin exponer metadata sensible)
     UserQueryResponse {
         username: String,
@@ -443,6 +452,10 @@ impl ZokaMessage {
             ZokaMessage::OfferAnnounce(msg) => msg.timestamp,
             ZokaMessage::OfferStatusUpdate(msg) => msg.timestamp,
             ZokaMessage::OfferPaymentFailure(report) => report.timestamp,
+            ZokaMessage::TeamAdvertise(message) => message.timestamp,
+            ZokaMessage::TeamJoin(message) => message.timestamp,
+            ZokaMessage::ShareSubmit(message) => message.timestamp,
+            ZokaMessage::TurnUpdate(message) => message.timestamp,
             ZokaMessage::UserRegistry { .. } => 0,
             ZokaMessage::UserQuery { .. } => 0,
             ZokaMessage::UserQueryResponse { .. } => 0,

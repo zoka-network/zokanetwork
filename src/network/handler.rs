@@ -165,6 +165,30 @@ impl MessageHandler for DefaultMessageHandler {
                     report.offer_id, report.tron_tx_hash
                 );
             }
+            ZokaMessage::TeamAdvertise(advertisement) => {
+                info!(
+                    "Mining team advertised: {} ({} members)",
+                    advertisement.team_id, advertisement.member_count
+                );
+            }
+            ZokaMessage::TeamJoin(membership) => {
+                info!(
+                    "Mining team membership request: {} {:?}",
+                    membership.team_id, membership.action
+                );
+            }
+            ZokaMessage::ShareSubmit(share) => {
+                info!(
+                    "Mining share submitted: {} by {}",
+                    share.template_id, share.miner_address
+                );
+            }
+            ZokaMessage::TurnUpdate(update) => {
+                info!(
+                    "Mining team turn update: {} epoch {}",
+                    update.state.team_id, update.state.epoch
+                );
+            }
         }
 
         let mut count = self.processed_count.write().await;

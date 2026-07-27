@@ -19,6 +19,7 @@ pub mod private_wallet;
 pub mod snapshot;
 pub mod state;
 pub mod storage;
+pub mod team_mining;
 pub mod transaction;
 pub mod types;
 pub mod wallet;
