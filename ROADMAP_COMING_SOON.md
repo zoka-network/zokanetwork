@@ -20,7 +20,7 @@ Este documento es el estado de verdad del trabajo. **Leelo entero antes de tocar
 | **Etapa 0** (limpieza de UI) | ✅ Completa, mergeada y pusheada a `main` de `zsilent-core`. |
 | **Etapa 1** (Explorer) | ✅ Completa, **verificada contra nodo real** (mainnet, altura 12943). |
 | **Etapa 2** (P2P Exchange) | 🔶 ~97%. Backend en `etapa2-p2p-reservation-integration` y UI en `zsilent-core:etapa2-p2p-ui-integration`. 73 tests de `p2p_exchange::` y 28 tests de ZSilent en verde; implementación y gate completos, falta pase visual y prueba real. |
-| **Etapa 3** (Mining Pool) | 🔶 Backend funcional en `etapa2-p2p-reservation-integration` (`d5486db9`, `cab6023d`, `d290328`, `344989b`): protocolo, worker, rotación, hijack y failover. 12 tests de dominio + tests dirigidos del worker/coinbase/fees en verde; falta UI y prueba real con dos nodos. |
+| **Etapa 3** (Mining Pool) | 🔶 Implementación backend y UI completa. Backend en `etapa2-p2p-reservation-integration` (`d5486db9`, `cab6023d`, `d290328`, `344989b`); UI en `zsilent-core:etapa2-p2p-ui-integration` (`d78adbb`, `ac2f855`). 12 tests de dominio + tests dirigidos del worker/coinbase/fees y 32 tests de ZSilent en verde; faltan pase visual y prueba real con dos nodos. |
 
 ### Por dónde seguir, en este orden
 
@@ -47,7 +47,9 @@ Este documento es el estado de verdad del trabajo. **Leelo entero antes de tocar
    implementados. Verificado con 12 tests de `team_mining::`, tests dirigidos del worker,
    coinbase privada remota y fee claims, más `cargo check --bin zoka --no-default-features`.
    **No se verificó todavía contra dos nodos reales ni con RandomX mainnet.**
-6. Implementar §3.6 en ZSilent, ejecutar los tests de UI y hacer el pase visual conjunto.
+6. ~~Implementar §3.6 en ZSilent y ejecutar los tests de UI.~~ ✅ Cliente RPC, opt-in
+   persistido y pantalla operativa completos; `gradlew test` pasó 32/32. **Falta el pase
+   visual conjunto; la suite no verifica render ni interacción real con dos nodos.**
 7. Release conjunto y pruebas reales pendientes: P2P Exchange con monto mínimo/Tron mainnet y
    Team Mining con dos nodos. No confundir esos pendientes con “Node too old” del binario viejo.
 
@@ -67,7 +69,10 @@ Este documento es el estado de verdad del trabajo. **Leelo entero antes de tocar
 
 - El binario en `target/release` es del **23/7** y **no** tiene los endpoints
   `/p2p-exchange/*`. Por eso la pantalla de P2P dice "Node too old". Hay que recompilar
-  (`cargo build --release`) y reiniciar el nodo.
+  (`cargo build --release`) y reiniciar el nodo. Confirmado nuevamente el 2026-07-26:
+  `/p2p-exchange/status` y `/team-mining/status` devolvieron 404 mientras
+  `/blocks/latest` respondió 200 en altura 12952; es el binario viejo esperado, no un bug
+  de las pantallas nuevas.
 - **El nodo del usuario corre en `127.0.0.1:3000`.** Los endpoints del explorer son de solo
   lectura: **no hace falta contraseña** para verificar contra él.
 - `cargo test --lib` completo (860+ tests) **excede 10 minutos**. Filtrá:
@@ -161,6 +166,7 @@ Este documento es el estado de verdad del trabajo. **Leelo entero antes de tocar
 | Reparto de fees | El miembro asignado recibe tanto el coinbase como los fee claims privados del bloque. El scanner de wallet recupera ambos; el coordinador no cobra una comisión implícita. |
 | Exclusión con minería solo | Activar Team Mining suspende el worker de minería solitaria del mismo fullnode para no duplicar CPU ni competir con el template del equipo. |
 | Leave | Un leave aceptado borra el estado local de equipo y apaga el worker. El coordinador no puede irse sin handoff; debe entrar el failover. |
+| Consentimiento de Team Mining | El opt-in de la sección se persiste por separado. La pantalla mantiene visibles los riesgos y exige un acknowledgement local antes de crear o unirse a un equipo; no se envía ni se comparte por gossip. |
 
 ---
 
@@ -633,7 +639,7 @@ test dirigido `team_share_worker_solves_the_exact_coordinator_template`.
       rotación converja a proporcional en el tiempo.
 - [x] Al confirmarse un bloque del equipo, descontar lo cobrado del saldo de turnos de ese
       miembro.
-- [ ] Comunicar en la UI que el reparto es **estadístico**: a corto plazo es desparejo, converge
+- [x] Comunicar en la UI que el reparto es **estadístico**: a corto plazo es desparejo, converge
       con el tiempo.
 
 Una solución de red ya encontrada no salta validaciones: el coordinador recomputa hash/template,
@@ -649,7 +655,7 @@ bloque de Team Mining entre dos nodos reales ni con RandomX mainnet.**
 - [x] Al confirmarse un bloque encontrado por el equipo, verificar que el receptor del coinbase
       sea el que el coordinador había asignado.
 - [x] Si no coincide: marcar al miembro y expulsarlo del equipo.
-- [ ] Dejar claro en la UI, al unirse, que esto es detectable pero **no impedible** a nivel
+- [x] Dejar claro en la UI, al unirse, que esto es detectable pero **no impedible** a nivel
       protocolo — un bloque válido que te paga a vos es válido para toda la red. El modelo asume
       equipos entre conocidos.
 
@@ -674,12 +680,21 @@ de un coordinador en una red de dos nodos**.
 
 ### 3.6 UI
 
-- [ ] Reemplazar `MiningPoolScreen()`.
-- [ ] Toggle "team mining" (off por defecto).
-- [ ] Código de invitación, miembros activos, hashrate combinado.
-- [ ] Shares propias vs. del equipo, y turno estimado para cobrar.
-- [ ] Reusar el lenguaje visual de las `StatusCard` de la minería solitaria.
-- [ ] Flag opt-in en Settings + release conjunto.
+- [x] Reemplazar `MiningPoolScreen()`.
+- [x] Toggle "team mining" (off por defecto).
+- [x] Código de invitación, miembros activos, hashrate combinado.
+- [x] Shares propias vs. del equipo, y turno estimado para cobrar.
+- [x] Reusar el lenguaje visual de las `StatusCard` de la minería solitaria.
+- [x] Flag opt-in en Settings.
+- [ ] Release conjunto, pase visual y prueba real con dos nodos.
+
+La pantalla consulta exclusivamente el RPC local cada 5 s y distingue nodo apagado, endpoint
+ausente y error de transporte; un 404 del binario viejo se muestra como actualización requerida,
+no como equipo vacío. Crear/unirse exige aceptar el disclosure de payouts estadísticos y hijack;
+iniciar/detener, potencia, membresía, templates, shares y turnos usan el estado real del nodo.
+Implementado en `zsilent-core:etapa2-p2p-ui-integration` (`d78adbb`, `ac2f855`).
+`gradlew test` pasó 32/32, incluido decoding de payloads Rust y persistencia/upgrade del opt-in.
+**No se levantó la app para verificar render/interacciones y no se conectó a dos nodos reales.**
 
 ---
 
