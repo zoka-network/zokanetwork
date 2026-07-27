@@ -19,8 +19,10 @@
 use serde::{Deserialize, Serialize};
 
 pub mod store;
+pub mod tron;
 
 pub use store::{OfferStore, ReconcileReport, StoreError};
+pub use tron::{TronConfig, TronTransfer};
 
 /// Generates an offer id: 128 random bits, hex encoded.
 ///
