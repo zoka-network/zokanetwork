@@ -9,6 +9,66 @@ Orden de ejecución: **Etapa 0 (limpieza) → Explorer → P2P Exchange → Mini
 
 ---
 
+## LEEME PRIMERO — handoff
+
+Este documento es el estado de verdad del trabajo. **Leelo entero antes de tocar código.**
+
+### Dónde está todo
+
+| Qué | Estado |
+| --- | --- |
+| **Etapa 0** (limpieza de UI) | ✅ Completa, mergeada y pusheada a `main` de `zsilent-core`. |
+| **Etapa 1** (Explorer) | ✅ Completa, **verificada contra nodo real** (mainnet, altura 12943). |
+| **Etapa 2** (P2P Exchange) | 🔶 ~70%. Rama `etapa2-p2p-exchange` del repo ZOKA, pusheada. 66 tests de `p2p_exchange::` en verde. |
+| **Etapa 3** (Mining Pool) | ⬜ Solo UI. El backend está entero por delante. |
+
+### Por dónde seguir, en este orden
+
+1. **Enchufar `select_notes` a `create_exchange_offer`** (`src/api/mod.rs`) y marcar las notas
+   reservadas en la wallet. La lógica ya existe y está testeada en
+   `src/p2p_exchange/reservation.rs` — es conectar, no diseñar. Cierra el agujero de ofertas
+   sin respaldo: hoy las ofertas se crean con `reserved_note_ids` vacío.
+2. **Cliente HTTP de Tron** que use `tron::trc20_transfers_path` **por el proxy SOCKS** y
+   aplique `tron::transfer_settles_offer`. Las reglas están completas; falta el transporte.
+3. **§2.6** presencia del vendedor y **§2.7** liberación automática + reputación.
+4. **§2.8** revisión de seguridad — gate obligatorio antes de habilitarlo a usuarios reales.
+5. Pase visual sobre las 3 secciones, y recién ahí la Etapa 3.
+
+### Reglas de trabajo
+
+- **Las decisiones de la sección "Decisiones cerradas" no se reabren.** Son 32, varias
+  involucran fondos reales y costaron pensarlas. Si algo parece mal, decilo — no lo cambies
+  por tu cuenta.
+- **Andá tachando y anotando acá a medida que avanzás.** Marcá `- [x]` lo que completes,
+  agregá qué encontraste, y **si tomás una decisión nueva, escribila en la tabla**. Este
+  archivo es lo único que sobrevive entre sesiones: lo que no esté acá, se pierde.
+- **Si algo no se verificó, decilo.** "Compila" y "funciona" no son lo mismo. En este
+  documento cada ✅ significa que se probó, no que se escribió.
+- **Rama nueva + commit por subetapa.** No mergear a `main` sin aprobación del usuario.
+
+### Gotchas que te van a hacer perder tiempo
+
+- El binario en `target/release` es del **23/7** y **no** tiene los endpoints
+  `/p2p-exchange/*`. Por eso la pantalla de P2P dice "Node too old". Hay que recompilar
+  (`cargo build --release`) y reiniciar el nodo.
+- **El nodo del usuario corre en `127.0.0.1:3000`.** Los endpoints del explorer son de solo
+  lectura: **no hace falta contraseña** para verificar contra él.
+- `cargo test --lib` completo (860+ tests) **excede 10 minutos**. Filtrá:
+  `cargo test --lib p2p_exchange::`.
+- Los guardarraíles `deny` (`rm -rf`, `git reset --hard`, `git push --force`) viven en
+  `.claude/settings.json` y **solo aplican a Claude Code**. Otras herramientas no los respetan.
+
+### Deudas conocidas — no son olvidos
+
+- La firma de gossipsub autentica el **nodo**, no la **wallet**: alguien puede publicar una
+  oferta con la `zka1` de otro. Aceptado para v1; `Offer::signing_preimage()` ya está listo
+  para atarlo cuando se cierre.
+- **Nada de P2P Exchange ni Mining Pool se probó contra un nodo real.** Solo el Explorer.
+- El lock de ZKA es contabilidad de wallet, **no un escrow on-chain**. Un cliente modificado
+  puede gastar una nota "reservada". Es inherente al diseño v1 y está avisado en la UI.
+
+---
+
 ## Decisiones cerradas (no reabrir)
 
 ### Transversales
