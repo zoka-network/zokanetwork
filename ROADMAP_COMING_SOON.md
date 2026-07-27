@@ -129,10 +129,19 @@ que es lo que parcheó `b697e0f`).
 
 ---
 
-## Etapa 1 — Explorer ✅ COMPLETADA (código)
+## Etapa 1 — Explorer ✅ COMPLETADA Y VERIFICADA
 
-Mergeada a `main` (`c0281cf`), **sin pushear**. 19 tests en verde. Falta verificación contra
-un nodo real (ver 1.6).
+Mergeada y pusheada a `main`. Tests en verde.
+
+**Verificado contra nodo real (2026-07-26, mainnet altura 12943):** los modelos coinciden
+campo por campo. Genesis efectivamente sirve `difficulty_bits: null` — el tipo nullable era
+necesario, no defensivo, porque `0` es lo primero que cualquiera busca. Altura fuera de rango
+da 404 → "no encontrado"; `/p2p-exchange/offers` da 404 en el binario viejo → "Node too old"
+en vez de afirmar que no hay ofertas.
+
+Esa corrida encontró dos errores de fixture que **ningún test unitario podía detectar**
+(ambos decodifican igual): `reward_zka_display` es `"12"` pelado, no `"12.00000000 ZKA"`, y
+la recompensa son 12_000_000 atoms, no 1_200_000_000. Ya corregidos.
 
 ### 1.1 Extender `ZokaRpcClient` ✅
 
