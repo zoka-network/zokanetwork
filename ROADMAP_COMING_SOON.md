@@ -20,7 +20,7 @@ Este documento es el estado de verdad del trabajo. **Leelo entero antes de tocar
 | **Etapa 0** (limpieza de UI) | ✅ Completa, mergeada y pusheada a `main` de `zsilent-core`. |
 | **Etapa 1** (Explorer) | ✅ Completa, **verificada contra nodo real** (mainnet, altura 12943). |
 | **Etapa 2** (P2P Exchange) | 🔶 ~97%. Backend en `etapa2-p2p-reservation-integration` y UI en `zsilent-core:etapa2-p2p-ui-integration`. 73 tests de `p2p_exchange::` y 28 tests de ZSilent en verde; implementación y gate completos, falta pase visual y prueba real. |
-| **Etapa 3** (Mining Pool) | ⬜ Solo UI. El backend está entero por delante. |
+| **Etapa 3** (Mining Pool) | 🔶 Backend funcional en `etapa2-p2p-reservation-integration` (`d5486db9`, `cab6023d`, `d290328`, `344989b`): protocolo, worker, rotación, hijack y failover. 12 tests de dominio + tests dirigidos del worker/coinbase/fees en verde; falta UI y prueba real con dos nodos. |
 
 ### Por dónde seguir, en este orden
 
@@ -42,7 +42,14 @@ Este documento es el estado de verdad del trabajo. **Leelo entero antes de tocar
    reales.~~ ✅ Backend y UI revisados: recuperación/rebroadcast durable, expiración segura,
    aceptación autoritativa del claim, binding de wallet, consentimiento persistido y denuncia
    con disclosure explícito. **Falta ejecutar el flujo real de monto mínimo.**
-5. Pase visual sobre Explorer y P2P Exchange, y después implementar la Etapa 3.
+5. ~~Implementar el backend de **Etapa 3** (§3.1–§3.5).~~ ✅ Modelo, gossip dedicado,
+   worker de shares, bloque real con coinbase rotativo, detección/expulsión y failover
+   implementados. Verificado con 12 tests de `team_mining::`, tests dirigidos del worker,
+   coinbase privada remota y fee claims, más `cargo check --bin zoka --no-default-features`.
+   **No se verificó todavía contra dos nodos reales ni con RandomX mainnet.**
+6. Implementar §3.6 en ZSilent, ejecutar los tests de UI y hacer el pase visual conjunto.
+7. Release conjunto y pruebas reales pendientes: P2P Exchange con monto mínimo/Tron mainnet y
+   Team Mining con dos nodos. No confundir esos pendientes con “Node too old” del binario viejo.
 
 ### Reglas de trabajo
 
@@ -73,7 +80,10 @@ Este documento es el estado de verdad del trabajo. **Leelo entero antes de tocar
 - La firma de gossipsub autentica el **nodo**, no la **wallet**: alguien puede publicar una
   oferta con la `zka1` de otro. Aceptado para v1; `Offer::signing_preimage()` ya está listo
   para atarlo cuando se cierre.
-- **Nada de P2P Exchange ni Mining Pool se probó contra un nodo real.** Solo el Explorer.
+- **Nada de P2P Exchange ni Mining Pool se probó contra dos nodos reales.** Solo el Explorer
+  tuvo verificación real. En Team Mining el bloque completo todavía se verificó por piezas
+  (dominio, PoW, coinbase/fees y compilación del ensamblador), no mediante una sesión distribuida
+  ni RandomX mainnet.
 - El lock de ZKA es contabilidad de wallet, **no un escrow on-chain**. Un cliente modificado
   puede gastar una nota "reservada". Es inherente al diseño v1 y está avisado en la UI.
 - ✅ **Bloqueante de release resuelto en §2.8:** la wallet cifrada funciona como journal de la
@@ -138,6 +148,19 @@ Este documento es el estado de verdad del trabajo. **Leelo entero antes de tocar
 | Dificultad de shares | Automática, ajustada al hashrate de cada minero. |
 | Comisión | Ninguna. |
 | Tamaño de equipo | Sin límite duro en v1. |
+
+### Decisiones nuevas 2026-07-26 (implementación de Team Mining)
+
+| Tema | Decisión |
+| --- | --- |
+| Transporte | Tópico gossipsub separado `zoka/team-mining/v1` con `TeamAdvertise`, `TeamJoin`, `ShareSubmit` y `TurnUpdate`. No se reutiliza `/mining/*` ni el tópico general. La firma sigue siendo la identidad del nodo; el binding wallet↔PeerId se aprende al unirse. |
+| Identidad de equipo | `team_id` aleatorio de 128 bits. Invitación autocontenida `ZTM1-<team_id>-<checksum>`; no agrega infraestructura de identidad. |
+| Respaldo | El primer miembro aceptado queda como respaldo. Tras 90 s sin coordinador se promociona, incrementa `epoch`, deja inactivo al coordinador anterior y elige el siguiente respaldo determinísticamente. |
+| Estado autoritativo | El coordinador transfiere el `TeamState` completo (contadores, template y replay journal) al respaldo. Cada mutación lleva `revision` monotónica; un update firmado pero atrasado no puede hacer rollback de shares. |
+| Cadencia de shares | Objetivo de una share cada 15 s por miembro, ajuste cada 8 shares e inicio en `network_difficulty - 8` (mínimo 1). |
+| Reparto de fees | El miembro asignado recibe tanto el coinbase como los fee claims privados del bloque. El scanner de wallet recupera ambos; el coordinador no cobra una comisión implícita. |
+| Exclusión con minería solo | Activar Team Mining suspende el worker de minería solitaria del mismo fullnode para no duplicar CPU ni competir con el template del equipo. |
+| Leave | Un leave aceptado borra el estado local de equipo y apaga el worker. El coordinador no puede irse sin handoff; debe entrar el failover. |
 
 ---
 
@@ -574,50 +597,80 @@ encontrar un bloque que le paga a otro y reescribirlo para cobrarlo él. Ver §3
 
 ### 3.1 Modelo de equipo
 
-- [ ] Estructura: `team_id`, miembros (address de cada uno), coordinador actual, coordinador de
+- [x] Estructura: `team_id`, miembros (address de cada uno), coordinador actual, coordinador de
       respaldo.
-- [ ] Invitación por código de equipo. Sin infraestructura de identidad nueva.
-- [ ] Sin límite duro de tamaño en v1.
-- [ ] Confirmar que no se toca el consenso: `validate_coinbase_shape` /
+- [x] Invitación por código de equipo. Sin infraestructura de identidad nueva.
+- [x] Sin límite duro de tamaño en v1.
+- [x] Confirmar que no se toca el consenso: `validate_coinbase_shape` /
       `validate_coinbase_amount` (`src/state/chain.rs`) siguen exigiendo un receptor único —
       la rotación respeta eso por diseño.
 
+Implementado en `src/team_mining/mod.rs` y expuesto por
+`/team-mining/{status,team,join,leave,start,stop}`. El runtime persiste en
+`<network-dir>/team_mining/team.json`. La validación de coinbase real vive hoy en
+`src/mining/block_validator.rs` (la referencia original a `src/state/chain.rs` era conceptual);
+no se cambió ninguna regla de consenso.
+
 ### 3.2 Protocolo de shares
 
-- [ ] Endpoint nuevo para enviar soluciones parciales al coordinador. No hay nada reutilizable
+- [x] Endpoint nuevo para enviar soluciones parciales al coordinador. No hay nada reutilizable
       de `/mining/*` (es solo para minería solitaria).
-- [ ] Dificultad de share **automática por minero**, ajustada a su hashrate para un ritmo parejo
+- [x] Dificultad de share **automática por minero**, ajustada a su hashrate para un ritmo parejo
       de envío. Un minero débil tiene que poder aportar; uno fuerte no debe saturar.
-- [ ] Validar las shares recalculando contra el header candidato: un miembro no puede inflar su
+- [x] Validar las shares recalculando contra el header candidato: un miembro no puede inflar su
       aporte con shares falsas.
+
+El “endpoint” distribuido quedó como mensaje `ShareSubmit` en el tópico dedicado, no como HTTP
+central. Cada fullnode corre un worker `spawn_blocking`, cancela templates stale/stop y el
+coordinador recalcula el PoW exacto antes de acreditar. Verificado con 12 tests de dominio y el
+test dirigido `team_share_worker_solves_the_exact_coordinator_template`.
 
 ### 3.3 Rotación del coinbase
 
-- [ ] El coordinador arma cada template asignando el receptor según quién acumuló más shares sin
+- [x] El coordinador arma cada template asignando el receptor según quién acumuló más shares sin
       cobrar todavía.
-- [ ] Llevar la cuenta de lo aportado vs. lo efectivamente cobrado por cada miembro, para que la
+- [x] Llevar la cuenta de lo aportado vs. lo efectivamente cobrado por cada miembro, para que la
       rotación converja a proporcional en el tiempo.
-- [ ] Al confirmarse un bloque del equipo, descontar lo cobrado del saldo de turnos de ese
+- [x] Al confirmarse un bloque del equipo, descontar lo cobrado del saldo de turnos de ese
       miembro.
 - [ ] Comunicar en la UI que el reparto es **estadístico**: a corto plazo es desparejo, converge
       con el tiempo.
 
+Una solución de red ya encontrada no salta validaciones: el coordinador recomputa hash/template,
+reutiliza `run_mining_batch_with_progress`, pasa por `validate_pow_block` y
+`state::chain::apply_block`, y recién entonces avanza el turno. La coinbase privada se construye
+para una wallet remota sin cargar sus claves; el test prueba que solo el destinatario puede
+reclamarla. Los fee claims privados siguen el mismo turno y el scanner evita duplicados.
+**El ensamblado completo compila y sus piezas están testeadas, pero todavía no se ejecutó un
+bloque de Team Mining entre dos nodos reales ni con RandomX mainnet.**
+
 ### 3.4 Detección de bloques hijackeados
 
-- [ ] Al confirmarse un bloque encontrado por el equipo, verificar que el receptor del coinbase
+- [x] Al confirmarse un bloque encontrado por el equipo, verificar que el receptor del coinbase
       sea el que el coordinador había asignado.
-- [ ] Si no coincide: marcar al miembro y expulsarlo del equipo.
+- [x] Si no coincide: marcar al miembro y expulsarlo del equipo.
 - [ ] Dejar claro en la UI, al unirse, que esto es detectable pero **no impedible** a nivel
       protocolo — un bloque válido que te paga a vos es válido para toda la red. El modelo asume
       equipos entre conocidos.
 
+La comprobación corre tanto para el bloque ensamblado localmente como para un `BlockResponse`
+que acaba de quedar canónico. Si el source firmado está ligado a un miembro, queda inactivo y
+expulsado. Verificado por `coordinator_expels_source_bound_member_after_coinbase_hijack`.
+Límite v1: si el source no puede atribuirse a un miembro conocido se registra el hijack, pero no
+se adivina un culpable.
+
 ### 3.5 Coordinador de respaldo
 
-- [ ] Designar un miembro de respaldo al formar el equipo.
-- [ ] Si el coordinador se cae, el respaldo toma el rol automáticamente.
-- [ ] Transferir el estado de shares al respaldo para que nadie pierda lo aportado.
-- [ ] Sin riesgo de custodia agregado: no hay clave de equipo que compartir, solo el rol de
+- [x] Designar un miembro de respaldo al formar el equipo.
+- [x] Si el coordinador se cae, el respaldo toma el rol automáticamente.
+- [x] Transferir el estado de shares al respaldo para que nadie pierda lo aportado.
+- [x] Sin riesgo de custodia agregado: no hay clave de equipo que compartir, solo el rol de
       coordinación.
+
+Heartbeat 30 s, TTL 90 s y promoción por `epoch`. El full-state transfer incluye contadores,
+replay ids y template; `revision` impide que gossip firmado fuera de orden restaure un estado
+viejo. Verificado en tests de promoción, transferencia y anti-rollback; **no mediante caída real
+de un coordinador en una red de dos nodos**.
 
 ### 3.6 UI
 
