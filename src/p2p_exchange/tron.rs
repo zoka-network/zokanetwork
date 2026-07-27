@@ -310,12 +310,26 @@ impl TronClient {
 }
 
 impl TronConfig {
+    /// Builds config from environment, honoring `ZOKA_TRON_NETWORK` first so
+    /// `base_url` can default to *that* network's endpoint rather than always
+    /// mainnet's. Reading them in the other order would default `base_url` to
+    /// mainnet, then quietly attach it to a Nile-selected config — the exact
+    /// mismatch [`TronNetwork`] exists to make impossible.
     pub fn from_env(socks_proxy: Option<String>) -> Self {
+        let network = std::env::var("ZOKA_TRON_NETWORK")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .and_then(|value| match value.as_str() {
+                "mainnet" | "" => Some(TronNetwork::Mainnet),
+                "nile" | "testnet" => Some(TronNetwork::Nile),
+                _ => None,
+            })
+            .unwrap_or_default();
         let base_url = std::env::var("ZOKA_TRON_API_URL")
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| DEFAULT_TRONGRID_URL.to_string());
+            .unwrap_or_else(|| network.default_url().to_string());
         let fallback_urls = std::env::var("ZOKA_TRON_FALLBACK_URLS")
             .ok()
             .into_iter()
@@ -333,7 +347,7 @@ impl TronConfig {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         Self {
-            network: TronNetwork::default(),
+            network,
             base_url,
             fallback_urls,
             api_key,
@@ -741,6 +755,85 @@ mod tests {
         let mainnet = trc20_transfers_path(PAYOUT, 50, TronNetwork::Mainnet);
         assert!(mainnet.contains(USDT_TRC20_CONTRACT));
         assert!(!mainnet.contains(USDT_TRC20_CONTRACT_NILE));
+    }
+
+    // Guards ZOKA_TRON_* env vars: Rust runs tests in parallel threads within
+    // one process, and two tests racing to set/clear the same var would read
+    // each other's values. A poisoned lock (a prior test panicking mid-test)
+    // must not cascade into every later env test failing for an unrelated
+    // reason, hence `.unwrap_or_else(|p| p.into_inner())`.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_clean_tron_env<R>(f: impl FnOnce() -> R) -> R {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        for var in ["ZOKA_TRON_NETWORK", "ZOKA_TRON_API_URL", "ZOKA_TRON_FALLBACK_URLS", "ZOKA_TRON_API_KEY"] {
+            std::env::remove_var(var);
+        }
+        let result = f();
+        for var in ["ZOKA_TRON_NETWORK", "ZOKA_TRON_API_URL", "ZOKA_TRON_FALLBACK_URLS", "ZOKA_TRON_API_KEY"] {
+            std::env::remove_var(var);
+        }
+        result
+    }
+
+    #[test]
+    fn from_env_defaults_to_mainnet_with_no_env_set() {
+        with_clean_tron_env(|| {
+            let config = TronConfig::from_env(None);
+            assert_eq!(config.network, TronNetwork::Mainnet);
+            assert_eq!(config.base_url, DEFAULT_TRONGRID_URL);
+            assert_eq!(config.usdt_contract(), USDT_TRC20_CONTRACT);
+        });
+    }
+
+    #[test]
+    fn zoka_tron_network_nile_selects_niles_own_endpoint_and_contract() {
+        // The bug this closes: base_url defaulted to mainnet's regardless of
+        // which network was selected, so a Nile-selected config could end up
+        // querying mainnet's endpoint with Nile's contract, or vice versa —
+        // exactly the mismatch that makes every honest payment invisible.
+        with_clean_tron_env(|| {
+            std::env::set_var("ZOKA_TRON_NETWORK", "nile");
+            let config = TronConfig::from_env(None);
+            assert_eq!(config.network, TronNetwork::Nile);
+            assert_eq!(config.base_url, NILE_TRONGRID_URL);
+            assert_eq!(config.usdt_contract(), USDT_TRC20_CONTRACT_NILE);
+        });
+    }
+
+    #[test]
+    fn zoka_tron_network_is_case_insensitive_and_accepts_testnet_as_an_alias() {
+        with_clean_tron_env(|| {
+            std::env::set_var("ZOKA_TRON_NETWORK", "NILE");
+            assert_eq!(TronConfig::from_env(None).network, TronNetwork::Nile);
+        });
+        with_clean_tron_env(|| {
+            std::env::set_var("ZOKA_TRON_NETWORK", "testnet");
+            assert_eq!(TronConfig::from_env(None).network, TronNetwork::Nile);
+        });
+    }
+
+    #[test]
+    fn an_unrecognised_network_value_falls_back_to_mainnet_rather_than_erroring() {
+        // A typo here must not silently verify against testnet money; it must
+        // fail toward the safer, real-funds-aware default.
+        with_clean_tron_env(|| {
+            std::env::set_var("ZOKA_TRON_NETWORK", "nilee");
+            assert_eq!(TronConfig::from_env(None).network, TronNetwork::Mainnet);
+        });
+    }
+
+    #[test]
+    fn an_explicit_api_url_overrides_the_networks_default_without_changing_the_contract() {
+        // Operators pointing at a self-hosted or alternate TronGrid-compatible
+        // endpoint must not accidentally switch which token counts as USDT.
+        with_clean_tron_env(|| {
+            std::env::set_var("ZOKA_TRON_NETWORK", "nile");
+            std::env::set_var("ZOKA_TRON_API_URL", "https://my-nile-mirror.example");
+            let config = TronConfig::from_env(None);
+            assert_eq!(config.base_url, "https://my-nile-mirror.example");
+            assert_eq!(config.usdt_contract(), USDT_TRC20_CONTRACT_NILE);
+        });
     }
 
     #[test]
