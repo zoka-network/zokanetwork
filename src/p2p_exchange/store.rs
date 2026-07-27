@@ -129,8 +129,13 @@ impl OfferStore {
         {
             return Err(StoreError::TooManyOpenOffers);
         }
-        self.offers.insert(offer.id.clone(), offer);
-        self.persist()
+        let offer_id = offer.id.clone();
+        self.offers.insert(offer_id.clone(), offer);
+        if let Err(error) = self.persist() {
+            self.offers.remove(&offer_id);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Claims an offer for `buyer` at `now`, starting the payment window.
@@ -382,6 +387,29 @@ mod tests {
         assert!(matches!(store.insert_local(bad), Err(StoreError::Invalid(_))));
         assert!(store.is_empty());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_failed_persist_does_not_leave_an_offer_in_memory() {
+        let root = std::env::temp_dir().join(format!(
+            "zoka-offer-store-failure-{}-{}",
+            std::process::id(),
+            crate::p2p_exchange::new_offer_id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let blocked_parent = root.join("not-a-directory");
+        let path = blocked_parent.join("offers.json");
+        let mut store = OfferStore::open(&path).unwrap();
+        std::fs::write(&blocked_parent, "blocks directory creation").unwrap();
+
+        assert!(matches!(
+            store.insert_local(offer("a", "zka1seller")),
+            Err(StoreError::Io(_))
+        ));
+        assert!(store.is_empty());
+
+        let _ = std::fs::remove_file(&blocked_parent);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

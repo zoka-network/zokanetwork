@@ -36,7 +36,72 @@ type SharedMempool = Arc<Mempool>;
 /// inside `PrivateWalletManager::private_pool`; wrapping the manager in
 /// `RwLock` mirrors the pattern used by `StateManager` and `Mempool`
 /// (shared ownership + interior mutability for the async HTTP handlers).
-type SharedPrivateWalletManager = Arc<RwLock<PrivateWalletManager>>;
+pub type SharedPrivateWalletManager = Arc<RwLock<PrivateWalletManager>>;
+
+/// Wallet and durable state required by the exchange endpoints.
+pub struct ExchangeRuntime {
+    pub offer_store: Arc<tokio::sync::Mutex<crate::p2p_exchange::OfferStore>>,
+    pub wallet_manager: SharedPrivateWalletManager,
+    pub default_wallet_name: String,
+    pub seller_address: String,
+    wallet_storage: Option<Arc<crate::wallet::storage::WalletStorage>>,
+    wallet_password: Option<String>,
+}
+
+impl ExchangeRuntime {
+    pub fn new(
+        offer_store: crate::p2p_exchange::OfferStore,
+        wallet_manager: SharedPrivateWalletManager,
+        default_wallet_name: String,
+        seller_address: String,
+        wallet_storage: Option<Arc<crate::wallet::storage::WalletStorage>>,
+        wallet_password: Option<String>,
+    ) -> Self {
+        Self {
+            offer_store: Arc::new(tokio::sync::Mutex::new(offer_store)),
+            wallet_manager,
+            default_wallet_name,
+            seller_address,
+            wallet_storage,
+            wallet_password,
+        }
+    }
+
+    fn persist_wallet(
+        &self,
+        manager: &PrivateWalletManager,
+        wallet_name: &str,
+    ) -> Result<(), String> {
+        let Some(storage) = &self.wallet_storage else {
+            return Ok(());
+        };
+        let wallet = manager
+            .get_private_wallet(wallet_name)
+            .ok_or_else(|| format!("wallet {wallet_name} disappeared before persistence"))?;
+        storage
+            .save_private_wallet(wallet, self.wallet_password.as_deref())
+            .map_err(|error| error.to_string())
+    }
+
+    fn refresh_wallet(
+        &self,
+        manager: &mut PrivateWalletManager,
+        wallet_name: &str,
+    ) -> Result<(), String> {
+        let Some(storage) = &self.wallet_storage else {
+            return Ok(());
+        };
+        let mut wallet = storage
+            .load_private_wallet(wallet_name, self.wallet_password.as_deref())
+            .map_err(|error| error.to_string())?;
+        wallet.normalize_key_material();
+        let slot = manager
+            .get_private_wallet_mut(wallet_name)
+            .ok_or_else(|| format!("wallet {wallet_name} disappeared before refresh"))?;
+        *slot = wallet;
+        Ok(())
+    }
+}
 
 /// Channel sender used by HTTP handlers (specifically the
 /// `/private/tx` endpoint) to hand a validated
@@ -1342,7 +1407,7 @@ pub struct AppState {
     /// run without the exchange (and in tests), which is what makes the
     /// endpoints answer 404 — a client can then tell "this node does not do
     /// exchange" apart from "there are no offers".
-    pub offer_store: Option<Arc<tokio::sync::Mutex<crate::p2p_exchange::OfferStore>>>,
+    pub exchange_runtime: Option<Arc<ExchangeRuntime>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4540,10 +4605,10 @@ pub struct CreateOfferRequest {
 /// 404 rather than an empty list: a client must be able to tell "this node
 /// does not do exchange" from "nobody is offering anything", because the
 /// second is a claim about the network a user would act on.
-fn offer_store_or_404(
+fn exchange_runtime_or_404(
     app_state: &Arc<AppState>,
-) -> Result<&Arc<tokio::sync::Mutex<crate::p2p_exchange::OfferStore>>, (StatusCode, String)> {
-    app_state.offer_store.as_ref().ok_or((
+) -> Result<&Arc<ExchangeRuntime>, (StatusCode, String)> {
+    app_state.exchange_runtime.as_ref().ok_or((
         StatusCode::NOT_FOUND,
         "this node does not run the P2P exchange".to_string(),
     ))
@@ -4559,8 +4624,8 @@ fn now_secs() -> u64 {
 async fn list_exchange_offers(
     State(app_state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let store = offer_store_or_404(&app_state)?;
-    let mut guard = store.lock().await;
+    let exchange = exchange_runtime_or_404(&app_state)?;
+    let mut guard = exchange.offer_store.lock().await;
     // Sweep lapsed claims before answering, so a caller never sees an offer
     // advertised as claimable when its window has already closed.
     let _ = guard.expire_due(now_secs());
@@ -4572,35 +4637,42 @@ async fn create_exchange_offer(
     State(app_state): State<Arc<AppState>>,
     Json(req): Json<CreateOfferRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let store = offer_store_or_404(&app_state)?;
+    let exchange = exchange_runtime_or_404(&app_state)?;
     let seller_address = req.seller_address.trim();
-    if seller_address.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "seller_address is required".to_string(),
-        ));
-    }
-    let wallet_manager = app_state.private_wallet_manager.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "the node wallet is unavailable".to_string(),
-    ))?;
+    let effective_seller = if seller_address.is_empty() {
+        exchange.seller_address.as_str()
+    } else {
+        seller_address
+    };
 
     let now = now_secs();
     let offer_id = crate::p2p_exchange::new_offer_id();
-    let mut wallets = wallet_manager.write().await;
-    let wallet_name = wallets
-        .get_private_wallet_names()
-        .into_iter()
-        .find(|name| {
-            wallets
-                .get_private_wallet(name)
-                .map(|wallet| wallet.commitment_key == seller_address)
-                .unwrap_or(false)
-        })
-        .ok_or((
-            StatusCode::BAD_REQUEST,
-            "seller_address does not belong to a local wallet".to_string(),
-        ))?;
+    let mut wallets = exchange.wallet_manager.write().await;
+    let wallet_name = if effective_seller == exchange.seller_address {
+        exchange.default_wallet_name.clone()
+    } else {
+        wallets
+            .get_private_wallet_names()
+            .into_iter()
+            .find(|name| {
+                wallets
+                    .get_private_wallet(name)
+                    .map(|wallet| wallet.commitment_key == effective_seller)
+                    .unwrap_or(false)
+            })
+            .ok_or((
+                StatusCode::BAD_REQUEST,
+                "seller_address does not belong to a local wallet".to_string(),
+            ))?
+    };
+    exchange
+        .refresh_wallet(&mut wallets, &wallet_name)
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to refresh wallet before reservation: {error}"),
+            )
+        })?;
     let wallet = wallets.get_private_wallet(&wallet_name).ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
         "the selected wallet disappeared".to_string(),
@@ -4629,10 +4701,17 @@ async fn create_exchange_offer(
     wallets
         .reserve_wallet_notes(&wallet_name, &reservation.note_ids, &offer_id)
         .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+    if let Err(error) = exchange.persist_wallet(&wallets, &wallet_name) {
+        wallets.release_wallet_reservation(&wallet_name, &offer_id);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to persist wallet reservation: {error}"),
+        ));
+    }
 
     let offer = crate::p2p_exchange::Offer {
         id: offer_id.clone(),
-        seller_address: seller_address.to_string(),
+        seller_address: effective_seller.to_string(),
         zka_atoms: req.zka_atoms,
         micro_usdt: req.micro_usdt,
         usdt_receive_address: req.usdt_receive_address.trim().to_string(),
@@ -4643,9 +4722,15 @@ async fn create_exchange_offer(
         reserved_note_ids: reservation.note_ids,
     };
 
-    let mut guard = store.lock().await;
+    let mut guard = exchange.offer_store.lock().await;
     if let Err(e) = guard.insert_local(offer.clone()) {
         wallets.release_wallet_reservation(&wallet_name, &offer_id);
+        if let Err(error) = exchange.persist_wallet(&wallets, &wallet_name) {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("offer rejected and wallet rollback could not be persisted: {error}"),
+            ));
+        }
         let message = match e {
             crate::p2p_exchange::StoreError::Invalid(reason) => reason.to_string(),
             crate::p2p_exchange::StoreError::TooManyOpenOffers => {
@@ -4667,7 +4752,7 @@ async fn claim_exchange_offer(
     Path(offer_id): Path<String>,
     Json(req): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let store = offer_store_or_404(&app_state)?;
+    let exchange = exchange_runtime_or_404(&app_state)?;
     let buyer = req
         .get("buyer_address")
         .and_then(|v| v.as_str())
@@ -4681,7 +4766,7 @@ async fn claim_exchange_offer(
         ));
     }
 
-    let mut guard = store.lock().await;
+    let mut guard = exchange.offer_store.lock().await;
     let now = now_secs();
     let _ = guard.expire_due(now);
     let claimed = guard.claim(&offer_id, &buyer, now).map_err(|e| match e {
@@ -5922,12 +6007,55 @@ pub async fn start_api_on_bind_with_broadcaster(
     .await
 }
 
+/// Fullnode entrypoint: exposes private-wallet and exchange state through the
+/// same shared instances used for durable offer reservations.
+pub async fn start_api_on_bind_with_runtime(
+    state_manager: SharedState,
+    mempool: SharedMempool,
+    bind_addr: String,
+    broadcaster: Option<PrivateTxBroadcastSender>,
+    private_wallet_manager: SharedPrivateWalletManager,
+    exchange_runtime: Arc<ExchangeRuntime>,
+) -> Result<(), StateError> {
+    start_api_with_config_on_bind_and_runtime(
+        state_manager,
+        mempool,
+        ApiSecurityConfig::default(),
+        bind_addr,
+        broadcaster,
+        Some(private_wallet_manager),
+        Some(exchange_runtime),
+    )
+    .await
+}
+
 pub async fn start_api_with_config_on_bind(
     state_manager: SharedState,
     mempool: SharedMempool,
     security: ApiSecurityConfig,
     bind_addr: String,
     private_tx_broadcaster: Option<PrivateTxBroadcastSender>,
+) -> Result<(), StateError> {
+    start_api_with_config_on_bind_and_runtime(
+        state_manager,
+        mempool,
+        security,
+        bind_addr,
+        private_tx_broadcaster,
+        None,
+        None,
+    )
+    .await
+}
+
+async fn start_api_with_config_on_bind_and_runtime(
+    state_manager: SharedState,
+    mempool: SharedMempool,
+    security: ApiSecurityConfig,
+    bind_addr: String,
+    private_tx_broadcaster: Option<PrivateTxBroadcastSender>,
+    private_wallet_manager: Option<SharedPrivateWalletManager>,
+    exchange_runtime: Option<Arc<ExchangeRuntime>>,
 ) -> Result<(), StateError> {
     let app_state = Arc::new(AppState {
         state_manager,
@@ -5937,9 +6065,9 @@ pub async fn start_api_with_config_on_bind(
         security_stats: Arc::new(ApiSecurityStats::default()),
         ws_manager: WebSocketConnectionManager::new(),
         pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
-        private_wallet_manager: None,
+        private_wallet_manager,
         private_tx_broadcaster,
-        offer_store: None,
+        exchange_runtime,
     });
 
     let listener = tokio::net::TcpListener::bind(&bind_addr)
@@ -5993,8 +6121,34 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         }
+    }
+
+    fn configure_test_exchange(
+        state: &mut AppState,
+        store_path: &std::path::Path,
+        balance_atoms: u64,
+    ) -> (Arc<ExchangeRuntime>, String) {
+        let mut manager = PrivateWalletManager::new();
+        let seller = manager.create_private_wallet("seller").unwrap();
+        if balance_atoms > 0 {
+            manager
+                .deposit_to_private_wallet("seller", balance_atoms)
+                .unwrap();
+        }
+        let wallet_manager = Arc::new(RwLock::new(manager));
+        let exchange = Arc::new(ExchangeRuntime::new(
+            crate::p2p_exchange::OfferStore::open(store_path).unwrap(),
+            Arc::clone(&wallet_manager),
+            "seller".to_string(),
+            seller.clone(),
+            None,
+            None,
+        ));
+        state.private_wallet_manager = Some(wallet_manager);
+        state.exchange_runtime = Some(Arc::clone(&exchange));
+        (exchange, seller)
     }
 
     /// A node without the exchange must 404 rather than return an empty list.
@@ -6008,7 +6162,7 @@ mod tests {
     async fn exchange_endpoints_404_when_the_node_has_no_offer_store() {
         let dir = format!("./test_db_exchange_absent_{}", std::process::id());
         let app_state = Arc::new(test_app_state(&dir));
-        assert!(app_state.offer_store.is_none());
+        assert!(app_state.exchange_runtime.is_none());
 
         let result = list_exchange_offers(State(app_state)).await;
         match result {
@@ -6019,13 +6173,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn creating_an_offer_without_a_seller_is_rejected() {
+    async fn creating_an_offer_without_a_seller_uses_the_node_wallet() {
         let dir = format!("./test_db_exchange_seller_{}", std::process::id());
         let mut state = test_app_state(&dir);
         let store_path = std::env::temp_dir().join(format!("offers-{}.json", std::process::id()));
-        state.offer_store = Some(Arc::new(tokio::sync::Mutex::new(
-            crate::p2p_exchange::OfferStore::open(&store_path).unwrap(),
-        )));
+        let (_, seller) = configure_test_exchange(
+            &mut state,
+            &store_path,
+            100 * crate::economics::ATOMS_PER_ZKA,
+        );
         let app_state = Arc::new(state);
 
         let result = create_exchange_offer(
@@ -6037,12 +6193,9 @@ mod tests {
                 seller_address: "   ".to_string(),
             }),
         )
-        .await;
-
-        match result {
-            Err((status, _)) => assert_eq!(status, StatusCode::BAD_REQUEST),
-            Ok(_) => panic!("an offer with no seller must not be stored"),
-        }
+        .await
+        .expect("the UI omits seller_address and the node supplies its wallet");
+        assert_eq!(result.0["seller_address"], seller);
         let _ = std::fs::remove_file(&store_path);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6053,15 +6206,11 @@ mod tests {
         let mut state = test_app_state(&dir);
         let store_path =
             std::env::temp_dir().join(format!("offers-reservation-{}.json", std::process::id()));
-        state.offer_store = Some(Arc::new(tokio::sync::Mutex::new(
-            crate::p2p_exchange::OfferStore::open(&store_path).unwrap(),
-        )));
-        let mut manager = PrivateWalletManager::new();
-        let seller = manager.create_private_wallet("seller").unwrap();
-        manager
-            .deposit_to_private_wallet("seller", 150 * crate::economics::ATOMS_PER_ZKA)
-            .unwrap();
-        state.private_wallet_manager = Some(Arc::new(RwLock::new(manager)));
+        let (_, seller) = configure_test_exchange(
+            &mut state,
+            &store_path,
+            150 * crate::economics::ATOMS_PER_ZKA,
+        );
         let app_state = Arc::new(state);
 
         let response = create_exchange_offer(
@@ -6103,18 +6252,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn creating_an_offer_persists_the_wallet_reservation() {
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            crate::p2p_exchange::new_offer_id()
+        );
+        let root = std::env::temp_dir().join(format!("zoka-exchange-persist-{suffix}"));
+        let db_dir = root.join("db");
+        let store_path = root.join("offers.json");
+        let wallet_storage =
+            Arc::new(crate::wallet::storage::WalletStorage::from_base_dir(&root).unwrap());
+        let mut manager = PrivateWalletManager::new();
+        let seller = manager.create_private_wallet("seller").unwrap();
+        manager
+            .deposit_to_private_wallet("seller", 100 * crate::economics::ATOMS_PER_ZKA)
+            .unwrap();
+        wallet_storage
+            .save_private_wallet(manager.get_private_wallet("seller").unwrap(), None)
+            .unwrap();
+        let wallet_manager = Arc::new(RwLock::new(manager));
+        let exchange = Arc::new(ExchangeRuntime::new(
+            crate::p2p_exchange::OfferStore::open(&store_path).unwrap(),
+            Arc::clone(&wallet_manager),
+            "seller".to_string(),
+            seller,
+            Some(Arc::clone(&wallet_storage)),
+            None,
+        ));
+        let mut state = test_app_state(db_dir.to_str().unwrap());
+        state.private_wallet_manager = Some(wallet_manager);
+        state.exchange_runtime = Some(exchange);
+        let app_state = Arc::new(state);
+
+        let _ = create_exchange_offer(
+            State(Arc::clone(&app_state)),
+            Json(CreateOfferRequest {
+                zka_atoms: 100 * crate::economics::ATOMS_PER_ZKA,
+                micro_usdt: 25_000_000,
+                usdt_receive_address: "TQ5NMqJjW8dWvJf3zJ8xYqL2mNpR4sT6uV".to_string(),
+                seller_address: String::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let reloaded = wallet_storage.load_private_wallet("seller", None).unwrap();
+        assert_eq!(reloaded.private_notes.len(), 1);
+        assert!(reloaded.private_notes[0].reserved);
+        assert!(reloaded.private_notes[0].reserved_by_tx.is_some());
+        drop(app_state);
+        drop(wallet_storage);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn an_unfunded_offer_is_rejected_without_being_stored() {
         let dir = format!("./test_db_exchange_unfunded_{}", std::process::id());
         let mut state = test_app_state(&dir);
         let store_path =
             std::env::temp_dir().join(format!("offers-unfunded-{}.json", std::process::id()));
-        let store = Arc::new(tokio::sync::Mutex::new(
-            crate::p2p_exchange::OfferStore::open(&store_path).unwrap(),
-        ));
-        state.offer_store = Some(Arc::clone(&store));
-        let mut manager = PrivateWalletManager::new();
-        let seller = manager.create_private_wallet("seller").unwrap();
-        state.private_wallet_manager = Some(Arc::new(RwLock::new(manager)));
+        let (exchange, seller) = configure_test_exchange(&mut state, &store_path, 0);
 
         let result = create_exchange_offer(
             State(Arc::new(state)),
@@ -6134,7 +6332,7 @@ mod tests {
             }
             Ok(_) => panic!("an unfunded offer must not be stored"),
         }
-        assert!(store.lock().await.is_empty());
+        assert!(exchange.offer_store.lock().await.is_empty());
         let _ = std::fs::remove_file(&store_path);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6145,15 +6343,11 @@ mod tests {
         let mut state = test_app_state(&dir);
         let store_path =
             std::env::temp_dir().join(format!("offers-rollback-{}.json", std::process::id()));
-        state.offer_store = Some(Arc::new(tokio::sync::Mutex::new(
-            crate::p2p_exchange::OfferStore::open(&store_path).unwrap(),
-        )));
-        let mut manager = PrivateWalletManager::new();
-        let seller = manager.create_private_wallet("seller").unwrap();
-        manager
-            .deposit_to_private_wallet("seller", 100 * crate::economics::ATOMS_PER_ZKA)
-            .unwrap();
-        state.private_wallet_manager = Some(Arc::new(RwLock::new(manager)));
+        let (_, seller) = configure_test_exchange(
+            &mut state,
+            &store_path,
+            100 * crate::economics::ATOMS_PER_ZKA,
+        );
         let app_state = Arc::new(state);
 
         let result = create_exchange_offer(
@@ -6369,7 +6563,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         });
 
         let _router = create_router(state);
@@ -6401,7 +6595,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         });
 
         let root_resp = get_state_root(State(app_state.clone())).await;
@@ -6476,7 +6670,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         });
 
         let resp = get_block_by_height(State(app_state), Path(0)).await;
@@ -6517,7 +6711,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         });
 
         let resp = get_block_by_hash(State(app_state), Path(block_hash.clone())).await;
@@ -6564,7 +6758,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         });
 
         let resp = get_blocks_range(State(app_state), Path((1u64, 3u64))).await;
@@ -6612,7 +6806,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         });
 
         // Check initial height
@@ -7622,7 +7816,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         });
 
         let req = SubscribeRequest {
@@ -7659,7 +7853,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         });
 
         // First subscribe
@@ -7706,7 +7900,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         });
 
         // Add some connections
@@ -7746,7 +7940,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         });
 
         let req = SubscribeRequest {
@@ -7787,7 +7981,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         });
 
         let _router = create_router(app_state);
@@ -7815,7 +8009,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         });
 
         let req = PbftStartRequest {
@@ -7858,7 +8052,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         });
 
         // First start consensus
@@ -7903,7 +8097,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         });
 
         // First start consensus
@@ -7972,7 +8166,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         });
 
         // First start consensus
@@ -8064,7 +8258,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         });
 
         let req = PbftMessageRequest {
@@ -8103,7 +8297,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         });
 
         let req = PbftMessageRequest {
@@ -8140,7 +8334,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         });
 
         let req = PbftStartRequest {
@@ -8174,7 +8368,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         });
 
         let resp =
@@ -8205,7 +8399,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         });
 
         // Create snapshot first
@@ -8243,7 +8437,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         });
 
         let filter = AdvancedEventFilter {
@@ -8286,7 +8480,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         });
 
         let resp = list_profiles(State(app_state)).await;
@@ -8321,7 +8515,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         });
 
         let res = get_private_tx_by_hash(State(app_state), Path("deadbeef".to_string())).await;
@@ -8354,7 +8548,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         });
 
         let req = ProfileManagementRequest {
@@ -8379,7 +8573,7 @@ mod tests {
             pbft_consensus: Arc::new(tokio::sync::Mutex::new(None)),
             private_wallet_manager: None,
             private_tx_broadcaster: None,
-            offer_store: None,
+            exchange_runtime: None,
         })))
         .await
         .unwrap();

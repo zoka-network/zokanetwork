@@ -405,12 +405,19 @@ huérfana es ingastable para siempre y el usuario ni siquiera ve por qué le fal
       el id de oferta y hace rollback si falla `OfferStore::insert_local`.
 - [x] Rechazar la creación si la address no corresponde a una wallet local o si las notas
       disponibles no cubren `zka_atoms`.
-- [ ] **Hallazgo 2026-07-26:** el arranque normal del API todavía construye `AppState` con
-      `private_wallet_manager: None` y `offer_store: None`. Los handlers y sus tests funcionan,
-      pero un binario recompilado aún respondería 404/503 hasta enchufar ambos recursos en
-      `start_api_on_bind_with_broadcaster`. No se verificó contra el nodo real.
-- [ ] Persistir en disco el cambio `reserved` de la wallet. El store persiste
-      `reserved_note_ids`, pero el manager compartido que usa el handler todavía es solo memoria.
+- [x] Enchufar wallet manager + offer store al arranque normal del fullnode. Se agregó un
+      `ExchangeRuntime` único compartido por los endpoints, con store en
+      `<network-dir>/p2p_exchange/offers.json`.
+- [x] Persistir cifrado el cambio `reserved` de la wallet **antes** de publicar la oferta, y
+      persistir también el rollback si el store la rechaza. Antes de seleccionar, el handler
+      refresca la wallet desde disco para no pisar cambios concurrentes del proceso de minería.
+- [x] Reconciliar al arranque: expirar claims vencidos, liberar reservas huérfanas y persistir
+      la wallet reparada.
+- [x] La UI actual omite `seller_address`; el nodo completa la address de su wallet seleccionada,
+      tal como anticipaba `CreateOfferRequest`, en vez de rechazar el request real de ZSilent.
+- [x] Verificado: recarga desde disco conserva `reserved`/id de oferta; un fallo de persistencia
+      del store no deja una oferta fantasma en memoria; 67 tests `p2p_exchange::` en verde y
+      `cargo check --bin zoka` en verde. **Todavía no verificado contra el nodo real.**
 - [ ] Al expirar/cancelar: `release_reserved_notes`.
 - [ ] Al completarse: gastar las notas hacia la address del comprador.
 

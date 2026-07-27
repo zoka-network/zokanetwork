@@ -3738,6 +3738,34 @@ impl PrivateWalletManager {
         }
     }
 
+    pub fn release_reservation_from_all_wallets(&mut self, reservation_id: &str) {
+        for wallet in self.private_wallets.values_mut() {
+            wallet.release_reserved_notes(reservation_id);
+        }
+    }
+
+    pub fn release_note_ids(&mut self, note_ids: &[String]) {
+        let ids: HashSet<&str> = note_ids.iter().map(String::as_str).collect();
+        for wallet in self.private_wallets.values_mut() {
+            for note in wallet.private_notes.iter_mut() {
+                if ids.contains(note.note_id.as_str()) {
+                    note.reserved = false;
+                    note.reserved_by_tx = None;
+                }
+            }
+            wallet.sync_balance_cache();
+        }
+    }
+
+    pub fn reserved_note_ids(&self) -> Vec<String> {
+        self.private_wallets
+            .values()
+            .flat_map(|wallet| wallet.private_notes.iter())
+            .filter(|note| note.reserved && !note.spent)
+            .map(|note| note.note_id.clone())
+            .collect()
+    }
+
     /// Deposit to private wallet
     pub fn deposit_to_private_wallet(&mut self, name: &str, amount: u64) -> Result<(), BlockError> {
         let wallet = self.private_wallets.get_mut(name).ok_or_else(|| {

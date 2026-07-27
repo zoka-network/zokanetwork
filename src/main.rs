@@ -9326,14 +9326,14 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     }
 
     let storage = wallet_storage_for_network(network)?;
-    let (manager, wallet_name, created) = select_or_create_private_node_wallet(
+    let (mut private_wallet_manager, wallet_name, created) = select_or_create_private_node_wallet(
         &storage,
         password.as_deref(),
         wallet_selector.as_deref(),
         true,
         network,
     )?;
-    let wallet = manager
+    let wallet = private_wallet_manager
         .get_private_wallet(&wallet_name)
         .ok_or_else(|| format!("wallet not found after selection: {wallet_name}"))?;
     let export = private_wallet_secrets_export(wallet);
@@ -9398,6 +9398,47 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
 
     // Receiver half of the API → fullnode-main-loop channel; populated
     // only when the HTTP API is spun up (i.e. `--db` path present).
+    let offer_store_path = PathBuf::from(network.local_dir())
+        .join("p2p_exchange")
+        .join("offers.json");
+    let mut offer_store = zoka::p2p_exchange::OfferStore::open(&offer_store_path)
+        .map_err(|error| format!("failed to open P2P exchange store: {error:?}"))?;
+    let reserved_note_ids = private_wallet_manager.reserved_note_ids();
+    let reconciliation = offer_store
+        .reconcile(&reserved_note_ids, now_secs())
+        .map_err(|error| format!("failed to reconcile P2P exchange store: {error:?}"))?;
+    if !reconciliation.orphaned_note_ids.is_empty() {
+        private_wallet_manager.release_note_ids(&reconciliation.orphaned_note_ids);
+        for name in private_wallet_manager.get_private_wallet_names() {
+            if let Some(wallet) = private_wallet_manager.get_private_wallet(&name) {
+                storage
+                    .save_private_wallet(wallet, password.as_deref())
+                    .map_err(|error| {
+                        format!("failed to persist reconciled wallet {name}: {error}")
+                    })?;
+            }
+        }
+        startup_notes.push(format!(
+            "Released {} orphaned P2P note reservation(s) during startup reconciliation.",
+            reconciliation.orphaned_note_ids.len()
+        ));
+    }
+    if !reconciliation.expired_offers.is_empty() {
+        startup_notes.push(format!(
+            "Expired {} lapsed P2P offer(s) during startup reconciliation.",
+            reconciliation.expired_offers.len()
+        ));
+    }
+    let private_wallet_manager = Arc::new(tokio::sync::RwLock::new(private_wallet_manager));
+    let exchange_runtime = Arc::new(zoka::api::ExchangeRuntime::new(
+        offer_store,
+        Arc::clone(&private_wallet_manager),
+        wallet_name.clone(),
+        wallet_address.clone(),
+        Some(Arc::new(storage.clone())),
+        password.clone(),
+    ));
+
     let mut private_tx_recv_outer: Option<
         tokio::sync::mpsc::UnboundedReceiver<zoka::private_wallet::PrivateTransaction>,
     > = None;
@@ -9578,12 +9619,16 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         tokio::spawn({
             let api_broadcaster = api_broadcaster.clone();
             let manager = Arc::clone(&manager);
+            let private_wallet_manager = Arc::clone(&private_wallet_manager);
+            let exchange_runtime = Arc::clone(&exchange_runtime);
             async move {
-                if let Err(e) = zoka::api::start_api_on_bind_with_broadcaster(
+                if let Err(e) = zoka::api::start_api_on_bind_with_runtime(
                     manager,
                     api_mempool,
                     api_bind_addr,
                     api_broadcaster,
+                    private_wallet_manager,
+                    exchange_runtime,
                 )
                 .await
                 {

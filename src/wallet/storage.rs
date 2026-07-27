@@ -13,6 +13,7 @@ use zeroize::Zeroize;
 const DEFAULT_WALLET_BASE_DIR: &str = ".zoka/mainnet";
 
 /// Encrypted wallet storage on disk
+#[derive(Clone)]
 pub struct WalletStorage {
     wallets_path: PathBuf,
     private_wallets_path: PathBuf,
