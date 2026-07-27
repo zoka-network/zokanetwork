@@ -13,6 +13,25 @@ Orden de ejecución: **Etapa 0 (limpieza) → Explorer → P2P Exchange → Mini
 
 Este documento es el estado de verdad del trabajo. **Leelo entero antes de tocar código.**
 
+### ✅ Verificado end-to-end en vivo (2026-07-27, Nile testnet)
+
+Primer ciclo completo del exchange probado con dos máquinas reales (PC = vendedor, VM =
+comprador), sin mocks: PC publicó oferta (70 ZKA / 10 USDT) → VM la tomó y pagó USDT real de
+Nile → el nodo vendedor verificó el pago contra la cadena de Nile → liberó los ZKA
+automáticamente, sin botón manual → la transacción se propagó por la red pública real (tardó
+~10 bloques por la baja cantidad de peers de cada nodo, no fue un bug) → **la VM recibió los
+70 ZKA.**
+
+Esto confirma que §2.4 (verificación Tron), la liberación automática, y la propagación de
+transacciones privadas del exchange funcionan de verdad, no solo en tests unitarios. Contrato
+de Nile confirmado, selector de red mainnet/Nile operativo (ZSilent 1.9.3 + nodo 1.9.3).
+
+**Sigue sin ejercitarse:** §2.6 (oferta que deja de listarse si el vendedor se desconecta) y
+§2.7 (registro de incumplimiento por gossip) — nadie probó el camino de que el vendedor NO
+libere. Y la propagación con 1 solo peer por nodo demostró ser lenta (~10 bloques); no se
+investigó el enrutamiento Dandelion/stem en detalle — funcionó, pero no se entiende del todo
+por qué tardó tanto.
+
 ### Dónde está todo
 
 | Qué | Estado |
