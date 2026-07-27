@@ -24,10 +24,11 @@ Este documento es el estado de verdad del trabajo. **Leelo entero antes de tocar
 
 ### Por dónde seguir, en este orden
 
-1. **Enchufar `select_notes` a `create_exchange_offer`** (`src/api/mod.rs`) y marcar las notas
-   reservadas en la wallet. La lógica ya existe y está testeada en
-   `src/p2p_exchange/reservation.rs` — es conectar, no diseñar. Cierra el agujero de ofertas
-   sin respaldo: hoy las ofertas se crean con `reserved_note_ids` vacío.
+1. ~~**Enchufar `select_notes` a `create_exchange_offer`** (`src/api/mod.rs`) y marcar las notas
+   reservadas en la wallet.~~ ✅ Conectado en `etapa2-p2p-reservation-integration`: la oferta
+   rechaza fondos insuficientes, guarda los ids elegidos, marca las notas con el id de oferta y
+   revierte la reserva si el store rechaza la inserción. Verificado con 4 tests del handler y
+   los 66 tests de `p2p_exchange::`; **todavía no verificado contra nodo real**.
 2. **Cliente HTTP de Tron** que use `tron::trc20_transfers_path` **por el proxy SOCKS** y
    aplique `tron::transfer_settles_offer`. Las reglas están completas; falta el transporte.
 3. **§2.6** presencia del vendedor y **§2.7** liberación automática + reputación.
@@ -314,8 +315,8 @@ en el repo ZOKA, commit `796c086b`, 3 tests en verde.
 >
 > **Pendiente — sobre todo integración:**
 >
-> 1. Enchufar `select_notes` a `create_exchange_offer` y marcar las notas reservadas en la
->    wallet. Hoy las ofertas se crean con `reserved_note_ids` vacío.
+> 1. ✅ `select_notes` ya está conectado a `create_exchange_offer`; reserva las notas en la
+>    wallet y llena `reserved_note_ids`. Verificado por tests del handler, no contra nodo real.
 > 2. Cliente HTTP que consuma `tron::trc20_transfers_path` **por el proxy SOCKS** y aplique
 >    `transfer_settles_offer`. Las reglas están; falta el transporte.
 > 3. §2.6 presencia del vendedor, §2.7 liberación + reputación.
@@ -398,8 +399,18 @@ huérfana es ingastable para siempre y el usuario ni siquiera ve por qué le fal
 
 ### 2.3 Lock de ZKA sobre notas privadas
 
-- [ ] Reutilizar `reserved` / `reserved_by_tx` de `PrivateNote`
+- [x] Reutilizar `reserved` / `reserved_by_tx` de `PrivateNote`
       (`src/private_wallet/mod.rs`, Fase A1 de `ROADMAP.md`). No construir un mecanismo nuevo.
+      `create_exchange_offer` selecciona notas de la wallet local, las reserva atómicamente con
+      el id de oferta y hace rollback si falla `OfferStore::insert_local`.
+- [x] Rechazar la creación si la address no corresponde a una wallet local o si las notas
+      disponibles no cubren `zka_atoms`.
+- [ ] **Hallazgo 2026-07-26:** el arranque normal del API todavía construye `AppState` con
+      `private_wallet_manager: None` y `offer_store: None`. Los handlers y sus tests funcionan,
+      pero un binario recompilado aún respondería 404/503 hasta enchufar ambos recursos en
+      `start_api_on_bind_with_broadcaster`. No se verificó contra el nodo real.
+- [ ] Persistir en disco el cambio `reserved` de la wallet. El store persiste
+      `reserved_note_ids`, pero el manager compartido que usa el handler todavía es solo memoria.
 - [ ] Al expirar/cancelar: `release_reserved_notes`.
 - [ ] Al completarse: gastar las notas hacia la address del comprador.
 

@@ -4573,17 +4573,66 @@ async fn create_exchange_offer(
     Json(req): Json<CreateOfferRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let store = offer_store_or_404(&app_state)?;
-    if req.seller_address.trim().is_empty() {
+    let seller_address = req.seller_address.trim();
+    if seller_address.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             "seller_address is required".to_string(),
         ));
     }
+    let wallet_manager = app_state.private_wallet_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the node wallet is unavailable".to_string(),
+    ))?;
 
     let now = now_secs();
+    let offer_id = crate::p2p_exchange::new_offer_id();
+    let mut wallets = wallet_manager.write().await;
+    let wallet_name = wallets
+        .get_private_wallet_names()
+        .into_iter()
+        .find(|name| {
+            wallets
+                .get_private_wallet(name)
+                .map(|wallet| wallet.commitment_key == seller_address)
+                .unwrap_or(false)
+        })
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "seller_address does not belong to a local wallet".to_string(),
+        ))?;
+    let wallet = wallets.get_private_wallet(&wallet_name).ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the selected wallet disappeared".to_string(),
+    ))?;
+    // Coinbase outputs only enter PrivateWallet after maturity, so there are
+    // no outstanding unlock heights to supply at this point.
+    let spendable = crate::p2p_exchange::reservation::spendable_from_wallet_notes(
+        &wallet.private_notes,
+        &HashMap::new(),
+    );
+    let reservation =
+        crate::p2p_exchange::select_notes(&spendable, req.zka_atoms, 0).map_err(|error| {
+            let message = match error {
+                crate::p2p_exchange::ReservationError::ZeroAmount => {
+                    "zka_atoms must be greater than zero".to_string()
+                }
+                crate::p2p_exchange::ReservationError::InsufficientFunds {
+                    needed_atoms,
+                    available_atoms,
+                } => format!(
+                    "insufficient private funds: need {needed_atoms} atoms, have {available_atoms}"
+                ),
+            };
+            (StatusCode::BAD_REQUEST, message)
+        })?;
+    wallets
+        .reserve_wallet_notes(&wallet_name, &reservation.note_ids, &offer_id)
+        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+
     let offer = crate::p2p_exchange::Offer {
-        id: crate::p2p_exchange::new_offer_id(),
-        seller_address: req.seller_address.trim().to_string(),
+        id: offer_id.clone(),
+        seller_address: seller_address.to_string(),
         zka_atoms: req.zka_atoms,
         micro_usdt: req.micro_usdt,
         usdt_receive_address: req.usdt_receive_address.trim().to_string(),
@@ -4591,14 +4640,12 @@ async fn create_exchange_offer(
         created_at: now,
         claim_expires_at: None,
         claimed_by: None,
-        // Reserving the seller's notes is wired with the wallet integration;
-        // until then an offer carries no lock and must not be presented as if
-        // it did.
-        reserved_note_ids: Vec::new(),
+        reserved_note_ids: reservation.note_ids,
     };
 
     let mut guard = store.lock().await;
-    guard.insert_local(offer.clone()).map_err(|e| {
+    if let Err(e) = guard.insert_local(offer.clone()) {
+        wallets.release_wallet_reservation(&wallet_name, &offer_id);
         let message = match e {
             crate::p2p_exchange::StoreError::Invalid(reason) => reason.to_string(),
             crate::p2p_exchange::StoreError::TooManyOpenOffers => {
@@ -4609,8 +4656,8 @@ async fn create_exchange_offer(
             }
             other => format!("{other:?}"),
         };
-        (StatusCode::BAD_REQUEST, message)
-    })?;
+        return Err((StatusCode::BAD_REQUEST, message));
+    }
 
     Ok(Json(serde_json::to_value(&offer).unwrap_or_default()))
 }
@@ -5996,6 +6043,141 @@ mod tests {
             Err((status, _)) => assert_eq!(status, StatusCode::BAD_REQUEST),
             Ok(_) => panic!("an offer with no seller must not be stored"),
         }
+        let _ = std::fs::remove_file(&store_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn creating_an_offer_reserves_wallet_notes_and_records_them() {
+        let dir = format!("./test_db_exchange_reservation_{}", std::process::id());
+        let mut state = test_app_state(&dir);
+        let store_path =
+            std::env::temp_dir().join(format!("offers-reservation-{}.json", std::process::id()));
+        state.offer_store = Some(Arc::new(tokio::sync::Mutex::new(
+            crate::p2p_exchange::OfferStore::open(&store_path).unwrap(),
+        )));
+        let mut manager = PrivateWalletManager::new();
+        let seller = manager.create_private_wallet("seller").unwrap();
+        manager
+            .deposit_to_private_wallet("seller", 150 * crate::economics::ATOMS_PER_ZKA)
+            .unwrap();
+        state.private_wallet_manager = Some(Arc::new(RwLock::new(manager)));
+        let app_state = Arc::new(state);
+
+        let response = create_exchange_offer(
+            State(Arc::clone(&app_state)),
+            Json(CreateOfferRequest {
+                zka_atoms: 100 * crate::economics::ATOMS_PER_ZKA,
+                micro_usdt: 25_000_000,
+                usdt_receive_address: "TQ5NMqJjW8dWvJf3zJ8xYqL2mNpR4sT6uV".to_string(),
+                seller_address: seller,
+            }),
+        )
+        .await
+        .expect("funded local wallet should create an offer");
+
+        let reserved_ids: Vec<String> =
+            serde_json::from_value(response.0["reserved_note_ids"].clone()).unwrap();
+        assert_eq!(reserved_ids.len(), 1);
+        let wallets = app_state
+            .private_wallet_manager
+            .as_ref()
+            .unwrap()
+            .read()
+            .await;
+        let wallet = wallets.get_private_wallet("seller").unwrap();
+        let reserved = wallet
+            .private_notes
+            .iter()
+            .find(|note| note.note_id == reserved_ids[0])
+            .unwrap();
+        assert!(reserved.reserved);
+        assert_eq!(
+            reserved.reserved_by_tx.as_deref(),
+            response.0["id"].as_str()
+        );
+        drop(wallets);
+
+        let _ = std::fs::remove_file(&store_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_unfunded_offer_is_rejected_without_being_stored() {
+        let dir = format!("./test_db_exchange_unfunded_{}", std::process::id());
+        let mut state = test_app_state(&dir);
+        let store_path =
+            std::env::temp_dir().join(format!("offers-unfunded-{}.json", std::process::id()));
+        let store = Arc::new(tokio::sync::Mutex::new(
+            crate::p2p_exchange::OfferStore::open(&store_path).unwrap(),
+        ));
+        state.offer_store = Some(Arc::clone(&store));
+        let mut manager = PrivateWalletManager::new();
+        let seller = manager.create_private_wallet("seller").unwrap();
+        state.private_wallet_manager = Some(Arc::new(RwLock::new(manager)));
+
+        let result = create_exchange_offer(
+            State(Arc::new(state)),
+            Json(CreateOfferRequest {
+                zka_atoms: 100 * crate::economics::ATOMS_PER_ZKA,
+                micro_usdt: 25_000_000,
+                usdt_receive_address: "TQ5NMqJjW8dWvJf3zJ8xYqL2mNpR4sT6uV".to_string(),
+                seller_address: seller,
+            }),
+        )
+        .await;
+
+        match result {
+            Err((status, message)) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert!(message.contains("insufficient private funds"));
+            }
+            Ok(_) => panic!("an unfunded offer must not be stored"),
+        }
+        assert!(store.lock().await.is_empty());
+        let _ = std::fs::remove_file(&store_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_offer_releases_its_wallet_reservation() {
+        let dir = format!("./test_db_exchange_rollback_{}", std::process::id());
+        let mut state = test_app_state(&dir);
+        let store_path =
+            std::env::temp_dir().join(format!("offers-rollback-{}.json", std::process::id()));
+        state.offer_store = Some(Arc::new(tokio::sync::Mutex::new(
+            crate::p2p_exchange::OfferStore::open(&store_path).unwrap(),
+        )));
+        let mut manager = PrivateWalletManager::new();
+        let seller = manager.create_private_wallet("seller").unwrap();
+        manager
+            .deposit_to_private_wallet("seller", 100 * crate::economics::ATOMS_PER_ZKA)
+            .unwrap();
+        state.private_wallet_manager = Some(Arc::new(RwLock::new(manager)));
+        let app_state = Arc::new(state);
+
+        let result = create_exchange_offer(
+            State(Arc::clone(&app_state)),
+            Json(CreateOfferRequest {
+                zka_atoms: 100 * crate::economics::ATOMS_PER_ZKA,
+                micro_usdt: 25_000_000,
+                usdt_receive_address: "not-a-tron-address".to_string(),
+                seller_address: seller,
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err((StatusCode::BAD_REQUEST, _))));
+        let wallets = app_state
+            .private_wallet_manager
+            .as_ref()
+            .unwrap()
+            .read()
+            .await;
+        let note = &wallets.get_private_wallet("seller").unwrap().private_notes[0];
+        assert!(!note.reserved);
+        assert!(note.reserved_by_tx.is_none());
+        drop(wallets);
         let _ = std::fs::remove_file(&store_path);
         let _ = std::fs::remove_dir_all(&dir);
     }

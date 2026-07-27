@@ -3018,6 +3018,49 @@ impl PrivateWallet {
         self.sync_balance_cache();
     }
 
+    /// Reserve an exact set of notes for an operation identified by `reservation_id`.
+    ///
+    /// Validation happens before mutation so a stale selection cannot leave a
+    /// partially-reserved wallet.
+    pub fn reserve_notes(
+        &mut self,
+        note_ids: &[String],
+        reservation_id: &str,
+    ) -> Result<(), BlockError> {
+        let selected: HashSet<&str> = note_ids.iter().map(String::as_str).collect();
+        if selected.len() != note_ids.len() || selected.is_empty() {
+            return Err(BlockError::TransactionValidationFailed(
+                "note reservation must contain unique note ids".to_string(),
+            ));
+        }
+
+        for note_id in &selected {
+            let note = self
+                .private_notes
+                .iter()
+                .find(|note| note.note_id == *note_id)
+                .ok_or_else(|| {
+                    BlockError::TransactionValidationFailed(format!(
+                        "private note {note_id} not found"
+                    ))
+                })?;
+            if note.spent || note.reserved {
+                return Err(BlockError::TransactionValidationFailed(format!(
+                    "private note {note_id} is no longer available"
+                )));
+            }
+        }
+
+        for note in self.private_notes.iter_mut() {
+            if selected.contains(note.note_id.as_str()) {
+                note.reserved = true;
+                note.reserved_by_tx = Some(reservation_id.to_string());
+            }
+        }
+        self.sync_balance_cache();
+        Ok(())
+    }
+
     /// Confirm reserved notes as spent when the TX lands in a block.
     pub fn confirm_reserved_notes(&mut self, tx_hash: &str) {
         let spend_timestamp = current_timestamp();
@@ -3673,6 +3716,26 @@ impl PrivateWalletManager {
     /// Get private wallet (mutable)
     pub fn get_private_wallet_mut(&mut self, name: &str) -> Option<&mut PrivateWallet> {
         self.private_wallets.get_mut(name)
+    }
+
+    pub fn reserve_wallet_notes(
+        &mut self,
+        wallet_name: &str,
+        note_ids: &[String],
+        reservation_id: &str,
+    ) -> Result<(), BlockError> {
+        self.private_wallets
+            .get_mut(wallet_name)
+            .ok_or_else(|| {
+                BlockError::TransactionValidationFailed("Wallet not found".to_string())
+            })?
+            .reserve_notes(note_ids, reservation_id)
+    }
+
+    pub fn release_wallet_reservation(&mut self, wallet_name: &str, reservation_id: &str) {
+        if let Some(wallet) = self.private_wallets.get_mut(wallet_name) {
+            wallet.release_reserved_notes(reservation_id);
+        }
     }
 
     /// Deposit to private wallet
