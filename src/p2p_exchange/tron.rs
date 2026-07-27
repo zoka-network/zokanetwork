@@ -27,9 +27,65 @@ pub const DEFAULT_TRONGRID_URL: &str = "https://api.trongrid.io";
 /// release real ZKA for it.
 pub const USDT_TRC20_CONTRACT: &str = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
 
+/// Nile testnet endpoint.
+pub const NILE_TRONGRID_URL: &str = "https://nile.trongrid.io";
+
+/// USDT on Nile. Confirmed against a real faucet transfer, not a web search:
+/// tx `20a41a21e78b3ee9…` carried `token_info.address` = this value, symbol
+/// `USDT`, 6 decimals — the same precision as mainnet, so amount arithmetic is
+/// unchanged across networks.
+pub const USDT_TRC20_CONTRACT_NILE: &str = "TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf";
+
+/// Which Tron network a node verifies payments on.
+///
+/// Endpoint and contract travel together deliberately. Holding them as two
+/// free-standing strings invites the combination that silently breaks
+/// everything — mainnet's contract queried against Nile's endpoint matches
+/// nothing, and every honest payment looks like non-payment.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TronNetwork {
+    #[default]
+    Mainnet,
+    Nile,
+}
+
+impl TronNetwork {
+    pub fn default_url(self) -> &'static str {
+        match self {
+            TronNetwork::Mainnet => DEFAULT_TRONGRID_URL,
+            TronNetwork::Nile => NILE_TRONGRID_URL,
+        }
+    }
+
+    /// The USDT contract for this network. Nothing else counts as payment.
+    pub fn usdt_contract(self) -> &'static str {
+        match self {
+            TronNetwork::Mainnet => USDT_TRC20_CONTRACT,
+            TronNetwork::Nile => USDT_TRC20_CONTRACT_NILE,
+        }
+    }
+
+    /// Whether payment checks must go through Tor.
+    ///
+    /// Mainnet: yes — the query links an IP to a trade. Nile: no, because
+    /// there is no money or privacy to protect there and forcing Tor only
+    /// makes a failed check ambiguous between "no payment" and "proxy down".
+    pub fn requires_tor(self) -> bool {
+        matches!(self, TronNetwork::Mainnet)
+    }
+
+    pub fn is_testnet(self) -> bool {
+        matches!(self, TronNetwork::Nile)
+    }
+}
+
 /// Where and how to reach Tron.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TronConfig {
+    /// Network being verified against. Selects the contract, so it must match
+    /// the endpoint below.
+    #[serde(default)]
+    pub network: TronNetwork,
     pub base_url: String,
     /// Additional TronGrid-compatible endpoints tried in order.
     #[serde(default)]
@@ -45,12 +101,38 @@ pub struct TronConfig {
 
 impl Default for TronConfig {
     fn default() -> Self {
+        Self::for_network(TronNetwork::default())
+    }
+}
+
+impl TronConfig {
+    /// Config for `network`, with its matching endpoint and contract.
+    ///
+    /// The only constructor that cannot produce a mismatched pair, which is
+    /// why callers should prefer it over building the struct by hand.
+    pub fn for_network(network: TronNetwork) -> Self {
         Self {
-            base_url: DEFAULT_TRONGRID_URL.to_string(),
+            network,
+            base_url: network.default_url().to_string(),
             fallback_urls: Vec::new(),
             api_key: None,
             socks_proxy: None,
         }
+    }
+
+    /// The contract this config treats as USDT.
+    pub fn usdt_contract(&self) -> &'static str {
+        self.network.usdt_contract()
+    }
+
+    /// Whether payment checks may run.
+    ///
+    /// Mainnet demands Tor: the query ties the caller's IP to the address they
+    /// are watching, and refusing is the safer failure — an unverified payment
+    /// costs an expired offer, a deanonymised trade cannot be undone. Nile has
+    /// neither money nor privacy at stake, so it runs either way.
+    pub fn may_query(&self) -> bool {
+        !self.network.requires_tor() || self.is_private()
     }
 }
 
@@ -251,6 +333,7 @@ impl TronConfig {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         Self {
+            network: TronNetwork::default(),
             base_url,
             fallback_urls,
             api_key,
@@ -615,6 +698,48 @@ mod tests {
     }
 
     #[test]
+    fn each_network_pairs_its_own_endpoint_and_contract() {
+        // The pairing is the point: mainnet's contract queried against Nile's
+        // endpoint matches nothing, and every honest payment would look like
+        // non-payment.
+        let mainnet = TronConfig::for_network(TronNetwork::Mainnet);
+        assert_eq!(mainnet.base_url, DEFAULT_TRONGRID_URL);
+        assert_eq!(mainnet.usdt_contract(), USDT_TRC20_CONTRACT);
+
+        let nile = TronConfig::for_network(TronNetwork::Nile);
+        assert_eq!(nile.base_url, NILE_TRONGRID_URL);
+        assert_eq!(nile.usdt_contract(), USDT_TRC20_CONTRACT_NILE);
+
+        assert_ne!(
+            USDT_TRC20_CONTRACT, USDT_TRC20_CONTRACT_NILE,
+            "the two networks must not share a contract"
+        );
+    }
+
+    #[test]
+    fn defaulting_lands_on_mainnet() {
+        // A config that forgot to say which network it meant must not silently
+        // become testnet, where a worthless token would release real ZKA.
+        assert_eq!(TronNetwork::default(), TronNetwork::Mainnet);
+        assert_eq!(TronConfig::default().network, TronNetwork::Mainnet);
+    }
+
+    #[test]
+    fn mainnet_refuses_to_query_without_tor_and_nile_does_not() {
+        let mut mainnet = TronConfig::for_network(TronNetwork::Mainnet);
+        assert!(!mainnet.may_query(), "mainnet must not query in the clear");
+        mainnet.socks_proxy = Some("127.0.0.1:9050".to_string());
+        assert!(mainnet.may_query());
+
+        // Nile has no money and no privacy at stake, and forcing Tor there
+        // makes a failed check ambiguous between "no payment" and "proxy down".
+        let nile = TronConfig::for_network(TronNetwork::Nile);
+        assert!(nile.may_query(), "testnet must not be gated on Tor");
+        assert!(!nile.network.requires_tor());
+        assert!(nile.network.is_testnet());
+    }
+
+    #[test]
     fn the_default_endpoint_is_public_trongrid_without_a_key() {
         let config = TronConfig::default();
         assert_eq!(config.base_url, DEFAULT_TRONGRID_URL);
@@ -655,6 +780,7 @@ mod tests {
         .to_string();
         let (proxy, mut requests, task) = spawn_mock_socks_http(vec![(200, body)]).await;
         let client = TronClient::new(TronConfig {
+            network: TronNetwork::Mainnet,
             base_url: "http://tron-primary.test".to_string(),
             fallback_urls: Vec::new(),
             api_key: Some("secret-test-key".to_string()),
@@ -683,6 +809,7 @@ mod tests {
         let (proxy, mut requests, task) =
             spawn_mock_socks_http(vec![(503, "{}".to_string()), (200, body)]).await;
         let client = TronClient::new(TronConfig {
+            network: TronNetwork::Mainnet,
             base_url: "http://tron-primary.test".to_string(),
             fallback_urls: vec!["http://tron-fallback.test".to_string()],
             api_key: None,
