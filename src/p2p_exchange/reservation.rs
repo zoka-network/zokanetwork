@@ -94,6 +94,31 @@ pub fn select_notes(
     Ok(Reservation { note_ids: chosen, total_atoms: total })
 }
 
+/// Adapts the wallet's notes into the form [`select_notes`] takes.
+///
+/// Drops spent notes here rather than in the selector: `SpendableNote` is
+/// meant to describe something spendable, so letting a spent one through would
+/// make every caller responsible for a filter they could forget.
+///
+/// `unlock_heights` supplies coinbase maturity, which `PrivateNote` does not
+/// carry — the wallet tracks locked rewards separately. Anything missing from
+/// the map is treated as mature, matching a note that was never a coinbase.
+pub fn spendable_from_wallet_notes(
+    notes: &[crate::private_wallet::PrivateNote],
+    unlock_heights: &std::collections::HashMap<String, u64>,
+) -> Vec<SpendableNote> {
+    notes
+        .iter()
+        .filter(|note| !note.spent)
+        .map(|note| SpendableNote {
+            id: note.note_id.clone(),
+            amount_atoms: note.amount,
+            reserved: note.reserved,
+            unlock_height: unlock_heights.get(&note.note_id).copied().unwrap_or(0),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,5 +233,78 @@ mod tests {
         let notes = vec![note("zero", 0), note("real", 100)];
         let picked = select_notes(&notes, 100, 0).unwrap();
         assert_eq!(picked.note_ids, vec!["real".to_string()]);
+    }
+
+    // ── Wallet adapter ───────────────────────────────────────────────────
+
+    fn wallet_note(id: &str, amount: u64) -> crate::private_wallet::PrivateNote {
+        // Only the fields the adapter reads matter; the cryptographic ones are
+        // irrelevant to note selection.
+        crate::private_wallet::PrivateNote {
+            note_id: id.to_string(),
+            asset_tag: "ZKA".to_string(),
+            source_tx_hash: String::new(),
+            recipient_commitment: String::new(),
+            stealth_address: String::new(),
+            ephemeral_pubkey: Vec::new(),
+            commitment: String::new(),
+            amount_commitment: String::new(),
+            range_proof: Vec::new(),
+            one_time_public_key: String::new(),
+            commitment_blind: Vec::new(),
+            amount,
+            is_change: false,
+            spent: false,
+            created_at: 0,
+            spent_at: None,
+            reserved: false,
+            reserved_by_tx: None,
+        }
+    }
+
+    #[test]
+    fn spent_notes_never_reach_the_selector() {
+        // Dropped in the adapter rather than the selector, so no caller can
+        // forget the filter and back an offer with coins already gone.
+        let mut spent = wallet_note("gone", 500);
+        spent.spent = true;
+        let notes = vec![spent, wallet_note("live", 100)];
+
+        let spendable = spendable_from_wallet_notes(&notes, &std::collections::HashMap::new());
+        assert_eq!(spendable.len(), 1);
+        assert_eq!(spendable[0].id, "live");
+    }
+
+    #[test]
+    fn the_wallets_reserved_flag_is_carried_through() {
+        let mut held = wallet_note("held", 100);
+        held.reserved = true;
+        let spendable =
+            spendable_from_wallet_notes(&[held], &std::collections::HashMap::new());
+        assert!(spendable[0].reserved);
+    }
+
+    #[test]
+    fn coinbase_maturity_comes_from_the_supplied_map() {
+        // PrivateNote carries no unlock height; the wallet tracks locked
+        // rewards separately, so it has to be supplied alongside.
+        let notes = vec![wallet_note("reward", 1_000), wallet_note("normal", 100)];
+        let mut heights = std::collections::HashMap::new();
+        heights.insert("reward".to_string(), 900u64);
+
+        let spendable = spendable_from_wallet_notes(&notes, &heights);
+        let reward = spendable.iter().find(|n| n.id == "reward").unwrap();
+        let normal = spendable.iter().find(|n| n.id == "normal").unwrap();
+
+        assert_eq!(reward.unlock_height, 900);
+        // Absent from the map means it was never a coinbase, so it is mature.
+        assert_eq!(normal.unlock_height, 0);
+
+        // Below the unlock height the reward cannot back an offer.
+        assert!(matches!(
+            select_notes(&spendable, 1_000, 899),
+            Err(ReservationError::InsufficientFunds { .. })
+        ));
+        assert!(select_notes(&spendable, 1_000, 900).is_ok());
     }
 }
