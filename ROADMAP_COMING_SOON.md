@@ -1,6 +1,6 @@
 # ZSilent Core — Roadmap: Explorer, P2P Exchange, Mining Pool
 
-Última actualización: 2026-07-25
+Última actualización: 2026-07-26
 Complementa a `ROADMAP.md` (Fases A–D, wallet/core). Cubre las tres secciones que aparecieron en
 el sidebar de ZSilent en v1.9.1 como "Coming Soon" (`ui/screens/Screens.kt`) y que hoy no tienen
 funcionalidad real detrás.
@@ -234,13 +234,34 @@ en el repo ZOKA, commit `796c086b`, 3 tests en verde.
    la red** — spam de logs proporcional al volumen de ofertas. Con un tópico propio los nodos
    viejos ni se suscriben y no ven nada. → **Usar tópico separado.**
 
-> **Estado al 2026-07-26.** Rama `etapa2-p2p-exchange` (repo ZOKA), pusheada. Hechas: 2.0,
-> 2.1, 2.2, 2.3/2.5 — 35 tests del módulo en verde + 20 de `network::message` + 39 de
-> `network::p2p` sin regresión. Pendientes: **2.4** (verificación Tron por Tor), **2.6**
-> (presencia del vendedor), **2.7** (claim atómico ya está en el store; falta liberación y
-> reputación), **2.8** (pantalla de riesgos) y **2.9** (UI).
+> **Estado al 2026-07-26 (fin de sesión).** Rama `etapa2-p2p-exchange` (repo ZOKA), pusheada.
+> **66 tests de `p2p_exchange::` en verde**, más `network::message` (20) y `network::p2p` (39)
+> sin regresión. UI y flag del Explorer están en `main` de zsilent-core, también pusheado.
 >
-> Nota: `cargo test --lib` completo (836 tests) excede 10 min; usar filtros
+> **Hecho:** 2.0 (compat P2P), 2.1 (modelo `Offer`), 2.2 (gossip + tópico propio +
+> `signing_preimage`), 2.3 (`select_notes` + adaptador de wallet), 2.4 (reglas de pago Tron),
+> 2.5 (store persistente + reconciliación), endpoints RPC (`/p2p-exchange/*`), 2.8 (pantalla
+> de riesgos) y 2.9 (UI de las 3 secciones).
+>
+> **Pendiente — sobre todo integración:**
+>
+> 1. Enchufar `select_notes` a `create_exchange_offer` y marcar las notas reservadas en la
+>    wallet. Hoy las ofertas se crean con `reserved_note_ids` vacío.
+> 2. Cliente HTTP que consuma `tron::trc20_transfers_path` **por el proxy SOCKS** y aplique
+>    `transfer_settles_offer`. Las reglas están; falta el transporte.
+> 3. §2.6 presencia del vendedor, §2.7 liberación + reputación.
+> 4. Pase visual sobre las 3 secciones (acordado para el cierre de la etapa).
+>
+> **Deudas anotadas, no olvidadas:**
+>
+> - La firma de gossipsub autentica el **nodo**, no la **wallet**: alguien puede publicar una
+>   oferta con la `zka1` de otro. Aceptado para v1, `signing_preimage()` listo para atarlo.
+> - **Nada se verificó nunca contra un nodo real.** Todo es compilación + tests unitarios.
+>   Desbloquea: crear la wallet del nodo (`zoka node --password <la tuya>`).
+> - El binario del nodo en `target/release` es del 23/7 y **no** tiene los endpoints nuevos;
+>   por eso la UI de P2P dice "Node too old" hasta recompilar.
+>
+> Nota: `cargo test --lib` completo (860+ tests) excede 10 min; usar filtros
 > (`cargo test --lib p2p_exchange::`).
 
 ### Decisiones cerradas 2026-07-26 (segunda ronda)
