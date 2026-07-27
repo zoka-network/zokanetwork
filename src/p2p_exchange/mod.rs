@@ -18,9 +18,11 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod reservation;
 pub mod store;
 pub mod tron;
 
+pub use reservation::{select_notes, Reservation, ReservationError, SpendableNote};
 pub use store::{OfferStore, ReconcileReport, StoreError};
 pub use tron::{TronConfig, TronTransfer};
 
