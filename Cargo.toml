@@ -49,6 +49,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
 tokio-socks = "0.5"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks"] }
 libp2p = { version = "0.53", features = ["tokio", "noise", "yamux", "tcp", "kad", "identify", "gossipsub", "request-response", "macros", "dns", "ping"] }
 # Modern P2P layer (n0/IPFS): QUIC + built-in NAT hole-punching (direct
 # connections with no open ports and no Tor) plus verified, resumable blob

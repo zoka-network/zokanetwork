@@ -29,8 +29,11 @@ Este documento es el estado de verdad del trabajo. **Leelo entero antes de tocar
    rechaza fondos insuficientes, guarda los ids elegidos, marca las notas con el id de oferta y
    revierte la reserva si el store rechaza la inserción. Verificado con 4 tests del handler y
    los 66 tests de `p2p_exchange::`; **todavía no verificado contra nodo real**.
-2. **Cliente HTTP de Tron** que use `tron::trc20_transfers_path` **por el proxy SOCKS** y
-   aplique `tron::transfer_settles_offer`. Las reglas están completas; falta el transporte.
+2. ~~**Cliente HTTP de Tron** que use `tron::trc20_transfers_path` **por el proxy SOCKS** y
+   aplique `tron::transfer_settles_offer`.~~ ✅ Transporte Rust implementado con `socks5h`,
+   TronGrid, API key opcional y fallbacks configurables. Se niega a construirse sin Tor.
+   Verificado contra un servidor HTTP simulado detrás de un proxy SOCKS real de test; no se
+   consultó Tron mainnet.
 3. **§2.6** presencia del vendedor y **§2.7** liberación automática + reputación.
 4. **§2.8** revisión de seguridad — gate obligatorio antes de habilitarlo a usuarios reales.
 5. Pase visual sobre las 3 secciones, y recién ahí la Etapa 3.
@@ -317,8 +320,8 @@ en el repo ZOKA, commit `796c086b`, 3 tests en verde.
 >
 > 1. ✅ `select_notes` ya está conectado a `create_exchange_offer`; reserva las notas en la
 >    wallet y llena `reserved_note_ids`. Verificado por tests del handler, no contra nodo real.
-> 2. Cliente HTTP que consuma `tron::trc20_transfers_path` **por el proxy SOCKS** y aplique
->    `transfer_settles_offer`. Las reglas están; falta el transporte.
+> 2. ✅ `TronClient` consume `trc20_transfers_path` exclusivamente por SOCKS (`socks5h`) y
+>    `settling_transfer` aplica las reglas existentes. Falta enchufarlo al loop automático §2.7.
 > 3. §2.6 presencia del vendedor, §2.7 liberación + reputación.
 > 4. Pase visual sobre las 3 secciones (acordado para el cierre de la etapa).
 >
@@ -423,17 +426,24 @@ huérfana es ingastable para siempre y el usuario ni siquiera ve por qué le fal
 
 ### 2.4 Verificación de pago USDT vía Tor
 
-- [ ] Cliente HTTP con Ktor CIO (ya es dependencia) configurado con **proxy SOCKS hacia el
-      TorSupervisor existente**. La consulta a Tron nunca sale directo.
-- [ ] Manejar Tor caído como estado explícito: sin Tor no hay verificación, y el usuario tiene
+- [x] Cliente HTTP implementado en **Rust/reqwest**, porque el handoff vigente exige consumir
+      `tron::trc20_transfers_path` y aplicar `tron::transfer_settles_offer` sin duplicar esas
+      reglas económicas en Kotlin. Usa `socks5h`, por lo que conexión y DNS salen por el proxy
+      que ZSilent ya pasa al nodo mediante `--tor-proxy`; no existe fallback directo.
+- [x] Manejar Tor caído como estado explícito: sin Tor no hay verificación, y el usuario tiene
       que verlo — no fallar en silencio ni caer a conexión directa.
-- [ ] TronGrid como proveedor primario, un fallback configurado (ej. TronScan).
+- [x] TronGrid público como proveedor primario, API key opcional y lista ordenada de endpoints
+      compatibles de fallback (`ZOKA_TRON_API_URL`, `ZOKA_TRON_API_KEY`,
+      `ZOKA_TRON_FALLBACK_URLS`).
 - [ ] Solo el vendedor consulta. El comprador ve el estado por gossip.
-- [ ] Matching: address de cobro + monto + timestamp posterior al claim. Nunca solo por monto.
-- [ ] Pago de menos (fuera de tolerancia) → no libera, la oferta expira normal.
-- [ ] Pago de más → libera igual.
-- [ ] Tolerancia de redondeo ~0.5%, configurable.
-- [ ] Ventana de expiración: 45 min desde el claim, configurable.
+- [x] Matching: contrato USDT + address de cobro + monto + timestamp posterior al claim. Nunca
+      solo por monto.
+- [x] Pago de menos (fuera de tolerancia) → no libera; pago de más → libera igual.
+- [x] Tolerancia de redondeo 0.5% y ventana de expiración de 45 min fijadas por tests.
+- [x] Verificado: 17 tests de `p2p_exchange::tron`, incluidos proxy SOCKS, API key, decodificación
+      de respuesta, fallback y negativa sin Tor. **No verificado contra TronGrid real.**
+- [ ] Exponer URL/API key/fallback en Settings; hoy el transporte ya acepta overrides por
+      entorno, pero la UI todavía no los persiste ni los pasa al proceso.
 
 ### 2.5 Persistencia y arranque
 

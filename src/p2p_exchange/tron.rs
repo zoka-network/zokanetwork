@@ -31,6 +31,9 @@ pub const USDT_TRC20_CONTRACT: &str = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TronConfig {
     pub base_url: String,
+    /// Additional TronGrid-compatible endpoints tried in order.
+    #[serde(default)]
+    pub fallback_urls: Vec<String>,
     /// Optional TronGrid API key. Absent means the public rate limit.
     #[serde(default)]
     pub api_key: Option<String>,
@@ -44,13 +47,194 @@ impl Default for TronConfig {
     fn default() -> Self {
         Self {
             base_url: DEFAULT_TRONGRID_URL.to_string(),
+            fallback_urls: Vec::new(),
             api_key: None,
             socks_proxy: None,
         }
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum TronClientError {
+    #[error("Tor SOCKS proxy is unavailable; payment verification was not attempted")]
+    TorUnavailable,
+    #[error("invalid SOCKS proxy address: {0}")]
+    InvalidProxy(String),
+    #[error("all Tron providers failed: {0}")]
+    ProvidersExhausted(String),
+}
+
+#[derive(Clone)]
+pub struct TronClient {
+    config: TronConfig,
+    client: reqwest::Client,
+}
+
+#[derive(Debug, Deserialize)]
+struct TronGridResponse {
+    #[serde(default)]
+    data: Vec<TronGridTransfer>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TronGridTransfer {
+    transaction_id: String,
+    to: String,
+    from: String,
+    token_info: TronGridTokenInfo,
+    value: String,
+    block_timestamp: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct TronGridTokenInfo {
+    address: String,
+}
+
+impl TronClient {
+    /// Builds a client that can only connect through the configured SOCKS
+    /// proxy. `socks5h` keeps DNS resolution on the Tor side.
+    pub fn new(config: TronConfig) -> Result<Self, TronClientError> {
+        let proxy = config
+            .socks_proxy
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or(TronClientError::TorUnavailable)?;
+        let proxy_url = if proxy.starts_with("socks5://") || proxy.starts_with("socks5h://") {
+            proxy.to_string()
+        } else {
+            format!("socks5h://{proxy}")
+        };
+        let proxy = reqwest::Proxy::all(&proxy_url)
+            .map_err(|error| TronClientError::InvalidProxy(error.to_string()))?;
+        let client = reqwest::Client::builder()
+            .proxy(proxy)
+            .build()
+            .map_err(|error| TronClientError::InvalidProxy(error.to_string()))?;
+        Ok(Self { config, client })
+    }
+
+    pub async fn fetch_transfers(
+        &self,
+        address: &str,
+        limit: u32,
+    ) -> Result<Vec<TronTransfer>, TronClientError> {
+        let path = trc20_transfers_path(address, limit);
+        let providers = std::iter::once(self.config.base_url.as_str())
+            .chain(self.config.fallback_urls.iter().map(String::as_str));
+        let mut failures = Vec::new();
+
+        for provider in providers {
+            let provider = provider.trim().trim_end_matches('/');
+            if provider.is_empty() {
+                continue;
+            }
+            let mut request = self.client.get(format!("{provider}{path}"));
+            if let Some(api_key) = self
+                .config
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                request = request.header("TRON-PRO-API-KEY", api_key);
+            }
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    failures.push(format!("{provider}: {error}"));
+                    continue;
+                }
+            };
+            let response = match response.error_for_status() {
+                Ok(response) => response,
+                Err(error) => {
+                    failures.push(format!("{provider}: {error}"));
+                    continue;
+                }
+            };
+            let payload = match response.json::<TronGridResponse>().await {
+                Ok(payload) => payload,
+                Err(error) => {
+                    failures.push(format!("{provider}: invalid response: {error}"));
+                    continue;
+                }
+            };
+            let mut transfers = Vec::with_capacity(payload.data.len());
+            let mut malformed = None;
+            for transfer in payload.data {
+                match transfer.value.parse::<u64>() {
+                    Ok(value) => transfers.push(TronTransfer {
+                        transaction_id: transfer.transaction_id,
+                        to: transfer.to,
+                        from: transfer.from,
+                        contract_address: transfer.token_info.address,
+                        value,
+                        block_timestamp: transfer.block_timestamp,
+                    }),
+                    Err(error) => {
+                        malformed = Some(format!(
+                            "{provider}: invalid transfer value '{}': {error}",
+                            transfer.value
+                        ));
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = malformed {
+                failures.push(error);
+                continue;
+            }
+            return Ok(transfers);
+        }
+
+        Err(TronClientError::ProvidersExhausted(failures.join("; ")))
+    }
+
+    pub async fn settling_transfer(
+        &self,
+        offer: &Offer,
+        claimed_at_secs: u64,
+    ) -> Result<Option<TronTransfer>, TronClientError> {
+        let transfers = self
+            .fetch_transfers(&offer.usdt_receive_address, 200)
+            .await?;
+        Ok(find_settling_transfer(offer, &transfers, claimed_at_secs).cloned())
+    }
+}
+
 impl TronConfig {
+    pub fn from_env(socks_proxy: Option<String>) -> Self {
+        let base_url = std::env::var("ZOKA_TRON_API_URL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_TRONGRID_URL.to_string());
+        let fallback_urls = std::env::var("ZOKA_TRON_FALLBACK_URLS")
+            .ok()
+            .into_iter()
+            .flat_map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let api_key = std::env::var("ZOKA_TRON_API_KEY")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        Self {
+            base_url,
+            fallback_urls,
+            api_key,
+            socks_proxy,
+        }
+    }
+
     /// Whether payment checks may run.
     ///
     /// Without a proxy the request would tie the user's IP to the address they
@@ -162,6 +346,7 @@ mod tests {
     use super::*;
     use crate::economics::ATOMS_PER_ZKA;
     use crate::p2p_exchange::{OfferStatus, MICRO_USDT_PER_USDT};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const PAYOUT: &str = "TQ5NMqJjW8dWvJf3zJ8xYqL2mNpR4sT6uV";
     const CLAIMED_AT: u64 = 1_751_000_000;
@@ -190,6 +375,79 @@ mod tests {
             value: 25 * MICRO_USDT_PER_USDT,
             block_timestamp: (CLAIMED_AT + 60) * 1_000,
         }
+    }
+
+    async fn spawn_mock_socks_http(
+        responses: Vec<(u16, String)>,
+    ) -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut greeting = [0u8; 2];
+                socket.read_exact(&mut greeting).await.unwrap();
+                let mut methods = vec![0u8; greeting[1] as usize];
+                socket.read_exact(&mut methods).await.unwrap();
+                socket.write_all(&[5, 0]).await.unwrap();
+
+                let mut request_head = [0u8; 4];
+                socket.read_exact(&mut request_head).await.unwrap();
+                let destination = match request_head[3] {
+                    1 => {
+                        let mut ip = [0u8; 4];
+                        socket.read_exact(&mut ip).await.unwrap();
+                        std::net::Ipv4Addr::from(ip).to_string()
+                    }
+                    3 => {
+                        let mut len = [0u8; 1];
+                        socket.read_exact(&mut len).await.unwrap();
+                        let mut host = vec![0u8; len[0] as usize];
+                        socket.read_exact(&mut host).await.unwrap();
+                        String::from_utf8(host).unwrap()
+                    }
+                    atyp => panic!("unexpected SOCKS address type {atyp}"),
+                };
+                let mut port = [0u8; 2];
+                socket.read_exact(&mut port).await.unwrap();
+                socket
+                    .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80])
+                    .await
+                    .unwrap();
+
+                let mut request = Vec::new();
+                loop {
+                    let mut byte = [0u8; 1];
+                    socket.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = format!(
+                    "SOCKS-Destination: {destination}\n{}",
+                    String::from_utf8(request).unwrap()
+                );
+                requests_tx.send(request).unwrap();
+
+                let reason = if status == 200 {
+                    "OK"
+                } else {
+                    "Service Unavailable"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (address.to_string(), requests_rx, task)
     }
 
     #[test]
@@ -341,5 +599,74 @@ mod tests {
         // Absurd limits are clamped rather than forwarded.
         assert!(trc20_transfers_path(PAYOUT, 99_999).contains("limit=200"));
         assert!(trc20_transfers_path(PAYOUT, 0).contains("limit=1"));
+    }
+
+    #[test]
+    fn client_refuses_to_exist_without_tor() {
+        assert!(matches!(
+            TronClient::new(TronConfig::default()),
+            Err(TronClientError::TorUnavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn transfers_are_fetched_through_socks_and_decoded() {
+        let body = serde_json::json!({
+            "data": [{
+                "transaction_id": "tron-tx-1",
+                "to": PAYOUT,
+                "from": "TBuyerAddress111111111111111111111",
+                "token_info": { "address": USDT_TRC20_CONTRACT },
+                "value": (25 * MICRO_USDT_PER_USDT).to_string(),
+                "block_timestamp": (CLAIMED_AT + 60) * 1_000
+            }]
+        })
+        .to_string();
+        let (proxy, mut requests, task) = spawn_mock_socks_http(vec![(200, body)]).await;
+        let client = TronClient::new(TronConfig {
+            base_url: "http://tron-primary.test".to_string(),
+            fallback_urls: Vec::new(),
+            api_key: Some("secret-test-key".to_string()),
+            socks_proxy: Some(proxy),
+        })
+        .unwrap();
+
+        let settling = client
+            .settling_transfer(&claimed_offer(), CLAIMED_AT)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(settling.transaction_id, "tron-tx-1");
+        let request = requests.recv().await.unwrap();
+        assert!(request.contains("SOCKS-Destination: tron-primary.test"));
+        assert!(request.contains(&trc20_transfers_path(PAYOUT, 200)));
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("tron-pro-api-key: secret-test-key"));
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_primary_uses_the_configured_fallback() {
+        let body = serde_json::json!({ "data": [] }).to_string();
+        let (proxy, mut requests, task) = spawn_mock_socks_http(vec![
+            (503, "{}".to_string()),
+            (200, body),
+        ])
+        .await;
+        let client = TronClient::new(TronConfig {
+            base_url: "http://tron-primary.test".to_string(),
+            fallback_urls: vec!["http://tron-fallback.test".to_string()],
+            api_key: None,
+            socks_proxy: Some(proxy),
+        })
+        .unwrap();
+
+        assert!(client.fetch_transfers(PAYOUT, 50).await.unwrap().is_empty());
+        let primary = requests.recv().await.unwrap();
+        let fallback = requests.recv().await.unwrap();
+        assert!(primary.contains("SOCKS-Destination: tron-primary.test"));
+        assert!(fallback.contains("SOCKS-Destination: tron-fallback.test"));
+        task.await.unwrap();
     }
 }
