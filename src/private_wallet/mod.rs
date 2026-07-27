@@ -4188,6 +4188,33 @@ impl PrivateWalletManager {
             .cloned()
     }
 
+    /// Cache a canonical block transaction as confirmed so a wallet that was
+    /// not its sender or receiver can still verify and redeem a mining fee
+    /// envelope addressed to it. This is needed by non-custodial team mining:
+    /// the coordinator constructs the block, but the assigned remote member
+    /// owns both coinbase and its private fee claims.
+    pub fn cache_confirmed_private_transaction_for_fee_claim(
+        &mut self,
+        tx: PrivateTransaction,
+    ) -> Result<(), BlockError> {
+        let tx_hash = tx.tx_hash.clone();
+        if self
+            .get_private_transaction(&tx_hash)
+            .is_some_and(|existing| existing.status == PrivacyStatus::Confirmed)
+        {
+            return Ok(());
+        }
+        if self
+            .private_pool
+            .confirm_private_transaction(&tx_hash)
+            .is_ok()
+        {
+            return Ok(());
+        }
+        let tx_hash = self.private_pool.submit_private_transaction(tx)?;
+        self.private_pool.confirm_private_transaction(&tx_hash)
+    }
+
     /// Build an encrypted fee-opening envelope `(fee, fee_blind)` for the
     /// block-winning miner. This is the sender side of pending item `#1b`.
     pub fn create_miner_fee_claim_envelope(

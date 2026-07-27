@@ -4249,6 +4249,43 @@ fn settle_synced_private_coinbase_rewards(
     Ok(registered.saturating_add(if settled > 0 { 1 } else { 0 }))
 }
 
+fn claim_private_fee_rewards_from_block(
+    manager: &mut PrivateWalletManager,
+    wallet_name: &str,
+    block: &zoka::types::Block,
+) -> Result<usize, String> {
+    if block.private_fee_claims.is_empty() {
+        return Ok(0);
+    }
+    let claimed_hashes = block
+        .private_fee_claims
+        .iter()
+        .map(|claim| claim.tx_hash.as_str())
+        .collect::<HashSet<_>>();
+    for body in &block.private_tx_bodies {
+        let Ok(tx) = serde_json::from_slice::<PrivateTransaction>(body) else {
+            continue;
+        };
+        if claimed_hashes.contains(tx.tx_hash.as_str()) {
+            let _ = manager.cache_confirmed_private_transaction_for_fee_claim(tx);
+        }
+    }
+    let outcome = match manager
+        .claim_private_fees_from_block_claims(wallet_name, &block.private_fee_claims)
+    {
+        Ok(outcome) => outcome,
+        Err(error) if error.to_string().contains("No valid private fee claims found") => {
+            return Ok(0);
+        }
+        Err(error) => {
+            return Err(format!(
+                "failed to scan private mining fee claims: {error}"
+            ));
+        }
+    };
+    Ok(outcome.claimed_tx_hashes.len())
+}
+
 fn sync_private_coinbase_outputs_from_blocks<I>(
     storage: &WalletStorage,
     manager: &mut PrivateWalletManager,
@@ -4272,10 +4309,16 @@ where
     state.chain_height = state.chain_height.max(chain_height);
 
     let mut registered = 0usize;
+    let mut claimed_fees = 0usize;
     for block in blocks {
         if block.header.block_height < restore_height {
             continue;
         }
+        claimed_fees = claimed_fees.saturating_add(claim_private_fee_rewards_from_block(
+            manager,
+            wallet_name,
+            &block,
+        )?);
         if register_private_coinbase_reward_from_block(
             manager,
             wallet_name,
@@ -4291,6 +4334,9 @@ where
     let settled = settle_synced_private_coinbase_rewards(
         storage, manager, password, network, &mut state, registered,
     )?;
+    if claimed_fees > 0 {
+        persist_private_wallet(storage, manager, wallet_name, password)?;
+    }
 
     // Advance the wallet's scan checkpoint past every block this call covered
     // so the next unlock only scans new blocks instead of re-reading the
@@ -4299,7 +4345,7 @@ where
     // performance optimization, not a correctness dependency.
     advance_private_wallet_restore_height(storage, manager, wallet_name, password, chain_height)?;
 
-    Ok(settled)
+    Ok(settled.saturating_add(claimed_fees))
 }
 
 /// Bumps `wallet.restore_height` to `scanned_through + 1` so future coinbase
@@ -4344,13 +4390,22 @@ fn sync_private_coinbase_outputs_from_rpc(
     let restore_height = wallet.restore_height.max(1);
 
     let mut registered = 0usize;
+    let mut claimed_fees = 0usize;
     let mut from = restore_height;
     while from <= chain_height {
         let to = from.saturating_add(255).min(chain_height);
         let responses = fetch_rpc_block_range(rpc, from, to)?;
         for response in responses {
-            let block: zoka::types::Block = serde_json::from_slice(&response.encrypted_block)
+            let mut block: zoka::types::Block = serde_json::from_slice(&response.encrypted_block)
                 .map_err(|e| format!("RPC private coinbase block decode failed: {e}"))?;
+            if block.private_tx_bodies.is_empty() {
+                block.private_tx_bodies = response.private_tx_bodies;
+            }
+            claimed_fees = claimed_fees.saturating_add(claim_private_fee_rewards_from_block(
+                manager,
+                wallet_name,
+                &block,
+            )?);
             if register_private_coinbase_reward_from_block(
                 manager,
                 wallet_name,
@@ -4368,10 +4423,13 @@ fn sync_private_coinbase_outputs_from_rpc(
     let settled = settle_synced_private_coinbase_rewards(
         storage, manager, password, network, &mut state, registered,
     )?;
+    if claimed_fees > 0 {
+        persist_private_wallet(storage, manager, wallet_name, password)?;
+    }
 
     advance_private_wallet_restore_height(storage, manager, wallet_name, password, chain_height)?;
 
-    Ok(settled)
+    Ok(settled.saturating_add(claimed_fees))
 }
 
 fn push_unique_rpc_url(urls: &mut Vec<String>, url: String) {
@@ -4604,10 +4662,14 @@ fn sync_private_coinbase_outputs_from_chain_db(
         .unwrap_or(1);
     let mut blocks = Vec::new();
     for height in scan_from..=chain_height {
-        if let Some(block) = chain_storage
+        if let Some(mut block) = chain_storage
             .get_block_by_height(height)
             .map_err(|e| format!("failed to read block at height {height}: {e}"))?
         {
+            if block.private_tx_bodies.is_empty() {
+                block.private_tx_bodies =
+                    collect_private_tx_bodies_from_storage(&chain_storage, &block);
+            }
             blocks.push(block);
         }
     }
@@ -6000,10 +6062,13 @@ fn run_mining_batch_with_progress(
             },
             _ => Vec::new(),
         };
+        let payout_commitment =
+            zoka::private_wallet::canonical_payment_address(&payout_address)
+                .map_err(|e| format!("invalid mining payout address: {e}"))?;
         let private_fee_claims_for_block = private_manager
             .create_local_private_fee_claims_for_block(
                 &private_tx_hashes_for_block,
-                &wallet_commitment,
+                &payout_commitment,
             )
             .map_err(|e| format!("failed to build private fee claims: {e}"))?;
         let private_coinbase =
@@ -6014,7 +6079,10 @@ fn run_mining_batch_with_progress(
                 height.saturating_add(COINBASE_MATURITY_BLOCKS),
             )
             .map_err(|e| format!("failed to build private coinbase output: {e}"))?;
-        let local_coinbase_recipient = private_coinbase.recipient_commitment == wallet_commitment;
+        if private_coinbase.recipient_commitment != payout_commitment {
+            return Err("private coinbase recipient mismatch".to_string());
+        }
+        let local_coinbase_recipient = payout_commitment == wallet_commitment;
         let mut block = zoka::types::Block {
             header: zoka::types::BlockHeader {
                 hash: String::new(),
@@ -6110,7 +6178,7 @@ fn run_mining_batch_with_progress(
             let mut wallet_state_changed = private_manager
                 .mark_private_transactions_confirmed_locally(&private_tx_hashes_for_block)
                 > 0
-                || !private_fee_claims_for_block.is_empty();
+                || (local_coinbase_recipient && !private_fee_claims_for_block.is_empty());
             // Scan the private tx bodies included in this block and credit any
             // outputs destined for the miner's own wallet.  This handles the
             // case where a third party (e.g. another local wallet) submitted a
@@ -6137,7 +6205,7 @@ fn run_mining_batch_with_progress(
                     }
                 }
             }
-            if !private_fee_claims_for_block.is_empty() {
+            if local_coinbase_recipient && !private_fee_claims_for_block.is_empty() {
                 wallet_state_changed = true;
             }
             if wallet_state_changed {
@@ -6170,7 +6238,7 @@ fn run_mining_batch_with_progress(
                         }
                     }
                 }
-                if !private_fee_claims_for_block.is_empty() {
+                if local_coinbase_recipient && !private_fee_claims_for_block.is_empty() {
                     fresh_manager
                         .claim_private_fees_from_block_claims(
                             &wallet_name,
@@ -17753,6 +17821,53 @@ mod tests {
             template.network_difficulty_bits,
         )
         .is_err());
+    }
+
+    #[test]
+    fn team_recipient_can_scan_fee_claims_from_the_block() {
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("sender").unwrap();
+        let receiver = manager.create_private_wallet("receiver").unwrap();
+        let team_recipient = manager.create_private_wallet("team-recipient").unwrap();
+        manager
+            .deposit_to_private_wallet("sender", 40)
+            .unwrap();
+        let tx_hash = manager
+            .send_private_transaction_with_fee("sender", receiver, 10, 3)
+            .unwrap();
+        let claims = manager
+            .create_local_private_fee_claims_for_block(
+                std::slice::from_ref(&tx_hash),
+                &team_recipient,
+            )
+            .unwrap();
+        let mut block = zoka::types::Block::new(
+            "parent".to_string(),
+            100,
+            0,
+            1,
+            Vec::new(),
+            zoka::types::PublicKey(Vec::new()),
+            zoka::types::Signature(Vec::new()),
+        );
+        block.private_fee_claims = claims;
+        block.private_tx_bodies = vec![
+            serde_json::to_vec(&manager.get_private_transaction(&tx_hash).unwrap()).unwrap(),
+        ];
+
+        assert_eq!(
+            claim_private_fee_rewards_from_block(&mut manager, "receiver", &block).unwrap(),
+            0
+        );
+        assert_eq!(
+            claim_private_fee_rewards_from_block(&mut manager, "team-recipient", &block).unwrap(),
+            1
+        );
+        assert_eq!(manager.get_private_balance("team-recipient"), Some(3));
+        assert_eq!(
+            claim_private_fee_rewards_from_block(&mut manager, "team-recipient", &block).unwrap(),
+            0
+        );
     }
 
     #[test]
