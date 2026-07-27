@@ -20,7 +20,7 @@ Este documento es el estado de verdad del trabajo. **Leelo entero antes de tocar
 | **Etapa 0** (limpieza de UI) | ✅ Completa, mergeada y pusheada a `main` de `zsilent-core`. |
 | **Etapa 1** (Explorer) | ✅ Completa, **verificada contra nodo real** (mainnet, altura 12943). |
 | **Etapa 2** (P2P Exchange) | 🔶 ~97%. Backend en `etapa2-p2p-reservation-integration` y UI en `zsilent-core:etapa2-p2p-ui-integration`. 73 tests de `p2p_exchange::` y 28 tests de ZSilent en verde; implementación y gate completos, falta pase visual y prueba real. |
-| **Etapa 3** (Mining Pool) | 🔶 Implementación backend y UI completa. Backend en `etapa2-p2p-reservation-integration` (`d5486db9`, `cab6023d`, `d290328`, `344989b`); UI en `zsilent-core:etapa2-p2p-ui-integration` (`d78adbb`, `ac2f855`). 12 tests de dominio + tests dirigidos del worker/coinbase/fees y 32 tests de ZSilent en verde; faltan pase visual y prueba real con dos nodos. |
+| **Etapa 3** (Mining Pool) | 🔶 ~99%. Implementación backend y UI completa. Backend en `etapa2-p2p-reservation-integration` (`d5486db9`, `cab6023d`, `d290328`, `344989b`, `63da315`); UI en `zsilent-core:etapa2-p2p-ui-integration` (`d78adbb`, `ac2f855`). 12 tests de dominio + tests dirigidos del worker/coinbase/fees y 32 tests de ZSilent en verde. Verificada además con dos fullnodes reales aislados en testnet/RandomX: join, shares, bloque canónico y failover. Faltan pase visual, dificultad normal/mainnet y release conjunto. |
 
 ### Por dónde seguir, en este orden
 
@@ -46,12 +46,16 @@ Este documento es el estado de verdad del trabajo. **Leelo entero antes de tocar
    worker de shares, bloque real con coinbase rotativo, detección/expulsión y failover
    implementados. Verificado con 12 tests de `team_mining::`, tests dirigidos del worker,
    coinbase privada remota y fee claims, más `cargo check --bin zoka --no-default-features`.
-   **No se verificó todavía contra dos nodos reales ni con RandomX mainnet.**
+   Verificación distribuida adicional: dos procesos reales, gossip/join, dos shares,
+   bloque 1 con el mismo hash en ambos y failover a los 90,5 s. Usó RandomX de testnet con
+   `--unsafe-rehearsal-difficulty-bits 1`; **no verifica dificultad normal ni mainnet**.
 6. ~~Implementar §3.6 en ZSilent y ejecutar los tests de UI.~~ ✅ Cliente RPC, opt-in
    persistido y pantalla operativa completos; `gradlew test` pasó 32/32. **Falta el pase
    visual conjunto; la suite no verifica render ni interacción real con dos nodos.**
-7. Release conjunto y pruebas reales pendientes: P2P Exchange con monto mínimo/Tron mainnet y
-   Team Mining con dos nodos. No confundir esos pendientes con “Node too old” del binario viejo.
+7. Release conjunto y pruebas reales pendientes: P2P Exchange con monto mínimo/Tron mainnet;
+   para Team Mining quedan pase visual y dificultad normal/mainnet (la sesión local de dos nodos
+   ya pasó). No mergear/reiniciar el nodo de uso ni mover fondos sin la aprobación correspondiente.
+   No confundir esos pendientes con “Node too old” del binario viejo.
 
 ### Reglas de trabajo
 
@@ -85,10 +89,14 @@ Este documento es el estado de verdad del trabajo. **Leelo entero antes de tocar
 - La firma de gossipsub autentica el **nodo**, no la **wallet**: alguien puede publicar una
   oferta con la `zka1` de otro. Aceptado para v1; `Offer::signing_preimage()` ya está listo
   para atarlo cuando se cierre.
-- **Nada de P2P Exchange ni Mining Pool se probó contra dos nodos reales.** Solo el Explorer
-  tuvo verificación real. En Team Mining el bloque completo todavía se verificó por piezas
-  (dominio, PoW, coinbase/fees y compilación del ensamblador), no mediante una sesión distribuida
-  ni RandomX mainnet.
+- **P2P Exchange todavía no se probó contra dos nodos reales.** Team Mining sí tuvo una sesión
+  distribuida local con dos procesos/fullnodes, wallets/DB/puertos aislados y RandomX de testnet
+  a dificultad de ensayo 1: convergieron membresía/backup, se aceptaron shares, ambos aplicaron
+  el mismo bloque y el backup asumió tras la caída real del coordinador. Esto **no** reemplaza
+  dificultad normal/mainnet, una corrida prolongada ni la validación visual desde ZSilent.
+- En la observación inmediata del bloque, el coordinador ya mostraba `confirmed_blocks=1` y el
+  miembro todavía `0`; el bloque canónico sí estaba en ambos. La sesión terminó al comprobar el
+  mismo hash, así que la convergencia posterior del `TurnUpdate` no quedó medida.
 - El lock de ZKA es contabilidad de wallet, **no un escrow on-chain**. Un cliente modificado
   puede gastar una nota "reservada". Es inherente al diseño v1 y está avisado en la UI.
 - ✅ **Bloqueante de release resuelto en §2.8:** la wallet cifrada funciona como journal de la
@@ -647,8 +655,10 @@ reutiliza `run_mining_batch_with_progress`, pasa por `validate_pow_block` y
 `state::chain::apply_block`, y recién entonces avanza el turno. La coinbase privada se construye
 para una wallet remota sin cargar sus claves; el test prueba que solo el destinatario puede
 reclamarla. Los fee claims privados siguen el mismo turno y el scanner evita duplicados.
-**El ensamblado completo compila y sus piezas están testeadas, pero todavía no se ejecutó un
-bloque de Team Mining entre dos nodos reales ni con RandomX mainnet.**
+La sesión distribuida de QA ejecutó el ensamblado completo con RandomX de testnet y dificultad
+de ensayo 1. El coordinador aceptó 2 shares, minó el bloque 1 y ambos nodos expusieron el mismo
+hash canónico `80439241d0cdd3352636969063196374eaa3759b45d9776e4d19ac615aa73210`.
+**No se ejecutó con dificultad normal ni en mainnet.**
 
 ### 3.4 Detección de bloques hijackeados
 
@@ -675,8 +685,9 @@ se adivina un culpable.
 
 Heartbeat 30 s, TTL 90 s y promoción por `epoch`. El full-state transfer incluye contadores,
 replay ids y template; `revision` impide que gossip firmado fuera de orden restaure un estado
-viejo. Verificado en tests de promoción, transferencia y anti-rollback; **no mediante caída real
-de un coordinador en una red de dos nodos**.
+viejo. Además de los tests de promoción, transferencia y anti-rollback, se detuvo el proceso
+coordinador en una red real de dos nodos: a los 90,5 s el backup pasó a coordinador,
+`epoch` avanzó de 0 a 1 y el coordinador anterior quedó `active=false`.
 
 ### 3.6 UI
 
@@ -694,7 +705,29 @@ no como equipo vacío. Crear/unirse exige aceptar el disclosure de payouts estad
 iniciar/detener, potencia, membresía, templates, shares y turnos usan el estado real del nodo.
 Implementado en `zsilent-core:etapa2-p2p-ui-integration` (`d78adbb`, `ac2f855`).
 `gradlew test` pasó 32/32, incluido decoding de payloads Rust y persistencia/upgrade del opt-in.
-**No se levantó la app para verificar render/interacciones y no se conectó a dos nodos reales.**
+**No se levantó la app para verificar render/interacciones.** La sesión de dos nodos de §3.7
+usó los endpoints directamente, no ZSilent.
+
+### 3.7 QA distribuido y arranque
+
+- [x] Dos fullnodes reales con `ZOKA_HOME`, wallets, DB, API y puertos P2P separados.
+- [x] Descubrimiento por gossip, join, dos miembros y primer miembro aceptado como backup.
+- [x] Workers reales con RandomX de testnet, 2 shares aceptadas y bloque canónico igual en ambos.
+- [x] Caída real del coordinador: promoción a los 90,5 s, incremento de `epoch` y miembro viejo
+      inactivo.
+- [x] Corregido stack overflow del fullnode debug en Windows: el future grande ahora se aloja en
+      heap (`63da315`). Verificado con `cargo build --bin zoka`, arranque aislado de 10 s y las
+      dos sesiones distribuidas posteriores.
+- [ ] Repetir minería con dificultad normal/mainnet y una sesión prolongada.
+- [ ] Medir la convergencia del `TurnUpdate` post-bloque en el miembro; al instante de cortar la
+      sesión el bloque ya era canónico en ambos, pero `confirmed_blocks` seguía 1/0.
+- [ ] Pase visual desde ZSilent contra los endpoints nuevos.
+
+Los ensayos usaron `--no-network-config` porque el manifiesto público de testnet todavía declara
+el protocol freeze viejo `/zoka/1.0.0`, incompatible con el binario actual
+`/zoka/1.9.0-mainnet-recovery`. Esto no alteró el protocolo entre los dos procesos iguales; ambos
+se conectaron por seed local explícito. Queda como deuda de release actualizar el manifiesto de
+testnet de forma coordinada, no cambiar el freeze unilateralmente desde esta etapa.
 
 ---
 
