@@ -1608,6 +1608,7 @@ impl RbacConfig {
         endpoint_permissions.insert("/transactions/:hash", ApiRole::Read);
         endpoint_permissions.insert("/mempool/metrics", ApiRole::Read);
         endpoint_permissions.insert("/network/runtime", ApiRole::Read);
+        endpoint_permissions.insert("/team-mining/status", ApiRole::Read);
         endpoint_permissions.insert("/crypto/server-pubkey", ApiRole::Read);
 
         // Write endpoints
@@ -1616,6 +1617,11 @@ impl RbacConfig {
         endpoint_permissions.insert("/network/miners/heartbeat", ApiRole::Write);
         endpoint_permissions.insert("/local/mining/start", ApiRole::Write);
         endpoint_permissions.insert("/local/mining/stop", ApiRole::Write);
+        endpoint_permissions.insert("/team-mining/team", ApiRole::Write);
+        endpoint_permissions.insert("/team-mining/join", ApiRole::Write);
+        endpoint_permissions.insert("/team-mining/leave", ApiRole::Write);
+        endpoint_permissions.insert("/team-mining/start", ApiRole::Write);
+        endpoint_permissions.insert("/team-mining/stop", ApiRole::Write);
         endpoint_permissions.insert("/private/view-scan", ApiRole::Write);
         endpoint_permissions.insert("/private/view-scan-key", ApiRole::Write);
         endpoint_permissions.insert("/private/wallet/send-from-seed", ApiRole::Write);
@@ -1822,6 +1828,10 @@ pub struct AppState {
     /// endpoints answer 404 — a client can then tell "this node does not do
     /// exchange" apart from "there are no offers".
     pub exchange_runtime: Option<Arc<ExchangeRuntime>>,
+    /// Non-custodial team-mining coordination shared with the fullnode P2P
+    /// and mining loops. `None` keeps older/non-fullnode API contexts honest:
+    /// the client sees an unsupported endpoint, not an empty team.
+    pub team_mining_runtime: Option<Arc<crate::team_mining::TeamMiningRuntime>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5001,6 +5011,136 @@ async fn get_mempool_metrics(State(app_state): State<Arc<AppState>>) -> Json<ser
 }
 
 /// Get a specific transaction from mempool by hash
+// ── Team mining ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JoinMiningTeamRequest {
+    invite_code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct TeamMiningControlRequest {
+    #[serde(default)]
+    threads: u64,
+}
+
+fn team_mining_runtime_or_404(
+    app_state: &Arc<AppState>,
+) -> Result<&Arc<crate::team_mining::TeamMiningRuntime>, (StatusCode, String)> {
+    app_state.team_mining_runtime.as_ref().ok_or((
+        StatusCode::NOT_FOUND,
+        "this node does not run the team-mining protocol".to_string(),
+    ))
+}
+
+fn team_error_response(error: crate::team_mining::TeamError) -> (StatusCode, String) {
+    use crate::team_mining::TeamError;
+    let status = match error {
+        TeamError::NotCoordinator
+        | TeamError::PeerBindingMismatch
+        | TeamError::CoordinatorCannotLeave => StatusCode::FORBIDDEN,
+        TeamError::TeamNotDiscovered
+        | TeamError::FailoverNotReady
+        | TeamError::NoActiveTemplate
+        | TeamError::StaleTemplate => StatusCode::CONFLICT,
+        TeamError::Persistence(_) | TeamError::Pow(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    (status, error.to_string())
+}
+
+async fn get_team_mining_status(
+    State(app_state): State<Arc<AppState>>,
+) -> Result<Json<crate::team_mining::TeamRuntimeStatus>, (StatusCode, String)> {
+    Ok(Json(
+        team_mining_runtime_or_404(&app_state)?.status().await,
+    ))
+}
+
+async fn create_mining_team(
+    State(app_state): State<Arc<AppState>>,
+) -> Result<Json<crate::team_mining::TeamRuntimeStatus>, (StatusCode, String)> {
+    let runtime = team_mining_runtime_or_404(&app_state)?;
+    if runtime.store.lock().await.state().is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "this wallet already belongs to a mining team".to_string(),
+        ));
+    }
+    runtime
+        .create_team(now_secs())
+        .await
+        .map_err(team_error_response)?;
+    Ok(Json(runtime.status().await))
+}
+
+async fn join_mining_team(
+    State(app_state): State<Arc<AppState>>,
+    Json(request): Json<JoinMiningTeamRequest>,
+) -> Result<Json<crate::team_mining::TeamRuntimeStatus>, (StatusCode, String)> {
+    let runtime = team_mining_runtime_or_404(&app_state)?;
+    if runtime.store.lock().await.state().is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "leave the current mining team before joining another".to_string(),
+        ));
+    }
+    runtime
+        .request_join(&request.invite_code, now_secs())
+        .await
+        .map_err(team_error_response)?;
+    Ok(Json(runtime.status().await))
+}
+
+async fn leave_mining_team(
+    State(app_state): State<Arc<AppState>>,
+) -> Result<Json<crate::team_mining::TeamRuntimeStatus>, (StatusCode, String)> {
+    let runtime = team_mining_runtime_or_404(&app_state)?;
+    runtime
+        .request_leave(now_secs())
+        .await
+        .map_err(team_error_response)?;
+    runtime.set_enabled(false, 1).await;
+    Ok(Json(runtime.status().await))
+}
+
+async fn start_team_mining(
+    State(app_state): State<Arc<AppState>>,
+    body: Option<Json<TeamMiningControlRequest>>,
+) -> Result<Json<crate::team_mining::TeamRuntimeStatus>, (StatusCode, String)> {
+    let runtime = team_mining_runtime_or_404(&app_state)?;
+    let status = runtime.status().await;
+    let joined = status.team.as_ref().is_some_and(|team| {
+        team.members
+            .get(&status.local_address)
+            .is_some_and(|member| member.active && !member.expelled)
+    });
+    if !joined {
+        return Err((
+            StatusCode::CONFLICT,
+            "create or join a mining team before starting".to_string(),
+        ));
+    }
+    if global_network_runtime().checkpoint_quarantined() {
+        return Err((
+            StatusCode::CONFLICT,
+            "team mining is quarantined until canonical history matches the checkpoint"
+                .to_string(),
+        ));
+    }
+    let threads = body.map(|Json(request)| request.threads).unwrap_or(1).max(1);
+    runtime.set_enabled(true, threads).await;
+    Ok(Json(runtime.status().await))
+}
+
+async fn stop_team_mining(
+    State(app_state): State<Arc<AppState>>,
+) -> Result<Json<crate::team_mining::TeamRuntimeStatus>, (StatusCode, String)> {
+    let runtime = team_mining_runtime_or_404(&app_state)?;
+    runtime.set_enabled(false, 1).await;
+    Ok(Json(runtime.status().await))
+}
+
 // ── P2P exchange ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -6115,6 +6255,12 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         .route("/local/mining/control", get(get_local_mining_control))
         .route("/local/mining/start", post(post_local_mining_start))
         .route("/local/mining/stop", post(post_local_mining_stop))
+        .route("/team-mining/status", get(get_team_mining_status))
+        .route("/team-mining/team", post(create_mining_team))
+        .route("/team-mining/join", post(join_mining_team))
+        .route("/team-mining/leave", post(leave_mining_team))
+        .route("/team-mining/start", post(start_team_mining))
+        .route("/team-mining/stop", post(stop_team_mining))
         .route("/health", get(health))
         .route("/health/checks", get(health_checks))
         .route("/ready", get(ready))
@@ -6602,6 +6748,7 @@ pub async fn start_api_on_bind_with_runtime(
     broadcaster: Option<PrivateTxBroadcastSender>,
     private_wallet_manager: SharedPrivateWalletManager,
     exchange_runtime: Arc<ExchangeRuntime>,
+    team_mining_runtime: Arc<crate::team_mining::TeamMiningRuntime>,
 ) -> Result<(), StateError> {
     start_api_with_config_on_bind_and_runtime(
         state_manager,
@@ -6611,6 +6758,7 @@ pub async fn start_api_on_bind_with_runtime(
         broadcaster,
         Some(private_wallet_manager),
         Some(exchange_runtime),
+        Some(team_mining_runtime),
     )
     .await
 }
@@ -6630,6 +6778,7 @@ pub async fn start_api_with_config_on_bind(
         private_tx_broadcaster,
         None,
         None,
+        None,
     )
     .await
 }
@@ -6642,6 +6791,7 @@ async fn start_api_with_config_on_bind_and_runtime(
     private_tx_broadcaster: Option<PrivateTxBroadcastSender>,
     private_wallet_manager: Option<SharedPrivateWalletManager>,
     exchange_runtime: Option<Arc<ExchangeRuntime>>,
+    team_mining_runtime: Option<Arc<crate::team_mining::TeamMiningRuntime>>,
 ) -> Result<(), StateError> {
     let app_state = Arc::new(AppState {
         state_manager,
@@ -6654,6 +6804,7 @@ async fn start_api_with_config_on_bind_and_runtime(
         private_wallet_manager,
         private_tx_broadcaster,
         exchange_runtime,
+        team_mining_runtime,
     });
 
     let listener = tokio::net::TcpListener::bind(&bind_addr)
@@ -6708,6 +6859,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         }
     }
 
@@ -6750,6 +6902,61 @@ mod tests {
             claimed_by: None,
             reserved_note_ids: vec!["remote-note".to_string()],
         }
+    }
+
+    fn configure_test_team(
+        state: &mut AppState,
+    ) -> Arc<crate::team_mining::TeamMiningRuntime> {
+        let mut manager = PrivateWalletManager::new();
+        let address = manager.create_private_wallet("team-member").unwrap();
+        let runtime = Arc::new(
+            crate::team_mining::TeamMiningRuntime::new(
+                crate::team_mining::TeamStore::memory(),
+                address,
+            )
+            .unwrap(),
+        );
+        state.team_mining_runtime = Some(Arc::clone(&runtime));
+        runtime
+    }
+
+    #[tokio::test]
+    async fn team_mining_endpoints_distinguish_unsupported_from_not_joined() {
+        let dir = format!("./test_db_team_absent_{}", std::process::id());
+        let app_state = Arc::new(test_app_state(&dir));
+        let result = get_team_mining_status(State(app_state)).await;
+        assert!(matches!(
+            result,
+            Err((StatusCode::NOT_FOUND, _))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn team_create_and_start_endpoints_enable_real_runtime_state() {
+        let dir = format!("./test_db_team_create_{}", std::process::id());
+        let mut state = test_app_state(&dir);
+        configure_test_team(&mut state);
+        let app_state = Arc::new(state);
+
+        let created = create_mining_team(State(Arc::clone(&app_state)))
+            .await
+            .unwrap()
+            .0;
+        let team = created.team.as_ref().expect("team should be created");
+        assert!(crate::team_mining::parse_invite_code(&team.invite_code).is_some());
+        assert_eq!(team.coordinator, created.local_address);
+
+        let started = start_team_mining(
+            State(app_state),
+            Some(Json(TeamMiningControlRequest { threads: 3 })),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(started.enabled);
+        assert_eq!(started.threads, 3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A node without the exchange must 404 rather than return an empty list.
@@ -7938,6 +8145,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         });
 
         let _router = create_router(state);
@@ -7970,6 +8178,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         });
 
         let root_resp = get_state_root(State(app_state.clone())).await;
@@ -8045,6 +8254,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         });
 
         let resp = get_block_by_height(State(app_state), Path(0)).await;
@@ -8086,6 +8296,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         });
 
         let resp = get_block_by_hash(State(app_state), Path(block_hash.clone())).await;
@@ -8133,6 +8344,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         });
 
         let resp = get_blocks_range(State(app_state), Path((1u64, 3u64))).await;
@@ -8181,6 +8393,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         });
 
         // Check initial height
@@ -9191,6 +9404,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         });
 
         let req = SubscribeRequest {
@@ -9228,6 +9442,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         });
 
         // First subscribe
@@ -9275,6 +9490,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         });
 
         // Add some connections
@@ -9315,6 +9531,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         });
 
         let req = SubscribeRequest {
@@ -9356,6 +9573,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         });
 
         let _router = create_router(app_state);
@@ -9384,6 +9602,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         });
 
         let req = PbftStartRequest {
@@ -9427,6 +9646,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         });
 
         // First start consensus
@@ -9472,6 +9692,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         });
 
         // First start consensus
@@ -9541,6 +9762,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         });
 
         // First start consensus
@@ -9633,6 +9855,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         });
 
         let req = PbftMessageRequest {
@@ -9672,6 +9895,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         });
 
         let req = PbftMessageRequest {
@@ -9709,6 +9933,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         });
 
         let req = PbftStartRequest {
@@ -9743,6 +9968,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         });
 
         let resp =
@@ -9774,6 +10000,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         });
 
         // Create snapshot first
@@ -9812,6 +10039,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         });
 
         let filter = AdvancedEventFilter {
@@ -9855,6 +10083,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         });
 
         let resp = list_profiles(State(app_state)).await;
@@ -9890,6 +10119,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         });
 
         let res = get_private_tx_by_hash(State(app_state), Path("deadbeef".to_string())).await;
@@ -9923,6 +10153,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         });
 
         let req = ProfileManagementRequest {
@@ -9948,6 +10179,7 @@ mod tests {
             private_wallet_manager: None,
             private_tx_broadcaster: None,
             exchange_runtime: None,
+            team_mining_runtime: None,
         })))
         .await
         .unwrap();

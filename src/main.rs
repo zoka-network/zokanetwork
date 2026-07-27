@@ -6907,6 +6907,7 @@ async fn handle_fullnode_network_message(
     message: &zoka::network::message::ZokaMessage,
     source: Option<libp2p::PeerId>,
     exchange_runtime: &Arc<zoka::api::ExchangeRuntime>,
+    team_mining_runtime: &Arc<zoka::team_mining::TeamMiningRuntime>,
     chain_id: &str,
     chain_db_path: Option<&str>,
     storage: Option<&RocksDbStorage>,
@@ -6962,6 +6963,88 @@ async fn handle_fullnode_network_message(
                     "Ignored payment failure for offer {}: {error:?}",
                     report.offer_id
                 )),
+            }
+        }
+        zoka::network::message::ZokaMessage::TeamAdvertise(advertisement) => {
+            let Some(source) = source else {
+                return Some(
+                    "Ignored mining-team advertisement without a signed source peer.".to_string(),
+                );
+            };
+            match team_mining_runtime
+                .observe_advertisement(
+                    advertisement.clone(),
+                    source.to_string(),
+                    now_secs(),
+                )
+                .await
+            {
+                Ok(()) => Some(format!(
+                    "Mining team {} is online.",
+                    advertisement.team_id
+                )),
+                Err(error) => Some(format!(
+                    "Ignored mining team {}: {error}",
+                    advertisement.team_id
+                )),
+            }
+        }
+        zoka::network::message::ZokaMessage::TeamJoin(membership) => {
+            let Some(source) = source else {
+                return Some(
+                    "Ignored mining-team membership request without a signed source peer."
+                        .to_string(),
+                );
+            };
+            match team_mining_runtime
+                .ingest_membership(membership.clone(), source.to_string(), now_secs())
+                .await
+            {
+                Ok(()) => Some(format!(
+                    "Mining-team membership updated for {}.",
+                    membership.member_address
+                )),
+                Err(error) => Some(format!(
+                    "Ignored mining-team membership request: {error}"
+                )),
+            }
+        }
+        zoka::network::message::ZokaMessage::ShareSubmit(share) => {
+            let Some(source) = source else {
+                return Some("Ignored mining share without a signed source peer.".to_string());
+            };
+            match team_mining_runtime
+                .ingest_share(share.clone(), source.to_string(), now_secs())
+                .await
+            {
+                Ok(validated) => Some(format!(
+                    "Accepted mining share from {} ({} leading bits{}).",
+                    share.miner_address,
+                    validated.actual_difficulty_bits,
+                    if validated.network_solution {
+                        ", full solution"
+                    } else {
+                        ""
+                    }
+                )),
+                Err(error) => Some(format!("Ignored mining share: {error}")),
+            }
+        }
+        zoka::network::message::ZokaMessage::TurnUpdate(update) => {
+            let Some(source) = source else {
+                return Some(
+                    "Ignored mining-team turn update without a signed source peer.".to_string(),
+                );
+            };
+            match team_mining_runtime
+                .ingest_turn_update(update.clone(), source.to_string(), now_secs())
+                .await
+            {
+                Ok(()) => Some(format!(
+                    "Mining team {} state synchronized.",
+                    update.state.team_id
+                )),
+                Err(error) => Some(format!("Ignored mining-team turn update: {error}")),
             }
         }
         zoka::network::message::ZokaMessage::BlockResponse(_) => handle_inbound_block_message(
@@ -7352,6 +7435,30 @@ async fn announce_local_exchange_offers(
         node.publish_message(&message)
             .map_err(|error| format!("offer announce failed: {error}"))?;
         published += 1;
+    }
+    Ok(published)
+}
+
+async fn publish_team_mining_messages(
+    node: &mut Node,
+    runtime: &Arc<zoka::team_mining::TeamMiningRuntime>,
+) -> Result<usize, String> {
+    runtime
+        .tick(now_secs())
+        .await
+        .map_err(|error| format!("team-mining tick failed: {error}"))?;
+    let outbound = runtime.drain_outbound_messages().await;
+    let mut published = 0usize;
+    let mut outbound = outbound.into_iter();
+    while let Some(message) = outbound.next() {
+        if let Err(error) = node.publish_message(&message) {
+            runtime.queue_message(message).await;
+            for pending in outbound {
+                runtime.queue_message(pending).await;
+            }
+            return Err(format!("team-mining gossip failed: {error}"));
+        }
+        published = published.saturating_add(1);
     }
     Ok(published)
 }
@@ -9567,6 +9674,15 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             zoka::p2p_exchange::tron::TronConfig::from_env(tor_proxy.clone()),
         ))
         .await;
+    let team_store_path = PathBuf::from(network.local_dir())
+        .join("team_mining")
+        .join("team.json");
+    let team_store = zoka::team_mining::TeamStore::load(&team_store_path)
+        .map_err(|error| format!("failed to open team-mining store: {error}"))?;
+    let team_mining_runtime = Arc::new(
+        zoka::team_mining::TeamMiningRuntime::new(team_store, wallet_address.clone())
+            .map_err(|error| format!("failed to initialize team-mining runtime: {error}"))?,
+    );
 
     let mut private_tx_recv_outer: Option<
         tokio::sync::mpsc::UnboundedReceiver<zoka::private_wallet::PrivateTransaction>,
@@ -9753,6 +9869,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             let manager = Arc::clone(&manager);
             let private_wallet_manager = Arc::clone(&private_wallet_manager);
             let exchange_runtime = Arc::clone(&exchange_runtime);
+            let team_mining_runtime = Arc::clone(&team_mining_runtime);
             async move {
                 if let Err(e) = zoka::api::start_api_on_bind_with_runtime(
                     manager,
@@ -9761,6 +9878,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     api_broadcaster,
                     private_wallet_manager,
                     exchange_runtime,
+                    team_mining_runtime,
                 )
                 .await
                 {
@@ -10252,6 +10370,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut next_warmup_seed_reconnect_at = tokio::time::Instant::now();
     let mut next_warmup_offer_announce_at = tokio::time::Instant::now();
     let mut next_warmup_exchange_process_at = tokio::time::Instant::now();
+    let mut next_warmup_team_tick_at = tokio::time::Instant::now();
     let mut warmup_seed_reconnect_failures = 0u32;
     // --mining-console throttle, shared by the warmup loop and the main loop:
     // emit one compact status line every ~6s (instead of clearing and redrawing
@@ -10278,6 +10397,16 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 last_event = error;
             }
             next_warmup_offer_announce_at = tokio::time::Instant::now() + Duration::from_secs(30);
+            now = tokio::time::Instant::now();
+        }
+        if now >= next_warmup_team_tick_at {
+            if let Err(error) =
+                publish_team_mining_messages(&mut node, &team_mining_runtime).await
+            {
+                last_event = error;
+            }
+            next_warmup_team_tick_at =
+                tokio::time::Instant::now() + Duration::from_secs(1);
             now = tokio::time::Instant::now();
         }
         if now >= next_warmup_seed_reconnect_at {
@@ -10366,6 +10495,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     &message,
                     sourced.source,
                     &exchange_runtime,
+                    &team_mining_runtime,
                     &chain_id,
                     db_path.as_deref(),
                     chain_storage_outer.as_deref(),
@@ -10571,6 +10701,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut next_sync_state_at = tokio::time::Instant::now();
     let mut next_offer_announce_at = tokio::time::Instant::now();
     let mut next_exchange_process_at = tokio::time::Instant::now();
+    let mut next_team_tick_at = tokio::time::Instant::now();
     // publish_recent_chain_blocks re-gossips up to `sync_rebroadcast_recent_blocks`
     // full block payloads. Running that on the same 3s cadence as the cheap
     // height/announce broadcasts turned into a self-inflicted gossip storm: a
@@ -10662,6 +10793,14 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 last_event = error;
             }
             next_offer_announce_at = tokio::time::Instant::now() + Duration::from_secs(30);
+        }
+        if tokio::time::Instant::now() >= next_team_tick_at {
+            if let Err(error) =
+                publish_team_mining_messages(&mut node, &team_mining_runtime).await
+            {
+                last_event = error;
+            }
+            next_team_tick_at = tokio::time::Instant::now() + Duration::from_secs(1);
         }
         if let Some(deadline) = maybe_deadline {
             if tokio::time::Instant::now() >= deadline {
@@ -11694,6 +11833,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     &message,
                     sourced.source,
                     &exchange_runtime,
+                    &team_mining_runtime,
                     &chain_id,
                     db_path.as_deref(),
                     chain_storage_outer.as_deref(),
