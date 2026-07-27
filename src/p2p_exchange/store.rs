@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::{Offer, OfferStatus, CLAIM_WINDOW_SECONDS, MAX_OPEN_OFFERS_PER_ADDRESS};
+use super::{
+    Offer, OfferStatus, PaymentFailureReport, CLAIM_WINDOW_SECONDS, MAX_OPEN_OFFERS_PER_ADDRESS,
+};
 
 /// Why an operation on the store was refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,6 +29,9 @@ pub enum StoreError {
     /// The seller already has the maximum number of open offers.
     TooManyOpenOffers,
     DuplicateOfferId,
+    ConflictingOffer,
+    InvalidTransition,
+    SellerMismatch,
     /// The offer failed its own shape validation.
     Invalid(&'static str),
     Io(String),
@@ -36,12 +41,15 @@ pub enum StoreError {
 struct OfferFile {
     #[serde(default)]
     offers: Vec<Offer>,
+    #[serde(default)]
+    payment_failures: Vec<PaymentFailureReport>,
 }
 
 /// Offers held by this node, persisted to disk.
 pub struct OfferStore {
     path: PathBuf,
     offers: HashMap<String, Offer>,
+    payment_failures: Vec<PaymentFailureReport>,
 }
 
 impl OfferStore {
@@ -52,19 +60,26 @@ impl OfferStore {
     /// reservations with nothing to release them.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref().to_path_buf();
-        let offers = if path.exists() {
+        let (offers, payment_failures) = if path.exists() {
             let raw = std::fs::read_to_string(&path).map_err(|e| StoreError::Io(e.to_string()))?;
             let parsed: OfferFile =
                 serde_json::from_str(&raw).map_err(|e| StoreError::Io(e.to_string()))?;
-            parsed
-                .offers
-                .into_iter()
-                .map(|offer| (offer.id.clone(), offer))
-                .collect()
+            (
+                parsed
+                    .offers
+                    .into_iter()
+                    .map(|offer| (offer.id.clone(), offer))
+                    .collect(),
+                parsed.payment_failures,
+            )
         } else {
-            HashMap::new()
+            (HashMap::new(), Vec::new())
         };
-        Ok(Self { path, offers })
+        Ok(Self {
+            path,
+            offers,
+            payment_failures,
+        })
     }
 
     fn persist(&self) -> Result<(), StoreError> {
@@ -73,6 +88,7 @@ impl OfferStore {
         }
         let file = OfferFile {
             offers: self.offers.values().cloned().collect(),
+            payment_failures: self.payment_failures.clone(),
         };
         let encoded =
             serde_json::to_string_pretty(&file).map_err(|e| StoreError::Io(e.to_string()))?;
@@ -105,12 +121,42 @@ impl OfferStore {
             .collect()
     }
 
+    pub fn all_offers(&self) -> Vec<&Offer> {
+        self.offers.values().collect()
+    }
+
+    pub fn record_payment_failure(
+        &mut self,
+        report: PaymentFailureReport,
+    ) -> Result<(), StoreError> {
+        report.validate().map_err(StoreError::Invalid)?;
+        if self.payment_failures.iter().any(|existing| {
+            existing.offer_id == report.offer_id
+                || existing
+                    .tron_tx_hash
+                    .eq_ignore_ascii_case(&report.tron_tx_hash)
+        }) {
+            return Ok(());
+        }
+        self.payment_failures.push(report);
+        if let Err(error) = self.persist() {
+            self.payment_failures.pop();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn seller_failure_count(&self, seller_address: &str) -> usize {
+        self.payment_failures
+            .iter()
+            .filter(|report| report.seller_address == seller_address)
+            .count()
+    }
+
     fn open_count_for(&self, seller_address: &str) -> usize {
         self.offers
             .values()
-            .filter(|offer| {
-                offer.seller_address == seller_address && offer.status.is_claimable()
-            })
+            .filter(|offer| offer.seller_address == seller_address && offer.status.is_claimable())
             .count()
     }
 
@@ -120,7 +166,9 @@ impl OfferStore {
     /// exists to keep one seller from flooding the topic, and every published
     /// offer passes through this method.
     pub fn insert_local(&mut self, offer: Offer) -> Result<(), StoreError> {
-        offer.validate().map_err(|r| StoreError::Invalid(r.as_str()))?;
+        offer
+            .validate()
+            .map_err(|r| StoreError::Invalid(r.as_str()))?;
         if self.offers.contains_key(&offer.id) {
             return Err(StoreError::DuplicateOfferId);
         }
@@ -138,17 +186,73 @@ impl OfferStore {
         Ok(())
     }
 
+    /// Inserts a remote announcement, or treats an identical reannouncement
+    /// as a heartbeat. Immutable offer terms can never be replaced.
+    pub fn upsert_remote(&mut self, offer: Offer) -> Result<(), StoreError> {
+        offer
+            .validate()
+            .map_err(|rejection| StoreError::Invalid(rejection.as_str()))?;
+        if offer.status != OfferStatus::Open {
+            return Err(StoreError::Invalid("remote announcement must be open"));
+        }
+        if let Some(existing) = self.offers.get(&offer.id) {
+            return if existing.signing_preimage() == offer.signing_preimage() {
+                Ok(())
+            } else {
+                Err(StoreError::ConflictingOffer)
+            };
+        }
+        self.insert_local(offer)
+    }
+
+    pub fn apply_remote_update(
+        &mut self,
+        offer_id: &str,
+        seller_address: &str,
+        status: OfferStatus,
+        claimed_by: Option<String>,
+        claim_expires_at: Option<u64>,
+    ) -> Result<(), StoreError> {
+        let offer = self
+            .offers
+            .get_mut(offer_id)
+            .ok_or(StoreError::UnknownOffer)?;
+        if offer.seller_address != seller_address {
+            return Err(StoreError::SellerMismatch);
+        }
+        let allowed = matches!(
+            (offer.status, status),
+            (
+                OfferStatus::Open,
+                OfferStatus::Claimed | OfferStatus::Cancelled
+            ) | (
+                OfferStatus::Claimed,
+                OfferStatus::PaymentDetected | OfferStatus::Released | OfferStatus::Expired
+            ) | (
+                OfferStatus::PaymentDetected,
+                OfferStatus::Released | OfferStatus::Expired
+            )
+        );
+        if !allowed {
+            return Err(StoreError::InvalidTransition);
+        }
+        let previous = offer.clone();
+        offer.status = status;
+        offer.claimed_by = claimed_by;
+        offer.claim_expires_at = claim_expires_at;
+        if let Err(error) = self.persist() {
+            self.offers.insert(offer_id.to_string(), previous);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Claims an offer for `buyer` at `now`, starting the payment window.
     ///
     /// Compare-and-set: a second caller gets [`StoreError::NotClaimable`]
     /// rather than overwriting the first buyer. Without that, two people could
     /// each pay USDT for ZKA only one of them can receive.
-    pub fn claim(
-        &mut self,
-        offer_id: &str,
-        buyer: &str,
-        now: u64,
-    ) -> Result<Offer, StoreError> {
+    pub fn claim(&mut self, offer_id: &str, buyer: &str, now: u64) -> Result<Offer, StoreError> {
         let offer = self
             .offers
             .get_mut(offer_id)
@@ -378,13 +482,66 @@ mod tests {
     }
 
     #[test]
+    fn identical_remote_reannouncements_are_heartbeats_but_conflicts_are_rejected() {
+        let path = temp_path("remote-heartbeat");
+        let mut store = OfferStore::open(&path).unwrap();
+        let original = offer("remote", "zka1remote");
+        store.upsert_remote(original.clone()).unwrap();
+        store.upsert_remote(original.clone()).unwrap();
+        assert_eq!(store.len(), 1);
+
+        let mut conflict = original;
+        conflict.micro_usdt += 1;
+        assert_eq!(
+            store.upsert_remote(conflict),
+            Err(StoreError::ConflictingOffer)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remote_status_updates_only_move_forward_and_keep_the_seller() {
+        let path = temp_path("remote-update");
+        let mut store = OfferStore::open(&path).unwrap();
+        store.upsert_remote(offer("remote", "zka1remote")).unwrap();
+        store
+            .apply_remote_update(
+                "remote",
+                "zka1remote",
+                OfferStatus::Claimed,
+                Some("zka1buyer".to_string()),
+                Some(1_751_002_700),
+            )
+            .unwrap();
+        assert_eq!(store.get("remote").unwrap().status, OfferStatus::Claimed);
+        assert_eq!(
+            store.apply_remote_update("remote", "zka1remote", OfferStatus::Open, None, None),
+            Err(StoreError::InvalidTransition)
+        );
+        assert_eq!(
+            store.apply_remote_update(
+                "remote",
+                "zka1impostor",
+                OfferStatus::Released,
+                Some("zka1buyer".to_string()),
+                Some(1_751_002_700)
+            ),
+            Err(StoreError::SellerMismatch)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn invalid_offers_never_reach_the_file() {
         let path = temp_path("invalid");
         let mut store = OfferStore::open(&path).unwrap();
         let mut bad = offer("a", "zka1seller");
         bad.usdt_receive_address = "0xdeadbeef".to_string();
 
-        assert!(matches!(store.insert_local(bad), Err(StoreError::Invalid(_))));
+        assert!(matches!(
+            store.insert_local(bad),
+            Err(StoreError::Invalid(_))
+        ));
         assert!(store.is_empty());
         let _ = std::fs::remove_file(&path);
     }
@@ -443,8 +600,8 @@ mod tests {
         store.insert_local(offer("a", "zka1seller")).unwrap();
 
         let wallet_reserved = vec![
-            "note-a".to_string(),      // backed by the live offer
-            "note-ghost".to_string(),  // no offer at all
+            "note-a".to_string(),     // backed by the live offer
+            "note-ghost".to_string(), // no offer at all
         ];
 
         let report = store.reconcile(&wallet_reserved, 1_751_000_100).unwrap();

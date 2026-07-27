@@ -260,6 +260,44 @@ pub fn payment_address_from_scan_key(scan_key: &[u8]) -> Result<String, BlockErr
     Ok(payment_address_from_keys(scan_key, &spending_key))
 }
 
+pub fn canonical_payment_address(address: &str) -> Result<String, BlockError> {
+    let trimmed = address.trim();
+    if trimmed.starts_with("zpriv:") && parse_payment_address(trimmed).is_some() {
+        return Ok(trimmed.to_string());
+    }
+    let encoded = trimmed.strip_prefix("zka1").ok_or_else(|| {
+        BlockError::TransactionValidationFailed(
+            "recipient must be a zka1 private address".to_string(),
+        )
+    })?;
+    let bytes = bs58::decode(encoded).into_vec().map_err(|_| {
+        BlockError::TransactionValidationFailed(
+            "recipient zka1 address is not valid Base58".to_string(),
+        )
+    })?;
+    if bytes.len() != 68 {
+        return Err(BlockError::TransactionValidationFailed(
+            "recipient zka1 address has invalid length".to_string(),
+        ));
+    }
+    let (payload, checksum) = bytes.split_at(64);
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"zoka-private-address-v1");
+    hasher.update(payload);
+    let digest = hasher.finalize();
+    if checksum != &digest[..4] {
+        return Err(BlockError::TransactionValidationFailed(
+            "recipient zka1 address checksum mismatch".to_string(),
+        ));
+    }
+    Ok(format!(
+        "zpriv:{}:{}",
+        hex::encode(&payload[..32]),
+        hex::encode(&payload[32..64])
+    ))
+}
+
 fn parse_payment_address(payment_address: &str) -> Option<(RistrettoPoint, RistrettoPoint)> {
     let parts = payment_address.split(':').collect::<Vec<_>>();
     if parts.len() != 3 || parts[0] != "zpriv" {
@@ -2858,6 +2896,91 @@ impl PrivateWallet {
         })?;
         let (selected_note_indices, selected_notes) =
             self.prepare_selected_notes_with_bound(total_required, proof_profile.max_inputs)?;
+        self.build_private_transaction_from_selected_notes(
+            amount,
+            fee,
+            recipient_commitment,
+            nullifier_set,
+            ring_members,
+            private_commitment_root,
+            input_inclusion_proofs,
+            ring_backend,
+            proof_profile,
+            selected_note_indices,
+            selected_notes,
+        )
+    }
+
+    pub fn create_private_transaction_from_reservation(
+        &mut self,
+        amount: u64,
+        recipient_commitment: String,
+        reservation_id: &str,
+        reserved_note_ids: &[String],
+        nullifier_set: Arc<Mutex<NullifierSet>>,
+        ring_members: Vec<String>,
+        ring_backend: RingSignatureBackend,
+    ) -> Result<PrivateTransaction, BlockError> {
+        let wanted: HashSet<&str> = reserved_note_ids.iter().map(String::as_str).collect();
+        if wanted.is_empty() || wanted.len() != reserved_note_ids.len() {
+            return Err(BlockError::TransactionValidationFailed(
+                "offer reservation has invalid note ids".to_string(),
+            ));
+        }
+        let selected_note_indices = self
+            .private_notes
+            .iter()
+            .enumerate()
+            .filter(|(_, note)| wanted.contains(note.note_id.as_str()))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if selected_note_indices.len() != wanted.len() {
+            return Err(BlockError::TransactionValidationFailed(
+                "offer reservation references a missing note".to_string(),
+            ));
+        }
+        let selected_notes = selected_note_indices
+            .iter()
+            .map(|index| self.private_notes[*index].clone())
+            .collect::<Vec<_>>();
+        if selected_notes
+            .iter()
+            .any(|note| note.spent || note.reserved_by_tx.as_deref() != Some(reservation_id))
+        {
+            return Err(BlockError::TransactionValidationFailed(
+                "offer reservation no longer owns all selected notes".to_string(),
+            ));
+        }
+        self.build_private_transaction_from_selected_notes(
+            amount,
+            0,
+            recipient_commitment,
+            nullifier_set,
+            ring_members,
+            String::new(),
+            Vec::new(),
+            ring_backend,
+            PRIVATE_PROOF_SPEC_V1,
+            selected_note_indices,
+            selected_notes,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_private_transaction_from_selected_notes(
+        &mut self,
+        amount: u64,
+        fee: u64,
+        recipient_commitment: String,
+        nullifier_set: Arc<Mutex<NullifierSet>>,
+        ring_members: Vec<String>,
+        private_commitment_root: String,
+        input_inclusion_proofs: Vec<PrivateCommitmentInclusionProof>,
+        ring_backend: RingSignatureBackend,
+        proof_profile: PrivateProofProfileSpec,
+        selected_note_indices: Vec<usize>,
+        selected_notes: Vec<PrivateNote>,
+    ) -> Result<PrivateTransaction, BlockError> {
         if selected_notes.len() > proof_profile.max_inputs {
             return Err(BlockError::TransactionValidationFailed(format!(
                 "private transaction selected {} inputs, exceeding Groth16 bound {}",
@@ -3496,6 +3619,41 @@ impl PrivateWalletManager {
         )
     }
 
+    pub fn send_reserved_exchange_transaction(
+        &mut self,
+        from_wallet: &str,
+        to_commitment: String,
+        amount: u64,
+        reservation_id: &str,
+        reserved_note_ids: &[String],
+    ) -> Result<PrivateTransaction, BlockError> {
+        let ring_members = self.build_sender_ring_members(from_wallet, &to_commitment, amount);
+        let wallet = self.private_wallets.get_mut(from_wallet).ok_or_else(|| {
+            BlockError::TransactionValidationFailed("Wallet not found".to_string())
+        })?;
+        let nullifier_set = self.private_pool.nullifier_set();
+        let tx = wallet.create_private_transaction_from_reservation(
+            amount,
+            to_commitment,
+            reservation_id,
+            reserved_note_ids,
+            nullifier_set,
+            ring_members,
+            self.ring_backend,
+        )?;
+        if let Err(error) = self.private_pool.submit_private_transaction(tx.clone()) {
+            for note in wallet.private_notes.iter_mut() {
+                if reserved_note_ids.contains(&note.note_id) {
+                    note.reserved = true;
+                    note.reserved_by_tx = Some(reservation_id.to_string());
+                }
+            }
+            wallet.sync_balance_cache();
+            return Err(error);
+        }
+        Ok(tx)
+    }
+
     pub fn send_private_transaction_with_fee(
         &mut self,
         from_wallet: &str,
@@ -3726,9 +3884,7 @@ impl PrivateWalletManager {
     ) -> Result<(), BlockError> {
         self.private_wallets
             .get_mut(wallet_name)
-            .ok_or_else(|| {
-                BlockError::TransactionValidationFailed("Wallet not found".to_string())
-            })?
+            .ok_or_else(|| BlockError::TransactionValidationFailed("Wallet not found".to_string()))?
             .reserve_notes(note_ids, reservation_id)
     }
 
@@ -6448,5 +6604,32 @@ mod tests {
 
         let result = manager.validate_inbound_private_transaction(&tx);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn exchange_release_spends_the_reserved_notes_not_other_wallet_funds() {
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("seller").unwrap();
+        let buyer = manager.create_private_wallet("buyer").unwrap();
+        manager.deposit_to_private_wallet("seller", 150).unwrap();
+        manager.deposit_to_private_wallet("seller", 500).unwrap();
+        let (reserved_id, reserved_commitment, unreserved_commitment) = {
+            let wallet = manager.get_private_wallet("seller").unwrap();
+            (
+                wallet.private_notes[0].note_id.clone(),
+                wallet.private_notes[0].commitment.clone(),
+                wallet.private_notes[1].commitment.clone(),
+            )
+        };
+        manager
+            .reserve_wallet_notes("seller", std::slice::from_ref(&reserved_id), "offer-1")
+            .unwrap();
+
+        let tx = manager
+            .send_reserved_exchange_transaction("seller", buyer, 100, "offer-1", &[reserved_id])
+            .unwrap();
+
+        assert!(tx.input_commitments.contains(&reserved_commitment));
+        assert!(!tx.input_commitments.contains(&unreserved_commitment));
     }
 }

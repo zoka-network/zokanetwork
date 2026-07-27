@@ -76,6 +76,8 @@ pub enum ZokaMessage {
     /// Cambio de estado de una oferta ya anunciada (tomada, expirada,
     /// cancelada, liberada).
     OfferStatusUpdate(OfferStatusUpdateMessage),
+    /// Public evidence of a paid trade the seller did not release.
+    OfferPaymentFailure(crate::p2p_exchange::PaymentFailureReport),
     /// Respuesta de consulta (sin exponer metadata sensible)
     UserQueryResponse {
         username: String,
@@ -440,6 +442,7 @@ impl ZokaMessage {
             },
             ZokaMessage::OfferAnnounce(msg) => msg.timestamp,
             ZokaMessage::OfferStatusUpdate(msg) => msg.timestamp,
+            ZokaMessage::OfferPaymentFailure(report) => report.timestamp,
             ZokaMessage::UserRegistry { .. } => 0,
             ZokaMessage::UserQuery { .. } => 0,
             ZokaMessage::UserQueryResponse { .. } => 0,
@@ -1063,6 +1066,24 @@ mod tests {
                 assert_eq!(msg.claimed_by.as_deref(), Some("zka1buyer"));
             }
             other => panic!("expected OfferStatusUpdate, got {other:?}"),
+        }
+
+        let failure = ZokaMessage::OfferPaymentFailure(crate::p2p_exchange::PaymentFailureReport {
+            offer_id: "offer-1".to_string(),
+            seller_address: "zka1seller".to_string(),
+            buyer_address: "zka1buyer".to_string(),
+            tron_tx_hash: "a".repeat(64),
+            timestamp: 1_751_002_701,
+            signature: vec![7, 8, 9],
+        });
+        let bytes = failure.to_bytes().unwrap();
+        match ZokaMessage::from_bytes(&bytes).unwrap() {
+            ZokaMessage::OfferPaymentFailure(report) => {
+                assert_eq!(report.offer_id, "offer-1");
+                assert_eq!(report.tron_tx_hash, "a".repeat(64));
+                assert_eq!(report.timestamp, 1_751_002_701);
+            }
+            other => panic!("expected OfferPaymentFailure, got {other:?}"),
         }
     }
 

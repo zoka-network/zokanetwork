@@ -159,6 +159,12 @@ impl MessageHandler for DefaultMessageHandler {
                     update.offer_id, update.status
                 );
             }
+            ZokaMessage::OfferPaymentFailure(report) => {
+                info!(
+                    "Offer payment failure received: {} proof {}",
+                    report.offer_id, report.tron_tx_hash
+                );
+            }
         }
 
         let mut count = self.processed_count.write().await;

@@ -19,7 +19,7 @@ Este documento es el estado de verdad del trabajo. **Leelo entero antes de tocar
 | --- | --- |
 | **Etapa 0** (limpieza de UI) | ✅ Completa, mergeada y pusheada a `main` de `zsilent-core`. |
 | **Etapa 1** (Explorer) | ✅ Completa, **verificada contra nodo real** (mainnet, altura 12943). |
-| **Etapa 2** (P2P Exchange) | 🔶 ~70%. Rama `etapa2-p2p-exchange` del repo ZOKA, pusheada. 66 tests de `p2p_exchange::` en verde. |
+| **Etapa 2** (P2P Exchange) | 🔶 ~85%. Integración activa en `etapa2-p2p-reservation-integration`. 72 tests de `p2p_exchange::` en verde; falta el gate §2.8, UI/flags y prueba real. |
 | **Etapa 3** (Mining Pool) | ⬜ Solo UI. El backend está entero por delante. |
 
 ### Por dónde seguir, en este orden
@@ -34,7 +34,10 @@ Este documento es el estado de verdad del trabajo. **Leelo entero antes de tocar
    TronGrid, API key opcional y fallbacks configurables. Se niega a construirse sin Tor.
    Verificado contra un servidor HTTP simulado detrás de un proxy SOCKS real de test; no se
    consultó Tron mainnet.
-3. **§2.6** presencia del vendedor y **§2.7** liberación automática + reputación.
+3. ~~**§2.6** presencia del vendedor y **§2.7** liberación automática + reputación.~~
+   ✅ Integrado: heartbeat/TTL, claim decidido atómicamente por el vendedor, consulta Tron
+   solo del vendedor, liberación desde las notas exactas y denuncia persistida por gossip.
+   Verificado con tests unitarios/integración simulada; **no contra dos nodos ni Tron mainnet**.
 4. **§2.8** revisión de seguridad — gate obligatorio antes de habilitarlo a usuarios reales.
 5. Pase visual sobre las 3 secciones, y recién ahí la Etapa 3.
 
@@ -70,6 +73,9 @@ Este documento es el estado de verdad del trabajo. **Leelo entero antes de tocar
 - **Nada de P2P Exchange ni Mining Pool se probó contra un nodo real.** Solo el Explorer.
 - El lock de ZKA es contabilidad de wallet, **no un escrow on-chain**. Un cliente modificado
   puede gastar una nota "reservada". Es inherente al diseño v1 y está avisado en la UI.
+- La transacción de liberación se construye, persiste en la wallet y se entrega al loop P2P,
+  pero todavía no tiene un journal durable propio. Un crash entre esos pasos puede obligar a
+  reconstruirla o dejarla sin rebroadcast. **Bloqueante encontrado para el gate §2.8.**
 
 ---
 
@@ -308,7 +314,7 @@ en el repo ZOKA, commit `796c086b`, 3 tests en verde.
    viejos ni se suscriben y no ven nada. → **Usar tópico separado.**
 
 > **Estado al 2026-07-26 (fin de sesión).** Rama `etapa2-p2p-exchange` (repo ZOKA), pusheada.
-> **66 tests de `p2p_exchange::` en verde**, más `network::message` (20) y `network::p2p` (39)
+> **72 tests de `p2p_exchange::` en verde**, más `network::message` (20) y `network::p2p` (39)
 > sin regresión. UI y flag del Explorer están en `main` de zsilent-core, también pusheado.
 >
 > **Hecho:** 2.0 (compat P2P), 2.1 (modelo `Offer`), 2.2 (gossip + tópico propio +
@@ -321,8 +327,9 @@ en el repo ZOKA, commit `796c086b`, 3 tests en verde.
 > 1. ✅ `select_notes` ya está conectado a `create_exchange_offer`; reserva las notas en la
 >    wallet y llena `reserved_note_ids`. Verificado por tests del handler, no contra nodo real.
 > 2. ✅ `TronClient` consume `trc20_transfers_path` exclusivamente por SOCKS (`socks5h`) y
->    `settling_transfer` aplica las reglas existentes. Falta enchufarlo al loop automático §2.7.
-> 3. §2.6 presencia del vendedor, §2.7 liberación + reputación.
+>    `settling_transfer` aplica las reglas existentes y ya está conectado al loop automático.
+> 3. ✅ §2.6 presencia del vendedor y §2.7 liberación + reputación integradas. Falta resolver
+>    la durabilidad de la tx de release señalada en §2.8 y verificar el flujo con nodos reales.
 > 4. Pase visual sobre las 3 secciones (acordado para el cierre de la etapa).
 >
 > **Deudas anotadas, no olvidadas:**
@@ -345,6 +352,7 @@ en el repo ZOKA, commit `796c086b`, 3 tests en verde.
 | Fondos insuficientes | **Rechazar la oferta.** Si no hay notas suficientes para reservar, la creación falla. Ninguna oferta llega a la red sin respaldo. |
 | Id de oferta | **128 bits aleatorios** (`new_offer_id()`). El id entra en el preimagen de firma, así que una colisión sería un vector de falsificación, no una molestia. |
 | Endpoint Tron | **TronGrid público por defecto + override en Settings** (URL y API key opcional). Sin fricción inicial, con salida si rate-limitea. |
+| Presencia de oferta | **Heartbeat firmado cada 30 s + TTL receptor de 90 s.** Al caer el vendedor deja de reanunciar y la oferta desaparece al vencer el TTL. No se emite un estado `offline`: el protocolo no tiene ese estado y un peer ya desconectado no puede garantizar un último update. Esto controla visibilidad, no muta el lifecycle persistido. |
 
 ### 2.1 Modelo de datos `Offer` ✅
 
@@ -392,13 +400,14 @@ huérfana es ingastable para siempre y el usuario ni siquiera ve por qué le fal
 
 ### 2.2-bis Gossip (checklist original)
 
-- [ ] Mensajes `OfferAnnounce` (publicar) y `OfferStatusUpdate` (tomada/expirada/cancelada).
+- [x] Mensajes `OfferAnnounce` (publicar) y `OfferStatusUpdate` (tomada/expirada/cancelada).
 - [ ] Firmar los anuncios con la clave del vendedor: sin esto cualquiera publica ofertas ajenas
       o cancela las de otros.
 - [ ] Anti-spam: no propagar ofertas sin ZKA efectivamente bloqueados.
-- [ ] Monto mínimo por oferta + tope de ofertas abiertas simultáneas por address.
-- [ ] TTL / rebroadcast: cuánto vive una oferta y qué pasa con las expiradas.
-- [ ] Solo propagar ofertas de vendedores online (§2.6).
+- [x] Monto mínimo por oferta + tope de ofertas abiertas simultáneas por address.
+- [x] TTL / rebroadcast: heartbeat cada 30 s, presencia remota por 90 s y expiración del claim
+      a los 45 min.
+- [x] Solo mostrar como tomables ofertas de vendedores online (§2.6).
 
 ### 2.3 Lock de ZKA sobre notas privadas
 
@@ -421,8 +430,12 @@ huérfana es ingastable para siempre y el usuario ni siquiera ve por qué le fal
 - [x] Verificado: recarga desde disco conserva `reserved`/id de oferta; un fallo de persistencia
       del store no deja una oferta fantasma en memoria; 67 tests `p2p_exchange::` en verde y
       `cargo check --bin zoka` en verde. **Todavía no verificado contra el nodo real.**
-- [ ] Al expirar/cancelar: `release_reserved_notes`.
-- [ ] Al completarse: gastar las notas hacia la address del comprador.
+- [x] Al expirar/cancelar: liberar las notas reservadas. El barrido periódico es el único que
+      vence claims, para que un endpoint de lectura no cambie el estado sin liberar la wallet.
+      La cancelación solo acepta ofertas locales todavía `Open`.
+- [x] Al completarse: construir la transferencia privada usando **exactamente**
+      `reserved_note_ids` y enviarla a la address canónica del comprador. Verificado con una
+      transacción criptográfica real en test y con un pago Tron simulado.
 
 ### 2.4 Verificación de pago USDT vía Tor
 
@@ -435,7 +448,8 @@ huérfana es ingastable para siempre y el usuario ni siquiera ve por qué le fal
 - [x] TronGrid público como proveedor primario, API key opcional y lista ordenada de endpoints
       compatibles de fallback (`ZOKA_TRON_API_URL`, `ZOKA_TRON_API_KEY`,
       `ZOKA_TRON_FALLBACK_URLS`).
-- [ ] Solo el vendedor consulta. El comprador ve el estado por gossip.
+- [x] Solo el vendedor consulta. El loop filtra por `seller_address` local; el comprador recibe
+      `OfferStatusUpdate` por gossip.
 - [x] Matching: contrato USDT + address de cobro + monto + timestamp posterior al claim. Nunca
       solo por monto.
 - [x] Pago de menos (fuera de tolerancia) → no libera; pago de más → libera igual.
@@ -447,29 +461,36 @@ huérfana es ingastable para siempre y el usuario ni siquiera ve por qué le fal
 
 ### 2.5 Persistencia y arranque
 
-- [ ] Ofertas y reservas sobreviven a un reinicio del nodo.
-- [ ] **Al arrancar, reconciliar:** toda nota marcada `reserved` sin una oferta viva que la
+- [x] Ofertas y reservas sobreviven a un reinicio del nodo (verificado recargando ambos archivos
+      en tests; no mediante reinicio de un nodo real).
+- [x] **Al arrancar, reconciliar:** toda nota marcada `reserved` sin una oferta viva que la
       respalde tiene que liberarse. Sin esto un reinicio en mal momento deja fondos trabados
       para siempre.
-- [ ] Al reiniciar, reanunciar por gossip las ofertas todavía abiertas.
+- [x] Al reiniciar, reanunciar por gossip las ofertas todavía abiertas.
 
 ### 2.6 Presencia del vendedor
 
-- [ ] Una oferta solo se propaga y es tomable mientras el nodo del vendedor está online.
-- [ ] Al desconectarse: dejar de reanunciar y emitir `OfferStatusUpdate`.
+- [x] Una oferta remota solo aparece en el feed/tomable mientras recibió un heartbeat firmado
+      del peer vendedor en los últimos 90 s.
+- [x] Al desconectarse deja de reanunciar. Por la decisión nueva de presencia no se intenta
+      emitir un update imposible desde un peer caído: el receptor la oculta al vencer el TTL.
 - [ ] La UI del comprador tiene que reflejar que una oferta dejó de estar disponible.
+      El endpoint ya la elimina del feed; falta verificar visualmente el polling de ZSilent.
 
 ### 2.7 Claim atómico y liberación
 
-- [ ] Al tomar una oferta, marcarla `claimed` atómicamente: dos compradores no pueden tomarla
+- [x] Al tomar una oferta, marcarla `claimed` atómicamente: dos compradores no pueden tomarla
       a la vez.
-- [ ] Liberación **automática** al detectar el pago verificado. No existe botón "liberar" que el
-      vendedor pueda no apretar.
-- [ ] Registro de incumplimiento: si un vendedor no libera pese al pago verificado, se registra.
-- [ ] Denuncia compartida por gossip, firmada por el comprador y **con el hash de la tx USDT como
-      prueba**. Sin prueba no se propaga.
+- [x] Liberación **automática** al detectar el pago verificado. No existe botón "liberar" que el
+      vendedor pueda no apretar. Verificado de extremo a extremo con Tron simulado → tx ZKA
+      construida → canal de broadcast; no contra TronGrid ni dos nodos reales.
+- [x] Registro de incumplimiento persistido: si un vendedor no libera después del deadline,
+      el comprador puede registrar la denuncia y el score local cuenta al vendedor.
+- [x] Denuncia compartida por gossip, autenticada por la firma de nodo aceptada para v1 y
+      **con un hash de tx USDT hexadecimal de 32 bytes como prueba**. Sin prueba no se propaga.
 - [ ] Advertir al comprador que denunciar expone públicamente su transacción USDT — es el precio
-      de que la denuncia sea verificable.
+      de que la denuncia sea verificable. El API exige un acknowledgement explícito; falta la
+      advertencia y confirmación visual en ZSilent.
 
 ### 2.8 Seguridad y consentimiento — gate obligatorio
 
@@ -488,6 +509,12 @@ No sale de "Coming Soon" sin esto.
 - [ ] Revisión de seguridad dedicada (código + flujo económico) antes de habilitar para usuarios
       reales. Sin tope de monto y sin testnet, este gate es la única barrera antes de fondos
       reales.
+
+Hallazgo abierto para esa revisión:
+
+- [ ] Hacer durable la tx ZKA de liberación y su rebroadcast. Hoy un crash entre construir,
+      persistir wallet, entregar al loop P2P y marcar `Released` deja una ventana ambigua.
+      No habilitar el flag mientras esa secuencia no tenga journal/recovery probado.
 
 ### 2.9 UI
 

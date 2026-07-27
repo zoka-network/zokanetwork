@@ -1342,6 +1342,9 @@ impl Node {
                     _ => {}
                 }
             }
+            ZokaMessage::OfferPaymentFailure(report) => {
+                report.validate()?;
+            }
             ZokaMessage::BlockRequest { .. } | ZokaMessage::Ping(_) => {}
         }
         Ok(())
@@ -3123,9 +3126,9 @@ impl Node {
             ZokaMessage::Pbft(_) => self.pbft_topic.clone(),
             ZokaMessage::StemPrivateTransaction(_) => self.stem_topic.clone(),
             ZokaMessage::PrivateMixerBatch(_) => self.mixer_topic.clone(),
-            ZokaMessage::OfferAnnounce(_) | ZokaMessage::OfferStatusUpdate(_) => {
-                self.offers_topic.clone()
-            }
+            ZokaMessage::OfferAnnounce(_)
+            | ZokaMessage::OfferStatusUpdate(_)
+            | ZokaMessage::OfferPaymentFailure(_) => self.offers_topic.clone(),
             _ => self.general_topic.clone(),
         };
         match self.swarm.behaviour_mut().gossipsub.publish(topic, payload) {

@@ -6906,6 +6906,7 @@ async fn handle_fullnode_network_message(
     node: &mut Node,
     message: &zoka::network::message::ZokaMessage,
     source: Option<libp2p::PeerId>,
+    exchange_runtime: &Arc<zoka::api::ExchangeRuntime>,
     chain_id: &str,
     chain_db_path: Option<&str>,
     storage: Option<&RocksDbStorage>,
@@ -6913,6 +6914,55 @@ async fn handle_fullnode_network_message(
     unsafe_rehearsal_difficulty_bits: Option<u32>,
 ) -> Option<String> {
     match message {
+        zoka::network::message::ZokaMessage::OfferAnnounce(announce) => {
+            let Some(source) = source else {
+                return Some(
+                    "Ignored offer announcement without a signed source peer.".to_string(),
+                );
+            };
+            match exchange_runtime
+                .ingest_offer_announce(announce.offer.clone(), source.to_string(), now_secs())
+                .await
+            {
+                Ok(()) => Some(format!("Offer {} is online.", announce.offer.id)),
+                Err(error) => Some(format!("Ignored offer {}: {error:?}", announce.offer.id)),
+            }
+        }
+        zoka::network::message::ZokaMessage::OfferStatusUpdate(update) => {
+            let Some(source) = source else {
+                return Some("Ignored offer update without a signed source peer.".to_string());
+            };
+            match exchange_runtime
+                .ingest_offer_update(update, &source.to_string())
+                .await
+            {
+                Ok(()) => Some(format!(
+                    "Offer {} changed to {:?}.",
+                    update.offer_id, update.status
+                )),
+                Err(error) => Some(format!(
+                    "Ignored update for offer {}: {error:?}",
+                    update.offer_id
+                )),
+            }
+        }
+        zoka::network::message::ZokaMessage::OfferPaymentFailure(report) => {
+            match exchange_runtime
+                .offer_store
+                .lock()
+                .await
+                .record_payment_failure(report.clone())
+            {
+                Ok(()) => Some(format!(
+                    "Recorded payment failure for offer {}.",
+                    report.offer_id
+                )),
+                Err(error) => Some(format!(
+                    "Ignored payment failure for offer {}: {error:?}",
+                    report.offer_id
+                )),
+            }
+        }
         zoka::network::message::ZokaMessage::BlockResponse(_) => handle_inbound_block_message(
             node,
             message,
@@ -7224,6 +7274,47 @@ async fn handle_fullnode_network_message(
         }
         _ => None,
     }
+}
+
+async fn announce_local_exchange_offers(
+    node: &mut Node,
+    exchange_runtime: &Arc<zoka::api::ExchangeRuntime>,
+) -> Result<usize, String> {
+    let outbound = exchange_runtime.drain_outbound_messages().await;
+    let mut published = 0usize;
+    let mut outbound = outbound.into_iter();
+    while let Some(message) = outbound.next() {
+        if let Err(error) = node.publish_message(&message) {
+            exchange_runtime.queue_message(message).await;
+            for pending in outbound {
+                exchange_runtime.queue_message(pending).await;
+            }
+            return Err(format!("offer update failed: {error}"));
+        }
+        published += 1;
+    }
+    let offers = {
+        let store = exchange_runtime.offer_store.lock().await;
+        store
+            .open_offers()
+            .into_iter()
+            .filter(|offer| offer.seller_address == exchange_runtime.seller_address)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    for offer in offers {
+        let message = zoka::network::message::ZokaMessage::OfferAnnounce(
+            zoka::network::message::OfferAnnounceMessage {
+                offer,
+                signature: Vec::new(),
+                timestamp: now_secs(),
+            },
+        );
+        node.publish_message(&message)
+            .map_err(|error| format!("offer announce failed: {error}"))?;
+        published += 1;
+    }
+    Ok(published)
 }
 
 fn publish_local_sync_state(
@@ -9438,6 +9529,11 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         Some(Arc::new(storage.clone())),
         password.clone(),
     ));
+    exchange_runtime
+        .configure_tron(zoka::p2p_exchange::tron::TronClient::new(
+            zoka::p2p_exchange::tron::TronConfig::from_env(tor_proxy.clone()),
+        ))
+        .await;
 
     let mut private_tx_recv_outer: Option<
         tokio::sync::mpsc::UnboundedReceiver<zoka::private_wallet::PrivateTransaction>,
@@ -9613,6 +9709,9 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         let (private_tx_send, mut private_tx_recv) =
             tokio::sync::mpsc::unbounded_channel::<zoka::private_wallet::PrivateTransaction>();
         let api_broadcaster = Some(private_tx_send);
+        exchange_runtime
+            .set_private_tx_broadcaster(api_broadcaster.clone().unwrap())
+            .await;
         // Keep `private_tx_recv` alive across the main loop below by
         // shadowing the binding name when we move it into the select.
         let _ = &mut private_tx_recv;
@@ -10118,6 +10217,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let warmup_deadline = tokio::time::Instant::now() + Duration::from_secs(sync_warmup_secs);
     let mut next_warmup_ibd_at = tokio::time::Instant::now();
     let mut next_warmup_seed_reconnect_at = tokio::time::Instant::now();
+    let mut next_warmup_offer_announce_at = tokio::time::Instant::now();
+    let mut next_warmup_exchange_process_at = tokio::time::Instant::now();
     let mut warmup_seed_reconnect_failures = 0u32;
     // --mining-console throttle, shared by the warmup loop and the main loop:
     // emit one compact status line every ~6s (instead of clearing and redrawing
@@ -10130,6 +10231,22 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut last_console_session_rewards = 0u64;
     while tokio::time::Instant::now() < warmup_deadline {
         let mut now = tokio::time::Instant::now();
+        if now >= next_warmup_exchange_process_at {
+            match exchange_runtime.process_local_exchange(now_secs()).await {
+                Ok(events) if !events.is_empty() => last_event = events.join("; "),
+                Ok(_) => {}
+                Err(error) => last_event = format!("P2P exchange: {error}"),
+            }
+            next_warmup_exchange_process_at = tokio::time::Instant::now() + Duration::from_secs(10);
+            now = tokio::time::Instant::now();
+        }
+        if now >= next_warmup_offer_announce_at {
+            if let Err(error) = announce_local_exchange_offers(&mut node, &exchange_runtime).await {
+                last_event = error;
+            }
+            next_warmup_offer_announce_at = tokio::time::Instant::now() + Duration::from_secs(30);
+            now = tokio::time::Instant::now();
+        }
         if now >= next_warmup_seed_reconnect_at {
             let target_seed_peers =
                 seed_connection_target(configured_seed_nodes, reconnect_seed_peers.len());
@@ -10215,6 +10332,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     &mut node,
                     &message,
                     sourced.source,
+                    &exchange_runtime,
                     &chain_id,
                     db_path.as_deref(),
                     chain_storage_outer.as_deref(),
@@ -10418,6 +10536,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     };
     let mut next_mine_at = tokio::time::Instant::now();
     let mut next_sync_state_at = tokio::time::Instant::now();
+    let mut next_offer_announce_at = tokio::time::Instant::now();
+    let mut next_exchange_process_at = tokio::time::Instant::now();
     // publish_recent_chain_blocks re-gossips up to `sync_rebroadcast_recent_blocks`
     // full block payloads. Running that on the same 3s cadence as the cheap
     // height/announce broadcasts turned into a self-inflicted gossip storm: a
@@ -10496,6 +10616,20 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut next_peer_snapshot_probe_at = tokio::time::Instant::now() + Duration::from_secs(45);
     let mut mining_task: Option<tokio::task::JoinHandle<Result<MiningBatchSummary, String>>> = None;
     loop {
+        if tokio::time::Instant::now() >= next_exchange_process_at {
+            match exchange_runtime.process_local_exchange(now_secs()).await {
+                Ok(events) if !events.is_empty() => last_event = events.join("; "),
+                Ok(_) => {}
+                Err(error) => last_event = format!("P2P exchange: {error}"),
+            }
+            next_exchange_process_at = tokio::time::Instant::now() + Duration::from_secs(10);
+        }
+        if tokio::time::Instant::now() >= next_offer_announce_at {
+            if let Err(error) = announce_local_exchange_offers(&mut node, &exchange_runtime).await {
+                last_event = error;
+            }
+            next_offer_announce_at = tokio::time::Instant::now() + Duration::from_secs(30);
+        }
         if let Some(deadline) = maybe_deadline {
             if tokio::time::Instant::now() >= deadline {
                 last_event = "Fullnode session time limit reached.".to_string();
@@ -11526,6 +11660,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     &mut node,
                     &message,
                     sourced.source,
+                    &exchange_runtime,
                     &chain_id,
                     db_path.as_deref(),
                     chain_storage_outer.as_deref(),

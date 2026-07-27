@@ -133,6 +133,41 @@ pub struct Offer {
     pub reserved_note_ids: Vec<String>,
 }
 
+/// Public evidence that a seller did not release after an on-chain payment.
+///
+/// Publishing this deliberately links the buyer's Tron transaction to the
+/// trade; the UI must obtain explicit confirmation before sending it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaymentFailureReport {
+    pub offer_id: String,
+    pub seller_address: String,
+    pub buyer_address: String,
+    pub tron_tx_hash: String,
+    pub timestamp: u64,
+    #[serde(default)]
+    pub signature: Vec<u8>,
+}
+
+impl PaymentFailureReport {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.offer_id.trim().is_empty()
+            || self.seller_address.trim().is_empty()
+            || self.buyer_address.trim().is_empty()
+        {
+            return Err("payment failure report is missing trade identities");
+        }
+        if self.tron_tx_hash.len() != 64
+            || !self
+                .tron_tx_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("payment failure report needs a 64-character Tron transaction hash");
+        }
+        Ok(())
+    }
+}
+
 /// Why an offer was rejected. Rejections are values rather than strings so
 /// the UI can explain each case in its own words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,9 +209,7 @@ impl OfferRejection {
 /// payment simply never arrives and the offer expires.
 pub fn is_plausible_tron_address(address: &str) -> bool {
     const BASE58: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-    address.len() == 34
-        && address.starts_with('T')
-        && address.chars().all(|c| BASE58.contains(c))
+    address.len() == 34 && address.starts_with('T') && address.chars().all(|c| BASE58.contains(c))
 }
 
 /// Whether `paid` satisfies an offer asking `asked`.
@@ -246,7 +279,9 @@ impl Offer {
     /// terminal one has already released or freed its reservation.
     pub fn is_expired_at(&self, now: u64) -> bool {
         match (self.status, self.claim_expires_at) {
-            (OfferStatus::Claimed | OfferStatus::PaymentDetected, Some(deadline)) => now >= deadline,
+            (OfferStatus::Claimed | OfferStatus::PaymentDetected, Some(deadline)) => {
+                now >= deadline
+            }
             _ => false,
         }
     }
@@ -319,7 +354,9 @@ mod tests {
     fn the_test_address_is_actually_shaped_like_a_tron_address() {
         // Guards the fixture itself: if this were malformed, every other test
         // here would be asserting against a rejection it never intended.
-        assert!(is_plausible_tron_address(&valid_offer().usdt_receive_address));
+        assert!(is_plausible_tron_address(
+            &valid_offer().usdt_receive_address
+        ));
     }
 
     #[test]
@@ -338,11 +375,17 @@ mod tests {
         assert!(!is_plausible_tron_address(""));
         assert!(!is_plausible_tron_address("T"));
         // Right length, wrong prefix.
-        assert!(!is_plausible_tron_address("AQ5NMqJjW8dWvJf3zJ8xYqL2mNpR4sT6uV"));
+        assert!(!is_plausible_tron_address(
+            "AQ5NMqJjW8dWvJf3zJ8xYqL2mNpR4sT6uV"
+        ));
         // Right prefix, one char short.
-        assert!(!is_plausible_tron_address("TQ5NMqJjW8dWvJf3zJ8xYqL2mNpR4sT6u"));
+        assert!(!is_plausible_tron_address(
+            "TQ5NMqJjW8dWvJf3zJ8xYqL2mNpR4sT6u"
+        ));
         // Contains base58-excluded characters (0, O, I, l).
-        assert!(!is_plausible_tron_address("T0OIlqJjW8dWvJf3zJ8xYqL2mNpR4sT6uV"));
+        assert!(!is_plausible_tron_address(
+            "T0OIlqJjW8dWvJf3zJ8xYqL2mNpR4sT6uV"
+        ));
     }
 
     #[test]
@@ -374,19 +417,28 @@ mod tests {
         let mut offer = valid_offer();
         offer.status = OfferStatus::Claimed;
         offer.claimed_by = Some("zka1buyer".to_string());
-        assert_eq!(offer.validate(), Err(OfferRejection::ClaimedWithoutDeadline));
+        assert_eq!(
+            offer.validate(),
+            Err(OfferRejection::ClaimedWithoutDeadline)
+        );
     }
 
     #[test]
     fn exact_payment_releases() {
-        assert!(payment_satisfies(25 * MICRO_USDT_PER_USDT, 25 * MICRO_USDT_PER_USDT));
+        assert!(payment_satisfies(
+            25 * MICRO_USDT_PER_USDT,
+            25 * MICRO_USDT_PER_USDT
+        ));
     }
 
     #[test]
     fn overpayment_releases() {
         // The buyer already sent more than asked; withholding the ZKA over
         // their mistake would be theft.
-        assert!(payment_satisfies(25 * MICRO_USDT_PER_USDT, 30 * MICRO_USDT_PER_USDT));
+        assert!(payment_satisfies(
+            25 * MICRO_USDT_PER_USDT,
+            30 * MICRO_USDT_PER_USDT
+        ));
     }
 
     #[test]
@@ -509,8 +561,7 @@ mod tests {
 
         // Two offers published in the same second must not collide — that was
         // exactly the failure of the seller+timestamp scheme this replaced.
-        let ids: std::collections::HashSet<String> =
-            (0..500).map(|_| new_offer_id()).collect();
+        let ids: std::collections::HashSet<String> = (0..500).map(|_| new_offer_id()).collect();
         assert_eq!(ids.len(), 500);
     }
 
@@ -536,7 +587,11 @@ mod tests {
         // is where the buyer's USDT lands.
         let mut redirected = valid_offer();
         redirected.usdt_receive_address = "TXYZNMqJjW8dWvJf3zJ8xYqL2mNpR4sT6u".to_string();
-        assert_ne!(base, redirected.signing_preimage(), "payout address must be signed");
+        assert_ne!(
+            base,
+            redirected.signing_preimage(),
+            "payout address must be signed"
+        );
 
         let mut impostor = valid_offer();
         impostor.seller_address = "zka1someoneelse".to_string();

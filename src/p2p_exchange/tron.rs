@@ -68,6 +68,8 @@ pub enum TronClientError {
 pub struct TronClient {
     config: TronConfig,
     client: reqwest::Client,
+    #[cfg(test)]
+    mock_transfers: Option<Vec<TronTransfer>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,7 +114,24 @@ impl TronClient {
             .proxy(proxy)
             .build()
             .map_err(|error| TronClientError::InvalidProxy(error.to_string()))?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            #[cfg(test)]
+            mock_transfers: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_mock_transfers(transfers: Vec<TronTransfer>) -> Self {
+        Self {
+            config: TronConfig {
+                socks_proxy: Some("test-only".to_string()),
+                ..TronConfig::default()
+            },
+            client: reqwest::Client::new(),
+            mock_transfers: Some(transfers),
+        }
     }
 
     pub async fn fetch_transfers(
@@ -120,6 +139,10 @@ impl TronClient {
         address: &str,
         limit: u32,
     ) -> Result<Vec<TronTransfer>, TronClientError> {
+        #[cfg(test)]
+        if let Some(transfers) = &self.mock_transfers {
+            return Ok(transfers.clone());
+        }
         let path = trc20_transfers_path(address, limit);
         let providers = std::iter::once(self.config.base_url.as_str())
             .chain(self.config.fallback_urls.iter().map(String::as_str));
@@ -242,7 +265,9 @@ impl TronConfig {
     /// leaves the offer to expire and the ZKA returns to the seller, whereas a
     /// deanonymised trade cannot be undone.
     pub fn is_private(&self) -> bool {
-        self.socks_proxy.as_ref().is_some_and(|p| !p.trim().is_empty())
+        self.socks_proxy
+            .as_ref()
+            .is_some_and(|p| !p.trim().is_empty())
     }
 }
 
@@ -297,7 +322,10 @@ pub fn transfer_settles_offer(
     if !offer.status.holds_reservation() || offer.claimed_by.is_none() {
         return Err(PaymentMismatch::OfferNotClaimed);
     }
-    if !transfer.contract_address.eq_ignore_ascii_case(USDT_TRC20_CONTRACT) {
+    if !transfer
+        .contract_address
+        .eq_ignore_ascii_case(USDT_TRC20_CONTRACT)
+    {
         return Err(PaymentMismatch::WrongToken);
     }
     if transfer.to != offer.usdt_receive_address {
@@ -577,7 +605,10 @@ mod tests {
         assert!(!config.is_private());
 
         config.socks_proxy = Some("   ".to_string());
-        assert!(!config.is_private(), "blank proxy must not count as private");
+        assert!(
+            !config.is_private(),
+            "blank proxy must not count as private"
+        );
 
         config.socks_proxy = Some("127.0.0.1:9050".to_string());
         assert!(config.is_private());
@@ -649,11 +680,8 @@ mod tests {
     #[tokio::test]
     async fn a_failed_primary_uses_the_configured_fallback() {
         let body = serde_json::json!({ "data": [] }).to_string();
-        let (proxy, mut requests, task) = spawn_mock_socks_http(vec![
-            (503, "{}".to_string()),
-            (200, body),
-        ])
-        .await;
+        let (proxy, mut requests, task) =
+            spawn_mock_socks_http(vec![(503, "{}".to_string()), (200, body)]).await;
         let client = TronClient::new(TronConfig {
             base_url: "http://tron-primary.test".to_string(),
             fallback_urls: vec!["http://tron-fallback.test".to_string()],
