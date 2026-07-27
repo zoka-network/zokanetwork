@@ -43,3 +43,8 @@ discord-bot/.env
 
 # Tor Expert Bundle staged locally for packaging (downloaded, not versioned)
 third_party/
+
+# Test artifacts: RocksDB dirs from api tests and two-node QA rehearsals.
+# Without these the repo fills with dozens of untracked dirs after a test run.
+test_db_*/
+zoka-team-*/
