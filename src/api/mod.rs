@@ -4582,7 +4582,7 @@ async fn create_exchange_offer(
 
     let now = now_secs();
     let offer = crate::p2p_exchange::Offer {
-        id: format!("{}-{}", req.seller_address.trim(), now),
+        id: crate::p2p_exchange::new_offer_id(),
         seller_address: req.seller_address.trim().to_string(),
         zka_atoms: req.zka_atoms,
         micro_usdt: req.micro_usdt,

@@ -243,6 +243,15 @@ en el repo ZOKA, commit `796c086b`, 3 tests en verde.
 > Nota: `cargo test --lib` completo (836 tests) excede 10 min; usar filtros
 > (`cargo test --lib p2p_exchange::`).
 
+### Decisiones cerradas 2026-07-26 (segunda ronda)
+
+| Tema | Decisión |
+| --- | --- |
+| Clave de firma | **Confiar en la firma de gossipsub** para v1. libp2p ya firma cada mensaje con la identidad del nodo (`MessageAuthenticity::Signed`). **Límite aceptado:** autentica el *nodo*, no la *wallet* — impide que un peer falsifique mensajes ajenos en tránsito, pero **no** impide que alguien publique una oferta con la `zka1` de otro. El campo `signature` y `signing_preimage()` quedan listos para cuando se ate a la wallet. |
+| Fondos insuficientes | **Rechazar la oferta.** Si no hay notas suficientes para reservar, la creación falla. Ninguna oferta llega a la red sin respaldo. |
+| Id de oferta | **128 bits aleatorios** (`new_offer_id()`). El id entra en el preimagen de firma, así que una colisión sería un vector de falsificación, no una molestia. |
+| Endpoint Tron | **TronGrid público por defecto + override en Settings** (URL y API key opcional). Sin fricción inicial, con salida si rate-limitea. |
+
 ### 2.1 Modelo de datos `Offer` ✅
 
 Implementado en `src/p2p_exchange/mod.rs`. Decisiones que conviene no revisitar:

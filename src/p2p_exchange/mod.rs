@@ -22,6 +22,19 @@ pub mod store;
 
 pub use store::{OfferStore, ReconcileReport, StoreError};
 
+/// Generates an offer id: 128 random bits, hex encoded.
+///
+/// Random rather than derived from the seller and a timestamp. A derived id
+/// collides when one seller publishes twice in the same second, and the id is
+/// covered by [`Offer::signing_preimage`] — two offers sharing an id would
+/// share a signature, so a collision is a forgery vector rather than a nuisance.
+pub fn new_offer_id() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Micro-USDT per USDT. TRC-20 USDT carries six decimals, so amounts are held
 /// as integers — a float would silently round prices and, worse, make two
 /// nodes disagree about whether a payment matched.
@@ -479,6 +492,22 @@ mod tests {
     #[test]
     fn the_claim_window_is_45_minutes() {
         assert_eq!(CLAIM_WINDOW_SECONDS, 2_700);
+    }
+
+    #[test]
+    fn offer_ids_are_unique_and_full_width() {
+        let a = new_offer_id();
+        let b = new_offer_id();
+
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 32, "128 bits hex-encoded");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Two offers published in the same second must not collide — that was
+        // exactly the failure of the seller+timestamp scheme this replaced.
+        let ids: std::collections::HashSet<String> =
+            (0..500).map(|_| new_offer_id()).collect();
+        assert_eq!(ids.len(), 500);
     }
 
     #[test]
