@@ -6947,11 +6947,12 @@ async fn handle_fullnode_network_message(
             }
         }
         zoka::network::message::ZokaMessage::OfferPaymentFailure(report) => {
+            let Some(_) = source else {
+                return Some("Ignored payment failure without a signed source peer.".to_string());
+            };
             match exchange_runtime
-                .offer_store
-                .lock()
+                .ingest_payment_failure(report.clone(), now_secs())
                 .await
-                .record_payment_failure(report.clone())
             {
                 Ok(()) => Some(format!(
                     "Recorded payment failure for offer {}.",
@@ -7296,20 +7297,58 @@ async fn announce_local_exchange_offers(
     let offers = {
         let store = exchange_runtime.offer_store.lock().await;
         store
-            .open_offers()
+            .all_offers()
             .into_iter()
             .filter(|offer| offer.seller_address == exchange_runtime.seller_address)
             .cloned()
             .collect::<Vec<_>>()
     };
+    let now = now_secs();
     for offer in offers {
-        let message = zoka::network::message::ZokaMessage::OfferAnnounce(
-            zoka::network::message::OfferAnnounceMessage {
-                offer,
-                signature: Vec::new(),
-                timestamp: now_secs(),
-            },
-        );
+        let message = match offer.status {
+            zoka::p2p_exchange::OfferStatus::Open => {
+                zoka::network::message::ZokaMessage::OfferAnnounce(
+                    zoka::network::message::OfferAnnounceMessage {
+                        offer,
+                        signature: Vec::new(),
+                        timestamp: now,
+                    },
+                )
+            }
+            zoka::p2p_exchange::OfferStatus::Claimed
+            | zoka::p2p_exchange::OfferStatus::PaymentDetected => {
+                zoka::network::message::ZokaMessage::OfferStatusUpdate(
+                    zoka::network::message::OfferStatusUpdateMessage {
+                        offer_id: offer.id,
+                        seller_address: offer.seller_address,
+                        status: offer.status,
+                        claimed_by: offer.claimed_by,
+                        claim_expires_at: offer.claim_expires_at,
+                        signature: Vec::new(),
+                        timestamp: now,
+                    },
+                )
+            }
+            zoka::p2p_exchange::OfferStatus::Released
+            | zoka::p2p_exchange::OfferStatus::Expired
+                if offer
+                    .claim_expires_at
+                    .is_some_and(|deadline| now <= deadline.saturating_add(24 * 60 * 60)) =>
+            {
+                zoka::network::message::ZokaMessage::OfferStatusUpdate(
+                    zoka::network::message::OfferStatusUpdateMessage {
+                        offer_id: offer.id,
+                        seller_address: offer.seller_address,
+                        status: offer.status,
+                        claimed_by: offer.claimed_by,
+                        claim_expires_at: offer.claim_expires_at,
+                        signature: Vec::new(),
+                        timestamp: now,
+                    },
+                )
+            }
+            _ => continue,
+        };
         node.publish_message(&message)
             .map_err(|error| format!("offer announce failed: {error}"))?;
         published += 1;
@@ -9512,12 +9551,6 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         startup_notes.push(format!(
             "Released {} orphaned P2P note reservation(s) during startup reconciliation.",
             reconciliation.orphaned_note_ids.len()
-        ));
-    }
-    if !reconciliation.expired_offers.is_empty() {
-        startup_notes.push(format!(
-            "Expired {} lapsed P2P offer(s) during startup reconciliation.",
-            reconciliation.expired_offers.len()
         ));
     }
     let private_wallet_manager = Arc::new(tokio::sync::RwLock::new(private_wallet_manager));

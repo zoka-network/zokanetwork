@@ -49,6 +49,11 @@ pub const MICRO_USDT_PER_USDT: u64 = 1_000_000;
 /// short enough that a buyer who walks away does not strand the funds.
 pub const CLAIM_WINDOW_SECONDS: u64 = 45 * 60;
 
+/// Delay before a buyer may publish a non-release report. This avoids
+/// permanently accusing a seller because a release and the deadline crossed
+/// in adjacent polling/gossip cycles.
+pub const FAILURE_REPORT_GRACE_SECONDS: u64 = 5 * 60;
+
 /// Matching tolerance on the USDT amount, in basis points (0.5%). Exchanges
 /// and wallets shave fees off transfers, so demanding the exact figure would
 /// reject honest payments.
@@ -279,9 +284,7 @@ impl Offer {
     /// terminal one has already released or freed its reservation.
     pub fn is_expired_at(&self, now: u64) -> bool {
         match (self.status, self.claim_expires_at) {
-            (OfferStatus::Claimed | OfferStatus::PaymentDetected, Some(deadline)) => {
-                now >= deadline
-            }
+            (OfferStatus::Claimed, Some(deadline)) => now >= deadline,
             _ => false,
         }
     }
@@ -480,6 +483,12 @@ mod tests {
         assert!(!offer.is_expired_at(1_751_002_699));
         assert!(offer.is_expired_at(1_751_002_700));
         assert!(offer.is_expired_at(1_751_009_999));
+
+        // Once payment was verified, a temporary release/broadcast failure
+        // must never give the seller their ZKA back. The exact release keeps
+        // retrying until it confirms.
+        offer.status = OfferStatus::PaymentDetected;
+        assert!(!offer.is_expired_at(u64::MAX));
     }
 
     #[test]

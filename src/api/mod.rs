@@ -143,6 +143,11 @@ impl ExchangeRuntime {
                 .as_deref()
                 .filter(|buyer| !buyer.trim().is_empty())
                 .ok_or(crate::p2p_exchange::StoreError::InvalidTransition)?;
+            if buyer == self.seller_address {
+                return Err(crate::p2p_exchange::StoreError::InvalidTransition);
+            }
+            crate::private_wallet::canonical_payment_address(buyer)
+                .map_err(|_| crate::p2p_exchange::StoreError::Invalid("invalid buyer address"))?;
             let accepted_at = now_secs();
             let claimed =
                 self.offer_store
@@ -184,7 +189,36 @@ impl ExchangeRuntime {
         Ok(())
     }
 
-    pub async fn visible_open_offers(&self, now: u64) -> Vec<crate::p2p_exchange::Offer> {
+    pub async fn ingest_payment_failure(
+        &self,
+        report: crate::p2p_exchange::PaymentFailureReport,
+        now: u64,
+    ) -> Result<(), crate::p2p_exchange::StoreError> {
+        let mut store = self.offer_store.lock().await;
+        let offer = store
+            .get(&report.offer_id)
+            .cloned()
+            .ok_or(crate::p2p_exchange::StoreError::UnknownOffer)?;
+        if offer.seller_address != report.seller_address
+            || offer.claimed_by.as_deref() != Some(report.buyer_address.as_str())
+        {
+            return Err(crate::p2p_exchange::StoreError::SellerMismatch);
+        }
+        if offer.status == crate::p2p_exchange::OfferStatus::Released {
+            return Err(crate::p2p_exchange::StoreError::InvalidTransition);
+        }
+        let deadline = offer
+            .claim_expires_at
+            .ok_or(crate::p2p_exchange::StoreError::InvalidTransition)?;
+        let report_after =
+            deadline.saturating_add(crate::p2p_exchange::FAILURE_REPORT_GRACE_SECONDS);
+        if now < report_after || report.timestamp < report_after {
+            return Err(crate::p2p_exchange::StoreError::InvalidTransition);
+        }
+        store.record_payment_failure(report)
+    }
+
+    pub async fn visible_exchange_offers(&self, now: u64) -> Vec<crate::p2p_exchange::Offer> {
         const PRESENCE_TTL_SECS: u64 = 90;
         // Do not hold both locks at once: inbound announcements persist the
         // offer before refreshing presence, so taking them in the opposite
@@ -193,50 +227,28 @@ impl ExchangeRuntime {
         self.offer_store
             .lock()
             .await
-            .open_offers()
+            .all_offers()
             .into_iter()
             .filter(|offer| {
-                offer.seller_address == self.seller_address
-                    || presence
-                        .get(&offer.id)
-                        .is_some_and(|(_, seen)| now.saturating_sub(*seen) <= PRESENCE_TTL_SECS)
+                if offer.status == crate::p2p_exchange::OfferStatus::Open {
+                    offer.seller_address == self.seller_address
+                        || presence
+                            .get(&offer.id)
+                            .is_some_and(|(_, seen)| now.saturating_sub(*seen) <= PRESENCE_TTL_SECS)
+                } else {
+                    // Keep the user's own in-flight and historical trades in
+                    // the feed after an open offer disappears. Other buyers'
+                    // claims are not relevant to this wallet.
+                    offer.seller_address == self.seller_address
+                        || offer.claimed_by.as_deref() == Some(self.seller_address.as_str())
+                }
             })
             .cloned()
             .collect()
     }
 
     pub async fn process_local_exchange(&self, now: u64) -> Result<Vec<String>, String> {
-        let expired = self
-            .offer_store
-            .lock()
-            .await
-            .expire_due(now)
-            .map_err(|error| format!("failed to expire offers: {error:?}"))?;
         let mut events = Vec::new();
-        if !expired.is_empty() {
-            let mut wallets = self.wallet_manager.write().await;
-            self.refresh_wallet(&mut wallets, &self.default_wallet_name)?;
-            for offer in &expired {
-                if offer.seller_address == self.seller_address {
-                    wallets.release_wallet_reservation(&self.default_wallet_name, &offer.id);
-                    self.queue_message(crate::network::message::ZokaMessage::OfferStatusUpdate(
-                        crate::network::message::OfferStatusUpdateMessage {
-                            offer_id: offer.id.clone(),
-                            seller_address: offer.seller_address.clone(),
-                            status: crate::p2p_exchange::OfferStatus::Expired,
-                            claimed_by: offer.claimed_by.clone(),
-                            claim_expires_at: offer.claim_expires_at,
-                            signature: Vec::new(),
-                            timestamp: now,
-                        },
-                    ))
-                    .await;
-                    events.push(format!("offer {} expired", offer.id));
-                }
-            }
-            self.persist_wallet(&wallets, &self.default_wallet_name)?;
-        }
-
         let candidates = {
             let store = self.offer_store.lock().await;
             store
@@ -248,6 +260,7 @@ impl ExchangeRuntime {
                             offer.status,
                             crate::p2p_exchange::OfferStatus::Claimed
                                 | crate::p2p_exchange::OfferStatus::PaymentDetected
+                                | crate::p2p_exchange::OfferStatus::Released
                         )
                 })
                 .cloned()
@@ -256,29 +269,160 @@ impl ExchangeRuntime {
         if candidates.is_empty() {
             return Ok(events);
         }
-        let Some(tron_client) = self.tron_client.lock().await.clone() else {
-            return Ok(events);
-        };
 
         for offer in candidates {
-            let claimed_at = offer
-                .claim_expires_at
-                .unwrap_or(now)
-                .saturating_sub(crate::p2p_exchange::CLAIM_WINDOW_SECONDS);
-            *self.verification_status.lock().await = format!("checking offer {}", offer.id);
-            let transfer = match tron_client.settling_transfer(&offer, claimed_at).await {
-                Ok(Some(transfer)) => transfer,
-                Ok(None) => continue,
-                Err(error) => {
-                    *self.verification_status.lock().await = error.to_string();
+            let release_state = {
+                let mut wallets = self.wallet_manager.write().await;
+                self.refresh_wallet(&mut wallets, &self.default_wallet_name)?;
+                wallets
+                    .exchange_release_state(
+                        &self.default_wallet_name,
+                        &offer.id,
+                        &offer.reserved_note_ids,
+                    )
+                    .map_err(|error| error.to_string())?
+            };
+            match release_state {
+                crate::private_wallet::ExchangeReleaseState::Pending(tx) => {
+                    let broadcaster = self
+                        .private_tx_broadcaster
+                        .lock()
+                        .await
+                        .clone()
+                        .ok_or_else(|| {
+                            "private transaction broadcaster is unavailable".to_string()
+                        })?;
+                    broadcaster.send(tx.clone()).map_err(|_| {
+                        "private transaction broadcaster closed; durable release retained"
+                            .to_string()
+                    })?;
+                    if offer.status != crate::p2p_exchange::OfferStatus::Released {
+                        self.offer_store
+                            .lock()
+                            .await
+                            .set_status(&offer.id, crate::p2p_exchange::OfferStatus::Released)
+                            .map_err(|error| {
+                                format!("failed to record recovered release: {error:?}")
+                            })?;
+                        self.queue_message(
+                            crate::network::message::ZokaMessage::OfferStatusUpdate(
+                                crate::network::message::OfferStatusUpdateMessage {
+                                    offer_id: offer.id.clone(),
+                                    seller_address: offer.seller_address.clone(),
+                                    status: crate::p2p_exchange::OfferStatus::Released,
+                                    claimed_by: offer.claimed_by.clone(),
+                                    claim_expires_at: offer.claim_expires_at,
+                                    signature: Vec::new(),
+                                    timestamp: now,
+                                },
+                            ),
+                        )
+                        .await;
+                    }
+                    *self.verification_status.lock().await = "ready".to_string();
+                    events.push(format!(
+                        "offer {} rebroadcast durable release {}",
+                        offer.id, tx.tx_hash
+                    ));
                     continue;
                 }
+                crate::private_wallet::ExchangeReleaseState::Confirmed => {
+                    if offer.status != crate::p2p_exchange::OfferStatus::Released {
+                        self.offer_store
+                            .lock()
+                            .await
+                            .set_status(&offer.id, crate::p2p_exchange::OfferStatus::Released)
+                            .map_err(|error| {
+                                format!("failed to record confirmed release: {error:?}")
+                            })?;
+                        self.queue_message(
+                            crate::network::message::ZokaMessage::OfferStatusUpdate(
+                                crate::network::message::OfferStatusUpdateMessage {
+                                    offer_id: offer.id.clone(),
+                                    seller_address: offer.seller_address.clone(),
+                                    status: crate::p2p_exchange::OfferStatus::Released,
+                                    claimed_by: offer.claimed_by.clone(),
+                                    claim_expires_at: offer.claim_expires_at,
+                                    signature: Vec::new(),
+                                    timestamp: now,
+                                },
+                            ),
+                        )
+                        .await;
+                    }
+                    continue;
+                }
+                crate::private_wallet::ExchangeReleaseState::ReservedForOffer => {}
+            }
+
+            if offer.status == crate::p2p_exchange::OfferStatus::Released {
+                return Err(format!(
+                    "offer {} is Released but its durable transaction is missing",
+                    offer.id
+                ));
+            }
+
+            let transfer_id = if offer.status == crate::p2p_exchange::OfferStatus::PaymentDetected {
+                None
+            } else {
+                let Some(tron_client) = self.tron_client.lock().await.clone() else {
+                    *self.verification_status.lock().await = "tor_unavailable".to_string();
+                    // Never unlock a due claim until a successful Tron query
+                    // proves no qualifying payment exists.
+                    continue;
+                };
+                let claimed_at = offer
+                    .claim_expires_at
+                    .unwrap_or(now)
+                    .saturating_sub(crate::p2p_exchange::CLAIM_WINDOW_SECONDS);
+                *self.verification_status.lock().await = format!("checking offer {}", offer.id);
+                match tron_client.settling_transfer(&offer, claimed_at).await {
+                    Ok(Some(transfer)) => {
+                        self.offer_store
+                            .lock()
+                            .await
+                            .set_status(
+                                &offer.id,
+                                crate::p2p_exchange::OfferStatus::PaymentDetected,
+                            )
+                            .map_err(|error| format!("failed to record payment: {error:?}"))?;
+                        Some(transfer.transaction_id)
+                    }
+                    Ok(None) if offer.is_expired_at(now) => {
+                        self.offer_store
+                            .lock()
+                            .await
+                            .set_status(&offer.id, crate::p2p_exchange::OfferStatus::Expired)
+                            .map_err(|error| format!("failed to expire unpaid offer: {error:?}"))?;
+                        let mut wallets = self.wallet_manager.write().await;
+                        self.refresh_wallet(&mut wallets, &self.default_wallet_name)?;
+                        wallets.release_wallet_reservation(&self.default_wallet_name, &offer.id);
+                        self.persist_wallet(&wallets, &self.default_wallet_name)?;
+                        drop(wallets);
+                        self.queue_message(
+                            crate::network::message::ZokaMessage::OfferStatusUpdate(
+                                crate::network::message::OfferStatusUpdateMessage {
+                                    offer_id: offer.id.clone(),
+                                    seller_address: offer.seller_address.clone(),
+                                    status: crate::p2p_exchange::OfferStatus::Expired,
+                                    claimed_by: offer.claimed_by.clone(),
+                                    claim_expires_at: offer.claim_expires_at,
+                                    signature: Vec::new(),
+                                    timestamp: now,
+                                },
+                            ),
+                        )
+                        .await;
+                        events.push(format!("offer {} expired after final Tron check", offer.id));
+                        continue;
+                    }
+                    Ok(None) => continue,
+                    Err(error) => {
+                        *self.verification_status.lock().await = error.to_string();
+                        continue;
+                    }
+                }
             };
-            self.offer_store
-                .lock()
-                .await
-                .set_status(&offer.id, crate::p2p_exchange::OfferStatus::PaymentDetected)
-                .map_err(|error| format!("failed to record payment: {error:?}"))?;
             let buyer = offer.claimed_by.as_deref().ok_or_else(|| {
                 format!("offer {} lost its buyer after payment detection", offer.id)
             })?;
@@ -326,10 +470,13 @@ impl ExchangeRuntime {
             ))
             .await;
             *self.verification_status.lock().await = "ready".to_string();
-            events.push(format!(
-                "offer {} released after Tron payment {}",
-                offer.id, transfer.transaction_id
-            ));
+            events.push(match transfer_id {
+                Some(transaction_id) => format!(
+                    "offer {} released after Tron payment {}",
+                    offer.id, transaction_id
+                ),
+                None => format!("offer {} resumed its durable release", offer.id),
+            });
         }
         Ok(events)
     }
@@ -4900,7 +5047,7 @@ async fn list_exchange_offers(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let exchange = exchange_runtime_or_404(&app_state)?;
     let now = now_secs();
-    let offers = exchange.visible_open_offers(now).await;
+    let offers = exchange.visible_exchange_offers(now).await;
     let verification = exchange.verification_status().await;
     Ok(Json(
         serde_json::json!({ "offers": offers, "verification": verification }),
@@ -4918,27 +5065,17 @@ async fn create_exchange_offer(
     } else {
         seller_address
     };
+    if effective_seller != exchange.seller_address {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "seller_address must be the wallet selected by this node".to_string(),
+        ));
+    }
 
     let now = now_secs();
     let offer_id = crate::p2p_exchange::new_offer_id();
     let mut wallets = exchange.wallet_manager.write().await;
-    let wallet_name = if effective_seller == exchange.seller_address {
-        exchange.default_wallet_name.clone()
-    } else {
-        wallets
-            .get_private_wallet_names()
-            .into_iter()
-            .find(|name| {
-                wallets
-                    .get_private_wallet(name)
-                    .map(|wallet| wallet.commitment_key == effective_seller)
-                    .unwrap_or(false)
-            })
-            .ok_or((
-                StatusCode::BAD_REQUEST,
-                "seller_address does not belong to a local wallet".to_string(),
-            ))?
-    };
+    let wallet_name = exchange.default_wallet_name.clone();
     exchange
         .refresh_wallet(&mut wallets, &wallet_name)
         .map_err(|error| {
@@ -5047,6 +5184,12 @@ async fn claim_exchange_offer(
     let buyer = if buyer.is_empty() {
         exchange.seller_address.clone()
     } else {
+        if buyer != exchange.seller_address {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "buyer_address must be the wallet selected by this node".to_string(),
+            ));
+        }
         buyer
     };
 
@@ -5088,7 +5231,14 @@ async fn claim_exchange_offer(
         ))
         .await;
 
-    Ok(Json(serde_json::to_value(&requested).unwrap_or_default()))
+    // This is only a request. The buyer must not treat it as accepted (and
+    // send USDT) until the seller's signed authoritative update comes back
+    // through gossip and mutates the local store.
+    Ok(Json(serde_json::json!({
+        "offer_id": requested.id,
+        "seller_address": requested.seller_address,
+        "status": "claim_requested"
+    })))
 }
 
 async fn report_exchange_payment_failure(
@@ -5120,10 +5270,11 @@ async fn report_exchange_payment_failure(
         StatusCode::CONFLICT,
         "the offer was never claimed".to_string(),
     ))?;
-    if now < deadline {
+    let report_after = deadline.saturating_add(crate::p2p_exchange::FAILURE_REPORT_GRACE_SECONDS);
+    if now < report_after {
         return Err((
             StatusCode::CONFLICT,
-            "the seller still has time to complete the automatic release".to_string(),
+            "the seller still has time to complete and propagate the automatic release".to_string(),
         ));
     }
     let buyer = offer.claimed_by.clone().ok_or((
@@ -6651,6 +6802,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exchange_requests_cannot_redirect_the_nodes_selected_wallet() {
+        let dir = format!("./test_db_exchange_wallet_binding_{}", std::process::id());
+        let mut state = test_app_state(&dir);
+        let store_path =
+            std::env::temp_dir().join(format!("offers-wallet-binding-{}.json", std::process::id()));
+        let (exchange, _) = configure_test_exchange(
+            &mut state,
+            &store_path,
+            100 * crate::economics::ATOMS_PER_ZKA,
+        );
+        let other_wallet = exchange
+            .wallet_manager
+            .write()
+            .await
+            .create_private_wallet("other")
+            .unwrap();
+        let app_state = Arc::new(state);
+
+        let redirected_offer = create_exchange_offer(
+            State(Arc::clone(&app_state)),
+            Json(CreateOfferRequest {
+                zka_atoms: 100 * crate::economics::ATOMS_PER_ZKA,
+                micro_usdt: 25_000_000,
+                usdt_receive_address: "TQ5NMqJjW8dWvJf3zJ8xYqL2mNpR4sT6uV".to_string(),
+                seller_address: other_wallet.clone(),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            redirected_offer,
+            Err((StatusCode::BAD_REQUEST, _))
+        ));
+        assert!(exchange.offer_store.lock().await.is_empty());
+
+        exchange
+            .ingest_offer_announce(
+                remote_offer("wallet-bound-claim"),
+                "peer-seller".to_string(),
+                now_secs(),
+            )
+            .await
+            .unwrap();
+        let redirected_claim = claim_exchange_offer(
+            State(app_state),
+            Path("wallet-bound-claim".to_string()),
+            Some(Json(serde_json::json!({ "buyer_address": other_wallet }))),
+        )
+        .await;
+        assert!(matches!(
+            redirected_claim,
+            Err((StatusCode::BAD_REQUEST, _))
+        ));
+        assert_eq!(
+            exchange
+                .offer_store
+                .lock()
+                .await
+                .get("wallet-bound-claim")
+                .unwrap()
+                .status,
+            crate::p2p_exchange::OfferStatus::Open
+        );
+        let _ = std::fs::remove_file(&store_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn remote_offers_are_visible_only_while_the_seller_is_present() {
         let dir = format!("./test_db_exchange_presence_{}", std::process::id());
         let mut state = test_app_state(&dir);
@@ -6666,14 +6884,20 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(exchange.visible_open_offers(1_751_000_090).await.len(), 1);
-        assert!(exchange.visible_open_offers(1_751_000_091).await.is_empty());
+        assert_eq!(
+            exchange.visible_exchange_offers(1_751_000_090).await.len(),
+            1
+        );
+        assert!(exchange
+            .visible_exchange_offers(1_751_000_091)
+            .await
+            .is_empty());
         let _ = std::fs::remove_file(&store_path);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    async fn claim_without_a_body_uses_the_buyer_node_wallet_and_queues_gossip() {
+    async fn claim_without_a_body_queues_a_request_but_not_an_authoritative_claim() {
         let dir = format!("./test_db_exchange_claim_{}", std::process::id());
         let mut state = test_app_state(&dir);
         let store_path =
@@ -6693,14 +6917,38 @@ mod tests {
             claim_exchange_offer(State(app_state), Path("remote-claim".to_string()), None)
                 .await
                 .unwrap();
-        assert_eq!(response.0["claimed_by"], buyer);
+        assert_eq!(response.0["status"], "claim_requested");
+        assert_eq!(
+            exchange
+                .offer_store
+                .lock()
+                .await
+                .get("remote-claim")
+                .unwrap()
+                .status,
+            crate::p2p_exchange::OfferStatus::Open
+        );
         let outbound = exchange.drain_outbound_messages().await;
         assert!(matches!(
             outbound.as_slice(),
             [crate::network::message::ZokaMessage::OfferStatusUpdate(update)]
                 if update.offer_id == "remote-claim"
                     && update.status == crate::p2p_exchange::OfferStatus::Claimed
+                    && update.claimed_by.as_deref() == Some(buyer.as_str())
         ));
+        let update = match &outbound[0] {
+            crate::network::message::ZokaMessage::OfferStatusUpdate(update) => update.clone(),
+            _ => unreachable!(),
+        };
+        exchange
+            .ingest_offer_update(&update, "peer-seller")
+            .await
+            .unwrap();
+        let visible = exchange
+            .visible_exchange_offers(now_secs().saturating_add(91))
+            .await;
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].status, crate::p2p_exchange::OfferStatus::Claimed);
         let _ = std::fs::remove_file(&store_path);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6719,6 +6967,13 @@ mod tests {
         let offer = remote_offer("local-claim");
         let mut local_offer = offer;
         local_offer.seller_address = seller.clone();
+        let (buyer_a, buyer_b) = {
+            let mut wallets = exchange.wallet_manager.write().await;
+            (
+                wallets.create_private_wallet("buyer-a").unwrap(),
+                wallets.create_private_wallet("buyer-b").unwrap(),
+            )
+        };
         exchange
             .offer_store
             .lock()
@@ -6729,12 +6984,28 @@ mod tests {
             offer_id: "local-claim".to_string(),
             seller_address: seller,
             status: crate::p2p_exchange::OfferStatus::Claimed,
-            claimed_by: Some("zka1buyer-a".to_string()),
+            claimed_by: Some(buyer_a.clone()),
             claim_expires_at: Some(now_secs() + crate::p2p_exchange::CLAIM_WINDOW_SECONDS),
             signature: Vec::new(),
             timestamp: now_secs(),
         };
 
+        let mut invalid = claim.clone();
+        invalid.claimed_by = Some("not-a-wallet-address".to_string());
+        assert!(matches!(
+            exchange.ingest_offer_update(&invalid, "peer-bad").await,
+            Err(crate::p2p_exchange::StoreError::Invalid(_))
+        ));
+        assert_eq!(
+            exchange
+                .offer_store
+                .lock()
+                .await
+                .get("local-claim")
+                .unwrap()
+                .status,
+            crate::p2p_exchange::OfferStatus::Open
+        );
         exchange
             .ingest_offer_update(&claim, "peer-a")
             .await
@@ -6748,10 +7019,10 @@ mod tests {
                 .unwrap()
                 .claimed_by
                 .as_deref(),
-            Some("zka1buyer-a")
+            Some(buyer_a.as_str())
         );
         let mut second = claim;
-        second.claimed_by = Some("zka1buyer-b".to_string());
+        second.claimed_by = Some(buyer_b);
         assert_eq!(
             exchange.ingest_offer_update(&second, "peer-b").await,
             Err(crate::p2p_exchange::StoreError::NotClaimable)
@@ -6801,6 +7072,11 @@ mod tests {
             .await
             .claim("local-expiry", "zka1buyer", 1_751_000_000)
             .unwrap();
+        exchange
+            .configure_tron(Ok(
+                crate::p2p_exchange::tron::TronClient::with_mock_transfers(Vec::new()),
+            ))
+            .await;
 
         exchange
             .process_local_exchange(1_751_002_700)
@@ -6819,6 +7095,82 @@ mod tests {
                 .unwrap()
                 .status,
             crate::p2p_exchange::OfferStatus::Expired
+        );
+        let _ = std::fs::remove_file(&store_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_due_claim_stays_locked_until_tron_can_be_checked() {
+        let dir = format!(
+            "./test_db_exchange_unverified_expiry_{}",
+            std::process::id()
+        );
+        let mut state = test_app_state(&dir);
+        let store_path = std::env::temp_dir().join(format!(
+            "offers-unverified-expiry-{}.json",
+            std::process::id()
+        ));
+        let (exchange, seller) = configure_test_exchange(
+            &mut state,
+            &store_path,
+            100 * crate::economics::ATOMS_PER_ZKA,
+        );
+        let mut offer = remote_offer("local-unverified-expiry");
+        offer.seller_address = seller;
+        let note_id = exchange
+            .wallet_manager
+            .read()
+            .await
+            .get_private_wallet("seller")
+            .unwrap()
+            .private_notes[0]
+            .note_id
+            .clone();
+        offer.reserved_note_ids = vec![note_id];
+        exchange
+            .wallet_manager
+            .write()
+            .await
+            .reserve_wallet_notes("seller", &offer.reserved_note_ids, &offer.id)
+            .unwrap();
+        exchange
+            .offer_store
+            .lock()
+            .await
+            .insert_local(offer)
+            .unwrap();
+        exchange
+            .offer_store
+            .lock()
+            .await
+            .claim("local-unverified-expiry", "zka1buyer", 1_751_000_000)
+            .unwrap();
+
+        assert!(exchange
+            .process_local_exchange(1_751_002_700)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            exchange
+                .offer_store
+                .lock()
+                .await
+                .get("local-unverified-expiry")
+                .unwrap()
+                .status,
+            crate::p2p_exchange::OfferStatus::Claimed
+        );
+        assert!(
+            exchange
+                .wallet_manager
+                .read()
+                .await
+                .get_private_wallet("seller")
+                .unwrap()
+                .private_notes[0]
+                .reserved
         );
         let _ = std::fs::remove_file(&store_path);
         let _ = std::fs::remove_dir_all(&dir);
@@ -6869,6 +7221,11 @@ mod tests {
                 now_secs().saturating_sub(crate::p2p_exchange::CLAIM_WINDOW_SECONDS + 1),
             )
             .unwrap();
+        exchange
+            .configure_tron(Ok(
+                crate::p2p_exchange::tron::TronClient::with_mock_transfers(Vec::new()),
+            ))
+            .await;
         let app_state = Arc::new(state);
 
         let _ = list_exchange_offers(State(Arc::clone(&app_state)))
@@ -7003,6 +7360,16 @@ mod tests {
             reserved.reserved_by_tx.as_deref(),
             Some(release_tx.tx_hash.as_str())
         );
+        drop(wallets);
+
+        exchange
+            .process_local_exchange(claimed_at + 70)
+            .await
+            .unwrap();
+        let rebroadcast = tx_recv
+            .try_recv()
+            .expect("the durable release must be rebroadcast until confirmation");
+        assert_eq!(rebroadcast.tx_hash, release_tx.tx_hash);
         let _ = std::fs::remove_file(&store_path);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7029,7 +7396,11 @@ mod tests {
             .claim(
                 "remote-report",
                 &buyer,
-                now_secs().saturating_sub(crate::p2p_exchange::CLAIM_WINDOW_SECONDS + 1),
+                now_secs().saturating_sub(
+                    crate::p2p_exchange::CLAIM_WINDOW_SECONDS
+                        + crate::p2p_exchange::FAILURE_REPORT_GRACE_SECONDS
+                        + 1,
+                ),
             )
             .unwrap();
         let app_state = Arc::new(state);
@@ -7072,6 +7443,80 @@ mod tests {
                 message,
                 crate::network::message::ZokaMessage::OfferPaymentFailure(_)
             )));
+        let _ = std::fs::remove_file(&store_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn inbound_failure_reports_must_match_the_known_trade() {
+        let dir = format!("./test_db_exchange_report_binding_{}", std::process::id());
+        let mut state = test_app_state(&dir);
+        let store_path =
+            std::env::temp_dir().join(format!("offers-report-binding-{}.json", std::process::id()));
+        let (exchange, buyer) = configure_test_exchange(&mut state, &store_path, 0);
+        exchange
+            .ingest_offer_announce(
+                remote_offer("bound-report"),
+                "peer-seller".to_string(),
+                now_secs(),
+            )
+            .await
+            .unwrap();
+        let claimed_at = now_secs().saturating_sub(
+            crate::p2p_exchange::CLAIM_WINDOW_SECONDS
+                + crate::p2p_exchange::FAILURE_REPORT_GRACE_SECONDS
+                + 1,
+        );
+        exchange
+            .offer_store
+            .lock()
+            .await
+            .claim("bound-report", &buyer, claimed_at)
+            .unwrap();
+        let deadline = claimed_at + crate::p2p_exchange::CLAIM_WINDOW_SECONDS;
+        let report_after = deadline + crate::p2p_exchange::FAILURE_REPORT_GRACE_SECONDS;
+        let mut report = crate::p2p_exchange::PaymentFailureReport {
+            offer_id: "bound-report".to_string(),
+            seller_address: "zka1impostor".to_string(),
+            buyer_address: buyer,
+            tron_tx_hash: "b".repeat(64),
+            timestamp: report_after,
+            signature: Vec::new(),
+        };
+
+        assert_eq!(
+            exchange
+                .ingest_payment_failure(report.clone(), report_after)
+                .await,
+            Err(crate::p2p_exchange::StoreError::SellerMismatch)
+        );
+        assert_eq!(
+            exchange
+                .offer_store
+                .lock()
+                .await
+                .seller_failure_count("zka1remote"),
+            0
+        );
+        report.seller_address = "zka1remote".to_string();
+        assert_eq!(
+            exchange
+                .ingest_payment_failure(report.clone(), deadline)
+                .await,
+            Err(crate::p2p_exchange::StoreError::InvalidTransition)
+        );
+        exchange
+            .ingest_payment_failure(report, report_after)
+            .await
+            .unwrap();
+        assert_eq!(
+            exchange
+                .offer_store
+                .lock()
+                .await
+                .seller_failure_count("zka1remote"),
+            1
+        );
         let _ = std::fs::remove_file(&store_path);
         let _ = std::fs::remove_dir_all(&dir);
     }

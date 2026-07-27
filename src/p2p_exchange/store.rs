@@ -53,6 +53,20 @@ pub struct OfferStore {
 }
 
 impl OfferStore {
+    fn transition_allowed(from: OfferStatus, to: OfferStatus) -> bool {
+        from == to
+            || matches!(
+                (from, to),
+                (
+                    OfferStatus::Open,
+                    OfferStatus::Claimed | OfferStatus::Cancelled
+                ) | (
+                    OfferStatus::Claimed,
+                    OfferStatus::PaymentDetected | OfferStatus::Released | OfferStatus::Expired
+                ) | (OfferStatus::PaymentDetected, OfferStatus::Released)
+            )
+    }
+
     /// Opens the store at `path`, creating it empty if absent.
     ///
     /// A corrupt file is an error rather than a silent reset: the file records
@@ -220,20 +234,14 @@ impl OfferStore {
         if offer.seller_address != seller_address {
             return Err(StoreError::SellerMismatch);
         }
-        let allowed = matches!(
-            (offer.status, status),
-            (
-                OfferStatus::Open,
-                OfferStatus::Claimed | OfferStatus::Cancelled
-            ) | (
-                OfferStatus::Claimed,
-                OfferStatus::PaymentDetected | OfferStatus::Released | OfferStatus::Expired
-            ) | (
-                OfferStatus::PaymentDetected,
-                OfferStatus::Released | OfferStatus::Expired
-            )
-        );
-        if !allowed {
+        if offer.status == status {
+            return if offer.claimed_by == claimed_by && offer.claim_expires_at == claim_expires_at {
+                Ok(())
+            } else {
+                Err(StoreError::ConflictingOffer)
+            };
+        }
+        if !Self::transition_allowed(offer.status, status) {
             return Err(StoreError::InvalidTransition);
         }
         let previous = offer.clone();
@@ -260,11 +268,15 @@ impl OfferStore {
         if !offer.status.is_claimable() {
             return Err(StoreError::NotClaimable);
         }
+        let previous = offer.clone();
         offer.status = OfferStatus::Claimed;
         offer.claimed_by = Some(buyer.to_string());
         offer.claim_expires_at = Some(now.saturating_add(CLAIM_WINDOW_SECONDS));
         let claimed = offer.clone();
-        self.persist()?;
+        if let Err(error) = self.persist() {
+            self.offers.insert(offer_id.to_string(), previous);
+            return Err(error);
+        }
         Ok(claimed)
     }
 
@@ -274,58 +286,44 @@ impl OfferStore {
             .offers
             .get_mut(offer_id)
             .ok_or(StoreError::UnknownOffer)?;
+        if !Self::transition_allowed(offer.status, status) {
+            return Err(StoreError::InvalidTransition);
+        }
+        let previous = offer.clone();
         offer.status = status;
-        self.persist()
-    }
-
-    /// Expires every claimed offer whose window has closed, returning them.
-    ///
-    /// The caller releases the reservations: this type owns offer state, not
-    /// the wallet.
-    pub fn expire_due(&mut self, now: u64) -> Result<Vec<Offer>, StoreError> {
-        let due: Vec<String> = self
-            .offers
-            .values()
-            .filter(|offer| offer.is_expired_at(now))
-            .map(|offer| offer.id.clone())
-            .collect();
-        if due.is_empty() {
-            return Ok(Vec::new());
+        if let Err(error) = self.persist() {
+            self.offers.insert(offer_id.to_string(), previous);
+            return Err(error);
         }
-        let mut expired = Vec::with_capacity(due.len());
-        for id in due {
-            if let Some(offer) = self.offers.get_mut(&id) {
-                offer.status = OfferStatus::Expired;
-                expired.push(offer.clone());
-            }
-        }
-        self.persist()?;
-        Ok(expired)
+        Ok(())
     }
 
     /// Note ids that still have a live offer behind them.
     pub fn actively_reserved_note_ids(&self) -> Vec<String> {
         self.offers
             .values()
-            .filter(|offer| offer.status.holds_reservation())
+            // `Released` means the private tx was built and announced, not
+            // necessarily confirmed in a block. Its inputs stay locked by
+            // the tx hash and must survive startup reconciliation so the
+            // exact durable tx can be rebroadcast.
+            .filter(|offer| {
+                offer.status.holds_reservation() || offer.status == OfferStatus::Released
+            })
             .flat_map(|offer| offer.reserved_note_ids.iter().cloned())
             .collect()
     }
 
     /// Startup reconciliation.
     ///
-    /// Sweeps offers whose window lapsed while the node was down, then reports
-    /// which of `wallet_reserved_note_ids` no longer belong to a live offer.
-    /// The caller must release those: a reserved note with no offer behind it
-    /// is unspendable forever, which is the worst outcome this feature can
-    /// produce — worse than a failed trade, because the user cannot even see
-    /// why their balance is short.
+    /// Reports which of `wallet_reserved_note_ids` no longer belong to a live
+    /// offer. A due claim deliberately stays live here: after downtime the
+    /// seller must perform a final Tron query before deciding that no payment
+    /// arrived and freeing the ZKA.
     pub fn reconcile(
         &mut self,
         wallet_reserved_note_ids: &[String],
-        now: u64,
+        _now: u64,
     ) -> Result<ReconcileReport, StoreError> {
-        let expired = self.expire_due(now)?;
         let active = self.actively_reserved_note_ids();
         let orphaned = wallet_reserved_note_ids
             .iter()
@@ -333,7 +331,6 @@ impl OfferStore {
             .cloned()
             .collect();
         Ok(ReconcileReport {
-            expired_offers: expired,
             orphaned_note_ids: orphaned,
         })
     }
@@ -347,8 +344,6 @@ impl OfferStore {
 /// Outcome of [`OfferStore::reconcile`].
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ReconcileReport {
-    /// Offers whose payment window lapsed while the node was down.
-    pub expired_offers: Vec<Offer>,
     /// Reserved notes with no live offer behind them; the caller must release
     /// these or the funds stay locked forever.
     pub orphaned_note_ids: Vec<String>,
@@ -570,23 +565,28 @@ mod tests {
     }
 
     #[test]
-    fn expired_offers_are_swept_and_reported() {
-        let path = temp_path("expire");
+    fn failed_claim_and_status_persistence_roll_back_in_memory() {
+        let path = temp_path("transition-rollback");
         let mut store = OfferStore::open(&path).unwrap();
-        store.insert_local(offer("a", "zka1seller")).unwrap();
-        store.claim("a", "zka1buyer", 1_751_000_000).unwrap();
+        store.insert_local(offer("claim", "zka1seller")).unwrap();
+        store.insert_local(offer("cancel", "zka1seller")).unwrap();
 
-        // One second before the deadline nothing is due.
-        assert!(store
-            .expire_due(1_751_000_000 + CLAIM_WINDOW_SECONDS - 1)
-            .unwrap()
-            .is_empty());
+        let blocked_parent = path.with_extension("blocked");
+        std::fs::write(&blocked_parent, "not a directory").unwrap();
+        store.path = blocked_parent.join("offers.json");
 
-        let expired = store
-            .expire_due(1_751_000_000 + CLAIM_WINDOW_SECONDS)
-            .unwrap();
-        assert_eq!(expired.len(), 1);
-        assert_eq!(store.get("a").unwrap().status, OfferStatus::Expired);
+        assert!(matches!(
+            store.claim("claim", "zka1buyer", 1_751_000_000),
+            Err(StoreError::Io(_))
+        ));
+        assert_eq!(store.get("claim").unwrap().status, OfferStatus::Open);
+        assert!(matches!(
+            store.set_status("cancel", OfferStatus::Cancelled),
+            Err(StoreError::Io(_))
+        ));
+        assert_eq!(store.get("cancel").unwrap().status, OfferStatus::Open);
+
+        let _ = std::fs::remove_file(&blocked_parent);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -610,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_frees_notes_of_offers_that_expired_while_the_node_was_down() {
+    fn reconcile_keeps_a_due_claim_locked_until_the_final_tron_check() {
         let path = temp_path("downtime");
         let mut store = OfferStore::open(&path).unwrap();
         store.insert_local(offer("a", "zka1seller")).unwrap();
@@ -624,10 +624,8 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(report.expired_offers.len(), 1);
-        // Expiry is terminal, so the note is no longer backed and must be
-        // released by the caller.
-        assert_eq!(report.orphaned_note_ids, vec!["note-a".to_string()]);
+        assert!(report.orphaned_note_ids.is_empty());
+        assert_eq!(store.get("a").unwrap().status, OfferStatus::Claimed);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -644,7 +642,26 @@ mod tests {
             .reconcile(&["note-a".to_string()], 1_751_000_060)
             .unwrap();
 
-        assert!(report.expired_offers.is_empty());
+        assert!(report.orphaned_note_ids.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reconcile_keeps_released_inputs_locked_until_the_tx_confirms() {
+        let path = temp_path("released-pending");
+        let mut store = OfferStore::open(&path).unwrap();
+        let mut pending = offer("released", "zka1seller");
+        pending.reserved_note_ids = vec!["note-release".to_string()];
+        store.insert_local(pending).unwrap();
+        store.claim("released", "zka1buyer", 1_751_000_000).unwrap();
+        store
+            .set_status("released", OfferStatus::PaymentDetected)
+            .unwrap();
+        store.set_status("released", OfferStatus::Released).unwrap();
+
+        let report = store
+            .reconcile(&["note-release".to_string()], 1_751_009_999)
+            .unwrap();
         assert!(report.orphaned_note_ids.is_empty());
         let _ = std::fs::remove_file(&path);
     }
@@ -655,6 +672,10 @@ mod tests {
         let mut store = OfferStore::open(&path).unwrap();
         store.insert_local(offer("open", "zka1seller")).unwrap();
         store.insert_local(offer("done", "zka1seller")).unwrap();
+        store.claim("done", "zka1buyer", 1_751_000_000).unwrap();
+        store
+            .set_status("done", OfferStatus::PaymentDetected)
+            .unwrap();
         store.set_status("done", OfferStatus::Released).unwrap();
 
         let ids: Vec<&str> = store
