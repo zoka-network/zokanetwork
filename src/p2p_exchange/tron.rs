@@ -225,7 +225,7 @@ impl TronClient {
         if let Some(transfers) = &self.mock_transfers {
             return Ok(transfers.clone());
         }
-        let path = trc20_transfers_path(address, limit);
+        let path = trc20_transfers_path(address, limit, self.config.network);
         let providers = std::iter::once(self.config.base_url.as_str())
             .chain(self.config.fallback_urls.iter().map(String::as_str));
         let mut failures = Vec::new();
@@ -305,7 +305,7 @@ impl TronClient {
         let transfers = self
             .fetch_transfers(&offer.usdt_receive_address, 200)
             .await?;
-        Ok(find_settling_transfer(offer, &transfers, claimed_at_secs).cloned())
+        Ok(find_settling_transfer(offer, &transfers, claimed_at_secs, self.config.network).cloned())
     }
 }
 
@@ -401,13 +401,14 @@ pub fn transfer_settles_offer(
     offer: &Offer,
     transfer: &TronTransfer,
     claimed_at_secs: u64,
+    network: TronNetwork,
 ) -> Result<(), PaymentMismatch> {
     if !offer.status.holds_reservation() || offer.claimed_by.is_none() {
         return Err(PaymentMismatch::OfferNotClaimed);
     }
     if !transfer
         .contract_address
-        .eq_ignore_ascii_case(USDT_TRC20_CONTRACT)
+        .eq_ignore_ascii_case(network.usdt_contract())
     {
         return Err(PaymentMismatch::WrongToken);
     }
@@ -433,10 +434,11 @@ pub fn find_settling_transfer<'a>(
     offer: &Offer,
     transfers: &'a [TronTransfer],
     claimed_at_secs: u64,
+    network: TronNetwork,
 ) -> Option<&'a TronTransfer> {
     transfers
         .iter()
-        .filter(|t| transfer_settles_offer(offer, t, claimed_at_secs).is_ok())
+        .filter(|t| transfer_settles_offer(offer, t, claimed_at_secs, network).is_ok())
         .min_by_key(|t| t.block_timestamp)
 }
 
@@ -444,11 +446,11 @@ pub fn find_settling_transfer<'a>(
 ///
 /// Kept beside the matching rules so the request and the rules that judge its
 /// answer stay in step.
-pub fn trc20_transfers_path(address: &str, limit: u32) -> String {
+pub fn trc20_transfers_path(address: &str, limit: u32, network: TronNetwork) -> String {
     format!(
         "/v1/accounts/{address}/transactions/trc20?only_to=true&limit={}&contract_address={}",
         limit.clamp(1, 200),
-        USDT_TRC20_CONTRACT
+        network.usdt_contract()
     )
 }
 
@@ -564,7 +566,7 @@ mod tests {
     #[test]
     fn a_matching_payment_settles_the_offer() {
         assert_eq!(
-            transfer_settles_offer(&claimed_offer(), &transfer(), CLAIMED_AT),
+            transfer_settles_offer(&claimed_offer(), &transfer(), CLAIMED_AT, TronNetwork::Mainnet),
             Ok(())
         );
     }
@@ -576,7 +578,7 @@ mod tests {
         let mut fake = transfer();
         fake.contract_address = "TFakeUSDTContract11111111111111111".to_string();
         assert_eq!(
-            transfer_settles_offer(&claimed_offer(), &fake, CLAIMED_AT),
+            transfer_settles_offer(&claimed_offer(), &fake, CLAIMED_AT, TronNetwork::Mainnet),
             Err(PaymentMismatch::WrongToken)
         );
     }
@@ -586,7 +588,7 @@ mod tests {
         let mut elsewhere = transfer();
         elsewhere.to = "TSomeoneElse11111111111111111111111".to_string();
         assert_eq!(
-            transfer_settles_offer(&claimed_offer(), &elsewhere, CLAIMED_AT),
+            transfer_settles_offer(&claimed_offer(), &elsewhere, CLAIMED_AT, TronNetwork::Mainnet),
             Err(PaymentMismatch::WrongDestination)
         );
     }
@@ -599,7 +601,7 @@ mod tests {
         let mut earlier = transfer();
         earlier.block_timestamp = (CLAIMED_AT - 1) * 1_000;
         assert_eq!(
-            transfer_settles_offer(&claimed_offer(), &earlier, CLAIMED_AT),
+            transfer_settles_offer(&claimed_offer(), &earlier, CLAIMED_AT, TronNetwork::Mainnet),
             Err(PaymentMismatch::PredatesClaim)
         );
     }
@@ -609,7 +611,7 @@ mod tests {
         let mut short = transfer();
         short.value = 20 * MICRO_USDT_PER_USDT;
         assert_eq!(
-            transfer_settles_offer(&claimed_offer(), &short, CLAIMED_AT),
+            transfer_settles_offer(&claimed_offer(), &short, CLAIMED_AT, TronNetwork::Mainnet),
             Err(PaymentMismatch::Underpaid)
         );
     }
@@ -620,7 +622,7 @@ mod tests {
         // 0.2% short, the kind of shortfall a transfer fee produces.
         fee_shaved.value = 25 * MICRO_USDT_PER_USDT - 50_000;
         assert_eq!(
-            transfer_settles_offer(&claimed_offer(), &fee_shaved, CLAIMED_AT),
+            transfer_settles_offer(&claimed_offer(), &fee_shaved, CLAIMED_AT, TronNetwork::Mainnet),
             Ok(())
         );
     }
@@ -630,7 +632,7 @@ mod tests {
         let mut generous = transfer();
         generous.value = 30 * MICRO_USDT_PER_USDT;
         assert_eq!(
-            transfer_settles_offer(&claimed_offer(), &generous, CLAIMED_AT),
+            transfer_settles_offer(&claimed_offer(), &generous, CLAIMED_AT, TronNetwork::Mainnet),
             Ok(())
         );
     }
@@ -643,7 +645,7 @@ mod tests {
         open.status = OfferStatus::Open;
         open.claimed_by = None;
         assert_eq!(
-            transfer_settles_offer(&open, &transfer(), CLAIMED_AT),
+            transfer_settles_offer(&open, &transfer(), CLAIMED_AT, TronNetwork::Mainnet),
             Err(PaymentMismatch::OfferNotClaimed)
         );
     }
@@ -653,7 +655,7 @@ mod tests {
         let mut done = claimed_offer();
         done.status = OfferStatus::Released;
         assert_eq!(
-            transfer_settles_offer(&done, &transfer(), CLAIMED_AT),
+            transfer_settles_offer(&done, &transfer(), CLAIMED_AT, TronNetwork::Mainnet),
             Err(PaymentMismatch::OfferNotClaimed)
         );
     }
@@ -669,7 +671,7 @@ mod tests {
         later.value = 40 * MICRO_USDT_PER_USDT;
 
         let transfers = vec![later, transfer()];
-        let found = find_settling_transfer(&claimed_offer(), &transfers, CLAIMED_AT);
+        let found = find_settling_transfer(&claimed_offer(), &transfers, CLAIMED_AT, TronNetwork::Mainnet);
         assert_eq!(found.map(|t| t.transaction_id.as_str()), Some("tron-tx-1"));
     }
 
@@ -677,7 +679,7 @@ mod tests {
     fn no_qualifying_payment_returns_none() {
         let mut wrong = transfer();
         wrong.value = 1;
-        assert!(find_settling_transfer(&claimed_offer(), &[wrong], CLAIMED_AT).is_none());
+        assert!(find_settling_transfer(&claimed_offer(), &[wrong], CLAIMED_AT, TronNetwork::Mainnet).is_none());
     }
 
     #[test]
@@ -695,6 +697,50 @@ mod tests {
 
         config.socks_proxy = Some("127.0.0.1:9050".to_string());
         assert!(config.is_private());
+    }
+
+    #[test]
+    fn a_nile_payment_settles_on_nile_and_not_on_mainnet() {
+        // The whole reason the network is threaded through: judged against
+        // mainnet, a genuine Nile payment reads as a lookalike token and the
+        // seller never releases. Judged against Nile, it settles.
+        let mut nile_payment = transfer();
+        nile_payment.contract_address = USDT_TRC20_CONTRACT_NILE.to_string();
+
+        assert_eq!(
+            transfer_settles_offer(&claimed_offer(), &nile_payment, CLAIMED_AT, TronNetwork::Nile),
+            Ok(())
+        );
+        assert_eq!(
+            transfer_settles_offer(
+                &claimed_offer(),
+                &nile_payment,
+                CLAIMED_AT,
+                TronNetwork::Mainnet
+            ),
+            Err(PaymentMismatch::WrongToken)
+        );
+    }
+
+    #[test]
+    fn a_mainnet_payment_does_not_settle_a_nile_offer() {
+        // The direction that would matter with real money: testnet tokens must
+        // never be able to stand in for mainnet USDT, nor the reverse.
+        assert_eq!(
+            transfer_settles_offer(&claimed_offer(), &transfer(), CLAIMED_AT, TronNetwork::Nile),
+            Err(PaymentMismatch::WrongToken)
+        );
+    }
+
+    #[test]
+    fn the_query_asks_for_the_contract_of_the_network_it_targets() {
+        let nile = trc20_transfers_path(PAYOUT, 50, TronNetwork::Nile);
+        assert!(nile.contains(USDT_TRC20_CONTRACT_NILE));
+        assert!(!nile.contains(USDT_TRC20_CONTRACT));
+
+        let mainnet = trc20_transfers_path(PAYOUT, 50, TronNetwork::Mainnet);
+        assert!(mainnet.contains(USDT_TRC20_CONTRACT));
+        assert!(!mainnet.contains(USDT_TRC20_CONTRACT_NILE));
     }
 
     #[test]
@@ -748,13 +794,13 @@ mod tests {
 
     #[test]
     fn the_transfer_query_pins_the_usdt_contract_and_direction() {
-        let path = trc20_transfers_path(PAYOUT, 50);
+        let path = trc20_transfers_path(PAYOUT, 50, TronNetwork::Mainnet);
         assert!(path.contains(PAYOUT));
         assert!(path.contains("only_to=true"), "incoming transfers only");
         assert!(path.contains(USDT_TRC20_CONTRACT));
         // Absurd limits are clamped rather than forwarded.
-        assert!(trc20_transfers_path(PAYOUT, 99_999).contains("limit=200"));
-        assert!(trc20_transfers_path(PAYOUT, 0).contains("limit=1"));
+        assert!(trc20_transfers_path(PAYOUT, 99_999, TronNetwork::Mainnet).contains("limit=200"));
+        assert!(trc20_transfers_path(PAYOUT, 0, TronNetwork::Mainnet).contains("limit=1"));
     }
 
     #[test]
@@ -796,7 +842,7 @@ mod tests {
         assert_eq!(settling.transaction_id, "tron-tx-1");
         let request = requests.recv().await.unwrap();
         assert!(request.contains("SOCKS-Destination: tron-primary.test"));
-        assert!(request.contains(&trc20_transfers_path(PAYOUT, 200)));
+        assert!(request.contains(&trc20_transfers_path(PAYOUT, 200, TronNetwork::Mainnet)));
         assert!(request
             .to_ascii_lowercase()
             .contains("tron-pro-api-key: secret-test-key"));
