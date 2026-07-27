@@ -19,7 +19,7 @@ Este documento es el estado de verdad del trabajo. **Leelo entero antes de tocar
 | --- | --- |
 | **Etapa 0** (limpieza de UI) | ✅ Completa, mergeada y pusheada a `main` de `zsilent-core`. |
 | **Etapa 1** (Explorer) | ✅ Completa, **verificada contra nodo real** (mainnet, altura 12943). |
-| **Etapa 2** (P2P Exchange) | 🔶 ~90%. Integración activa en `etapa2-p2p-reservation-integration`. 73 tests de `p2p_exchange::` en verde; backend del gate §2.8 revisado, falta UI/flags y prueba real. |
+| **Etapa 2** (P2P Exchange) | 🔶 ~97%. Backend en `etapa2-p2p-reservation-integration` y UI en `zsilent-core:etapa2-p2p-ui-integration`. 73 tests de `p2p_exchange::` y 28 tests de ZSilent en verde; implementación y gate completos, falta pase visual y prueba real. |
 | **Etapa 3** (Mining Pool) | ⬜ Solo UI. El backend está entero por delante. |
 
 ### Por dónde seguir, en este orden
@@ -38,8 +38,11 @@ Este documento es el estado de verdad del trabajo. **Leelo entero antes de tocar
    ✅ Integrado: heartbeat/TTL, claim decidido atómicamente por el vendedor, consulta Tron
    solo del vendedor, liberación desde las notas exactas y denuncia persistida por gossip.
    Verificado con tests unitarios/integración simulada; **no contra dos nodos ni Tron mainnet**.
-4. **§2.8** revisión de seguridad — gate obligatorio antes de habilitarlo a usuarios reales.
-5. Pase visual sobre las 3 secciones, y recién ahí la Etapa 3.
+4. ~~**§2.8** revisión de seguridad — gate obligatorio antes de habilitarlo a usuarios
+   reales.~~ ✅ Backend y UI revisados: recuperación/rebroadcast durable, expiración segura,
+   aceptación autoritativa del claim, binding de wallet, consentimiento persistido y denuncia
+   con disclosure explícito. **Falta ejecutar el flujo real de monto mínimo.**
+5. Pase visual sobre Explorer y P2P Exchange, y después implementar la Etapa 3.
 
 ### Reglas de trabajo
 
@@ -381,12 +384,14 @@ Implementado en `src/p2p_exchange/mod.rs`. Decisiones que conviene no revisitar:
 
 ### 2.1-bis Modelo original (referencia)
 
-- [ ] Campos: `id`, `seller_address`, `zka_amount`, `usdt_amount`, `usdt_receive_address`
-      (TRC-20), `status` (`open`/`claimed`/`payment_detected`/`released`/`expired`/`cancelled`),
-      `created_at`, `claim_expires_at`, `claimed_by`, `reserved_note_ids`, `signature`.
-- [ ] Sin campos de comisión: `usdt_amount` es íntegro para el vendedor.
-- [ ] Serializable para viajar por el canal P2P — definirlo pensando en eso desde el inicio.
-- [ ] Persistido en disco (§2.5), no solo en memoria.
+- [x] Campos implementados: `id`, `seller_address`, `zka_atoms`, `micro_usdt`,
+      `usdt_receive_address` (TRC-20), `status` (`Open`/`Claimed`/`PaymentDetected`/
+      `Released`/`Expired`/`Cancelled`), `created_at`, `claim_expires_at`, `claimed_by` y
+      `reserved_note_ids`. La firma aceptada para v1 vive en el envelope de gossip, no en
+      `Offer`.
+- [x] Sin campos de comisión: `usdt_amount` es íntegro para el vendedor.
+- [x] Serializable para viajar por el canal P2P — definirlo pensando en eso desde el inicio.
+- [x] Persistido en disco (§2.5), no solo en memoria.
 
 ### 2.2 Gossip de ofertas ✅
 
@@ -397,8 +402,9 @@ disfrazado de cambio de estado. `validate_inbound_message` rechaza: announce con
 tomada, claim sin comprador o sin deadline, y cualquier update que reabra una oferta (un
 "reopen" resucitaría una oferta cuyos ZKA ya se gastaron).
 
-Falta: firmar los anuncios con la clave del vendedor (el campo `signature` existe pero todavía
-no se verifica) y el TTL/rebroadcast.
+La autenticación vigente es la firma de gossipsub con identidad de nodo, según la decisión
+cerrada para v1. El binding criptográfico nodo↔wallet sigue como deuda conocida; TTL y
+rebroadcast ya están implementados.
 
 ### 2.3/2.5 Store persistente ✅
 
@@ -413,7 +419,9 @@ transiciones mutadas en memoria hacen rollback si falla la persistencia.
 - [x] Mensajes `OfferAnnounce` (publicar) y `OfferStatusUpdate` (tomada/expirada/cancelada).
 - [ ] Firmar los anuncios con la clave del vendedor: sin esto cualquiera publica ofertas ajenas
       o cancela las de otros.
-- [ ] Anti-spam: no propagar ofertas sin ZKA efectivamente bloqueados.
+- [x] Anti-spam local: el nodo reserva las notas antes de encolar el anuncio y no publica si
+      la reserva/persistencia falla. Un receptor no puede probar criptográficamente el lock
+      de otra wallet; queda cubierto solo por piso+tope y la identidad de nodo aceptada para v1.
 - [x] Monto mínimo por oferta + tope de ofertas abiertas simultáneas por address.
 - [x] TTL / rebroadcast: heartbeat cada 30 s, presencia remota por 90 s y expiración del claim
       a los 45 min.
@@ -466,8 +474,9 @@ transiciones mutadas en memoria hacen rollback si falla la persistencia.
 - [x] Tolerancia de redondeo 0.5% y ventana de expiración de 45 min fijadas por tests.
 - [x] Verificado: 17 tests de `p2p_exchange::tron`, incluidos proxy SOCKS, API key, decodificación
       de respuesta, fallback y negativa sin Tor. **No verificado contra TronGrid real.**
-- [ ] Exponer URL/API key/fallback en Settings; hoy el transporte ya acepta overrides por
-      entorno, pero la UI todavía no los persiste ni los pasa al proceso.
+- [x] Exponer URL/API key/fallback en Settings. ZSilent los persiste y el `NodeController`
+      los pasa al proceso mediante las tres variables de entorno. Verificado por round-trip
+      del setup y por el test suite completo de ZSilent; no contra TronGrid real.
 
 ### 2.5 Persistencia y arranque
 
@@ -486,8 +495,9 @@ transiciones mutadas en memoria hacen rollback si falla la persistencia.
       del peer vendedor en los últimos 90 s.
 - [x] Al desconectarse deja de reanunciar. Por la decisión nueva de presencia no se intenta
       emitir un update imposible desde un peer caído: el receptor la oculta al vencer el TTL.
-- [ ] La UI del comprador tiene que reflejar que una oferta dejó de estar disponible.
-      El endpoint ya la elimina del feed; falta verificar visualmente el polling de ZSilent.
+- [x] La UI del comprador refresca el feed cada 5 s, por lo que una oferta deja de aparecer
+      cuando el endpoint la elimina al vencer su presencia. Cubierto por implementación y
+      compilación; **falta verificar visualmente con dos nodos**.
 
 ### 2.7 Claim atómico y liberación
 
@@ -502,30 +512,31 @@ transiciones mutadas en memoria hacen rollback si falla la persistencia.
       al vendedor.
 - [x] Denuncia compartida por gossip, autenticada por la firma de nodo aceptada para v1 y
       **con un hash de tx USDT hexadecimal de 32 bytes como prueba**. Sin prueba no se propaga.
-- [ ] Advertir al comprador que denunciar expone públicamente su transacción USDT — es el precio
-      de que la denuncia sea verificable. El API exige un acknowledgement explícito; falta la
-      advertencia y confirmación visual en ZSilent.
+- [x] Advertir al comprador que denunciar expone públicamente su transacción USDT. ZSilent
+      muestra el aviso, exige un checkbox y solo entonces envía el acknowledgement explícito
+      junto con un hash hexadecimal de 64 caracteres.
 
 ### 2.8 Seguridad y consentimiento — gate obligatorio
 
 No sale de "Coming Soon" sin esto.
 
-- [ ] Pantalla de riesgos con aceptación explícita la primera vez que se entra a la sección
-      (mismo patrón que `CustodyWarningScreen` del onboarding).
-- [ ] Explicar en esa pantalla, en inglés claro: el lock es de software y no criptográfico; no
+- [x] Pantalla de riesgos con aceptación explícita la primera vez que se entra a la sección
+      (mismo patrón que `CustodyWarningScreen` del onboarding). La aceptación se persiste.
+- [x] Explicar en esa pantalla, en inglés claro: el lock es de software y no criptográfico; no
       hay árbitro ni reembolso; el vendedor podría incumplir; sin tope de monto.
 - [x] **Riesgo asumido y preservado:** v1 sale sin tope de monto por oferta. El peor caso de un vendedor
       malicioso (cliente modificado que gasta notas "reservadas" tras cobrar el USDT) no tiene
       techo. Si aparece el primer abuso real, poner un tope es la mitigación inmediata a mano.
-- [ ] **Riesgo asumido:** se prueba directo en mainnet con montos mínimos, sin fase de testnet.
+- [x] **Riesgo asumido y comunicado en la UI:** se prueba directo en mainnet con montos mínimos,
+      sin fase de testnet.
       Mantener los montos realmente bajos hasta que el flujo completo se haya ejecutado varias
       veces sin incidentes.
 - [x] Revisión de seguridad dedicada del backend (código + flujo económico) completada antes de
       habilitar para usuarios
       reales. Sin tope de monto y sin testnet, este gate es la única barrera antes de fondos
       reales. Cerró: journal/rebroadcast de release, chequeo Tron antes de expirar, ack de claim,
-      rollback de transiciones, binding de wallet/reportes y gracia de denuncia. Falta revisar
-      la integración UI y ejecutar el flujo real de monto mínimo.
+      rollback de transiciones, binding de wallet/reportes, gracia de denuncia, opt-in y
+      consentimiento visual. Falta ejecutar el flujo real de monto mínimo.
 
 Hallazgo abierto para esa revisión:
 
@@ -536,12 +547,19 @@ Hallazgo abierto para esa revisión:
 
 ### 2.9 UI
 
-- [ ] Reemplazar `P2PExchangeScreen()`.
-- [ ] Publicar oferta: monto ZKA, monto USDT, address TRC-20 de cobro.
-- [ ] Listado de ofertas disponibles + tomar oferta.
-- [ ] Estado del intercambio: bloqueado → pago detectado → liberado / expirado.
-- [ ] Estado de Tor visible (sin Tor no hay verificación).
-- [ ] Flag opt-in en Settings + release conjunto.
+- [x] Reemplazar `P2PExchangeScreen()`.
+- [x] Publicar oferta: monto ZKA, monto USDT, address TRC-20 de cobro. Los decimales se
+      convierten exactamente a atoms/micro-USDT; una séptima cifra se rechaza, no se redondea.
+- [x] Listado de ofertas disponibles + tomar/cancelar oferta. El comprador ve
+      `claim_requested` como request pendiente y espera el `Claimed` autoritativo antes de pagar.
+- [x] Estado del intercambio: bloqueado → pago detectado → liberado / expirado, con countdown,
+      polling cada 5 s y denuncia posterior al período de gracia.
+- [x] Estado real de verificación Tor/Tron expuesto por el nodo; publicar queda bloqueado cuando
+      no está disponible.
+- [x] Flag opt-in en Settings, apagado por defecto, más consentimiento de riesgo persistido.
+- [ ] Release conjunto nodo+ZSilent y prueba visual/real. La implementación UI quedó en
+      `zsilent-core:etapa2-p2p-ui-integration` (`3f6b866`, `3ea8515`); `gradlew test` pasó
+      28/28. **Eso no verifica el flujo contra dos nodos ni Tron mainnet.**
 
 ---
 
