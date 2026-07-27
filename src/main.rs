@@ -1557,7 +1557,7 @@ async fn interactive_mining_menu() -> Result<bool, String> {
                 if allow_isolated {
                     args.push("--allow-isolated-start".to_string());
                 }
-                if let Err(err) = cmd_fullnode_auto(&args).await {
+                if let Err(err) = cmd_fullnode_auto_boxed(&args).await {
                     eprintln!("{}", err);
                 }
             }
@@ -1623,7 +1623,7 @@ async fn interactive_node_menu() -> Result<bool, String> {
                 if show_keys {
                     args.push("--show-keys".to_string());
                 }
-                if let Err(err) = cmd_fullnode_auto(&args).await {
+                if let Err(err) = cmd_fullnode_auto_boxed(&args).await {
                     eprintln!("{}", err);
                 }
             }
@@ -1649,7 +1649,7 @@ async fn interactive_node_menu() -> Result<bool, String> {
                 if allow_isolated {
                     args.push("--allow-isolated-start".to_string());
                 }
-                if let Err(err) = cmd_fullnode_auto(&args).await {
+                if let Err(err) = cmd_fullnode_auto_boxed(&args).await {
                     eprintln!("{}", err);
                 }
             }
@@ -12551,6 +12551,16 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Keep the very large fullnode state machine off the caller's stack.
+///
+/// The fullnode future owns the networking, sync, solo-mining and team-mining
+/// loop state. Embedding it directly in the top-level command dispatcher can
+/// overflow the default Windows main-thread stack in debug builds before the
+/// first startup message is printed.
+async fn cmd_fullnode_auto_boxed(args: &[String]) -> Result<(), String> {
+    Box::pin(cmd_fullnode_auto(args)).await
+}
+
 async fn run_zokahd_guided_default() -> Result<(), String> {
     println!("{}", dashboard_title("ZOKA Node Autopilot", ANSI_CYAN));
     println!("{}", dashboard_divider());
@@ -12645,7 +12655,7 @@ async fn run_zokahd_guided_default() -> Result<(), String> {
     if !use_network_config {
         args.push("--no-network-config".to_string());
     }
-    cmd_fullnode_auto(&args).await
+    cmd_fullnode_auto_boxed(&args).await
 }
 
 fn cmd_wallet_restore_from_keys(args: &[String]) -> Result<(), String> {
@@ -15996,10 +16006,10 @@ async fn run() -> Result<(), String> {
             return Ok(());
         }
         if first.starts_with('-') {
-            return cmd_fullnode_auto(&args).await;
+            return cmd_fullnode_auto_boxed(&args).await;
         }
         if first == "fullnode" {
-            return cmd_fullnode_auto(&args[1..]).await;
+            return cmd_fullnode_auto_boxed(&args[1..]).await;
         }
     }
 
@@ -16053,7 +16063,7 @@ async fn run() -> Result<(), String> {
             cmd_estimate_fee(&args)
         }
         "pending" => cmd_pending_transfers(tail),
-        "node" => cmd_fullnode_auto(tail).await,
+        "node" => cmd_fullnode_auto_boxed(tail).await,
         "node-status" => cmd_node_status(tail),
         "status" => cmd_status_overview(tail),
         "zokahd-guided" => run_zokahd_guided_default().await,
@@ -16099,7 +16109,7 @@ async fn run() -> Result<(), String> {
         "private-pending-diagnostics" => cmd_private_pending_diagnostics(tail),
         "tx-pending" => cmd_pending_transfers(tail),
         "estimate-fee" => cmd_estimate_fee(tail),
-        "fullnode" => cmd_fullnode_auto(tail).await,
+        "fullnode" => cmd_fullnode_auto_boxed(tail).await,
         "fullnode-status" => cmd_node_status(tail),
         "tx-send" => cmd_tx_send_unified(tail),
         "tx-send-many" => {
@@ -16115,7 +16125,7 @@ async fn run() -> Result<(), String> {
             // real peers or credited on the real chain, so it looked like it
             // worked and then silently went nowhere on mainnet.
             let args = normalize_positional_alias_args(tail, &["--address"]);
-            cmd_fullnode_auto(&args).await
+            cmd_fullnode_auto_boxed(&args).await
         }
         "genesis-verify" => cmd_genesis_verify(tail),
         "mainnet-network-lint" => cmd_mainnet_network_lint(tail),
