@@ -1529,6 +1529,54 @@ fn coinbase_amount_domain(block_height: u64, recipient_address: &str) -> String 
     format!("coinbase-v1:{block_height}:{recipient_address}")
 }
 
+/// Build a private coinbase output for any canonical recipient address.
+///
+/// Unlike [`PrivateWalletManager::create_private_coinbase_output`], this does
+/// not require the recipient wallet to be loaded locally. Team mining needs
+/// exactly that property: the coordinator assembles a block paying the member
+/// whose turn it is, while only that remote member holds the scan/spend keys.
+pub fn create_private_coinbase_output_for_recipient(
+    amount: u64,
+    block_height: u64,
+    recipient_address: &str,
+    unlock_height: u64,
+) -> Result<crate::types::PrivateCoinbaseOutput, BlockError> {
+    let recipient_commitment = canonical_payment_address(recipient_address)?;
+    let (commitment, commitment_blind) = Commitment::new_random(&amount.to_le_bytes());
+    let commitment_hex = bytes_to_hex(commitment.as_bytes());
+    let stealth_material = derive_stealth_payload(&recipient_commitment, &commitment_hex)?;
+    let amount_domain = coinbase_amount_domain(block_height, recipient_address);
+    let encrypted_amount = xor_amount_with_stream(
+        amount,
+        &commitment_blind,
+        &recipient_commitment,
+        &amount_domain,
+    );
+
+    Ok(crate::types::PrivateCoinbaseOutput {
+        block_height,
+        recipient_address: recipient_address.to_string(),
+        unlock_height,
+        output_id: derive_output_id(
+            &format!("coinbase:{block_height}"),
+            0,
+            &commitment_hex,
+            &recipient_commitment,
+        ),
+        asset_tag: default_asset_tag(),
+        asset_tag_commitment: asset_tag_commitment_hex(&default_asset_tag()),
+        recipient_commitment,
+        stealth_address: stealth_material.stealth_address,
+        ephemeral_pubkey: stealth_material.ephemeral_pubkey,
+        commitment: commitment_hex,
+        amount_commitment: amount_commitment_hex(amount, stealth_material.amount_blind),
+        range_proof: prove_output_range(amount, stealth_material.amount_blind)?,
+        one_time_public_key: stealth_material.one_time_public_key,
+        encrypted_amount,
+        commitment_blind,
+    })
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PrivateFeeClaimPayload {
     fee: u64,
@@ -6579,6 +6627,31 @@ mod tests {
             .unwrap();
         assert_eq!(credited, 12);
         assert_eq!(manager.get_private_balance("miner"), Some(12));
+    }
+
+    #[test]
+    fn test_remote_private_coinbase_is_claimable_only_by_recipient() {
+        let mut manager = PrivateWalletManager::new();
+        let alice_commitment = manager.create_private_wallet("alice").unwrap();
+        let bob_commitment = manager.create_private_wallet("bob").unwrap();
+        let output =
+            create_private_coinbase_output_for_recipient(12, 7, &bob_commitment, 67).unwrap();
+
+        assert_eq!(output.block_height, 7);
+        assert_eq!(output.unlock_height, 67);
+        assert_eq!(output.recipient_commitment, bob_commitment);
+        assert_ne!(output.recipient_commitment, alice_commitment);
+
+        let wrong_recipient =
+            manager.claim_private_coinbase_output("alice", "team-block", &output, 12, 67);
+        assert!(wrong_recipient.is_err());
+        assert_eq!(manager.get_private_balance("alice"), Some(0));
+
+        let credited = manager
+            .claim_private_coinbase_output("bob", "team-block", &output, 12, 67)
+            .unwrap();
+        assert_eq!(credited, 12);
+        assert_eq!(manager.get_private_balance("bob"), Some(12));
     }
 
     #[test]

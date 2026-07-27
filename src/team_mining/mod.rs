@@ -196,6 +196,11 @@ pub struct ValidatedShare {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamState {
     pub schema_version: u32,
+    /// Monotonic coordinator-owned state revision. Heartbeats may refresh
+    /// local liveness without changing it; every authoritative mutation
+    /// increments it so delayed signed gossip cannot roll accounting back.
+    #[serde(default)]
+    pub revision: u64,
     pub team_id: String,
     pub invite_code: String,
     pub coordinator: String,
@@ -220,9 +225,13 @@ impl TeamState {
         let team_id = new_team_id();
         let invite_code = invite_code_for(&team_id);
         let mut members = BTreeMap::new();
-        members.insert(coordinator.clone(), TeamMember::new(coordinator.clone(), 1));
+        // The network target is not known until the coordinator creates the
+        // first template. Zero is an internal "unassigned" sentinel; set_template
+        // replaces it with the same adaptive starting target used for joiners.
+        members.insert(coordinator.clone(), TeamMember::new(coordinator.clone(), 0));
         Ok(Self {
             schema_version: TEAM_SCHEMA_VERSION,
+            revision: 0,
             team_id,
             invite_code,
             coordinator,
@@ -855,7 +864,7 @@ impl TeamMiningRuntime {
                 && state.coordinator == advertisement.coordinator
                 && state.epoch == advertisement.epoch
         }) {
-            self.store.lock().await.mutate(|state| {
+            self.store.lock().await.mutate_local(|state| {
                 state.note_coordinator_seen(&advertisement.coordinator, advertisement.epoch, now);
                 Ok(())
             })?;
@@ -1002,6 +1011,15 @@ impl TeamMiningRuntime {
         if !allowed {
             return Err(TeamError::InvalidCoordinatorUpdate);
         }
+        if let Some(current) = current.as_ref() {
+            let revision_regressed = incoming.epoch == current.epoch
+                && incoming.revision < current.revision;
+            let failover_did_not_advance = incoming.epoch > current.epoch
+                && incoming.revision <= current.revision;
+            if revision_regressed || failover_did_not_advance {
+                return Err(TeamError::InvalidCoordinatorUpdate);
+            }
+        }
         let expected_peer = self
             .member_peers
             .lock()
@@ -1018,11 +1036,34 @@ impl TeamMiningRuntime {
             .lock()
             .await
             .insert(incoming.coordinator.clone(), source_peer);
+        if current.as_ref().is_some_and(|current| {
+            incoming.epoch == current.epoch && incoming.revision == current.revision
+        }) {
+            self.store.lock().await.mutate_local(|state| {
+                state.note_coordinator_seen(&incoming.coordinator, incoming.epoch, now);
+                Ok(())
+            })?;
+            *self.pending_join_team.lock().await = None;
+            *self.join_status.lock().await = "joined".to_string();
+            return Ok(());
+        }
         let mut incoming = incoming;
         incoming.note_coordinator_seen(&incoming.coordinator.clone(), incoming.epoch, now);
-        self.store.lock().await.replace(incoming)?;
         *self.pending_join_team.lock().await = None;
-        *self.join_status.lock().await = "joined".to_string();
+        let local_is_active = incoming
+            .members
+            .get(&self.local_address)
+            .is_some_and(|member| member.active && !member.expelled);
+        if local_is_active {
+            self.store.lock().await.replace(incoming)?;
+            *self.join_status.lock().await = "joined".to_string();
+        } else {
+            self.store.lock().await.clear()?;
+            self.member_peers.lock().await.clear();
+            *self.enabled.lock().await = false;
+            *self.hashing.lock().await = false;
+            *self.join_status.lock().await = "not_joined".to_string();
+        }
         Ok(())
     }
 
@@ -1333,6 +1374,31 @@ impl TeamStore {
                 return Err(error);
             }
         };
+        state.revision = state.revision.saturating_add(1);
+        if let Err(error) = state.validate() {
+            self.state = previous;
+            return Err(error);
+        }
+        if let Err(error) = self.persist() {
+            self.state = previous;
+            return Err(error);
+        }
+        Ok(result)
+    }
+
+    fn mutate_local<T>(
+        &mut self,
+        mutate: impl FnOnce(&mut TeamState) -> Result<T, TeamError>,
+    ) -> Result<T, TeamError> {
+        let previous = self.state.clone();
+        let state = self.state.as_mut().ok_or(TeamError::InvalidTeam)?;
+        let result = match mutate(state) {
+            Ok(result) => result,
+            Err(error) => {
+                self.state = previous;
+                return Err(error);
+            }
+        };
         if let Err(error) = state.validate() {
             self.state = previous;
             return Err(error);
@@ -1589,6 +1655,37 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_starts_near_network_target_and_difficulty_adapts() {
+        let (alice, _, _) = addresses();
+        let mut state = TeamState::create(alice.clone(), 100).unwrap();
+        assert_eq!(state.members[&alice].share_difficulty_bits, 0);
+        state
+            .set_template(
+                "zoka-dev-team".to_string(),
+                "parent".to_string(),
+                1,
+                101,
+                20,
+            )
+            .unwrap();
+        assert_eq!(
+            state.members[&alice].share_difficulty_bits,
+            initial_share_difficulty(20)
+        );
+
+        let member = state.members.get_mut(&alice).unwrap();
+        member.shares_since_adjustment = SHARES_PER_DIFFICULTY_ADJUSTMENT;
+        member.adjustment_started_at = Some(100);
+        adjust_member_difficulty(member, 120, 20);
+        assert_eq!(member.share_difficulty_bits, 13);
+
+        member.shares_since_adjustment = SHARES_PER_DIFFICULTY_ADJUSTMENT;
+        member.adjustment_started_at = Some(200);
+        adjust_member_difficulty(member, 500, 20);
+        assert_eq!(member.share_difficulty_bits, 12);
+    }
+
+    #[test]
     fn payout_turn_converges_by_contributed_work() {
         let (alice, bob, _) = addresses();
         let mut state = TeamState::create(alice.clone(), 100).unwrap();
@@ -1703,6 +1800,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
+        let stale_update = update.clone();
         member
             .ingest_turn_update(update, "peer-alice".to_string(), 104)
             .await
@@ -1711,8 +1809,32 @@ mod tests {
         let status = member.status().await;
         assert_eq!(status.join_status, "joined");
         assert_eq!(
-            status.team.unwrap().backup_coordinator.as_deref(),
+            status.team.as_ref().unwrap().backup_coordinator.as_deref(),
             Some(bob.as_str())
+        );
+
+        coordinator
+            .set_template("zoka-dev-team".to_string(), "parent".to_string(), 1, 105, 6)
+            .await
+            .unwrap();
+        let fresh_update = coordinator
+            .drain_outbound_messages()
+            .await
+            .into_iter()
+            .find_map(|message| match message {
+                crate::network::message::ZokaMessage::TurnUpdate(update) => Some(update),
+                _ => None,
+            })
+            .unwrap();
+        member
+            .ingest_turn_update(fresh_update, "peer-alice".to_string(), 106)
+            .await
+            .unwrap();
+        assert_eq!(
+            member
+                .ingest_turn_update(stale_update, "peer-alice".to_string(), 107)
+                .await,
+            Err(TeamError::InvalidCoordinatorUpdate)
         );
     }
 
@@ -1755,5 +1877,145 @@ mod tests {
                 .await,
             Err(TeamError::PeerBindingMismatch)
         );
+    }
+
+    #[tokio::test]
+    async fn coordinator_expels_source_bound_member_after_coinbase_hijack() {
+        let (alice, bob, _) = addresses();
+        let coordinator = TeamMiningRuntime::new(TeamStore::memory(), alice.clone()).unwrap();
+        coordinator.create_team(100).await.unwrap();
+        let team_id = coordinator
+            .store
+            .lock()
+            .await
+            .state()
+            .unwrap()
+            .team_id
+            .clone();
+        coordinator
+            .ingest_membership(
+                TeamMembership {
+                    team_id,
+                    member_address: bob.clone(),
+                    action: MembershipAction::Join,
+                    timestamp: 101,
+                },
+                "peer-bob".to_string(),
+                101,
+            )
+            .await
+            .unwrap();
+        coordinator
+            .set_template(
+                "zoka-dev-team".to_string(),
+                "parent".to_string(),
+                1,
+                102,
+                5,
+            )
+            .await
+            .unwrap();
+
+        coordinator
+            .record_confirmed_block(
+                1,
+                "parent",
+                &bob,
+                Some("peer-bob".to_string()),
+                103,
+            )
+            .await
+            .unwrap();
+
+        let status = coordinator.status().await;
+        let team = status.team.unwrap();
+        assert!(team.members[&bob].expelled);
+        assert!(!team.members[&bob].active);
+        assert_eq!(team.last_hijacked_recipient.as_deref(), Some(bob.as_str()));
+    }
+
+    #[tokio::test]
+    async fn accepted_leave_clears_member_state_and_stops_hashing() {
+        let (alice, bob, _) = addresses();
+        let coordinator = TeamMiningRuntime::new(TeamStore::memory(), alice.clone()).unwrap();
+        let member = TeamMiningRuntime::new(TeamStore::memory(), bob.clone()).unwrap();
+        let created = coordinator.create_team(100).await.unwrap();
+        let advertisement = coordinator
+            .drain_outbound_messages()
+            .await
+            .into_iter()
+            .find_map(|message| match message {
+                crate::network::message::ZokaMessage::TeamAdvertise(advertisement) => {
+                    Some(advertisement)
+                }
+                _ => None,
+            })
+            .unwrap();
+        member
+            .observe_advertisement(advertisement, "peer-alice".to_string(), 101)
+            .await
+            .unwrap();
+        member.request_join(&created.invite_code, 102).await.unwrap();
+        let join = member
+            .drain_outbound_messages()
+            .await
+            .into_iter()
+            .find_map(|message| match message {
+                crate::network::message::ZokaMessage::TeamJoin(join) => Some(join),
+                _ => None,
+            })
+            .unwrap();
+        coordinator
+            .ingest_membership(join, "peer-bob".to_string(), 103)
+            .await
+            .unwrap();
+        let joined = coordinator
+            .drain_outbound_messages()
+            .await
+            .into_iter()
+            .find_map(|message| match message {
+                crate::network::message::ZokaMessage::TurnUpdate(update) => Some(update),
+                _ => None,
+            })
+            .unwrap();
+        member
+            .ingest_turn_update(joined, "peer-alice".to_string(), 104)
+            .await
+            .unwrap();
+        member.set_enabled(true, 2).await;
+
+        member.request_leave(105).await.unwrap();
+        let leave = member
+            .drain_outbound_messages()
+            .await
+            .into_iter()
+            .find_map(|message| match message {
+                crate::network::message::ZokaMessage::TeamJoin(leave) => Some(leave),
+                _ => None,
+            })
+            .unwrap();
+        coordinator
+            .ingest_membership(leave, "peer-bob".to_string(), 106)
+            .await
+            .unwrap();
+        let left = coordinator
+            .drain_outbound_messages()
+            .await
+            .into_iter()
+            .find_map(|message| match message {
+                crate::network::message::ZokaMessage::TurnUpdate(update) => Some(update),
+                _ => None,
+            })
+            .unwrap();
+        member
+            .ingest_turn_update(left, "peer-alice".to_string(), 107)
+            .await
+            .unwrap();
+
+        let status = member.status().await;
+        assert_eq!(status.join_status, "not_joined");
+        assert!(!status.enabled);
+        assert!(!status.hashing);
+        assert!(status.team.is_none());
     }
 }

@@ -2224,6 +2224,12 @@ struct MiningEngineConfig {
     /// governed by that control (no --mine flag); standalone miners and
     /// --mine nodes ignore the control and must not churn on it.
     honor_local_mining_control: bool,
+    /// A network-difficulty solution already found by a mining-team member.
+    /// When present, the normal solver is skipped but the candidate is still
+    /// recomputed, self-validated, and persisted through the canonical block
+    /// path. The coordinator wallet remains the local storage/fee wallet;
+    /// coinbase is paid to the recipient committed by the team template.
+    team_solution: Option<zoka::team_mining::NetworkSolution>,
 }
 
 #[derive(Debug, Clone)]
@@ -2236,6 +2242,10 @@ struct MiningBatchSummary {
     /// peers can apply the same block via `state::chain::apply_block`.
     /// Standalone `mine` callers without a node simply ignore this.
     produced_blocks: Vec<zoka::types::Block>,
+    /// Set only when the batch assembled a mining-team solution. This lets
+    /// the network loop advance durable turn accounting after canonical
+    /// persistence, without treating a remote member's payout as local.
+    team_recipient: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2246,6 +2256,18 @@ struct MiningProgressSnapshot {
     hashes_attempted: u64,
     elapsed_secs: f64,
     estimated_hashrate_hps: f64,
+}
+
+struct TeamShareTask {
+    template_id: String,
+    cancel: Arc<AtomicBool>,
+    handle: tokio::task::JoinHandle<Result<TeamShareSolveSummary, String>>,
+}
+
+struct TeamShareSolveSummary {
+    share: zoka::team_mining::SubmittedShare,
+    hashes_attempted: u64,
+    elapsed_secs: f64,
 }
 
 impl Default for UserMiningState {
@@ -2600,6 +2622,175 @@ fn solve_pow_nonce(
             }
         }
     })
+}
+
+fn solve_team_share(
+    template: zoka::team_mining::MiningTemplate,
+    miner_address: String,
+    difficulty_bits: u32,
+    threads: usize,
+    cancel: Arc<AtomicBool>,
+) -> Result<TeamShareSolveSummary, String> {
+    if !template.validate_id() || difficulty_bits == 0 {
+        return Err("invalid mining-team work assignment".to_string());
+    }
+    let worker_count = threads.max(1);
+    let engines =
+        pow_engine_pool_for_height_for_chain(&template.chain_id, template.height, worker_count)?;
+    let started = Instant::now();
+    let found = Arc::new(AtomicBool::new(false));
+    let hashes_attempted = Arc::new(AtomicU64::new(0));
+    let (sender, receiver) = mpsc::channel::<Result<(Vec<u8>, u64), String>>();
+    let nonce_seed = rand::random::<u64>();
+
+    thread::scope(|scope| {
+        for (lane, engine) in engines.into_iter().enumerate() {
+            let sender = sender.clone();
+            let found = Arc::clone(&found);
+            let cancel = Arc::clone(&cancel);
+            let hashes_attempted = Arc::clone(&hashes_attempted);
+            let template = template.clone();
+            let stride = worker_count as u64;
+            scope.spawn(move || {
+                let mut nonce = nonce_seed.wrapping_add(lane as u64);
+                let mut local_hashes = 0u64;
+                while !found.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
+                    let input = build_pow_input_for_chain(
+                        &template.chain_id,
+                        &template.prev_hash,
+                        &template.recipient_address,
+                        template.height,
+                        template.timestamp,
+                        nonce,
+                    );
+                    let hash = match engine.calculate_hash(&input) {
+                        Ok(hash) => hash,
+                        Err(error) => {
+                            if local_hashes > 0 {
+                                hashes_attempted.fetch_add(local_hashes, Ordering::Relaxed);
+                            }
+                            found.store(true, Ordering::Relaxed);
+                            let _ = sender.send(Err(format!(
+                                "team share hashing failed: {error}"
+                            )));
+                            return;
+                        }
+                    };
+                    local_hashes = local_hashes.saturating_add(1);
+                    if local_hashes >= 128 {
+                        hashes_attempted.fetch_add(local_hashes, Ordering::Relaxed);
+                        local_hashes = 0;
+                    }
+                    if zoka::mining::pow::hash_meets_difficulty(&hash, difficulty_bits) {
+                        if local_hashes > 0 {
+                            hashes_attempted.fetch_add(local_hashes, Ordering::Relaxed);
+                        }
+                        found.store(true, Ordering::Relaxed);
+                        let _ = sender.send(Ok((hash, nonce)));
+                        return;
+                    }
+                    nonce = nonce.wrapping_add(stride);
+                }
+                if local_hashes > 0 {
+                    hashes_attempted.fetch_add(local_hashes, Ordering::Relaxed);
+                }
+            });
+        }
+        drop(sender);
+
+        loop {
+            match receiver.recv_timeout(Duration::from_millis(500)) {
+                Ok(result) => {
+                    found.store(true, Ordering::Relaxed);
+                    return result.map(|(hash, nonce)| {
+                        let elapsed_secs = started.elapsed().as_secs_f64();
+                        TeamShareSolveSummary {
+                            share: zoka::team_mining::SubmittedShare {
+                                team_id: template.team_id.clone(),
+                                template_id: template.id.clone(),
+                                miner_address,
+                                nonce,
+                                pow_hash_hex: hex::encode(hash),
+                                difficulty_bits,
+                                timestamp: now_secs(),
+                            },
+                            hashes_attempted: hashes_attempted.load(Ordering::Relaxed),
+                            elapsed_secs,
+                        }
+                    });
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if cancel.load(Ordering::Relaxed) {
+                        found.store(true, Ordering::Relaxed);
+                        return Err("team share work cancelled".to_string());
+                    }
+                    if zoka::api::global_network_runtime().local_chain_height()
+                        >= template.height
+                    {
+                        found.store(true, Ordering::Relaxed);
+                        return Err(format!(
+                            "stale team template: chain advanced past height {}",
+                            template.height
+                        ));
+                    }
+                    if zoka::api::global_network_runtime().checkpoint_quarantined() {
+                        found.store(true, Ordering::Relaxed);
+                        return Err("team share work stopped by checkpoint quarantine".to_string());
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    found.store(true, Ordering::Relaxed);
+                    return Err("team share workers stopped before finding a share".to_string());
+                }
+            }
+        }
+    })
+}
+
+fn verify_team_solution_for_candidate(
+    solution: &zoka::team_mining::NetworkSolution,
+    chain_id: &str,
+    height: u64,
+    prev_hash: &str,
+    expected_difficulty_bits: u32,
+) -> Result<Vec<u8>, String> {
+    let template = &solution.template;
+    if !template.validate_id()
+        || template.chain_id != chain_id
+        || template.height != height
+        || template.prev_hash != prev_hash
+        || template.network_difficulty_bits != expected_difficulty_bits
+        || solution.share.team_id != template.team_id
+        || solution.share.template_id != template.id
+        || solution.share.miner_address.trim().is_empty()
+    {
+        return Err(
+            "stale or inconsistent mining-team solution for canonical chain head".to_string(),
+        );
+    }
+    let claimed_hash = hex::decode(&solution.share.pow_hash_hex)
+        .map_err(|_| "mining-team solution contains invalid PoW hex".to_string())?;
+    let input = build_pow_input_for_chain(
+        chain_id,
+        prev_hash,
+        &template.recipient_address,
+        height,
+        template.timestamp,
+        solution.share.nonce,
+    );
+    let engine = pow_engine_for_height_for_chain(chain_id, height)?;
+    let recomputed = engine
+        .calculate_hash(&input)
+        .map_err(|error| format!("team solution PoW recomputation failed: {error}"))?;
+    if recomputed != claimed_hash
+        || !zoka::mining::pow::hash_meets_difficulty(
+            &recomputed,
+            expected_difficulty_bits,
+        )
+    {
+        return Err("mining-team solution does not satisfy its canonical template".to_string());
+    }
+    Ok(recomputed)
 }
 
 fn benchmark_hashrate_hps_for_chain(chain_id: &str, duration_ms: u64) -> u64 {
@@ -5458,6 +5649,9 @@ fn run_mining_batch_with_progress(
     if config.blocks == 0 {
         return Err("--blocks must be >= 1".to_string());
     }
+    if config.team_solution.is_some() && config.blocks != 1 {
+        return Err("a mining-team solution must assemble exactly one block".to_string());
+    }
     if config.mode != MAINNET_MINING_MODE && config.mode != TESTNET_MINING_MODE {
         return Err(format!(
             "invalid mining mode; expected {} or {}",
@@ -5560,6 +5754,7 @@ fn run_mining_batch_with_progress(
     let pow_epoch_blocks = economics::POW_KEY_EPOCH_BLOCKS;
     let mut next_height = chain_tip_height.saturating_add(1);
     let mut current_prev_hash = chain_tip_hash;
+    let team_solution = config.team_solution.as_ref();
     if let Some(callback) = progress.as_deref_mut() {
         callback(&MiningProgressSnapshot {
             height: next_height,
@@ -5632,7 +5827,7 @@ fn run_mining_batch_with_progress(
         // calls the same helper, so the miner cannot pick a number out
         // of thin air. Falls back to the local-state value when no
         // chain DB is configured (legacy CLI-only mining).
-        let difficulty_bits = match config.unsafe_rehearsal_difficulty_bits {
+        let expected_difficulty_bits = match config.unsafe_rehearsal_difficulty_bits {
             Some(bits) => bits,
             None => match config.chain_db_path.as_deref() {
                 Some(path) => {
@@ -5642,8 +5837,23 @@ fn run_mining_batch_with_progress(
                 None => last_difficulty.clamp(POW_MIN_DIFFICULTY_BITS, POW_MAX_DIFFICULTY_BITS),
             },
         };
-        let timestamp = now_secs();
-        let prev_hash = current_prev_hash.clone();
+        let (difficulty_bits, timestamp, prev_hash, payout_address) =
+            if let Some(solution) = team_solution {
+                let template = &solution.template;
+                (
+                    template.network_difficulty_bits,
+                    template.timestamp,
+                    template.prev_hash.clone(),
+                    template.recipient_address.clone(),
+                )
+            } else {
+                (
+                    expected_difficulty_bits,
+                    now_secs(),
+                    current_prev_hash.clone(),
+                    wallet_address.clone(),
+                )
+            };
         if let Some(callback) = progress.as_deref_mut() {
             callback(&MiningProgressSnapshot {
                 height,
@@ -5654,28 +5864,43 @@ fn run_mining_batch_with_progress(
                 estimated_hashrate_hps: config.hashrate_hps as f64,
             })?;
         }
-        mining_log(&format!(
-            "starting PoW solve for height={} difficulty_bits={} threads={}",
-            height, difficulty_bits, config.threads
-        ));
-        let solve_started = Instant::now();
-        let (pow_hash_bytes, found_nonce, block_hashes, solve_secs) = solve_pow_nonce(
-            &config.chain_id,
-            height,
-            difficulty_bits,
-            &prev_hash,
-            &wallet_address,
-            timestamp,
-            config.threads,
-            config.hashrate_hps,
-            config.honor_local_mining_control,
-            |snapshot| {
-                if let Some(callback) = progress.as_deref_mut() {
-                    callback(snapshot)?;
-                }
-                Ok(())
-            },
-        )?;
+        let (pow_hash_bytes, found_nonce, block_hashes, solve_secs) =
+            if let Some(solution) = team_solution {
+                let recomputed = verify_team_solution_for_candidate(
+                    solution,
+                    &config.chain_id,
+                    height,
+                    &prev_hash,
+                    expected_difficulty_bits,
+                )?;
+                mining_log(&format!(
+                    "assembling verified team solution for height={} recipient={} difficulty_bits={}",
+                    height, payout_address, difficulty_bits
+                ));
+                (recomputed, solution.share.nonce, 0, 0.0)
+            } else {
+                mining_log(&format!(
+                    "starting PoW solve for height={} difficulty_bits={} threads={}",
+                    height, difficulty_bits, config.threads
+                ));
+                solve_pow_nonce(
+                    &config.chain_id,
+                    height,
+                    difficulty_bits,
+                    &prev_hash,
+                    &wallet_address,
+                    timestamp,
+                    config.threads,
+                    config.hashrate_hps,
+                    config.honor_local_mining_control,
+                    |snapshot| {
+                        if let Some(callback) = progress.as_deref_mut() {
+                            callback(snapshot)?;
+                        }
+                        Ok(())
+                    },
+                )?
+            };
         mining_log(&format!(
             "solved height={} in {:.2}s ({} hashes, ~{:.0} H/s)",
             height,
@@ -5683,7 +5908,6 @@ fn run_mining_batch_with_progress(
             block_hashes,
             block_hashes as f64 / solve_secs.max(0.001)
         ));
-        let _ = solve_started;
         total_hashes = total_hashes.saturating_add(block_hashes);
 
         // Construct the canonical Block this miner just produced and run
@@ -5692,7 +5916,7 @@ fn run_mining_batch_with_progress(
         // produced something the network would reject, which must never
         // happen, so we treat it as a hard error.
         let coinbase_tx = zoka::mining::block_validator::build_coinbase_tx(
-            wallet_address.clone(),
+            payout_address.clone(),
             reward_for_block,
             height,
             timestamp,
@@ -5782,18 +6006,15 @@ fn run_mining_batch_with_progress(
                 &wallet_commitment,
             )
             .map_err(|e| format!("failed to build private fee claims: {e}"))?;
-        let private_coinbase = private_manager
-            .create_private_coinbase_output(
-                &wallet_name,
+        let private_coinbase =
+            zoka::private_wallet::create_private_coinbase_output_for_recipient(
                 reward_for_block,
                 height,
-                &wallet_address,
+                &payout_address,
                 height.saturating_add(COINBASE_MATURITY_BLOCKS),
             )
             .map_err(|e| format!("failed to build private coinbase output: {e}"))?;
-        if private_coinbase.recipient_commitment != wallet_commitment {
-            return Err("private coinbase recipient mismatch".to_string());
-        }
+        let local_coinbase_recipient = private_coinbase.recipient_commitment == wallet_commitment;
         let mut block = zoka::types::Block {
             header: zoka::types::BlockHeader {
                 hash: String::new(),
@@ -5968,9 +6189,11 @@ fn run_mining_batch_with_progress(
             }
         }
 
-        mined_reward = mined_reward
-            .checked_add(reward_for_block)
-            .ok_or_else(|| "reward overflow".to_string())?;
+        if local_coinbase_recipient {
+            mined_reward = mined_reward
+                .checked_add(reward_for_block)
+                .ok_or_else(|| "reward overflow".to_string())?;
+        }
         mined_blocks_effective = mined_blocks_effective.saturating_add(1);
         total_solve_secs += solve_secs;
         last_solve_secs = solve_secs;
@@ -5994,14 +6217,16 @@ fn run_mining_batch_with_progress(
         state.chain_height = height;
         state.total_supply_emitted = state.total_supply_emitted.saturating_add(reward_for_block);
         state.last_block_hash = header_hash.clone();
-        state.pending_rewards.push(PendingMiningReward {
-            wallet_address: wallet_address.clone(),
-            amount: reward_for_block,
-            source_height: height,
-            unlock_height: height.saturating_add(COINBASE_MATURITY_BLOCKS),
-            block_hash: header_hash.clone(),
-            private_coinbase: Some(private_coinbase),
-        });
+        if local_coinbase_recipient {
+            state.pending_rewards.push(PendingMiningReward {
+                wallet_address: wallet_address.clone(),
+                amount: reward_for_block,
+                source_height: height,
+                unlock_height: height.saturating_add(COINBASE_MATURITY_BLOCKS),
+                block_hash: header_hash.clone(),
+                private_coinbase: Some(private_coinbase),
+            });
+        }
         current_prev_hash = header_hash;
         next_height = height.saturating_add(1);
         produced_blocks.push(block);
@@ -6047,6 +6272,7 @@ fn run_mining_batch_with_progress(
         reward_credited: mined_reward,
         last_difficulty_bits: last_difficulty,
         produced_blocks,
+        team_recipient: team_solution.map(|solution| solution.template.recipient_address.clone()),
     })
 }
 
@@ -7047,15 +7273,63 @@ async fn handle_fullnode_network_message(
                 Err(error) => Some(format!("Ignored mining-team turn update: {error}")),
             }
         }
-        zoka::network::message::ZokaMessage::BlockResponse(_) => handle_inbound_block_message(
-            node,
-            message,
-            source,
-            chain_id,
-            storage,
-            peer_view,
-            unsafe_rehearsal_difficulty_bits,
-        ),
+        zoka::network::message::ZokaMessage::BlockResponse(response) => {
+            let source_peer = source.as_ref().map(ToString::to_string);
+            let verdict = handle_inbound_block_message(
+                node,
+                message,
+                source,
+                chain_id,
+                storage,
+                peer_view,
+                unsafe_rehearsal_difficulty_bits,
+            );
+            let canonical = storage
+                .and_then(|storage| zoka::state::chain::read_chain_head(storage).ok().flatten())
+                .is_some_and(|head| {
+                    head.height == response.block_height && head.hash == response.block_hash
+                });
+            if canonical {
+                if let Ok(block) =
+                    serde_json::from_slice::<zoka::types::Block>(&response.encrypted_block)
+                {
+                    if let Some(recipient) = block
+                        .transactions
+                        .first()
+                        .map(|coinbase| coinbase.receiver.as_str())
+                    {
+                        let status = team_mining_runtime.status().await;
+                        let tracks_template = status.team.as_ref().is_some_and(|team| {
+                            team.coordinator == status.local_address
+                                && team.active_template.as_ref().is_some_and(|template| {
+                                    template.height == block.header.block_height
+                                        && template.prev_hash == block.header.prev_hash
+                                })
+                        });
+                        if tracks_template {
+                            if let Err(error) = team_mining_runtime
+                                .record_confirmed_block(
+                                    block.header.block_height,
+                                    &block.header.prev_hash,
+                                    recipient,
+                                    source_peer,
+                                    now_secs(),
+                                )
+                                .await
+                            {
+                                return Some(format!(
+                                    "{} Team turn accounting warning: {error}.",
+                                    verdict.unwrap_or_else(|| {
+                                        "Canonical peer block applied.".to_string()
+                                    })
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            verdict
+        }
         zoka::network::message::ZokaMessage::BlockAnnounce(announce) => {
             handle_block_announce(node, announce, source, storage, peer_view)
         }
@@ -7461,6 +7735,66 @@ async fn publish_team_mining_messages(
         published = published.saturating_add(1);
     }
     Ok(published)
+}
+
+async fn current_team_mining_template(
+    runtime: &Arc<zoka::team_mining::TeamMiningRuntime>,
+    chain_id: &str,
+    storage: Option<&RocksDbStorage>,
+    unsafe_rehearsal_difficulty_bits: Option<u32>,
+) -> Result<Option<zoka::team_mining::MiningTemplate>, String> {
+    let status = runtime.status().await;
+    if !status.enabled {
+        return Ok(None);
+    }
+    let Some(team) = status.team else {
+        return Ok(None);
+    };
+    let local_is_active = team
+        .members
+        .get(&status.local_address)
+        .is_some_and(|member| member.active && !member.expelled);
+    if !local_is_active {
+        return Ok(None);
+    }
+    if team.coordinator != status.local_address {
+        return Ok(team.active_template);
+    }
+    let storage = storage.ok_or_else(|| {
+        "team mining requires the fullnode canonical chain database".to_string()
+    })?;
+    let head = zoka::state::chain::read_chain_head(storage)
+        .map_err(|error| format!("team mining failed to read chain head: {error}"))?;
+    let (height, prev_hash) = match head {
+        Some(head) => (head.height.saturating_add(1), head.hash),
+        None => (1, genesis_pow_hash_for_chain(chain_id)),
+    };
+    let difficulty_bits = match unsafe_rehearsal_difficulty_bits {
+        Some(bits) => bits,
+        None => zoka::mining::difficulty::expected_for_next_block(storage)
+            .map_err(|error| format!("team mining failed to read difficulty: {error}"))?,
+    };
+    if let Some(template) = team.active_template {
+        if template.chain_id == chain_id
+            && template.height == height
+            && template.prev_hash == prev_hash
+            && template.network_difficulty_bits == difficulty_bits
+            && template.validate_id()
+        {
+            return Ok(Some(template));
+        }
+    }
+    runtime
+        .set_template(
+            chain_id.to_string(),
+            prev_hash,
+            height,
+            now_secs(),
+            difficulty_bits,
+        )
+        .await
+        .map(Some)
+        .map_err(|error| format!("team mining failed to publish template: {error}"))
 }
 
 fn publish_local_sync_state(
@@ -10702,6 +11036,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut next_offer_announce_at = tokio::time::Instant::now();
     let mut next_exchange_process_at = tokio::time::Instant::now();
     let mut next_team_tick_at = tokio::time::Instant::now();
+    let mut next_team_work_at = tokio::time::Instant::now();
     // publish_recent_chain_blocks re-gossips up to `sync_rebroadcast_recent_blocks`
     // full block payloads. Running that on the same 3s cadence as the cheap
     // height/announce broadcasts turned into a self-inflicted gossip storm: a
@@ -10779,6 +11114,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     > = None;
     let mut next_peer_snapshot_probe_at = tokio::time::Instant::now() + Duration::from_secs(45);
     let mut mining_task: Option<tokio::task::JoinHandle<Result<MiningBatchSummary, String>>> = None;
+    let mut team_share_task: Option<TeamShareTask> = None;
+    let mut pending_team_solution: Option<zoka::team_mining::NetworkSolution> = None;
     loop {
         if tokio::time::Instant::now() >= next_exchange_process_at {
             match exchange_runtime.process_local_exchange(now_secs()).await {
@@ -10848,10 +11185,141 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             }
         }
 
+        if !checkpoint_quarantine
+            && tokio::time::Instant::now() >= next_team_work_at
+        {
+            if let Err(error) = current_team_mining_template(
+                &team_mining_runtime,
+                &chain_id,
+                chain_storage_outer.as_deref(),
+                unsafe_rehearsal_difficulty_bits,
+            )
+            .await
+            {
+                last_event = error;
+            }
+            next_team_work_at = tokio::time::Instant::now() + Duration::from_secs(1);
+        }
+
+        let team_status = team_mining_runtime.status().await;
+        let team_template = team_status
+            .team
+            .as_ref()
+            .and_then(|team| team.active_template.clone());
+        let team_member_difficulty = team_status.team.as_ref().and_then(|team| {
+            team.members
+                .get(&team_status.local_address)
+                .filter(|member| member.active && !member.expelled)
+                .map(|member| member.share_difficulty_bits)
+        });
+        let team_mining_enabled = !checkpoint_quarantine
+            && team_status.enabled
+            && team_template.is_some()
+            && team_member_difficulty.is_some();
+
+        if let Some(task) = team_share_task.as_ref() {
+            let assignment_changed = team_template
+                .as_ref()
+                .is_none_or(|template| template.id != task.template_id);
+            if !team_mining_enabled || assignment_changed || mining_task.is_some() {
+                task.cancel.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let team_share_finished = team_share_task
+            .as_ref()
+            .is_some_and(|task| task.handle.is_finished());
+        let mut team_share_completed_this_tick = false;
+        if team_share_finished {
+            let task = team_share_task
+                .take()
+                .ok_or_else(|| "team share task finished without a handle".to_string())?;
+            team_mining_runtime.set_hashing(false).await;
+            match task.handle.await {
+                Ok(Ok(summary)) => {
+                    match team_mining_runtime
+                        .submit_local_share(summary.share.clone(), now_secs())
+                        .await
+                    {
+                        Ok(validated) => {
+                            let measured_hashrate = if summary.elapsed_secs > 0.0 {
+                                summary.hashes_attempted as f64 / summary.elapsed_secs
+                            } else {
+                                0.0
+                            };
+                            last_event = format!(
+                                "Team share accepted ({} leading bits{}, ~{}).",
+                                validated.actual_difficulty_bits,
+                                if validated.network_solution {
+                                    ", full network solution"
+                                } else {
+                                    ""
+                                },
+                                format_hashrate_hps(measured_hashrate)
+                            );
+                        }
+                        Err(error) => {
+                            last_event = format!("Team share rejected: {error}");
+                        }
+                    }
+                }
+                Ok(Err(error))
+                    if error == "team share work cancelled"
+                        || error.starts_with("stale team template:") => {}
+                Ok(Err(error)) => {
+                    last_event = format!("Team share worker stopped: {error}");
+                }
+                Err(error) => {
+                    last_event = format!("Team share task failed: {error}");
+                }
+            }
+            team_share_completed_this_tick = true;
+        }
+
+        if pending_team_solution.is_none() {
+            pending_team_solution = team_mining_runtime.take_network_solution().await;
+        }
+
+        if team_share_task.is_none()
+            && !team_share_completed_this_tick
+            && pending_team_solution.is_none()
+            && mining_task.is_none()
+            && team_mining_enabled
+        {
+            let template = team_template
+                .clone()
+                .ok_or_else(|| "team mining lost its active template".to_string())?;
+            let difficulty_bits = team_member_difficulty
+                .ok_or_else(|| "team mining lost the local member assignment".to_string())?;
+            let template_id = template.id.clone();
+            let miner_address = team_status.local_address.clone();
+            let threads = team_status.threads.clamp(1, 128) as usize;
+            let cancel = Arc::new(AtomicBool::new(false));
+            let task_cancel = Arc::clone(&cancel);
+            let handle = tokio::task::spawn_blocking(move || {
+                solve_team_share(
+                    template,
+                    miner_address,
+                    difficulty_bits,
+                    threads,
+                    task_cancel,
+                )
+            });
+            team_share_task = Some(TeamShareTask {
+                template_id,
+                cancel,
+                handle,
+            });
+            team_mining_runtime.set_hashing(true).await;
+        }
+
+        let team_hashing = team_share_task.is_some();
         let mining_active = mining_task.is_some();
         let mining_control = zoka::api::global_local_mining_control().snapshot();
         let runtime_mining_enabled =
-            !checkpoint_quarantine && (auto_mine || mining_control.enabled);
+            !checkpoint_quarantine
+                && !team_status.enabled
+                && (auto_mine || mining_control.enabled);
         let runtime_mining_threads = if mining_control.threads > 0 {
             mining_control.threads.clamp(1, 128) as usize
         } else {
@@ -10893,9 +11361,16 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         zoka::api::global_network_runtime()
             .set_local_miner(
                 node.peer_id().to_string(),
-                runtime_mining_enabled || mining_active,
+                runtime_mining_enabled || mining_active || team_hashing,
                 runtime_chain_height,
-                if runtime_mining_enabled || mining_active {
+                if team_hashing {
+                    team_status
+                        .team
+                        .as_ref()
+                        .and_then(|team| team.members.get(&team_status.local_address))
+                        .map(|member| member.estimated_hashrate_hps)
+                        .unwrap_or(0)
+                } else if runtime_mining_enabled || mining_active {
                     runtime_mining_state.estimated_hashrate_hps
                 } else {
                     0
@@ -11450,6 +11925,26 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     continue;
                 }
             };
+            let mut team_accounting_warning = None;
+            if let Some(recipient) = batch.team_recipient.as_deref() {
+                let team_block = batch.produced_blocks.first().ok_or_else(|| {
+                    "team mining batch completed without a produced block".to_string()
+                })?;
+                if let Err(error) = team_mining_runtime
+                    .record_confirmed_block(
+                        team_block.header.block_height,
+                        &team_block.header.prev_hash,
+                        recipient,
+                        None,
+                        now_secs(),
+                    )
+                    .await
+                {
+                    team_accounting_warning = Some(format!(
+                        "team block persisted but turn accounting could not advance: {error}"
+                    ));
+                }
+            }
             session_mined_blocks = session_mined_blocks.saturating_add(batch.blocks_mined);
             session_mined_rewards = session_mined_rewards.saturating_add(batch.reward_credited);
             // here are non-fatal; the block is already persisted locally.
@@ -11487,7 +11982,15 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     rpc_submit_failures = rpc_submit_failures.saturating_add(failed);
                 }
             }
-            last_event = if publish_failures == 0 {
+            last_event = if let Some(recipient) = batch.team_recipient.as_deref() {
+                format!(
+                    "Team-mined {} block(s) for {} ({} broadcast failure(s)); next difficulty {} bits.",
+                    batch.blocks_mined,
+                    recipient,
+                    publish_failures,
+                    batch.last_difficulty_bits,
+                )
+            } else if publish_failures == 0 {
                 format!(
                     "Auto-mined {} block(s), broadcast to peers, scheduled {} for maturity, next difficulty {} bits.",
                     batch.blocks_mined,
@@ -11503,6 +12006,9 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     batch.last_difficulty_bits,
                 )
             };
+            if let Some(warning) = team_accounting_warning {
+                last_event = format!("{last_event} {warning}");
+            }
             if rpc_submit_failures > 0 {
                 last_event = format!(
                     "{last_event} RPC autopush had {rpc_submit_failures} endpoint failure(s); announce/request sync will keep peers aware of the new head."
@@ -11526,6 +12032,35 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 last_event = format!("{last_event} {rebroadcast_event}");
             }
             next_mine_at = tokio::time::Instant::now() + Duration::from_secs(mine_interval_secs);
+        }
+
+        if mining_task.is_none() {
+            if let Some(solution) = pending_team_solution.take() {
+                let recipient = solution.template.recipient_address.clone();
+                let height = solution.template.height;
+                let mining_config = MiningEngineConfig {
+                    chain_id: chain_id.clone(),
+                    wallet_selector: wallet_address.clone(),
+                    password: password.clone(),
+                    blocks: 1,
+                    mode: network.mining_mode().to_string(),
+                    hashrate_hps: 0,
+                    threads: 1,
+                    base_difficulty: mining_base_difficulty,
+                    unsafe_rehearsal_difficulty_bits,
+                    target_block_time_secs: mining_target_block_time_secs,
+                    chain_db_path: db_path.clone(),
+                    rpc_sync_endpoints: rpc_sync_endpoints.clone(),
+                    honor_local_mining_control: false,
+                    team_solution: Some(solution),
+                };
+                mining_task = Some(tokio::task::spawn_blocking(move || {
+                    run_mining_batch_with_progress(&mining_config, None)
+                }));
+                last_event = format!(
+                    "Assembling verified team solution at height {height} for {recipient}."
+                );
+            }
         }
 
         if runtime_mining_enabled
@@ -11643,6 +12178,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 // batch must not abort on it either or it would churn
                 // spawn/abort forever.
                 honor_local_mining_control: !auto_mine,
+                team_solution: None,
             };
             let progress_network = network;
             mining_task = Some(tokio::task::spawn_blocking(move || {
@@ -17160,6 +17696,63 @@ mod tests {
         ];
 
         assert_eq!(parse_thread_count_arg(&args).unwrap(), 3);
+    }
+
+    #[test]
+    fn team_share_worker_solves_the_exact_coordinator_template() {
+        let address = make_valid_zka1();
+        let mut team =
+            zoka::team_mining::TeamState::create(address.clone(), now_secs()).unwrap();
+        let template = team
+            .set_template(
+                "zoka-dev-team".to_string(),
+                "parent-hash".to_string(),
+                1_000_000,
+                now_secs(),
+                1,
+            )
+            .unwrap();
+        let difficulty = team
+            .members
+            .get(&address)
+            .unwrap()
+            .share_difficulty_bits;
+        let solved = solve_team_share(
+            template.clone(),
+            address,
+            difficulty,
+            2,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("team share");
+
+        let validated = team.validate_share(&solved.share).expect("valid share");
+        assert!(validated.actual_difficulty_bits >= difficulty);
+        assert!(solved.hashes_attempted > 0);
+
+        let solution = zoka::team_mining::NetworkSolution {
+            share: solved.share,
+            template: template.clone(),
+        };
+        assert_eq!(
+            verify_team_solution_for_candidate(
+                &solution,
+                &template.chain_id,
+                template.height,
+                &template.prev_hash,
+                template.network_difficulty_bits,
+            )
+            .unwrap(),
+            hex::decode(&solution.share.pow_hash_hex).unwrap()
+        );
+        assert!(verify_team_solution_for_candidate(
+            &solution,
+            &template.chain_id,
+            template.height,
+            "different-parent",
+            template.network_difficulty_bits,
+        )
+        .is_err());
     }
 
     #[test]
