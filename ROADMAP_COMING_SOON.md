@@ -148,7 +148,9 @@ Este documento es el estado de verdad del trabajo. **Leelo entero antes de tocar
 | Testing | ~~Mainnet con montos mínimos, sin testnet.~~ **REEMPLAZADA 2026-07-27: Nile testnet primero, como fase obligatoria.** El usuario consiguió fondos del faucet de Nile. Mainnet viene después, con el flujo ya ejercitado — más seguro que la decisión original. |
 | Red Tron | **Configurable** (`TronNetwork`: mainnet / Nile) con endpoint y contrato de USDT por red, seleccionable en Settings. Cambiar constantes a mano y volver a mainnet manualmente es fácil de olvidar justo cuando hay fondos reales en juego. |
 | Tor por red | **Opcional en Nile, obligatorio en mainnet.** En testnet no hay dinero ni privacidad que proteger, y exigir Tor solo complica el diagnóstico. |
-| Contrato USDT en Nile | ⚠️ **SIN CONFIRMAR — no hardcodear.** Una búsqueda web devolvió `TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf`, pero **ninguna fuente autoritativa lo respalda**: nileex.io responde 403 y los docs de Tron mencionan el faucet (`!nile_usdt`) sin publicar el contrato. La fuente de verdad es la propia transacción del faucet en la wallet del usuario: el `contract_address` del token recibido. Confirmarlo antes de escribirlo en el código — un contrato equivocado hace que el matcher acepte o rechace el token que no es. |
+| Contrato USDT en Nile | ✅ **CONFIRMADO 2026-07-27: `TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf`** (`Tether USD`, símbolo `USDT`). Verificado contra la transferencia real del faucet, no contra una búsqueda web: tx `20a41a21e78b3ee9…`, 1000 USDT a `TBB6JvN1Vy15o6SCF7Y3sV9bagQiE4bA2y`. |
+| Decimales en Nile | **6, iguales a mainnet.** Confirmado en `token_info.decimals` de la transferencia real. `MICRO_USDT_PER_USDT` y toda la aritmética de montos sirven sin cambios entre redes. |
+| Forma del JSON de Nile | **Idéntica a mainnet** (`token_info.address`, `value` como string, `block_timestamp` en ms). El parser de `TronClient` deserializa Nile sin modificaciones — solo cambian endpoint y contrato. |
 | Consentimiento | Pantalla de riesgos con aceptación explícita, una sola vez. |
 
 ### Mining Pool
