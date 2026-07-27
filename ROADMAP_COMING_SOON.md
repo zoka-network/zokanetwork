@@ -13,6 +13,39 @@ Orden de ejecución: **Etapa 0 (limpieza) → Explorer → P2P Exchange → Mini
 
 Este documento es el estado de verdad del trabajo. **Leelo entero antes de tocar código.**
 
+### 🔴 BUG CRÍTICO — arrancar por acá (reportado 2026-07-27)
+
+**Al publicar una oferta, el ZKA comprometido sigue siendo gastable en otra transacción.**
+Confirmado por el usuario: no es solo que el balance mostrado en la UI no baja — **los ZKA
+comprometidos en una oferta abierta se pueden efectivamente enviar en otra tx mientras la
+oferta sigue viva.** Es doble-compromiso real, no un problema cosmético de la pantalla.
+
+Esto contradice directamente la garantía que se diseñó en §2.3 (`select_notes` +
+`spendable_from_wallet_notes`, `src/p2p_exchange/reservation.rs`): *"ninguna oferta sin
+respaldo llega a la red"*. La selección de notas y el rechazo por fondos insuficientes están
+implementados y testeados (66+ tests), y el trade real del 2026-07-27 muestra que la oferta
+efectivamente guarda `reserved_note_ids` (no vacío). Así que el candidato más probable **no**
+es que falte la selección — es que:
+
+1. **La nota se referencia en la oferta pero nunca se marca `reserved: true` de verdad en el
+   `PrivateNote` de la wallet** (revisar el punto donde `create_exchange_offer`
+   —`src/api/mod.rs`— llama a `select_notes` y qué hace con el resultado: ¿llega a tocar el
+   flag `reserved` real, o solo copia los ids a `Offer.reserved_note_ids` sin persistir el
+   lock en la wallet?), **o**
+2. **El flujo de `Send` normal no filtra notas con `reserved: true`** al armar una transacción
+   nueva — es decir, el flag existe y está en `true`, pero nadie lo respeta al elegir qué
+   gastar fuera del contexto del exchange.
+
+**Primer paso concreto:** reproducir controladamente — publicar una oferta, mirar el JSON de
+la wallet en disco (o el estado en memoria) para confirmar si la nota específica de
+`reserved_note_ids` tiene `reserved: true` o no. Si SÍ lo tiene → el bug está en (2), en el
+selector de notas del flujo de Send. Si NO lo tiene → está en (1), en el wiring del endpoint
+de creación de oferta.
+
+**Por qué es prioridad sobre todo lo demás:** cualquier otra cosa del roadmap (Dandelion lento,
+§2.6, §2.7, pulido visual) puede esperar. Esto no — es la garantía central de que "publicar una
+oferta" signifique algo.
+
 ### ✅ Verificado end-to-end en vivo (2026-07-27, Nile testnet)
 
 Primer ciclo completo del exchange probado con dos máquinas reales (PC = vendedor, VM =
