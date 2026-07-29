@@ -2930,20 +2930,19 @@ fn load_user_mining_state_for_network(network: NetworkProfile) -> Result<UserMin
     }
     let raw = fs::read_to_string(&path)
         .map_err(|e| format!("failed to read mining state {}: {e}", path.display()))?;
-    let mut state: UserMiningState = match serde_json::from_str(&raw) {
-        Ok(state) => state,
-        Err(e) => {
-            // The mining-state file is a local runtime cache (mining
-            // stats/progress), not consensus data. A partial or interrupted
-            // write (e.g. the process was Ctrl+C'd mid-save) leaves it empty or
-            // truncated, and that must not stop the node from starting — reset
-            // to default and let it be rebuilt on the next save.
-            eprintln!(
-                "mining state {} was unreadable ({e}); resetting it to default",
-                path.display()
-            );
-            UserMiningState::default()
-        }
+    // The mining-state file is a local runtime cache (mining stats/progress),
+    // not consensus data. A partial or interrupted write (a Ctrl+C mid-save, or
+    // the machine losing power) leaves it empty, truncated or zero-filled, and
+    // that must not stop the node from starting — reset to default.
+    //
+    // Deliberately silent. This binary's output is consumed by ZSilent, which
+    // runs it with stderr merged into stdout and parses the result as JSON, so
+    // a diagnostic line here does not warn anybody: it turns a condition the
+    // node already recovers from into a wallet that refuses to unlock, with an
+    // error naming this file. That is exactly what happened on 2026-07-29.
+    let (mut state, recovered) = match serde_json::from_str::<UserMiningState>(&raw) {
+        Ok(state) => (state, false),
+        Err(_) => (UserMiningState::default(), true),
     };
     if state.total_supply_emitted == 0 && state.total_rewards > 0 {
         state.total_supply_emitted = state.total_rewards.min(EMISSION_MAX_SUPPLY);
@@ -2960,6 +2959,11 @@ fn load_user_mining_state_for_network(network: NetworkProfile) -> Result<UserMin
     }
     if state.last_block_hash.is_empty() {
         state.last_block_hash = genesis_pow_hash_for_chain(network.chain_id());
+    }
+    if recovered {
+        // Reparar también en disco, no sólo en memoria: un archivo ilegible que
+        // se deja donde está vuelve a fallar en cada comando siguiente.
+        let _ = save_user_mining_state_for_network(network, &state);
     }
     Ok(state)
 }
@@ -3020,7 +3024,32 @@ fn save_user_mining_state_for_network(
     let path = user_mining_state_path_for_network(network)?;
     let raw = serde_json::to_string_pretty(state)
         .map_err(|e| format!("failed to encode mining state json: {e}"))?;
-    fs::write(&path, raw).map_err(|e| format!("failed to write {}: {e}", path.display()))
+    write_file_atomically(&path, raw.as_bytes())
+}
+
+/// Escribe un archivo pequeño de forma atómica y durable.
+///
+/// `fs::write` trunca el destino y después escribe encima. Si la máquina se
+/// corta en el medio, NTFS deja el archivo con su largo final pero sin datos:
+/// una tira de ceros que ya no parsea, y que no se recupera sola. Pasó de
+/// verdad — un reinicio dejó `user_mining_state.json` con 737 KB de NUL.
+///
+/// El `sync_all()` antes del rename no es decorativo: sin él el rename puede
+/// llegar al disco antes que el contenido, que es justo el caso que rompe.
+fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let tmp = path.with_extension("tmp");
+    {
+        let mut file = fs::File::create(&tmp)
+            .map_err(|e| format!("failed to create {}: {e}", tmp.display()))?;
+        file.write_all(bytes)
+            .map_err(|e| format!("failed to write {}: {e}", tmp.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("failed to flush {}: {e}", tmp.display()))?;
+    }
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("failed to replace {}: {e}", path.display())
+    })
 }
 
 fn legacy_pow_sim_state_detected(state: &UserMiningState) -> bool {
@@ -17454,6 +17483,51 @@ mod tests {
             signature_hex: None,
             signer_pubkey_hex: None,
         }
+    }
+
+    #[test]
+    fn atomic_write_replaces_an_existing_file_and_leaves_no_temp() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("user_mining_state.json");
+
+        write_file_atomically(&path, b"{\"total_rewards\":1}").expect("first write");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"total_rewards\":1}");
+
+        // Sobrescribir es el caso real y no el de estreno: en Windows el rename
+        // tiene que reemplazar un destino que ya existe, no fallar.
+        write_file_atomically(&path, b"{\"total_rewards\":2}").expect("overwrite");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"total_rewards\":2}");
+
+        let leftovers: Vec<String> = fs::read_dir(dir.path())
+            .expect("read temp dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "quedaron temporales: {leftovers:?}");
+    }
+
+    #[test]
+    fn a_zero_filled_state_file_is_rejected_rather_than_read_as_state() {
+        // La firma exacta de la corrupcion por reinicio: el archivo conserva su
+        // largo pero los datos nunca llegaron al disco. Si esto alguna vez
+        // parsea, el nodo arranca con un estado inventado en vez de rehacerlo.
+        let zeros = "\u{0}".repeat(64);
+        assert!(serde_json::from_str::<UserMiningState>(&zeros).is_err());
+
+        // Y lo que sí guardamos tiene que poder releerse.
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("user_mining_state.json");
+        let mut state = UserMiningState::default();
+        state.total_rewards = 12;
+        state.mode = "pow".to_string();
+        let raw = serde_json::to_string_pretty(&state).expect("encode");
+        write_file_atomically(&path, raw.as_bytes()).expect("write");
+
+        let back: UserMiningState =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).expect("reload");
+        assert_eq!(back.total_rewards, 12);
+        assert_eq!(back.mode, "pow");
     }
 
     #[test]
