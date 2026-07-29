@@ -369,28 +369,28 @@ impl TeamState {
         if active.is_empty() {
             return None;
         }
-        if self.total_work == 0 {
+        let (active_work, projected_blocks) = active_turn_totals(&active);
+        if active_work == 0 {
             return active
                 .iter()
                 .find(|member| member.address == self.coordinator)
                 .or_else(|| active.first())
                 .map(|member| member.address.clone());
         }
-        let projected_blocks = self.confirmed_blocks.saturating_add(1);
         active
             .into_iter()
             .max_by(|left, right| {
-                compare_turn_debt(left, right, self.total_work, projected_blocks)
+                compare_turn_debt(left, right, active_work, projected_blocks)
                     .then_with(|| right.address.cmp(&left.address))
             })
             .map(|member| member.address.clone())
     }
 
     pub fn turn_order(&self) -> Vec<String> {
-        let projected_blocks = self.confirmed_blocks.saturating_add(1);
         let mut members = self.active_members().collect::<Vec<_>>();
+        let (active_work, projected_blocks) = active_turn_totals(&members);
         members.sort_by(|left, right| {
-            compare_turn_debt(right, left, self.total_work, projected_blocks)
+            compare_turn_debt(right, left, active_work, projected_blocks)
                 .then_with(|| left.address.cmp(&right.address))
         });
         members
@@ -1518,6 +1518,31 @@ fn template_id(
     hex::encode(hasher.finalize())
 }
 
+/// Denominadores del reparto por turnos, calculados SOLO sobre los miembros
+/// activos.
+///
+/// `state.total_work` y `state.confirmed_blocks` son historicos: nunca bajan
+/// cuando alguien deja el equipo. Usarlos como denominador mientras el conjunto
+/// de candidatos ya excluye a quien se fue mezcla dos poblaciones distintas, y
+/// el efecto es que el trabajo del que se fue diluye para siempre el derecho de
+/// los que quedan. En la practica eso sesga el reparto hacia quien menos aporta:
+/// con un equipo 60/30/10 donde se va el mayor aportante, los que quedan
+/// recibian 70.5/29.5 en vez del 75/25 que les corresponde.
+///
+/// Se calculan aca en vez de descontar al salir a proposito: no muta el estado
+/// persistido, no cambia el esquema y `TeamState::validate` no compara estos
+/// totales, asi que los nodos que todavia no tengan este arreglo siguen
+/// aceptando el estado que publica el coordinador.
+fn active_turn_totals(active: &[&TeamMember]) -> (u64, u64) {
+    let work = active
+        .iter()
+        .fold(0u64, |acc, member| acc.saturating_add(member.total_work));
+    let paid = active
+        .iter()
+        .fold(0u64, |acc, member| acc.saturating_add(member.blocks_paid));
+    (work, paid.saturating_add(1))
+}
+
 fn compare_turn_debt(
     left: &TeamMember,
     right: &TeamMember,
@@ -1716,6 +1741,63 @@ mod tests {
         state.promote_backup(&bob, 191).unwrap();
         assert_eq!(state.coordinator, bob);
         assert_eq!(state.epoch, 1);
+    }
+
+    #[test]
+    fn turn_rotation_stays_proportional_after_a_member_leaves() {
+        // Regresion: `total_work` y `confirmed_blocks` son historicos y nunca
+        // bajan cuando alguien deja el equipo. Si se usan como denominador
+        // mientras los candidatos ya excluyen al que se fue, su trabajo diluye
+        // para siempre el derecho de los que quedan y el reparto se sesga hacia
+        // quien menos aporta.
+        let (alice, bob, carol) = addresses();
+        let mut state = TeamState::create(alice.clone(), 100).unwrap();
+        state.add_member(bob.clone(), 8).unwrap();
+        state.add_member(carol.clone(), 8).unwrap();
+
+        // alice aporto mucho y ya cobro lo suyo; bob y carol quedan en una
+        // proporcion 3:1 entre ellos.
+        state.members.get_mut(&alice).unwrap().total_work = 6_000;
+        state.members.get_mut(&alice).unwrap().blocks_paid = 60;
+        state.members.get_mut(&bob).unwrap().total_work = 3_000;
+        state.members.get_mut(&bob).unwrap().blocks_paid = 30;
+        state.members.get_mut(&carol).unwrap().total_work = 1_000;
+        state.members.get_mut(&carol).unwrap().blocks_paid = 10;
+        state.total_work = 10_000;
+        state.confirmed_blocks = 100;
+
+        // alice se va: quedan bob (75% del trabajo activo) y carol (25%).
+        // Se marca inactiva directamente porque es la coordinadora y
+        // leave_member la rechaza -- ese hueco se resuelve aparte.
+        state.members.get_mut(&alice).unwrap().active = false;
+
+        let mut bob_turns = 0u32;
+        let mut carol_turns = 0u32;
+        for _ in 0..400 {
+            let winner = state.next_recipient().expect("hay miembros activos");
+            if winner == bob {
+                bob_turns += 1;
+            } else if winner == carol {
+                carol_turns += 1;
+            } else {
+                panic!("un miembro inactivo recibio un turno: {winner}");
+            }
+            // el ganador cobra y ambos siguen aportando en su proporcion
+            let member = state.members.get_mut(&winner).unwrap();
+            member.blocks_paid = member.blocks_paid.saturating_add(1);
+            state.confirmed_blocks = state.confirmed_blocks.saturating_add(1);
+            state.members.get_mut(&bob).unwrap().total_work += 30;
+            state.members.get_mut(&carol).unwrap().total_work += 10;
+            state.total_work += 40;
+        }
+
+        let total = bob_turns + carol_turns;
+        let bob_share = 100 * bob_turns / total;
+        // Con el denominador historico esto daba ~70%; lo correcto es ~75%.
+        assert!(
+            (73..=77).contains(&bob_share),
+            "bob aporta el 75% del trabajo activo pero recibio {bob_share}% de los turnos"
+        );
     }
 
     #[test]
