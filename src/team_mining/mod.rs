@@ -597,6 +597,37 @@ impl TeamState {
         Ok(())
     }
 
+    /// Traspasa la coordinacion al backup de forma voluntaria.
+    ///
+    /// Es lo mismo que `promote_backup` pero sin la guarda de TTL: esa guarda
+    /// existe para el failover, donde hay que esperar a estar seguros de que el
+    /// coordinador desaparecio. Aca el coordinador se esta yendo a proposito, y
+    /// hacer esperar al equipo el TTL completo solo lo dejaria sin plantillas
+    /// varios minutos.
+    ///
+    /// Devuelve la direccion del nuevo coordinador.
+    pub fn hand_over_coordination(&mut self, now: u64) -> Result<String, TeamError> {
+        let successor = self
+            .backup_coordinator
+            .clone()
+            .or_else(|| self.next_backup())
+            .ok_or(TeamError::NoActiveMembers)?;
+        let previous = self.coordinator.clone();
+        self.coordinator = successor.clone();
+        if let Some(member) = self.members.get_mut(&previous) {
+            member.active = false;
+        }
+        if let Some(member) = self.members.get_mut(&successor) {
+            member.active = true;
+            member.expelled = false;
+        }
+        self.epoch = self.epoch.saturating_add(1);
+        self.backup_coordinator = self.next_backup();
+        self.last_coordinator_seen = now;
+        self.active_template = None;
+        Ok(successor)
+    }
+
     fn next_backup(&self) -> Option<String> {
         self.members
             .values()
@@ -913,7 +944,23 @@ impl TeamMiningRuntime {
             .cloned()
             .ok_or(TeamError::InvalidTeam)?;
         if state.coordinator == self.local_address {
-            return Err(TeamError::CoordinatorCannotLeave);
+            // El coordinador ya no queda atrapado en su propio equipo: si hay
+            // sucesor, traspasa y se va como un miembro mas. Si no hay nadie a
+            // quien traspasar, el unico camino es disolver, y eso lo pide la
+            // interfaz explicitamente -- disolver por accidente al tocar
+            // "salir" seria destruir el equipo de todos.
+            let successor = {
+                let mut guard = self.store.lock().await;
+                let mut updated = state.clone();
+                let successor = updated.hand_over_coordination(now)?;
+                updated.revision = updated.revision.saturating_add(1);
+                guard.replace(updated.clone())?;
+                self.publish_authoritative_state(&updated, now).await;
+                successor
+            };
+            *self.join_status.lock().await = "left".to_string();
+            let _ = successor;
+            return Ok(());
         }
         self.queue_message(crate::network::message::ZokaMessage::TeamJoin(
             TeamMembership {
@@ -925,6 +972,30 @@ impl TeamMiningRuntime {
         ))
         .await;
         *self.join_status.lock().await = "leave_requested".to_string();
+        Ok(())
+    }
+
+    /// Disuelve el equipo del que este nodo es coordinador.
+    ///
+    /// Solo borra el estado local. No se manda un mensaje de disolucion porque
+    /// `MembershipAction` solo tiene Join y Leave: agregar una variante nueva
+    /// romperia la deserializacion en los nodos que todavia no la conozcan. Los
+    /// miembros detectan la ausencia del coordinador por el TTL de failover y
+    /// promueven al backup o quedan sin plantilla, que es el mismo camino que
+    /// si el coordinador se apagara.
+    pub async fn disband(&self) -> Result<(), TeamError> {
+        let state = self
+            .store
+            .lock()
+            .await
+            .state()
+            .cloned()
+            .ok_or(TeamError::InvalidTeam)?;
+        if state.coordinator != self.local_address {
+            return Err(TeamError::CoordinatorCannotLeave);
+        }
+        self.store.lock().await.clear()?;
+        *self.join_status.lock().await = "not_joined".to_string();
         Ok(())
     }
 
@@ -1797,6 +1868,47 @@ mod tests {
         assert!(
             (73..=77).contains(&bob_share),
             "bob aporta el 75% del trabajo activo pero recibio {bob_share}% de los turnos"
+        );
+    }
+
+    #[test]
+    fn coordinator_hands_over_instead_of_being_trapped() {
+        // El coordinador no podia salir nunca (CoordinatorCannotLeave), asi que
+        // quedaba atrapado en su propio equipo.
+        let (alice, bob, carol) = addresses();
+        let mut state = TeamState::create(alice.clone(), 100).unwrap();
+        state.add_member(bob.clone(), 8).unwrap();
+        state.add_member(carol.clone(), 8).unwrap();
+        assert_eq!(state.coordinator, alice);
+
+        let successor = state.hand_over_coordination(200).unwrap();
+
+        assert_ne!(successor, alice, "el sucesor no puede ser quien se va");
+        assert_eq!(state.coordinator, successor);
+        assert!(
+            !state.members[&alice].active,
+            "quien traspasa queda inactivo"
+        );
+        assert!(state.members[&successor].active);
+        assert_eq!(state.epoch, 1, "el traspaso abre una epoca nueva");
+        assert!(
+            state.active_template.is_none(),
+            "la plantilla del coordinador anterior no sigue vigente"
+        );
+        assert_ne!(state.backup_coordinator.as_deref(), Some(successor.as_str()));
+        // el estado sigue siendo valido para los pares que lo reciban
+        state.validate().unwrap();
+    }
+
+    #[test]
+    fn handover_without_anyone_to_promote_is_rejected() {
+        // Un coordinador solo no puede traspasar: ahi el unico camino es
+        // disolver, y eso lo pide la interfaz explicitamente.
+        let (alice, _, _) = addresses();
+        let mut state = TeamState::create(alice, 100).unwrap();
+        assert_eq!(
+            state.hand_over_coordination(200),
+            Err(TeamError::NoActiveMembers)
         );
     }
 

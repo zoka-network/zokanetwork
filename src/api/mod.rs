@@ -1620,6 +1620,7 @@ impl RbacConfig {
         endpoint_permissions.insert("/team-mining/team", ApiRole::Write);
         endpoint_permissions.insert("/team-mining/join", ApiRole::Write);
         endpoint_permissions.insert("/team-mining/leave", ApiRole::Write);
+        endpoint_permissions.insert("/team-mining/disband", ApiRole::Write);
         endpoint_permissions.insert("/team-mining/start", ApiRole::Write);
         endpoint_permissions.insert("/team-mining/stop", ApiRole::Write);
         endpoint_permissions.insert("/private/view-scan", ApiRole::Write);
@@ -5104,6 +5105,16 @@ async fn leave_mining_team(
     Ok(Json(runtime.status().await))
 }
 
+/// Disuelve el equipo. Solo el coordinador puede; el resto usa /leave.
+async fn disband_mining_team(
+    State(app_state): State<Arc<AppState>>,
+) -> Result<Json<crate::team_mining::TeamRuntimeStatus>, (StatusCode, String)> {
+    let runtime = team_mining_runtime_or_404(&app_state)?;
+    runtime.disband().await.map_err(team_error_response)?;
+    runtime.set_enabled(false, 1).await;
+    Ok(Json(runtime.status().await))
+}
+
 async fn start_team_mining(
     State(app_state): State<Arc<AppState>>,
     body: Option<Json<TeamMiningControlRequest>>,
@@ -6259,6 +6270,7 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         .route("/team-mining/team", post(create_mining_team))
         .route("/team-mining/join", post(join_mining_team))
         .route("/team-mining/leave", post(leave_mining_team))
+        .route("/team-mining/disband", post(disband_mining_team))
         .route("/team-mining/start", post(start_team_mining))
         .route("/team-mining/stop", post(stop_team_mining))
         .route("/health", get(health))
