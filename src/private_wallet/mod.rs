@@ -2604,6 +2604,16 @@ pub struct PrivateWallet {
     /// can be rebuilt after a node restart without scanning the full chain.
     #[serde(default)]
     pub spent_nullifiers: Vec<String>,
+    /// Hashes de las transacciones cuya comisión ya se cobró.
+    ///
+    /// Cobrar una comisión es un `deposit_to_private_wallet` liso: no deja nota
+    /// con `note_id`, así que nada lo deduplica después. Mientras esto vivía
+    /// sólo en memoria, lo único que evitaba cobrar dos veces era que
+    /// `restore_height` no retrocede nunca — y eso convierte cualquier rescan
+    /// de bloques ya vistos en saldo inventado. Persistido, la defensa deja de
+    /// depender de que nadie vuelva a mirar un bloque viejo.
+    #[serde(default)]
+    pub claimed_fee_tx_hashes: Vec<String>,
     pub private_transactions: Vec<PrivateTransaction>,
     #[serde(default)]
     pub private_fee_openings: HashMap<String, PrivateFeeOpening>,
@@ -2633,6 +2643,7 @@ impl PrivateWallet {
             private_balance: 0,
             pending_balance: 0,
             spent_nullifiers: vec![],
+            claimed_fee_tx_hashes: vec![],
             private_transactions: vec![],
             private_fee_openings: HashMap::new(),
             created_at: current_timestamp(),
@@ -3537,6 +3548,19 @@ impl PrivateWalletManager {
                 {
                     let _ = set.spend(nullifier);
                 }
+            }
+        }
+    }
+
+    /// Rebuild the in-memory claimed-fee guard from what the wallets persisted.
+    ///
+    /// Sin esto el conjunto arranca vacío en cada proceso, y lo único que evita
+    /// cobrar dos veces la misma comisión es que `restore_height` no retroceda.
+    /// Se llama junto a `rebuild_nullifier_set` al cargar desde disco.
+    pub fn rebuild_claimed_fee_tx_hashes(&mut self) {
+        for wallet in self.private_wallets.values() {
+            for tx_hash in &wallet.claimed_fee_tx_hashes {
+                self.claimed_fee_tx_hashes.insert(tx_hash.clone());
             }
         }
     }
@@ -4468,6 +4492,15 @@ impl PrivateWalletManager {
         self.deposit_to_private_wallet(miner_wallet, total_fee)?;
         for tx_hash in &claimed {
             self.claimed_fee_tx_hashes.insert(tx_hash.clone());
+        }
+        // Y en la wallet, que es lo que sobrevive al reinicio. El set de arriba
+        // se reconstruye desde acá en `rebuild_claimed_fee_tx_hashes`.
+        if let Some(wallet) = self.private_wallets.get_mut(miner_wallet) {
+            for tx_hash in &claimed {
+                if !wallet.claimed_fee_tx_hashes.contains(tx_hash) {
+                    wallet.claimed_fee_tx_hashes.push(tx_hash.clone());
+                }
+            }
         }
 
         Ok(PrivateFeeClaimOutcome {
@@ -6586,6 +6619,64 @@ mod tests {
 
         assert_eq!(outcome.total_fee_claimed, 5);
         assert_eq!(manager.get_private_balance("miner"), Some(5));
+    }
+
+    #[test]
+    fn a_claimed_fee_survives_a_restart_and_is_not_paid_twice() {
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        let bob_commitment = manager.create_private_wallet("bob").unwrap();
+        let miner_commitment = manager.create_private_wallet("miner").unwrap();
+
+        manager.deposit_to_private_wallet("alice", 90).unwrap();
+        let tx_hash = manager
+            .send_private_transaction_with_fee("alice", bob_commitment, 15, 3)
+            .unwrap();
+        manager.confirm_private_transaction(&tx_hash).unwrap();
+
+        let envelope = manager
+            .create_miner_fee_claim_envelope("alice", &tx_hash, &miner_commitment)
+            .unwrap();
+        manager
+            .claim_private_fees_for_wallet("miner", std::slice::from_ref(&envelope))
+            .unwrap();
+        assert_eq!(manager.get_private_balance("miner"), Some(3));
+
+        // El cobro tiene que quedar escrito en la wallet, que es lo que se
+        // guarda en disco, y no sólo en el conjunto del manager.
+        let miner_wallet = manager.get_private_wallet("miner").unwrap().clone();
+        assert!(
+            miner_wallet.claimed_fee_tx_hashes.contains(&tx_hash),
+            "el cobro tiene que quedar en la wallet persistida"
+        );
+        let confirmed_tx = manager.get_private_transaction(&tx_hash).unwrap();
+
+        // Reinicio: manager nuevo, wallet rehidratada desde su JSON.
+        let restored: PrivateWallet =
+            serde_json::from_str(&serde_json::to_string(&miner_wallet).unwrap()).unwrap();
+        let mut after_restart = PrivateWalletManager::new();
+        after_restart.create_private_wallet("miner").unwrap();
+        *after_restart.get_private_wallet_mut("miner").unwrap() = restored;
+        after_restart.rebuild_claimed_fee_tx_hashes();
+
+        // La transacción se cachea a propósito: así lo único que puede frenar
+        // el segundo cobro es el guardia persistido, y no que al manager nuevo
+        // le falte la transacción. Sin eso el test pasaría por el motivo
+        // equivocado.
+        after_restart
+            .cache_confirmed_private_transaction_for_fee_claim(confirmed_tx)
+            .unwrap();
+
+        let replay = after_restart.claim_private_fees_for_wallet("miner", &[envelope]);
+        assert!(
+            replay.is_err(),
+            "una comision ya cobrada no puede acreditarse otra vez tras reiniciar"
+        );
+        assert_eq!(
+            after_restart.get_private_balance("miner"),
+            Some(3),
+            "el saldo no puede haberse duplicado"
+        );
     }
 
     #[test]

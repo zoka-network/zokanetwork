@@ -213,6 +213,7 @@ pub fn build_private_transfer(
 
     let rebuild_nullifiers_started = Instant::now();
     manager.rebuild_nullifier_set();
+    manager.rebuild_claimed_fee_tx_hashes();
     metrics.rebuild_spend_set_ms = elapsed_ms(rebuild_nullifiers_started);
 
     let prove_started = Instant::now();
