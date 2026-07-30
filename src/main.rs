@@ -2834,16 +2834,41 @@ fn retarget_difficulty(current: u32, solve_secs: f64, target_block_time_secs: u6
     }
 }
 
+/// Techo del diagnóstico de minería, antes de rotarlo.
+///
+/// `mining_progress_log` escribe cada 3 segundos mientras se mina: unas 29 000
+/// líneas por día, y el archivo sólo crecía. En la PC del usuario llegó a 44 MB.
+/// Con la rotación el gasto queda acotado a dos veces este número, y lo que se
+/// conserva son las líneas recientes, que son las que sirven para diagnosticar.
+const MINING_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
 fn mining_log(message: &str) {
     eprintln!("{}", paint(&format!("mining: {message}"), ANSI_DIM));
     let path = PathBuf::from(NetworkProfile::Mainnet.local_dir()).join("mining_diagnostic.log");
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
+    rotate_mining_log_if_oversized(&path);
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
         use std::io::Write as _;
         let _ = writeln!(f, "{} mining: {}", now_secs(), message);
     }
+}
+
+/// Rota el diagnóstico a una única copia `.1` cuando pasa el techo.
+///
+/// Una sola copia a propósito: esto sirve para mirar qué pasó recién, no para
+/// llevar historia. Si el rename falla —otro proceso lo tiene abierto— se deja
+/// como está y se reintenta en la línea siguiente; perder una rotación es mucho
+/// más barato que perder la línea que se estaba por escribir.
+fn rotate_mining_log_if_oversized(path: &Path) {
+    let oversized = fs::metadata(path)
+        .map(|meta| meta.len() >= MINING_LOG_MAX_BYTES)
+        .unwrap_or(false);
+    if !oversized {
+        return;
+    }
+    let _ = fs::rename(path, path.with_extension("log.1"));
 }
 
 fn mining_progress_log(progress: &MiningProgressSnapshot) {
@@ -3022,7 +3047,12 @@ fn save_user_mining_state_for_network(
     state: &UserMiningState,
 ) -> Result<(), String> {
     let path = user_mining_state_path_for_network(network)?;
-    let raw = serde_json::to_string_pretty(state)
+    // Compacto, no `to_string_pretty`. Este archivo no lo lee nadie a mano, y lo
+    // que pesa son los range proofs de las recompensas sin madurar: bytes
+    // sueltos que en JSON indentado ocupan una línea cada uno. Con pretty el
+    // archivo llegó a 737 KB para ~60 entradas. Achicarlo además angosta la
+    // ventana en la que un corte lo puede dejar a medio escribir.
+    let raw = serde_json::to_string(state)
         .map_err(|e| format!("failed to encode mining state json: {e}"))?;
     write_file_atomically(&path, raw.as_bytes())
 }
@@ -17483,6 +17513,44 @@ mod tests {
             signature_hex: None,
             signer_pubkey_hex: None,
         }
+    }
+
+    #[test]
+    fn the_mining_diagnostic_rotates_instead_of_growing_forever() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("mining_diagnostic.log");
+
+        // Por debajo del techo no se toca: rotar de más tira las líneas que
+        // justamente se quieren leer.
+        fs::write(&path, vec![b'x'; 16]).expect("small log");
+        rotate_mining_log_if_oversized(&path);
+        assert_eq!(fs::metadata(&path).expect("still there").len(), 16);
+        assert!(!dir.path().join("mining_diagnostic.log.1").exists());
+
+        fs::write(&path, vec![b'x'; MINING_LOG_MAX_BYTES as usize]).expect("oversized log");
+        rotate_mining_log_if_oversized(&path);
+        assert!(
+            !path.exists(),
+            "tras rotar, el activo arranca de cero en la proxima escritura"
+        );
+        assert_eq!(
+            fs::metadata(dir.path().join("mining_diagnostic.log.1"))
+                .expect("rotado")
+                .len(),
+            MINING_LOG_MAX_BYTES
+        );
+
+        // Una segunda rotación pisa la copia vieja en vez de acumular copias.
+        fs::write(&path, vec![b'y'; MINING_LOG_MAX_BYTES as usize]).expect("oversized again");
+        rotate_mining_log_if_oversized(&path);
+        let rotated = fs::read(dir.path().join("mining_diagnostic.log.1")).expect("rotado");
+        assert!(rotated.iter().all(|b| *b == b'y'));
+        let logs: Vec<String> = fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(logs.len(), 1, "solo la copia rotada deberia quedar: {logs:?}");
     }
 
     #[test]
