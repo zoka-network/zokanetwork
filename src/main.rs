@@ -3654,6 +3654,48 @@ fn import_sidecar_private_txs_with_summary(
     summary
 }
 
+/// Cada cuánto se reintenta publicar una transacción privada sin minar.
+///
+/// 30 s es holgado frente al bloque objetivo de 120 s: da varias oportunidades
+/// antes de que a nadie le importe ya, y no satura un enlace onion.
+const PRIVATE_TX_REGOSSIP_INTERVAL_SECS: u64 = 30;
+
+/// Cuántas se reenvían por ronda. Acota el gasto cuando la cola es larga.
+const PRIVATE_TX_REGOSSIP_BATCH: usize = 8;
+
+/// Cuerpos de transacciones privadas que siguen pendientes y toca reintentar.
+///
+/// Una transacción privada se publicaba **una sola vez**, al crearla. Si ese
+/// único intento se perdía —Tor en un mal momento, un peer que todavía no se
+/// suscribió al tópico— quedaba viva en el pool local y muerta para el resto de
+/// la red: el emisor la veía "pending" para siempre, ningún minero la incluía, y
+/// al vencer la reserva el dinero volvía a su cuenta sin explicación.
+///
+/// Pasó el 2026-07-30 con 70 ZKA entre dos nodos conectados sólo por onion. La
+/// red de seguridad que existía —tirar de RPC públicos— no ayuda: en esta red
+/// `public_rpc` está vacío.
+///
+/// Se leen del pool pendiente y no del sidecar: el sidecar se borra en cuanto
+/// se importa, así que no sobrevive para un segundo intento.
+fn pending_private_tx_bodies_to_regossip(
+    storage: &RocksDbStorage,
+    limit: usize,
+) -> Vec<(String, Vec<u8>)> {
+    let Ok(hashes) = storage.iterate_pending_private_transaction_hashes() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for hash in hashes {
+        if out.len() >= limit {
+            break;
+        }
+        if let Ok(Some(bytes)) = storage.get_private_transaction_bytes(&hash) {
+            out.push((hash, bytes));
+        }
+    }
+    out
+}
+
 fn prune_confirmed_pending_private_txs(storage: &RocksDbStorage, db_path: Option<&str>) -> usize {
     let hashes = match storage.iterate_pending_private_transaction_hashes() {
         Ok(hashes) => hashes,
@@ -11216,6 +11258,10 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     // them, even when inbound P2P gossip never reaches it.
     let mut next_private_sidecar_import_at = tokio::time::Instant::now();
     let mut next_private_pull_at = tokio::time::Instant::now();
+    // Arranca corrido un intervalo: al levantar el nodo el gossip todavia no
+    // tiene peers suscritos, y reenviar en ese momento es tirar el intento.
+    let mut next_private_regossip_at = tokio::time::Instant::now()
+        + Duration::from_secs(PRIVATE_TX_REGOSSIP_INTERVAL_SECS);
     let mut next_private_body_pull_at = tokio::time::Instant::now();
     let mut last_private_body_scan_height = 0u64;
     let mut heartbeat_last_status_log = HashMap::<String, bool>::new();
@@ -11914,6 +11960,51 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 }
             }
             next_private_sidecar_import_at = tokio::time::Instant::now() + Duration::from_secs(2);
+        }
+
+        // Reintento de publicacion. Ver `pending_private_tx_bodies_to_regossip`:
+        // sin esto, un unico gossip perdido deja la transaccion viva localmente
+        // y muerta para la red, y el emisor no se entera nunca.
+        if tokio::time::Instant::now() >= next_private_regossip_at {
+            if let Some(storage) = chain_storage_outer.as_deref() {
+                let bodies =
+                    pending_private_tx_bodies_to_regossip(storage, PRIVATE_TX_REGOSSIP_BATCH);
+                let mut republished = 0usize;
+                for (hash, bytes) in bodies {
+                    let Ok(tx) = serde_json::from_slice::<PrivateTransaction>(&bytes) else {
+                        continue;
+                    };
+                    node.cache_private_tx_body(&hash, bytes.clone());
+                    let converted = serde_json::to_value(&tx).and_then(|v| {
+                        serde_json::from_value::<
+                            zoka::network::message::PrivateTransactionMessage,
+                        >(v)
+                    });
+                    let Ok(msg) = converted else { continue };
+                    let announce =
+                        zoka::network::message::PrivateTxAnnounceMessage::from_private_tx(
+                            &msg,
+                            Some(bytes.len() as u64),
+                        );
+                    let _ = node.publish_message(
+                        &zoka::network::message::ZokaMessage::PrivateTxAnnounce(announce),
+                    );
+                    if node
+                        .publish_message(&zoka::network::message::ZokaMessage::PrivateTransaction(
+                            msg,
+                        ))
+                        .is_ok()
+                    {
+                        republished = republished.saturating_add(1);
+                    }
+                }
+                if republished > 0 {
+                    last_event =
+                        format!("Re-gossiped {republished} pending private tx(s) still unmined");
+                }
+            }
+            next_private_regossip_at = tokio::time::Instant::now()
+                + Duration::from_secs(PRIVATE_TX_REGOSSIP_INTERVAL_SECS);
         }
 
         // Pull pending private txs from public RPC peers so a NAT'd miner can
@@ -17516,6 +17607,57 @@ mod tests {
             signature_hex: None,
             signer_pubkey_hex: None,
         }
+    }
+
+    #[test]
+    fn pending_private_txs_are_offered_for_regossip_and_confirmed_ones_are_not() {
+        let (_tmp, db) = temp_db_arg();
+        let storage = open_storage(&db).expect("storage");
+
+        // Dos pendientes con cuerpo, una pendiente sin cuerpo y una que no
+        // esta pendiente. Solo las dos primeras se pueden reenviar.
+        storage
+            .save_private_transaction_bytes("aaa", b"{\"tx_hash\":\"aaa\"}")
+            .expect("body aaa");
+        storage
+            .save_pending_private_transaction_hash("aaa")
+            .expect("pending aaa");
+        storage
+            .save_private_transaction_bytes("bbb", b"{\"tx_hash\":\"bbb\"}")
+            .expect("body bbb");
+        storage
+            .save_pending_private_transaction_hash("bbb")
+            .expect("pending bbb");
+        storage
+            .save_pending_private_transaction_hash("ccc")
+            .expect("pending sin cuerpo");
+        storage
+            .save_private_transaction_bytes("ddd", b"{\"tx_hash\":\"ddd\"}")
+            .expect("body ddd");
+
+        let picked = pending_private_tx_bodies_to_regossip(&storage, 16);
+        let hashes: Vec<&str> = picked.iter().map(|(h, _)| h.as_str()).collect();
+        assert!(hashes.contains(&"aaa"));
+        assert!(hashes.contains(&"bbb"));
+        assert!(
+            !hashes.contains(&"ccc"),
+            "sin cuerpo no hay nada que reenviar"
+        );
+        assert!(
+            !hashes.contains(&"ddd"),
+            "una que no esta pendiente no se reenvia"
+        );
+
+        // El lote acota el gasto por ronda: con una red lenta, reenviar todo
+        // de golpe compite con el propio trafico de bloques.
+        assert_eq!(pending_private_tx_bodies_to_regossip(&storage, 1).len(), 1);
+
+        // Y al confirmarse deja de ofrecerse.
+        storage
+            .delete_pending_private_transaction_hash("aaa")
+            .expect("confirmar aaa");
+        let after = pending_private_tx_bodies_to_regossip(&storage, 16);
+        assert!(!after.iter().any(|(h, _)| h == "aaa"));
     }
 
     #[test]
