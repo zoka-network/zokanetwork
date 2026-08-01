@@ -12,13 +12,78 @@
       "tcp"
     ]
   },
-  "seed_nodes": [],
+  "seed_nodes": [
+    {
+      "label": "seed1",
+      "operator": "zoka-core",
+      "region": "community",
+      "multiaddr": "/dns4/seed1.zoka.network/tcp/28080",
+      "onion": "/onion3/d5pk3nhesk5wlvz4f5unbhcozxgtj7u6mhagauyprjrxndzpwbaoeiid:28080",
+      "i2p": null,
+      "iroh": "ca7721e29d60af28dda8406191f6d7a98e146b95cd456392d0c2d2b996639f99",
+      "role": "seed",
+      "status": "active",
+      "note": "Same operator and same host as the mainnet seed. The onion service and iroh endpoint belong to the machine, not to the chain, so they serve testnet too — but only one network at a time, since both bind port 28080."
+    }
+  ],
   "public_rpc": [],
   "snapshot_signers": [],
   "notes": [
     "Public testnet configuration for the testnet-v0.1.0 release line.",
-    "Seed nodes are added as VPS operators come online.",
-    "Testnet uses the public ZOKA blockchain logic and RandomX PoW.",
-    "Bugs found on testnet must be fixed in shared code, not testnet-only blockchain paths."
-  ]
+    "Testnet uses the public ZOKA blockchain logic and RandomX PoW, same as mainnet.",
+    "Bugs found on testnet must be fixed in shared code, not testnet-only blockchain paths.",
+    "No recovery/checkpoint gate here on purpose: mainnet quarantines a node whose history does not match a signed checkpoint, which is exactly the safety net a testnet must not have if it is going to be reset and rebuilt freely."
+  ],
+  "minimum_client_version": "1.9.0",
+  "desktop": {
+    "local_rpc_url": "http://127.0.0.1:3000"
+  },
+  "mining": {
+    "algorithm": "randomx",
+    "open_participation": true,
+    "reward_routing": "direct-to-miner",
+    "note": "Same PoW as mainnet: canonical_algorithm_for() maps both chain ids to RandomX. What differs is the starting difficulty, which begins at the 12-bit floor, so early blocks land in seconds.",
+    "min_peers_to_mine": 1,
+    "example_command": "zoka fullnode --network testnet --network-config testnet-network.v1.json --mine-interval-secs 30 --mine-blocks 1 --min-mine-peers 1 --address <your-zka1-address> --password <your-password>"
+  },
+  "joining": {
+    "full_node": "zoka fullnode --network testnet --network-config testnet-network.v1.json --no-mine --allow-isolated-start --password <your-password>",
+    "miner": "zoka fullnode --network testnet --network-config testnet-network.v1.json --mine-interval-secs 30 --mine-blocks 1 --min-mine-peers 1 --address <your-zka1-address> --password <your-password>",
+    "note": "Testnet coins carry no value and the chain may be reset without notice. Wallets, chain data and offers live under .zoka/testnet, separate from mainnet."
+  },
+  "trusted_setup": {
+    "release": "https://github.com/ZokaNetwork/ZokaNetwork/releases/tag/trusted-setup-mainnet-v1",
+    "files": [
+      {
+        "name": "private_tx.params",
+        "url": "https://github.com/ZokaNetwork/ZokaNetwork/releases/download/trusted-setup-mainnet-v1/private_tx.params",
+        "sha256": "696d8fead7135313ce849f6712386bf2b283d11bf5565b6c1c2b1e37ce22f7a7",
+        "size_bytes": 11779072
+      },
+      {
+        "name": "balance.params",
+        "url": "https://github.com/ZokaNetwork/ZokaNetwork/releases/download/trusted-setup-mainnet-v1/balance.params",
+        "sha256": "5141f7d8cac2c856fda60a647dd59a90dff941df3ab00994913c90ed5fa1ac56",
+        "size_bytes": 3210
+      },
+      {
+        "name": "merkle.params",
+        "url": "https://github.com/ZokaNetwork/ZokaNetwork/releases/download/trusted-setup-mainnet-v1/merkle.params",
+        "sha256": "caad492d972a317ffc5efe3f8e2890340a189f5060f655771d634035784baf9f",
+        "size_bytes": 21811
+      },
+      {
+        "name": "nullifier.params",
+        "url": "https://github.com/ZokaNetwork/ZokaNetwork/releases/download/trusted-setup-mainnet-v1/nullifier.params",
+        "sha256": "11ecb6d4eef5a575b0a109999ddc411ed1225c7ef56aea9140562206dd9d7df7",
+        "size_bytes": 2752
+      },
+      {
+        "name": "DIGEST",
+        "url": "https://github.com/ZokaNetwork/ZokaNetwork/releases/download/trusted-setup-mainnet-v1/DIGEST",
+        "sha256": "120423b6e462667dd2a19bae810faffca1cf443b10245e2ba63cdfe9a85e4f53",
+        "size_bytes": 65
+      }
+    ]
+  }
 }
