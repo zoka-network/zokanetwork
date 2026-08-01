@@ -47,6 +47,41 @@ pub struct PrivateWalletMetadata {
     pub encrypted: bool,
 }
 
+/// Escribe un archivo de wallet de forma atómica y durable.
+///
+/// Antes era `File::create` + `write_all`: eso trunca el destino y después
+/// escribe encima, así que un corte de luz a mitad de camino deja el archivo de
+/// la wallet —el que contiene las claves cifradas y las notas— truncado o en
+/// ceros. Ya pasó con el estado de minería y dejó al usuario sin poder
+/// desbloquear; aquí el precio sería mucho más alto.
+///
+/// El `sync_all()` antes del rename no es decorativo: sin él el rename puede
+/// llegar al disco antes que el contenido, que es justo el caso que rompe.
+fn write_wallet_file_atomically(path: &Path, bytes: &[u8]) -> Result<(), BlockError> {
+    let temp = path.with_extension("json.tmp");
+    {
+        let mut file = fs::File::create(&temp).map_err(|e| {
+            BlockError::TransactionValidationFailed(format!(
+                "Failed to create temporary wallet file: {e}"
+            ))
+        })?;
+        file.write_all(bytes).map_err(|e| {
+            BlockError::TransactionValidationFailed(format!(
+                "Failed to write temporary wallet file: {e}"
+            ))
+        })?;
+        file.sync_all().map_err(|e| {
+            BlockError::TransactionValidationFailed(format!(
+                "Failed to flush temporary wallet file: {e}"
+            ))
+        })?;
+    }
+    fs::rename(&temp, path).map_err(|e| {
+        let _ = fs::remove_file(&temp);
+        BlockError::TransactionValidationFailed(format!("Failed to replace wallet file: {e}"))
+    })
+}
+
 impl WalletStorage {
     /// Create new wallet storage with default paths
     pub fn new() -> Result<Self, BlockError> {
@@ -250,21 +285,7 @@ impl WalletStorage {
         let filename = format!("{}.private.json", wallet.name);
         let filepath = self.private_wallets_path.join(&filename);
 
-        let mut file = fs::File::create(&filepath).map_err(|e| {
-            BlockError::TransactionValidationFailed(format!(
-                "Failed to create private wallet file: {}",
-                e
-            ))
-        })?;
-
-        file.write_all(json.as_bytes()).map_err(|e| {
-            BlockError::TransactionValidationFailed(format!(
-                "Failed to write private wallet file: {}",
-                e
-            ))
-        })?;
-
-        Ok(())
+        write_wallet_file_atomically(&filepath, json.as_bytes())
     }
 
     /// Load private wallet from disk
@@ -714,6 +735,51 @@ mod tests {
     fn test_wallet_storage_creation() {
         let storage = WalletStorage::new();
         assert!(storage.is_ok());
+    }
+
+    #[test]
+    fn saving_a_private_wallet_never_leaves_it_half_written() {
+        let mut suffix = [0u8; 4];
+        rand::rngs::OsRng.fill_bytes(&mut suffix);
+        let base = std::env::temp_dir()
+            .join("zoka-wallet-atomic")
+            .join(hex::encode(suffix));
+        let storage = WalletStorage::from_base_dir(&base).expect("storage");
+
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("atomica").expect("crear");
+        let wallet = manager.get_private_wallet("atomica").expect("wallet").clone();
+
+        storage
+            .save_private_wallet(&wallet, Some("pw"))
+            .expect("primer guardado");
+        let path = storage.private_wallets_dir().join("atomica.private.json");
+        let first_len = fs::metadata(&path).expect("existe").len();
+        assert!(first_len > 0);
+
+        // Sobrescribir es el caso real: en Windows el rename tiene que
+        // reemplazar un destino que ya existe, no fallar.
+        let mut grown = wallet.clone();
+        grown.restore_height = 4242;
+        storage
+            .save_private_wallet(&grown, Some("pw"))
+            .expect("sobrescritura");
+        let reloaded = storage
+            .load_private_wallet("atomica", Some("pw"))
+            .expect("recarga");
+        assert_eq!(reloaded.restore_height, 4242);
+
+        // Y sin temporales huerfanos: uno abandonado con el nombre equivocado
+        // podria confundirse con una wallet real en el listado.
+        let leftovers: Vec<String> = fs::read_dir(storage.private_wallets_dir())
+            .expect("listar")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "quedaron temporales: {leftovers:?}");
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

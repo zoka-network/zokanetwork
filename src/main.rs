@@ -6318,12 +6318,24 @@ fn run_mining_batch_with_progress(
                 // was running) are not silently overwritten.  Then replay the
                 // confirmed-status updates, incoming-output credits, and fee
                 // claims before flushing back to disk.
+                // La recarga que falla NO puede degradar a la copia en memoria.
+                // Antes era `.unwrap_or(private_manager)`: si el disco fallaba
+                // un instante, el nodo seguia con su vista vieja y la persistia
+                // encima, borrando las reservas que otro proceso —el `tx-send`
+                // de un envio— acababa de escribir. Esa nota volvia a figurar
+                // como disponible y la transaccion quedaba sin poder minarse.
+                // Perder un guardado es mucho mas barato que perder una reserva.
                 let mut fresh_manager = load_private_wallet_manager_for_network(
                     &storage,
                     config.password.as_deref(),
                     network,
                 )
-                .unwrap_or(private_manager);
+                .map_err(|error| {
+                    format!(
+                        "refusing to persist wallets from a stale in-memory copy: \
+                         reloading them from disk failed ({error})"
+                    )
+                })?;
                 fresh_manager
                     .mark_private_transactions_confirmed_locally(&private_tx_hashes_for_block);
                 for hash in &private_tx_hashes_for_block {
