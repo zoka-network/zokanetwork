@@ -379,6 +379,7 @@ mod tests {
             claim_expires_at: None,
             claimed_by: None,
             reserved_note_ids: vec![format!("note-{id}")],
+            reserved_atoms: 0,
         }
     }
 

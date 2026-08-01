@@ -136,6 +136,16 @@ pub struct Offer {
     /// restart can tell which reservations still have an offer behind them.
     #[serde(default)]
     pub reserved_note_ids: Vec<String>,
+    /// Cuánto suman esas notas. Es **mayor o igual** a `zka_atoms`, casi siempre
+    /// mayor: una nota privada es indivisible, así que respaldar una venta de 20
+    /// ZKA puede exigir inmovilizar una nota de 27,99 entera.
+    ///
+    /// Se guarda porque sin este número la interfaz no puede explicar por qué el
+    /// saldo disponible bajó más que lo vendido. El excedente vuelve como vuelto
+    /// al cerrarse la operación, pero mientras tanto no se puede gastar, y el
+    /// usuario merece verlo en vez de deducirlo.
+    #[serde(default)]
+    pub reserved_atoms: u64,
 }
 
 /// Public evidence that a seller did not release after an on-chain payment.
@@ -345,6 +355,7 @@ mod tests {
             claim_expires_at: None,
             claimed_by: None,
             reserved_note_ids: vec!["note-a".to_string()],
+            reserved_atoms: 0,
         }
     }
 

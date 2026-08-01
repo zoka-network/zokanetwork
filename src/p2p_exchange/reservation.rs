@@ -189,6 +189,27 @@ mod tests {
     }
 
     #[test]
+    fn backing_an_offer_locks_more_than_it_sells_when_no_note_fits_exactly() {
+        // Una nota privada es indivisible: para respaldar 20 hay que inmovilizar
+        // la de 28 entera. El excedente vuelve como vuelto al cerrarse, pero
+        // hasta entonces no se puede gastar.
+        //
+        // Esto no es un defecto que haya que corregir aqui: es la consecuencia
+        // de no partir notas. Se fija en un test porque la interfaz tiene que
+        // mostrar los dos numeros -- lo vendido y lo bloqueado -- y sin eso el
+        // usuario ve bajar su saldo mas de lo que vendio y cree que perdio algo.
+        let notes = vec![note("grande", 28), note("chica", 5)];
+        let picked = select_notes(&notes, 20, 0).unwrap();
+
+        assert_eq!(picked.note_ids, vec!["grande".to_string()]);
+        assert_eq!(picked.total_atoms, 28);
+        assert!(
+            picked.total_atoms > 20,
+            "se inmoviliza de mas, y la interfaz debe decirlo"
+        );
+    }
+
+    #[test]
     fn an_exact_match_uses_one_note() {
         let notes = vec![note("a", 100), note("b", 100)];
         let picked = select_notes(&notes, 100, 0).unwrap();

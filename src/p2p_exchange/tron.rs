@@ -490,6 +490,7 @@ mod tests {
             claim_expires_at: Some(CLAIMED_AT + 2_700),
             claimed_by: Some("zka1buyer".to_string()),
             reserved_note_ids: vec!["note-a".to_string()],
+            reserved_atoms: 0,
         }
     }
 

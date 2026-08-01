@@ -5282,6 +5282,10 @@ async fn create_exchange_offer(
         claim_expires_at: None,
         claimed_by: None,
         reserved_note_ids: reservation.note_ids,
+        // Lo que realmente queda inmovilizado, que es >= lo vendido porque las
+        // notas no se parten. Sin este dato la interfaz no puede explicar la
+        // diferencia y el usuario ve bajar el saldo mas de lo que vendio.
+        reserved_atoms: reservation.total_atoms,
     };
 
     let mut guard = exchange.offer_store.lock().await;
@@ -6913,6 +6917,7 @@ mod tests {
             claim_expires_at: None,
             claimed_by: None,
             reserved_note_ids: vec!["remote-note".to_string()],
+            reserved_atoms: 0,
         }
     }
 
