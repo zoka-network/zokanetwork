@@ -1,6 +1,6 @@
 ﻿[package]
 name = "zoka"
-version = "1.9.9"
+version = "1.10.0"
 edition = "2021"
 autobins = false
 
