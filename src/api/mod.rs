@@ -273,6 +273,15 @@ impl ExchangeRuntime {
         for offer in candidates {
             let release_state = {
                 let mut wallets = self.wallet_manager.write().await;
+                // El lock cubre recargar + modificar + guardar como una sola
+                // operacion. Sin el, entre la recarga y el guardado se cuela
+                // otro proceso y la reserva de la oferta desaparece.
+                let _wallet_lock = self
+                    .wallet_storage
+                    .as_ref()
+                    .map(|s| s.lock_private_wallets())
+                    .transpose()
+                    .map_err(|e| format!("failed to lock wallet directory: {e}"))?;
                 self.refresh_wallet(&mut wallets, &self.default_wallet_name)?;
                 wallets
                     .exchange_release_state(
@@ -395,7 +404,16 @@ impl ExchangeRuntime {
                             .set_status(&offer.id, crate::p2p_exchange::OfferStatus::Expired)
                             .map_err(|error| format!("failed to expire unpaid offer: {error:?}"))?;
                         let mut wallets = self.wallet_manager.write().await;
-                        self.refresh_wallet(&mut wallets, &self.default_wallet_name)?;
+                        // El lock cubre recargar + modificar + guardar como una sola
+                // operacion. Sin el, entre la recarga y el guardado se cuela
+                // otro proceso y la reserva de la oferta desaparece.
+                let _wallet_lock = self
+                    .wallet_storage
+                    .as_ref()
+                    .map(|s| s.lock_private_wallets())
+                    .transpose()
+                    .map_err(|e| format!("failed to lock wallet directory: {e}"))?;
+                self.refresh_wallet(&mut wallets, &self.default_wallet_name)?;
                         wallets.release_wallet_reservation(&self.default_wallet_name, &offer.id);
                         self.persist_wallet(&wallets, &self.default_wallet_name)?;
                         drop(wallets);
@@ -430,6 +448,15 @@ impl ExchangeRuntime {
                 .map_err(|error| error.to_string())?;
             let tx = {
                 let mut wallets = self.wallet_manager.write().await;
+                // El lock cubre recargar + modificar + guardar como una sola
+                // operacion. Sin el, entre la recarga y el guardado se cuela
+                // otro proceso y la reserva de la oferta desaparece.
+                let _wallet_lock = self
+                    .wallet_storage
+                    .as_ref()
+                    .map(|s| s.lock_private_wallets())
+                    .transpose()
+                    .map_err(|e| format!("failed to lock wallet directory: {e}"))?;
                 self.refresh_wallet(&mut wallets, &self.default_wallet_name)?;
                 let tx = wallets
                     .send_reserved_exchange_transaction(
@@ -481,6 +508,17 @@ impl ExchangeRuntime {
         Ok(events)
     }
 
+    /// Guarda la wallet del exchange.
+    ///
+    /// Toma el lock del directorio igual que `persist_private_wallet`. Este
+    /// camino se le habia escapado al arreglo anterior: llamaba a
+    /// `save_private_wallet` directo, asi que el nodo minando podia persistir su
+    /// copia encima y borrar la reserva de notas que respalda una oferta viva.
+    /// Cuando eso pasa, la liberacion falla con "offer release notes have
+    /// inconsistent spent/reserved state" y el trato queda trabado con el
+    /// comprador ya habiendo pagado. Paso el 2026-08-01 con una oferta real.
+    ///
+    /// El lock es reentrante, asi que anida sin trabarse con quien ya lo tenga.
     fn persist_wallet(
         &self,
         manager: &PrivateWalletManager,
@@ -489,6 +527,9 @@ impl ExchangeRuntime {
         let Some(storage) = &self.wallet_storage else {
             return Ok(());
         };
+        let _lock = storage
+            .lock_private_wallets()
+            .map_err(|error| format!("failed to lock wallet directory: {error}"))?;
         let wallet = manager
             .get_private_wallet(wallet_name)
             .ok_or_else(|| format!("wallet {wallet_name} disappeared before persistence"))?;
@@ -5227,6 +5268,14 @@ async fn create_exchange_offer(
     let offer_id = crate::p2p_exchange::new_offer_id();
     let mut wallets = exchange.wallet_manager.write().await;
     let wallet_name = exchange.default_wallet_name.clone();
+    // Mismo motivo: la reserva que se crea abajo se pierde si el nodo
+    // persiste su copia entre esta recarga y el guardado.
+    let _wallet_lock = exchange
+        .wallet_storage
+        .as_ref()
+        .map(|s| s.lock_private_wallets())
+        .transpose()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to lock wallet directory: {e}")))?;
     exchange
         .refresh_wallet(&mut wallets, &wallet_name)
         .map_err(|error| {
