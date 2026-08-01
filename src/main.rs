@@ -4180,12 +4180,25 @@ fn should_replace_duplicate_private_wallet(
     candidate_score > existing_score
 }
 
+/// Punto único por el que pasa toda escritura de wallet.
+///
+/// El lock se toma **aquí** y no sólo en las secuencias largas porque aparecían
+/// caminos que escribían sin pasar por ellas — el cierre del ciclo de minería,
+/// por ejemplo, persiste con su copia en memoria de larga vida. Cada uno de
+/// esos podía borrar la reserva de notas de un envío hecho desde otro proceso.
+/// Poniendolo en el cuello de botella, un camino nuevo queda cubierto sin que
+/// nadie tenga que acordarse.
+///
+/// Es reentrante, así que anida sin trabarse con quien ya lo tomó arriba.
 fn persist_private_wallet(
     storage: &WalletStorage,
     manager: &PrivateWalletManager,
     wallet_name: &str,
     password: Option<&str>,
 ) -> Result<(), String> {
+    let _lock = storage
+        .lock_private_wallets()
+        .map_err(|e| format!("failed to lock wallet directory: {e}"))?;
     let wallet = manager
         .get_private_wallet(wallet_name)
         .ok_or_else(|| format!("private wallet not found: {wallet_name}"))?;

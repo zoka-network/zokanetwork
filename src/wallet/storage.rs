@@ -64,15 +64,55 @@ pub struct PrivateWalletMetadata {
 /// El lock lo administra el sistema operativo, así que si un proceso muere se
 /// libera solo. Un lockfile casero se quedaría trabado hasta que alguien lo
 /// borre a mano.
+/// Estado del lock, compartido por todo el proceso.
+///
+/// Es **reentrante a propósito**. El lock se toma en dos alturas: al principio
+/// de una secuencia larga (un envío, el ciclo de minería) y otra vez dentro de
+/// cada escritura concreta. Sin reentrancia lo segundo se trabaría contra lo
+/// primero, porque `LockFileEx` es por descriptor y no perdona que el mismo
+/// proceso vuelva a pedirlo.
+///
+/// Tomarlo tambien dentro de la escritura no es redundante: es lo que hace que
+/// no haya que acordarse de tomarlo arriba en cada camino nuevo. Aparecieron
+/// varios que escribían sin pasar por la secuencia larga.
+struct WalletLockState {
+    /// Hilo que lo tiene. La reentrancia es **por hilo**, no por proceso: si
+    /// fuera por proceso, dos hilos del nodo escribirían a la vez creyendo cada
+    /// uno que lo tiene, que es justo la exclusión que se busca.
+    owner: Option<std::thread::ThreadId>,
+    depth: usize,
+    file: Option<fs::File>,
+}
+
+static WALLET_LOCK: std::sync::OnceLock<std::sync::Mutex<WalletLockState>> =
+    std::sync::OnceLock::new();
+
+fn wallet_lock_state() -> &'static std::sync::Mutex<WalletLockState> {
+    WALLET_LOCK.get_or_init(|| {
+        std::sync::Mutex::new(WalletLockState {
+            owner: None,
+            depth: 0,
+            file: None,
+        })
+    })
+}
+
 pub struct WalletDirLock {
-    _file: fs::File,
+    _private: (),
 }
 
 impl Drop for WalletDirLock {
     fn drop(&mut self) {
-        // fs4 libera al cerrar el descriptor; explícito para que se lea la
-        // intención y no parezca que el campo está sin usar.
-        let _ = fs4::FileExt::unlock(&self._file);
+        let Ok(mut state) = wallet_lock_state().lock() else {
+            return;
+        };
+        state.depth = state.depth.saturating_sub(1);
+        if state.depth == 0 {
+            state.owner = None;
+            if let Some(file) = state.file.take() {
+                let _ = fs4::FileExt::unlock(&file);
+            }
+        }
     }
 }
 
@@ -177,22 +217,52 @@ impl WalletStorage {
                 "Failed to create private wallet dir: {e}"
             ))
         })?;
-        let path = self.private_wallets_path.join(".wallets.lock");
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|e| {
-                BlockError::TransactionValidationFailed(format!(
-                    "Failed to open wallet lock file: {e}"
-                ))
-            })?;
-        fs4::FileExt::lock_exclusive(&file).map_err(|e| {
-            BlockError::TransactionValidationFailed(format!("Failed to lock wallet dir: {e}"))
-        })?;
-        Ok(WalletDirLock { _file: file })
+        let me = std::thread::current().id();
+        loop {
+            {
+                let mut state = wallet_lock_state().lock().map_err(|_| {
+                    BlockError::TransactionValidationFailed(
+                        "wallet lock state poisoned".to_string(),
+                    )
+                })?;
+                match state.owner {
+                    // Ya es mío: reentrada, sólo cuento un nivel más.
+                    Some(owner) if owner == me => {
+                        state.depth += 1;
+                        return Ok(WalletDirLock { _private: () });
+                    }
+                    // Libre: tomo también el lock del sistema operativo, que es
+                    // el que excluye a los otros procesos.
+                    None => {
+                        let path = self.private_wallets_path.join(".wallets.lock");
+                        let file = fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create(true)
+                            .truncate(false)
+                            .open(&path)
+                            .map_err(|e| {
+                                BlockError::TransactionValidationFailed(format!(
+                                    "Failed to open wallet lock file: {e}"
+                                ))
+                            })?;
+                        fs4::FileExt::lock_exclusive(&file).map_err(|e| {
+                            BlockError::TransactionValidationFailed(format!(
+                                "Failed to lock wallet dir: {e}"
+                            ))
+                        })?;
+                        state.file = Some(file);
+                        state.owner = Some(me);
+                        state.depth = 1;
+                        return Ok(WalletDirLock { _private: () });
+                    }
+                    // Lo tiene otro hilo: soltar el mutex y reintentar. Las
+                    // secciones que protege duran milisegundos.
+                    Some(_) => {}
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     /// Save public wallet to disk
@@ -812,6 +882,12 @@ mod tests {
         let storage = WalletStorage::from_base_dir(&base).expect("storage");
 
         let held = storage.lock_private_wallets().expect("primer lock");
+
+        // Reentrante: volver a pedirlo en el mismo proceso no se traba. De eso
+        // depende que `persist_private_wallet` pueda tomarlo por su cuenta
+        // aunque quien lo llame ya lo tenga.
+        let nested = storage.lock_private_wallets().expect("lock anidado");
+        drop(nested);
 
         // Un segundo "proceso" (hilo, aqui) pidiendo el mismo lock tiene que
         // esperar. Si no esperara, los dos harian leer-modificar-escribir a la
