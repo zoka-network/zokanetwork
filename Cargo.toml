@@ -91,6 +91,12 @@ clap = { version = "4.4", features = ["derive"] }
 toml = "0.8"
 bip39 = "2"
 bs58 = "0.5"
+# Bloqueo advisory de archivos entre procesos. ZSilent lanza `zoka tx-send`
+# como proceso aparte mientras el nodo corre: los dos escriben los mismos
+# archivos de wallet, y sin lock el nodo pisa las reservas del envio. Se
+# prefiere fs4 sobre una implementacion propia porque el sistema operativo
+# libera el lock si un proceso muere; un lockfile casero se queda trabado.
+fs4 = "0.8"
 
 [dev-dependencies]
 proptest = "1.0"

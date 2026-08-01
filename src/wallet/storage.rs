@@ -47,6 +47,35 @@ pub struct PrivateWalletMetadata {
     pub encrypted: bool,
 }
 
+/// Exclusión mutua entre procesos sobre el directorio de wallets.
+///
+/// Existe porque **hay más de un proceso escribiendo las mismas wallets**:
+/// ZSilent no envía por RPC, lanza `zoka tx-send` aparte, y quien usa la línea
+/// de comando hace lo mismo a mano mientras su nodo mina. Los dos hacen
+/// leer → modificar → escribir sobre el mismo archivo. Sin coordinación, el
+/// último en escribir gana y borra lo del otro: en la práctica, el nodo
+/// persistía su vista y hacía desaparecer la reserva de notas de un envío
+/// recién creado, dejando la transacción sin poder minarse.
+///
+/// Se sostiene durante **todo** el ciclo, no sólo durante la escritura.
+/// Tomarlo únicamente al guardar no alcanza: para entonces el estado en memoria
+/// ya puede ser viejo.
+///
+/// El lock lo administra el sistema operativo, así que si un proceso muere se
+/// libera solo. Un lockfile casero se quedaría trabado hasta que alguien lo
+/// borre a mano.
+pub struct WalletDirLock {
+    _file: fs::File,
+}
+
+impl Drop for WalletDirLock {
+    fn drop(&mut self) {
+        // fs4 libera al cerrar el descriptor; explícito para que se lea la
+        // intención y no parezca que el campo está sin usar.
+        let _ = fs4::FileExt::unlock(&self._file);
+    }
+}
+
 /// Escribe un archivo de wallet de forma atómica y durable.
 ///
 /// Antes era `File::create` + `write_all`: eso trunca el destino y después
@@ -130,6 +159,40 @@ impl WalletStorage {
     /// Directory where encrypted private wallet files are stored.
     pub fn private_wallets_dir(&self) -> &Path {
         &self.private_wallets_path
+    }
+
+    /// Toma el lock del directorio de wallets y lo sostiene hasta que se suelte
+    /// el valor devuelto.
+    ///
+    /// Se llama **antes de leer**, no antes de escribir. Ver [`WalletDirLock`]:
+    /// el problema no es que dos escrituras se pisen, es que una de ellas parta
+    /// de un estado que ya quedó viejo.
+    ///
+    /// Bloquea hasta conseguirlo. No hay timeout a propósito: el ciclo que
+    /// protege dura milisegundos, y rendirse antes significaría escribir sin
+    /// coordinación, que es exactamente lo que se quiere evitar.
+    pub fn lock_private_wallets(&self) -> Result<WalletDirLock, BlockError> {
+        fs::create_dir_all(&self.private_wallets_path).map_err(|e| {
+            BlockError::TransactionValidationFailed(format!(
+                "Failed to create private wallet dir: {e}"
+            ))
+        })?;
+        let path = self.private_wallets_path.join(".wallets.lock");
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| {
+                BlockError::TransactionValidationFailed(format!(
+                    "Failed to open wallet lock file: {e}"
+                ))
+            })?;
+        fs4::FileExt::lock_exclusive(&file).map_err(|e| {
+            BlockError::TransactionValidationFailed(format!("Failed to lock wallet dir: {e}"))
+        })?;
+        Ok(WalletDirLock { _file: file })
     }
 
     /// Save public wallet to disk
@@ -735,6 +798,45 @@ mod tests {
     fn test_wallet_storage_creation() {
         let storage = WalletStorage::new();
         assert!(storage.is_ok());
+    }
+
+    #[test]
+    fn the_wallet_lock_serializes_two_writers() {
+        use std::sync::mpsc;
+
+        let mut suffix = [0u8; 4];
+        rand::rngs::OsRng.fill_bytes(&mut suffix);
+        let base = std::env::temp_dir()
+            .join("zoka-wallet-lock")
+            .join(hex::encode(suffix));
+        let storage = WalletStorage::from_base_dir(&base).expect("storage");
+
+        let held = storage.lock_private_wallets().expect("primer lock");
+
+        // Un segundo "proceso" (hilo, aqui) pidiendo el mismo lock tiene que
+        // esperar. Si no esperara, los dos harian leer-modificar-escribir a la
+        // vez y el ultimo en guardar borraria lo del otro: exactamente el bug
+        // que hacia desaparecer la reserva de un envio.
+        let (tx, rx) = mpsc::channel();
+        let dir = base.clone();
+        let other = std::thread::spawn(move || {
+            let storage = WalletStorage::from_base_dir(&dir).expect("storage 2");
+            let guard = storage.lock_private_wallets().expect("segundo lock");
+            tx.send(()).expect("avisar");
+            drop(guard);
+        });
+
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(400)).is_err(),
+            "el segundo escritor entro mientras el lock estaba tomado"
+        );
+
+        drop(held);
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("el segundo escritor deberia entrar al soltarse el lock");
+        other.join().expect("hilo");
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

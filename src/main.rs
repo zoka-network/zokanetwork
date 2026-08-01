@@ -6318,6 +6318,12 @@ fn run_mining_batch_with_progress(
                 // was running) are not silently overwritten.  Then replay the
                 // confirmed-status updates, incoming-output credits, and fee
                 // claims before flushing back to disk.
+                // El lock cubre recarga + escritura como una sola operacion. Sin
+                // el, un `tx-send` podia colarse entre ambas y su reserva moria
+                // igual, aunque la recarga hubiera salido bien.
+                let _wallet_lock = storage
+                    .lock_private_wallets()
+                    .map_err(|e| format!("failed to lock wallet directory: {e}"))?;
                 // La recarga que falla NO puede degradar a la copia en memoria.
                 // Antes era `.unwrap_or(private_manager)`: si el disco fallaba
                 // un instante, el nodo seguia con su vista vieja y la persistia
@@ -13919,6 +13925,14 @@ fn cmd_private_send(args: &[String]) -> Result<(), String> {
     }
 
     let storage = wallet_storage_for_network(network)?;
+    // Se toma ANTES de leer la wallet y se sostiene hasta que termina el envio.
+    // Este proceso corre en paralelo con el nodo -- ZSilent lo lanza aparte, y
+    // quien usa la linea de comando lo corre a mano mientras su nodo mina. Sin
+    // el lock, el nodo persiste su vista entre que aca se lee y se guarda, y
+    // borra la reserva de notas que este envio acaba de crear.
+    let _wallet_lock = storage
+        .lock_private_wallets()
+        .map_err(|e| format!("failed to lock wallet directory: {e}"))?;
     let mut manager =
         load_private_wallet_manager_for_network(&storage, password.as_deref(), network)?;
     let (from_wallet, from_commitment) =
