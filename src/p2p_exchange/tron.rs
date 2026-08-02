@@ -333,10 +333,30 @@ impl TronConfig {
                 _ => None,
             })
             .unwrap_or_default();
-        let base_url = std::env::var("ZOKA_TRON_API_URL")
+        // Una URL heredada de OTRA red se descarta en favor de la de esta.
+        //
+        // El par endpoint+contrato tiene que viajar junto, y este es el unico
+        // resquicio por donde se podia romper: la red se elige por un lado y la
+        // URL por otro. Si quedaba una URL de mainnet guardada y despues se
+        // elegia Nile, el nodo pedia el contrato de Nile al servidor de mainnet
+        // y TronGrid contestaba 403 -- todos los proveedores fallaban y ningun
+        // pago se veia nunca. Paso el 2026-08-02 y costo una venta entera.
+        //
+        // Solo se descartan las URLs que son el default *de otra red conocida*:
+        // un endpoint propio que el usuario haya puesto a mano se respeta,
+        // porque ahi si sabe lo que esta haciendo.
+        let configured_url = std::env::var("ZOKA_TRON_API_URL")
             .ok()
             .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
+            .filter(|value| !value.is_empty());
+        let belongs_to_another_network = |url: &str| {
+            let url = url.trim_end_matches('/');
+            [TronNetwork::Mainnet, TronNetwork::Nile]
+                .into_iter()
+                .any(|other| other != network && other.default_url().trim_end_matches('/') == url)
+        };
+        let base_url = configured_url
+            .filter(|url| !belongs_to_another_network(url))
             .unwrap_or_else(|| network.default_url().to_string());
         let fallback_urls = std::env::var("ZOKA_TRON_FALLBACK_URLS")
             .ok()
@@ -515,6 +535,45 @@ mod tests {
         let decoded: Offer = serde_json::from_value(value).unwrap();
         assert_eq!(decoded.tron_network, None);
     }
+
+    /// El fallo del 2026-08-02, que costo una venta entera: quedaba guardada
+    /// la URL de mainnet, se elegia Nile, y el nodo pedia el contrato de Nile
+    /// al servidor de mainnet. TronGrid contestaba 403, todos los proveedores
+    /// fallaban, y ningun pago se veia jamas -- la oferta expiraba como si el
+    /// comprador no hubiera pagado.
+    #[test]
+    fn a_url_left_over_from_another_network_is_discarded() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ZOKA_TRON_NETWORK", "nile");
+        std::env::set_var("ZOKA_TRON_API_URL", DEFAULT_TRONGRID_URL);
+
+        let config = TronConfig::from_env(None);
+
+        assert_eq!(config.network, TronNetwork::Nile);
+        assert_eq!(
+            config.base_url, NILE_TRONGRID_URL,
+            "una URL de mainnet no puede sobrevivir a elegir Nile"
+        );
+        std::env::remove_var("ZOKA_TRON_NETWORK");
+        std::env::remove_var("ZOKA_TRON_API_URL");
+    }
+
+    /// Un endpoint propio se respeta: quien lo puso a mano sabe lo que hace, y
+    /// pisarlo dejaria sin salida a quien corre su propio nodo de Tron.
+    #[test]
+    fn a_custom_endpoint_is_left_alone() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ZOKA_TRON_NETWORK", "nile");
+        std::env::set_var("ZOKA_TRON_API_URL", "https://tron.example.internal");
+
+        let config = TronConfig::from_env(None);
+
+        assert_eq!(config.base_url, "https://tron.example.internal");
+        std::env::remove_var("ZOKA_TRON_NETWORK");
+        std::env::remove_var("ZOKA_TRON_API_URL");
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn claimed_offer() -> Offer {
         Offer {

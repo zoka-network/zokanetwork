@@ -5354,6 +5354,7 @@ async fn exchange_check_now(
 /// `reservation_ok` en falso significa que el pago no debería enviarse todavía.
 async fn exchange_diagnostics(
     State(app_state): State<Arc<AppState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let exchange = exchange_runtime_or_404(&app_state)?;
     let now = now_secs();
@@ -5363,7 +5364,17 @@ async fn exchange_diagnostics(
     let tron_network = exchange.tron_client.lock().await.as_ref().map(|c| c.network());
 
     let mut rows = Vec::new();
-    for offer in offers.iter().filter(|o| o.status.holds_reservation()) {
+    // SOLO las ofertas propias.
+    //
+    // La reserva vive en la cartera del vendedor: para una oferta ajena las
+    // notas nunca van a estar en esta cartera, asi que evaluarlas daba
+    // "RESERVATION BROKEN" siempre, y la pantalla del comprador mostraba un
+    // cartel rojo y un boton de cancelar por una venta que no es suya.
+    // Un diagnostico que no puede dar un resultado bueno no es un diagnostico.
+    for offer in offers
+        .iter()
+        .filter(|o| o.seller_address == exchange.seller_address && o.status.holds_reservation())
+    {
         // El veredicto sale de la misma funcion que decide si la oferta se
         // anuncia, para que lo que se muestra y lo que se hace no discrepen.
         let mut problems = ExchangeRuntime::reservation_problems_in(wallet, &offer);
@@ -5409,12 +5420,84 @@ async fn exchange_diagnostics(
         .filter(|r| r["reservation_ok"] == serde_json::json!(false))
         .count();
 
+    // Consulta real a Tron, con el motivo de rechazo de CADA transferencia.
+    //
+    // El ciclo de verificación descarta lo que no coincide en silencio
+    // (`Ok(None) => continue`), lo cual es correcto para operar pero deja sin
+    // respuesta la única pregunta que importa cuando una venta no cierra: el
+    // pago está en la cadena, ¿por qué el nodo no lo toma? Sin esto solo se
+    // puede adivinar comparando el código contra la API a mano.
+    //
+    // Va detrás de `?tron=1` porque consulta la red por Tor y este endpoint se
+    // llama seguido: no puede pagar ese costo en cada refresco de la pantalla.
+    let mut tron_report = serde_json::Value::Null;
+    if params.get("tron").map(String::as_str) == Some("1") {
+        let client = exchange.tron_client.lock().await.clone();
+        let mut checks = Vec::new();
+        for offer in offers.iter().filter(|o| {
+            o.seller_address == exchange.seller_address && o.status.holds_reservation()
+        }) {
+            let Some(client) = client.as_ref() else {
+                checks.push(serde_json::json!({
+                    "offer_id": offer.id,
+                    "error": "no Tron client: the SOCKS proxy is unavailable",
+                }));
+                continue;
+            };
+            let claimed_at = offer
+                .claim_expires_at
+                .unwrap_or(now)
+                .saturating_sub(crate::p2p_exchange::CLAIM_WINDOW_SECONDS);
+            match client.fetch_transfers(&offer.usdt_receive_address, 200).await {
+                Err(error) => checks.push(serde_json::json!({
+                    "offer_id": offer.id,
+                    "error": error.to_string(),
+                })),
+                Ok(transfers) => {
+                    let seen = transfers
+                        .iter()
+                        .map(|t| {
+                            let verdict = crate::p2p_exchange::tron::transfer_settles_offer(
+                                offer,
+                                t,
+                                claimed_at,
+                                client.network(),
+                            );
+                            serde_json::json!({
+                                "from": t.from,
+                                "value": t.value,
+                                "block_timestamp": t.block_timestamp,
+                                "contract": t.contract_address,
+                                "settles": verdict.is_ok(),
+                                "rejected_because": verdict.err().map(|e| format!("{e:?}")),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    checks.push(serde_json::json!({
+                        "offer_id": offer.id,
+                        // Lo que el nodo cree que esta buscando, para poder
+                        // compararlo contra lo que uno consulta a mano.
+                        "node_network": format!("{:?}", client.network()),
+                        "expects_contract": client.network().usdt_contract(),
+                        "expects_to": offer.usdt_receive_address,
+                        "expects_micro_usdt": offer.micro_usdt,
+                        "not_before": claimed_at,
+                        "transfers_seen": transfers.len(),
+                        "transfers": seen,
+                    }));
+                }
+            }
+        }
+        tron_report = serde_json::json!(checks);
+    }
+
     Ok(Json(serde_json::json!({
         "checked_at": now,
         "live_offers": rows.len(),
         "unhealthy_offers": unhealthy,
         "verification": exchange.verification_status().await,
         "offers": rows,
+        "tron": tron_report,
     })))
 }
 
