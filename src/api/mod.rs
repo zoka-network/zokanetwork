@@ -404,16 +404,16 @@ impl ExchangeRuntime {
                             .set_status(&offer.id, crate::p2p_exchange::OfferStatus::Expired)
                             .map_err(|error| format!("failed to expire unpaid offer: {error:?}"))?;
                         let mut wallets = self.wallet_manager.write().await;
-                        // El lock cubre recargar + modificar + guardar como una sola
-                // operacion. Sin el, entre la recarga y el guardado se cuela
-                // otro proceso y la reserva de la oferta desaparece.
-                let _wallet_lock = self
-                    .wallet_storage
-                    .as_ref()
-                    .map(|s| s.lock_private_wallets())
-                    .transpose()
-                    .map_err(|e| format!("failed to lock wallet directory: {e}"))?;
-                self.refresh_wallet(&mut wallets, &self.default_wallet_name)?;
+                        // El lock cubre recargar + modificar + guardar como una
+                        // sola operacion. Sin el, entre la recarga y el guardado
+                        // se cuela otro proceso y la reserva desaparece.
+                        let _wallet_lock = self
+                            .wallet_storage
+                            .as_ref()
+                            .map(|s| s.lock_private_wallets())
+                            .transpose()
+                            .map_err(|e| format!("failed to lock wallet directory: {e}"))?;
+                        self.refresh_wallet(&mut wallets, &self.default_wallet_name)?;
                         wallets.release_wallet_reservation(&self.default_wallet_name, &offer.id);
                         self.persist_wallet(&wallets, &self.default_wallet_name)?;
                         drop(wallets);
