@@ -2855,6 +2855,24 @@ fn mining_log(message: &str) {
     }
 }
 
+/// Bitácora del exchange, en su propio archivo.
+///
+/// Separada de la de minería porque se lee en otro momento y por otra razón:
+/// cuando una venta salió mal hay que poder reconstruir qué vio el nodo sin
+/// tener que filtrar miles de líneas de hashes. Rota con el mismo techo.
+fn log_exchange_event(message: &str) {
+    eprintln!("{}", paint(&format!("exchange: {message}"), ANSI_DIM));
+    let path = PathBuf::from(NetworkProfile::Mainnet.local_dir()).join("exchange_diagnostic.log");
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    rotate_mining_log_if_oversized(&path);
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write as _;
+        let _ = writeln!(f, "{} exchange: {}", now_secs(), message);
+    }
+}
+
 /// Rota el diagnóstico a una única copia `.1` cuando pasa el techo.
 ///
 /// Una sola copia a propósito: esto sirve para mirar qué pasó recién, no para
@@ -7865,6 +7883,26 @@ async fn announce_local_exchange_offers(
     };
     let now = now_secs();
     for offer in offers {
+        // Antes de ofrecerle la venta a la red, comprobar que el ZKA que la
+        // respalda sigue reservado. Si la reserva se rompio, la liberacion va a
+        // fallar despues de que el comprador ya haya mandado su USDT -- y ese
+        // dinero no vuelve. Callar la oferta es lo unico que protege a alguien
+        // que no puede ver nuestra wallet para comprobarlo por su cuenta.
+        //
+        // Solo se filtran las Open. Una oferta ya tomada se sigue anunciando
+        // aunque este rota: el comprador necesita ver que existe y en que
+        // estado quedo; borrarla de su vista seria peor.
+        if offer.status == zoka::p2p_exchange::OfferStatus::Open {
+            let problems = exchange_runtime.offer_reservation_problems(&offer).await;
+            if !problems.is_empty() {
+                log_exchange_event(&format!(
+                    "offer {} not announced: reservation is broken ({})",
+                    &offer.id[..8.min(offer.id.len())],
+                    problems.join("; ")
+                ));
+                continue;
+            }
+        }
         let message = match offer.status {
             zoka::p2p_exchange::OfferStatus::Open => {
                 zoka::network::message::ZokaMessage::OfferAnnounce(
@@ -10182,6 +10220,13 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         .reconcile(&reserved_note_ids, now_secs())
         .map_err(|error| format!("failed to reconcile P2P exchange store: {error:?}"))?;
     if !reconciliation.orphaned_note_ids.is_empty() {
+        // Este camino LIBERA notas, asi que es el que mas cuidado necesita: si
+        // corre sobre una vista vieja de la wallet puede soltar una reserva que
+        // otro proceso acaba de crear. El lock cubre leer-decidir-escribir como
+        // una sola operacion.
+        let _wallet_lock = storage
+            .lock_private_wallets()
+            .map_err(|error| format!("failed to lock wallet directory: {error}"))?;
         private_wallet_manager.release_note_ids(&reconciliation.orphaned_note_ids);
         for name in private_wallet_manager.get_private_wallet_names() {
             if let Some(wallet) = private_wallet_manager.get_private_wallet(&name) {
@@ -12915,6 +12960,11 @@ fn cmd_wallet_restore_from_keys(args: &[String]) -> Result<(), String> {
     wallet.restore_height = restore_height;
     wallet.anonymity_public_key = spend_public_hex;
 
+    // Toma el lock del directorio: este proceso corre en paralelo con el nodo,
+    // y sin coordinacion el ultimo en escribir pisa lo del otro.
+    let _wallet_lock = storage
+        .lock_private_wallets()
+        .map_err(|e| format!("failed to lock wallet directory: {e}"))?;
     storage
         .save_private_wallet(&wallet, Some(&password))
         .map_err(|e| format!("failed to save private wallet: {e}"))?;
@@ -14273,6 +14323,11 @@ fn cmd_wallet_restore_from_seed(args: &[String]) -> Result<(), String> {
     wallet.restore_height = restore_height;
     wallet.anonymity_public_key = spend_public_hex;
 
+    // Toma el lock del directorio: este proceso corre en paralelo con el nodo,
+    // y sin coordinacion el ultimo en escribir pisa lo del otro.
+    let _wallet_lock = storage
+        .lock_private_wallets()
+        .map_err(|e| format!("failed to lock wallet directory: {e}"))?;
     storage
         .save_private_wallet(&wallet, Some(&password))
         .map_err(|e| format!("failed to save private wallet: {e}"))?;
@@ -14339,6 +14394,11 @@ fn cmd_wallet_change_passphrase_unified(args: &[String]) -> Result<(), String> {
         .ok_or_else(|| format!("wallet not found: {wallet_name}"))?;
     wallet.normalize_key_material();
     let address = user_private_address_display(&wallet.commitment_key);
+    // Sin lock, el nodo puede persistir su copia -- cifrada con la contrasena
+    // vieja -- justo despues, y el cambio se pierde en silencio.
+    let _wallet_lock = storage
+        .lock_private_wallets()
+        .map_err(|e| format!("failed to lock wallet directory: {e}"))?;
     storage
         .save_private_wallet(wallet, Some(&new_password))
         .map_err(|e| format!("failed to change wallet passphrase: {e}"))?;

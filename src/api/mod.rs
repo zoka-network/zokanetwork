@@ -508,6 +508,57 @@ impl ExchangeRuntime {
         Ok(events)
     }
 
+    /// Problemas de integridad de la reserva que respalda una oferta.
+    ///
+    /// Vacío significa que se puede liberar. Devuelve motivos y no un booleano
+    /// porque quien decide no anunciar una oferta tiene que poder decir por qué,
+    /// y porque el diagnóstico y el anuncio comparten esta función: si cada uno
+    /// tuviera su propia versión terminarían discrepando justo cuando importa.
+    pub async fn offer_reservation_problems(
+        &self,
+        offer: &crate::p2p_exchange::Offer,
+    ) -> Vec<String> {
+        let wallets = self.wallet_manager.read().await;
+        Self::reservation_problems_in(
+            wallets.get_private_wallet(&self.default_wallet_name),
+            offer,
+        )
+    }
+
+    /// Igual que la anterior, pero sobre una wallet que quien llama ya tiene
+    /// prestada. Existe separada porque el candado de wallets prefiere a los
+    /// escritores: pedir un segundo `read()` teniendo uno tomado se traba si
+    /// hay un escritor esperando en el medio.
+    pub fn reservation_problems_in(
+        wallet: Option<&crate::private_wallet::PrivateWallet>,
+        offer: &crate::p2p_exchange::Offer,
+    ) -> Vec<String> {
+        let Some(wallet) = wallet else {
+            return vec!["the seller wallet is not loaded".to_string()];
+        };
+        let mut problems = Vec::new();
+        for id in &offer.reserved_note_ids {
+            match wallet.private_notes.iter().find(|n| &n.note_id == id) {
+                None => problems.push(format!("note {id} is missing from the wallet")),
+                Some(note) => {
+                    if note.spent {
+                        problems.push(format!("note {id} is already spent"));
+                    }
+                    if !note.reserved {
+                        problems.push(format!("note {id} is not marked reserved"));
+                    }
+                    match note.reserved_by_tx.as_deref() {
+                        Some(owner) if owner == offer.id => {}
+                        Some(owner) => problems
+                            .push(format!("note {id} is reserved by {owner}, not this offer")),
+                        None => problems.push(format!("note {id} has no reservation owner")),
+                    }
+                }
+            }
+        }
+        problems
+    }
+
     /// Guarda la wallet del exchange.
     ///
     /// Toma el lock del directorio igual que `persist_private_wallet`. Este
@@ -1663,6 +1714,7 @@ impl RbacConfig {
         endpoint_permissions.insert("/team-mining/leave", ApiRole::Write);
         endpoint_permissions.insert("/team-mining/disband", ApiRole::Write);
         endpoint_permissions.insert("/team-mining/start", ApiRole::Write);
+        endpoint_permissions.insert("/p2p-exchange/check-now", ApiRole::Write);
         endpoint_permissions.insert("/team-mining/stop", ApiRole::Write);
         endpoint_permissions.insert("/private/view-scan", ApiRole::Write);
         endpoint_permissions.insert("/private/view-scan-key", ApiRole::Write);
@@ -2018,6 +2070,7 @@ fn rate_limit_bucket(method: &str, path: &str) -> &'static str {
             || path.starts_with("/blocks")
             || path.starts_with("/mempool")
             || path == "/private/pending"
+            || path == "/p2p-exchange/diagnostics"
             || path.starts_with("/private/tx/"))
     {
         "public-read"
@@ -5246,6 +5299,95 @@ async fn list_exchange_offers(
     ))
 }
 
+/// Fuerza una pasada de verificación ahora, sin esperar el ciclo de sondeo.
+///
+/// Es la mitad del vendedor del aviso "ya pagué": el comprador no puede
+/// autorizar nada, pero sí puede pedir que se mire. La verificación es la misma
+/// de siempre —remitente, destinatario, monto contra Tron—, sólo cambia cuándo
+/// corre.
+///
+/// No recibe el hash de la transacción a propósito. `settling_transfer` busca
+/// entre los últimos transfers a la dirección del vendedor: encuentra el pago
+/// por sus datos, no por su identificador. Pedir el hash no aportaría precisión
+/// y en cambio ataría la dirección de Tron del comprador a la operación.
+async fn exchange_check_now(
+    State(app_state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let exchange = exchange_runtime_or_404(&app_state)?;
+    let now = now_secs();
+    match exchange.process_local_exchange(now).await {
+        Ok(events) => Ok(Json(serde_json::json!({
+            "checked_at": now,
+            "events": events,
+            "verification": exchange.verification_status().await,
+        }))),
+        Err(error) => Err((StatusCode::INTERNAL_SERVER_ERROR, error)),
+    }
+}
+
+/// Integridad de las reservas que respaldan las ofertas vivas.
+///
+/// Existe porque hasta ahora esto se deducía leyendo `offers.json` y el archivo
+/// de wallet a mano y cruzándolos con un script. Cuando una reserva se perdía,
+/// la interfaz seguía mostrando la oferta como normal y el fallo recién
+/// aparecía al intentar liberar — con el comprador ya habiendo pagado.
+///
+/// Cada oferta viva responde una pregunta sola: **¿se puede liberar esto?**
+/// `reservation_ok` en falso significa que el pago no debería enviarse todavía.
+async fn exchange_diagnostics(
+    State(app_state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let exchange = exchange_runtime_or_404(&app_state)?;
+    let now = now_secs();
+    let offers = exchange.visible_exchange_offers(now).await;
+    let wallets = exchange.wallet_manager.read().await;
+    let wallet = wallets.get_private_wallet(&exchange.default_wallet_name);
+
+    let mut rows = Vec::new();
+    for offer in offers.iter().filter(|o| o.status.holds_reservation()) {
+        // El veredicto sale de la misma funcion que decide si la oferta se
+        // anuncia, para que lo que se muestra y lo que se hace no discrepen.
+        let problems = ExchangeRuntime::reservation_problems_in(wallet, &offer);
+        let mut notes_found = 0usize;
+        let mut locked_atoms = 0u64;
+        for id in &offer.reserved_note_ids {
+            if let Some(note) = wallet.and_then(|w| w.private_notes.iter().find(|n| &n.note_id == id))
+            {
+                notes_found += 1;
+                locked_atoms = locked_atoms.saturating_add(note.amount);
+            }
+        }
+
+        rows.push(serde_json::json!({
+            "offer_id": offer.id,
+            "status": offer.status,
+            "sold_atoms": offer.zka_atoms,
+            "locked_atoms": locked_atoms,
+            // Lo inmovilizado de mas. No es una comision: es vuelto que todavia
+            // no existe porque la nota no se parte hasta que la operacion cierra.
+            "excess_atoms": locked_atoms.saturating_sub(offer.zka_atoms),
+            "notes_expected": offer.reserved_note_ids.len(),
+            "notes_found": notes_found,
+            "reservation_ok": problems.is_empty(),
+            "problems": problems,
+            "claim_expires_at": offer.claim_expires_at,
+        }));
+    }
+
+    let unhealthy = rows
+        .iter()
+        .filter(|r| r["reservation_ok"] == serde_json::json!(false))
+        .count();
+
+    Ok(Json(serde_json::json!({
+        "checked_at": now,
+        "live_offers": rows.len(),
+        "unhealthy_offers": unhealthy,
+        "verification": exchange.verification_status().await,
+        "offers": rows,
+    })))
+}
+
 async fn create_exchange_offer(
     State(app_state): State<Arc<AppState>>,
     Json(req): Json<CreateOfferRequest>,
@@ -6383,6 +6525,13 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
             "/p2p-exchange/offers",
             get(list_exchange_offers).post(create_exchange_offer),
         )
+        // Solo lectura: responde si las reservas que respaldan las ofertas
+        // vivas siguen sanas. Sin esto hay que cruzar offers.json con el
+        // archivo de wallet a mano para saber si un pago se va a poder liberar.
+        .route("/p2p-exchange/diagnostics", get(exchange_diagnostics))
+        // Disparador del aviso "ya pague": corre la verificacion ahora en vez
+        // de esperar el ciclo. No autoriza nada, solo adelanta el momento.
+        .route("/p2p-exchange/check-now", post(exchange_check_now))
         .route("/p2p-exchange/offers/:id/claim", post(claim_exchange_offer))
         .route(
             "/p2p-exchange/offers/:id/report-payment-failure",
@@ -6968,6 +7117,88 @@ mod tests {
             reserved_note_ids: vec!["remote-note".to_string()],
             reserved_atoms: 0,
         }
+    }
+
+    /// Una nota vacia salvo por lo que decide si la reserva esta sana.
+    fn reserved_note(id: &str, owner: Option<&str>) -> crate::private_wallet::PrivateNote {
+        crate::private_wallet::PrivateNote {
+            note_id: id.to_string(),
+            asset_tag: "ZKA".to_string(),
+            source_tx_hash: String::new(),
+            recipient_commitment: String::new(),
+            stealth_address: String::new(),
+            ephemeral_pubkey: Vec::new(),
+            commitment: String::new(),
+            amount_commitment: String::new(),
+            range_proof: Vec::new(),
+            one_time_public_key: String::new(),
+            commitment_blind: Vec::new(),
+            amount: 100 * crate::economics::ATOMS_PER_ZKA,
+            is_change: false,
+            spent: false,
+            reserved: owner.is_some(),
+            reserved_by_tx: owner.map(str::to_string),
+            created_at: 1_751_000_000,
+            spent_at: None,
+        }
+    }
+
+    /// El caso que costo 10 USDT: la nota sigue en la cartera y sin gastar,
+    /// pero perdio la marca de reserva porque otro proceso persistio una copia
+    /// vieja encima. Antes esto se anunciaba igual y la liberacion fallaba
+    /// despues de que el comprador ya habia pagado.
+    #[test]
+    fn an_offer_whose_note_lost_its_reservation_is_reported_broken() {
+        let offer = remote_offer("offer-1");
+        let mut wallet = PrivateWalletManager::new();
+        wallet.create_private_wallet("seller").unwrap();
+        let w = wallet.get_private_wallet_mut("seller").unwrap();
+        w.private_notes.push(reserved_note("remote-note", None));
+
+        let problems = ExchangeRuntime::reservation_problems_in(
+            wallet.get_private_wallet("seller"),
+            &offer,
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("not marked reserved")),
+            "una nota sin reservar tiene que salir como problema: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn an_offer_backed_by_its_own_reserved_note_is_healthy() {
+        let offer = remote_offer("offer-1");
+        let mut wallet = PrivateWalletManager::new();
+        wallet.create_private_wallet("seller").unwrap();
+        let w = wallet.get_private_wallet_mut("seller").unwrap();
+        w.private_notes
+            .push(reserved_note("remote-note", Some("offer-1")));
+
+        assert!(
+            ExchangeRuntime::reservation_problems_in(
+                wallet.get_private_wallet("seller"),
+                &offer,
+            )
+            .is_empty()
+        );
+    }
+
+    /// Una nota reservada por OTRA oferta no sirve de respaldo: si se anunciara,
+    /// dos ventas creerian tener el mismo ZKA detras.
+    #[test]
+    fn a_note_reserved_by_a_different_offer_does_not_back_this_one() {
+        let offer = remote_offer("offer-1");
+        let mut wallet = PrivateWalletManager::new();
+        wallet.create_private_wallet("seller").unwrap();
+        let w = wallet.get_private_wallet_mut("seller").unwrap();
+        w.private_notes
+            .push(reserved_note("remote-note", Some("offer-2")));
+
+        let problems = ExchangeRuntime::reservation_problems_in(
+            wallet.get_private_wallet("seller"),
+            &offer,
+        );
+        assert!(problems.iter().any(|p| p.contains("offer-2")), "{problems:?}");
     }
 
     fn configure_test_team(
