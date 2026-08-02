@@ -297,6 +297,14 @@ impl TronClient {
         Err(TronClientError::ProvidersExhausted(failures.join("; ")))
     }
 
+    /// Red contra la que este cliente consulta.
+    ///
+    /// Se expone para que quien verifique pueda comprobar que coincide con la
+    /// de la oferta antes de creerle a un resultado vacío.
+    pub fn network(&self) -> TronNetwork {
+        self.config.network
+    }
+
     pub async fn settling_transfer(
         &self,
         offer: &Offer,
@@ -478,6 +486,36 @@ mod tests {
     const PAYOUT: &str = "TQ5NMqJjW8dWvJf3zJ8xYqL2mNpR4sT6uV";
     const CLAIMED_AT: u64 = 1_751_000_000;
 
+    /// El fallo del 2026-08-02: la oferta se cobraba en mainnet, alguien paso
+    /// el ajuste a Nile, y la busqueda del pago dejo de encontrar nada. Como
+    /// "nada" en una oferta vencida significa expirar, la venta se destruyo
+    /// sola con el USDT ya enviado. Lo que este test fija es que la oferta
+    /// recuerde su red, que es lo que permite negarse a juzgarla.
+    #[test]
+    fn an_offer_remembers_which_tron_network_it_is_priced_on() {
+        let mut offer = claimed_offer();
+        offer.tron_network = Some(TronNetwork::Mainnet);
+
+        let encoded = serde_json::to_string(&offer).unwrap();
+        let decoded: Offer = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.tron_network, Some(TronNetwork::Mainnet));
+    }
+
+    /// Las ofertas guardadas antes de que el campo existiera se siguen leyendo.
+    /// Quedan en `None`, que significa "no se puede afirmar nada": se verifican
+    /// con la red configurada, como se hacia antes.
+    #[test]
+    fn an_offer_saved_before_the_field_existed_still_loads() {
+        let mut offer = claimed_offer();
+        offer.tron_network = Some(TronNetwork::Nile);
+        let mut value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&offer).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("tron_network");
+
+        let decoded: Offer = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.tron_network, None);
+    }
+
     fn claimed_offer() -> Offer {
         Offer {
             id: "offer-1".to_string(),
@@ -491,6 +529,7 @@ mod tests {
             claimed_by: Some("zka1buyer".to_string()),
             reserved_note_ids: vec!["note-a".to_string()],
             reserved_atoms: 0,
+            tron_network: None,
         }
     }
 

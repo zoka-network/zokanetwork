@@ -380,6 +380,7 @@ mod tests {
             claimed_by: None,
             reserved_note_ids: vec![format!("note-{id}")],
             reserved_atoms: 0,
+            tron_network: None,
         }
     }
 

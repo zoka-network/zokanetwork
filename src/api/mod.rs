@@ -380,6 +380,24 @@ impl ExchangeRuntime {
                     // proves no qualifying payment exists.
                     continue;
                 };
+                // Negarse a juzgar una oferta de otra red de Tron.
+                //
+                // Buscar el pago en la red equivocada no falla: no encuentra
+                // nada, y "no encontre nada" en una oferta vencida significa
+                // expirarla. Es decir, cambiar este ajuste con una venta en
+                // curso destruia la venta en silencio. Saltearla la deja viva
+                // hasta que la configuracion vuelva a coincidir o el vendedor
+                // la cancele a mano, que son dos finales reversibles.
+                let configured = tron_client.network();
+                if let Some(offer_network) = offer.tron_network {
+                    if offer_network != configured {
+                        *self.verification_status.lock().await = format!(
+                            "offer {} is on Tron {offer_network:?}, node is on {configured:?}",
+                            offer.id
+                        );
+                        continue;
+                    }
+                }
                 let claimed_at = offer
                     .claim_expires_at
                     .unwrap_or(now)
@@ -5342,12 +5360,24 @@ async fn exchange_diagnostics(
     let offers = exchange.visible_exchange_offers(now).await;
     let wallets = exchange.wallet_manager.read().await;
     let wallet = wallets.get_private_wallet(&exchange.default_wallet_name);
+    let tron_network = exchange.tron_client.lock().await.as_ref().map(|c| c.network());
 
     let mut rows = Vec::new();
     for offer in offers.iter().filter(|o| o.status.holds_reservation()) {
         // El veredicto sale de la misma funcion que decide si la oferta se
         // anuncia, para que lo que se muestra y lo que se hace no discrepen.
-        let problems = ExchangeRuntime::reservation_problems_in(wallet, &offer);
+        let mut problems = ExchangeRuntime::reservation_problems_in(wallet, &offer);
+        // Un desajuste de red no rompe la reserva, pero deja la oferta
+        // incobrable igual: el pago se busca donde nunca estuvo. Va en la misma
+        // lista porque para el usuario el efecto es el mismo -- no cierra.
+        if let (Some(offer_net), Some(node_net)) = (offer.tron_network, tron_network) {
+            if offer_net != node_net {
+                problems.push(format!(
+                    "this offer is priced on Tron {offer_net:?} but the node is configured \
+                     for {node_net:?}; payment cannot be verified until they match"
+                ));
+            }
+        }
         let mut notes_found = 0usize;
         let mut locked_atoms = 0u64;
         for id in &offer.reserved_note_ids {
@@ -5472,6 +5502,10 @@ async fn create_exchange_offer(
         created_at: now,
         claim_expires_at: None,
         claimed_by: None,
+        // Se sella la red de Tron al crear la oferta. Si despues alguien cambia
+        // el ajuste, la verificacion se niega a juzgarla en vez de buscar el
+        // pago donde nunca estuvo y expirarla por "falta de pago".
+        tron_network: exchange.tron_client.lock().await.as_ref().map(|c| c.network()),
         reserved_note_ids: reservation.note_ids,
         // Lo que realmente queda inmovilizado, que es >= lo vendido porque las
         // notas no se parten. Sin este dato la interfaz no puede explicar la
@@ -7116,6 +7150,7 @@ mod tests {
             claimed_by: None,
             reserved_note_ids: vec!["remote-note".to_string()],
             reserved_atoms: 0,
+            tron_network: None,
         }
     }
 

@@ -132,6 +132,19 @@ pub struct Offer {
     /// verified. `None` while the offer is still open.
     pub claim_expires_at: Option<u64>,
     pub claimed_by: Option<String>,
+    /// Red de Tron en la que se cobra esta oferta.
+    ///
+    /// Se guarda en la oferta y no se toma de la configuración del momento
+    /// porque la configuración puede cambiar mientras la operación está en
+    /// curso. Cada red tiene otro contrato USDT y otro servidor: buscar el pago
+    /// en la red equivocada no devuelve error, devuelve *nada* — y una oferta
+    /// pagada de verdad se expira como si el comprador nunca hubiera pagado.
+    /// Pasó exactamente eso el 2026-08-02.
+    ///
+    /// `None` en ofertas creadas antes de que existiera este campo: ahí no se
+    /// puede afirmar nada y se verifica con la red configurada, como antes.
+    #[serde(default)]
+    pub tron_network: Option<crate::p2p_exchange::tron::TronNetwork>,
     /// Notes reserved in the seller's wallet backing this offer. Kept so a
     /// restart can tell which reservations still have an offer behind them.
     #[serde(default)]
@@ -356,6 +369,7 @@ mod tests {
             claimed_by: None,
             reserved_note_ids: vec!["note-a".to_string()],
             reserved_atoms: 0,
+            tron_network: None,
         }
     }
 
