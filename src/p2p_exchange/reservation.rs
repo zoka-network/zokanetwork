@@ -47,8 +47,14 @@ pub struct Reservation {
 /// both are unspendable, and counting them would let an offer be published
 /// against ZKA that cannot actually be handed over.
 ///
-/// Prefers the largest notes first, so an offer locks as few as possible and
-/// leaves the wallet with usable change instead of fragmenting it.
+/// Prefers the **tightest single note** that covers the amount. Picking the
+/// largest instead locks far more than the offer is worth: with a wallet full
+/// of 12 ZKA rewards plus one note of 61, selling 10 immobilised the whole 61.
+/// The surplus only returns as change once the trade closes, so until then it
+/// is money the seller cannot touch.
+///
+/// When no single note covers it, falls back to largest-first so the offer is
+/// backed by as few notes as possible.
 pub fn select_notes(
     notes: &[SpendableNote],
     needed_atoms: u64,
@@ -81,6 +87,27 @@ pub fn select_notes(
         });
     }
 
+    // Si una sola nota alcanza, se toma la MAS CHICA que alcance en vez de la
+    // mas grande. Elegir la mayor minimiza la cantidad de notas, pero inmoviliza
+    // de mas: con notas de 12 y una de 61, vender 10 bloqueaba los 61 enteros y
+    // el vendedor veia desaparecer cinco veces lo que estaba vendiendo. El
+    // excedente vuelve como vuelto recien al cerrarse la operacion, asi que
+    // mientras tanto es plata que no puede usar.
+    //
+    // Se recorre al reves porque `usable` esta ordenado de mayor a menor: el
+    // ultimo que todavia cubre el importe es el mas ajustado.
+    if let Some(fitting) = usable
+        .iter()
+        .rev()
+        .find(|note| note.amount_atoms >= needed_atoms)
+    {
+        return Ok(Reservation {
+            note_ids: vec![fitting.id.clone()],
+            total_atoms: fitting.amount_atoms,
+        });
+    }
+    // Ninguna nota sola alcanza: hay que combinar, y ahi conviene la mayor
+    // primero para usar la menor cantidad posible.
     let mut chosen = Vec::new();
     let mut total: u64 = 0;
     for note in usable {
@@ -130,6 +157,33 @@ mod tests {
             reserved: false,
             unlock_height: 0,
         }
+    }
+
+    #[test]
+    fn a_small_offer_locks_the_tightest_note_not_the_biggest() {
+        // Cartera tipica de un minero: muchas recompensas iguales y alguna
+        // nota grande de un vuelto anterior.
+        let notes = vec![
+            note("reward-a", 12),
+            note("reward-b", 12),
+            note("big", 61),
+            note("huge", 98),
+        ];
+        let picked = select_notes(&notes, 10, 0).unwrap();
+
+        assert_eq!(picked.total_atoms, 12, "debe tomar una de 12, no la de 61");
+        assert_eq!(picked.note_ids.len(), 1);
+        assert!(picked.note_ids[0].starts_with("reward-"));
+    }
+
+    #[test]
+    fn when_no_single_note_covers_it_combines_the_largest() {
+        // Aca si conviene la mayor primero: minimiza cuantas notas se traban.
+        let notes = vec![note("a", 12), note("b", 12), note("c", 12)];
+        let picked = select_notes(&notes, 30, 0).unwrap();
+
+        assert_eq!(picked.note_ids.len(), 3);
+        assert_eq!(picked.total_atoms, 36);
     }
 
     #[test]
