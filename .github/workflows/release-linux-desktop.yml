@@ -73,9 +73,17 @@ jobs:
 
       # Sin el bundle de Tor: en Windows es obligatorio porque el instalador lo
       # lleva adentro, en Linux se espera que Tor venga del sistema.
+      #
+      # El chmod es un cinturon: el bit de ejecucion de gradlew ya esta puesto en
+      # el repositorio, pero se perdio una vez -- el repo se desarrolla en
+      # Windows, donde ese permiso no existe -- y el sintoma fue un escueto
+      # "Permission denied" a los diez minutos de compilar el nodo. Cuesta una
+      # linea evitar volver a pagar esa espera.
       - name: Package .deb and .rpm
         working-directory: zsilent-core
-        run: ./gradlew packageDeb packageRpm -Pzsilent.requireTorBundle=false --no-daemon
+        run: |
+          chmod +x ./gradlew
+          ./gradlew packageDeb packageRpm -Pzsilent.requireTorBundle=false --no-daemon
 
       - name: Collect artifacts and checksums
         run: |
