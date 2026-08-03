@@ -14737,6 +14737,24 @@ fn cmd_chain_economics_migrate(args: &[String]) -> Result<(), String> {
     let yes = has_flag(args, "--yes");
     let repair_supply = has_flag(args, "--repair-supply");
     let as_json = has_flag(args, "--json");
+    // Negarse si la base no existe todavia.
+    //
+    // La ruta por defecto es RELATIVA al directorio actual, asi que este comando
+    // corrido desde la carpeta equivocada abriria una base nueva, la encontraria
+    // vacia, la sellaria y diria "Marker written: yes". El usuario se va
+    // convencido de haber arreglado su cadena sin haber tocado su cadena.
+    //
+    // Este es el unico comando donde equivocarse de carpeta parece exito: los
+    // demas muestran altura 0 o ninguna wallet, que se ve mal a simple vista.
+    if !std::path::Path::new(&db_path).exists() {
+        return Err(format!(
+            "no chain db at '{db_path}'. This command never creates one: pass --db with the \
+             path to the database you mean to migrate, or run it from the directory that \
+             contains '{}'. Sealing an empty database would report success without \
+             migrating anything.",
+            network.default_db_path()
+        ));
+    }
     let storage = RocksDbStorage::new(&db_path)
         .map_err(|e| format!("failed to open chain db '{db_path}': {e}"))?;
     let report =
