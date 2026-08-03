@@ -10287,6 +10287,28 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             .set_phase("opening_db", Some("opening RocksDB".to_string()));
         let storage = open_storage(db)?;
 
+        // Sellar la base recien creada como contabilidad atomica.
+        //
+        // Este es el unico instante en que la base esta vacia, y por lo tanto
+        // el unico en que el marcador se puede poner sin riesgo de mezclar dos
+        // contabilidades. Si se deja pasar, la base se llena de bloques -- por
+        // IBD o por snapshot, da igual, ninguno de los dos lo escribe -- y a
+        // partir de ahi minar queda rechazado para siempre con "chain DB has
+        // no atomic economics marker".
+        //
+        // Antes esto solo ocurria al aplicar el genesis, y el genesis solo se
+        // aplica si existe `docs/genesis.mainnet.v1.json`, que el instalador de
+        // ZSilent no incluye. O sea que le pasaba a TODO usuario que instalara
+        // y sincronizara: nunca podia minar. Los nodos que si podian eran los
+        // que corrian desde el repo, donde ese archivo existe.
+        //
+        // El error se ignora a proposito, igual que en `private-send`. En una
+        // base que ya tiene bloques y no tiene marcador esto falla, y asi debe
+        // ser: esa base necesita `chain-economics-migrate`, que audita bloque
+        // por bloque antes de sellarla. Convertir eso en un fallo de arranque
+        // dejaria sin nodo a quien hoy al menos puede sincronizar y operar.
+        let _ = ensure_atomic_economics_db(&storage);
+
         // Fase 5 fast-bootstrap: if a local signed snapshot is well ahead of
         // what's already on disk, replay it (every block still goes through
         // apply_block inside import_into_storage, so PoW/coinbase/fork-link
@@ -18280,6 +18302,26 @@ mod tests {
             String::from_utf8(raw).unwrap(),
             economics::ECONOMICS_VERSION
         );
+    }
+
+    /// El orden que arregla al usuario nuevo: sellar mientras la base esta
+    /// vacia, y recien despues llenarla de bloques.
+    ///
+    /// Es la unica secuencia que funciona. Al reves -- sincronizar primero y
+    /// sellar despues -- cae en el rechazo del test siguiente, y eso es lo que
+    /// le pasaba a cualquiera que instalara ZSilent: ni el IBD ni el import de
+    /// snapshot escriben el marcador, y el genesis (que si lo escribia) no se
+    /// aplica porque el instalador no trae el archivo.
+    #[test]
+    fn a_db_marked_while_empty_stays_valid_once_blocks_arrive() {
+        let (_tmp, db) = temp_db_arg();
+        let storage = RocksDbStorage::new(&db).expect("temp rocksdb");
+
+        ensure_atomic_economics_db(&storage).expect("empty db should be marked");
+        storage.set_chain_height(1).expect("set height");
+
+        ensure_atomic_economics_db(&storage)
+            .expect("una base sellada de vacia sigue valiendo cuando llegan bloques");
     }
 
     #[test]
