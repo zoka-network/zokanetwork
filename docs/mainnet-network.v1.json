@@ -3,7 +3,7 @@
   "status": "release-candidate",
   "chain_id": "zoka-mainnet-zenith-v1",
   "protocol_freeze_id": "/zoka/1.9.0-mainnet-recovery",
-  "minimum_client_version": "1.9.0",
+  "minimum_client_version": "2.0.0",
   "recovery": {
     "policy_version": "zoka-mainnet-recovery-v1",
     "checkpoint": {
@@ -31,7 +31,9 @@
   "transport_policy": {
     "anonymous_transport_preferred": false,
     "clearnet_requires_explicit_operator_choice": false,
-    "supported": ["tcp"]
+    "supported": [
+      "tcp"
+    ]
   },
   "seed_nodes": [
     {

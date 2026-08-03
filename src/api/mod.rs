@@ -3314,11 +3314,21 @@ async fn get_stats(State(app_state): State<Arc<AppState>>) -> Json<serde_json::V
     };
     let runtime = global_network_runtime().snapshot().await;
 
+    // El suministro real que lleva la cadena, en atomos, junto al techo y a lo
+    // que falta emitir. `emission_zka` de arriba se mantiene porque hay
+    // clientes viejos que lo leen, pero es una estimacion derivada de la altura
+    // y no debe usarse para mostrar una cifra exacta.
+    let emitted_atoms = app_state.state_manager.get_total_supply_emitted_atoms().await;
+    let max_atoms = crate::economics::MAX_SUPPLY_ATOMS;
+
     Json(serde_json::json!({
         "height": height,
         "difficulty": difficulty_bits,
         "hashrate_hs": hashrate_hs,
         "emission_zka": emission_zka_f,
+        "total_supply_emitted_atoms": emitted_atoms,
+        "max_supply_atoms": max_atoms,
+        "remaining_supply_atoms": max_atoms.saturating_sub(emitted_atoms),
         "last_block_time": last_block_time,
         "network_version": env!("CARGO_PKG_VERSION"),
         "connected_peers": runtime.connected_peers,

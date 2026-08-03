@@ -415,6 +415,19 @@ impl StateManager {
         state.current_height
     }
 
+    /// ZKA emitidos hasta ahora, en átomos, según la propia cadena.
+    ///
+    /// Es el total que la cadena lleva contabilizado, no una estimación
+    /// derivada de la altura: recalcular desde la fórmula de halving supone que
+    /// cada bloque pagó exactamente lo que le tocaba, y ese supuesto es
+    /// justamente lo que el suministro real permite comprobar.
+    ///
+    /// En átomos y no en ZKA porque el dato tiene que ser exacto: pasar por un
+    /// decimal antes de mostrarlo introduce redondeo en la última cifra.
+    pub async fn get_total_supply_emitted_atoms(&self) -> u64 {
+        self.storage.get_total_supply_emitted().unwrap_or(0)
+    }
+
     /// Get the PoW difficulty (leading-zero bits) required for the next block.
     pub fn get_next_difficulty(&self) -> u32 {
         crate::mining::difficulty::expected_for_next_block(&self.storage)
