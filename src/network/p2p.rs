@@ -4342,6 +4342,45 @@ impl Node {
         }
     }
 
+    /// Por cada tópico: cuántos pares lo tienen suscrito y cuántos están en su
+    /// malla de propagación.
+    ///
+    /// Son dos números distintos y la diferencia importa. *Suscrito* significa
+    /// que ese par declaró interés en el tópico; *malla* significa que además
+    /// nos elegimos mutuamente para reenviarnos mensajes de ese tópico. Un
+    /// mensaje viaja por la malla: con suscriptores pero malla vacía, lo que
+    /// se publique sale por flood y lo que publiquen otros puede no llegar
+    /// nunca.
+    ///
+    /// Sin esto, "no me aparece la oferta que publicó otro" es indistinguible
+    /// de "no hay ofertas". Existía el equivalente solo para PBFT, y los
+    /// tópicos nuevos —ofertas, minería en equipo— quedaban a ciegas: un
+    /// cliente viejo se conecta y sincroniza bloques con normalidad, pero
+    /// nunca se suscribe a un tópico que no conoce, así que tener pares no
+    /// implica tener con quién intercambiar ofertas.
+    pub fn topic_peer_counts(&self) -> Vec<(String, usize, usize)> {
+        let gossipsub = &self.swarm.behaviour().gossipsub;
+        [
+            (GENERAL_TOPIC_NAME, &self.general_topic),
+            (PBFT_TOPIC_NAME, &self.pbft_topic),
+            (STEM_TOPIC_NAME, &self.stem_topic),
+            (MIXER_TOPIC_NAME, &self.mixer_topic),
+            (OFFERS_TOPIC_NAME, &self.offers_topic),
+            (TEAM_MINING_TOPIC_NAME, &self.team_mining_topic),
+        ]
+        .into_iter()
+        .map(|(name, topic)| {
+            let hash = topic.hash();
+            let suscritos = gossipsub
+                .all_peers()
+                .filter(|(_, topics)| topics.iter().any(|t| *t == &hash))
+                .count();
+            let malla = gossipsub.mesh_peers(&hash).count();
+            (name.to_string(), suscritos, malla)
+        })
+        .collect()
+    }
+
     /// Count known peers currently subscribed to the PBFT topic.
     pub fn pbft_subscribed_peer_count(&self) -> usize {
         let pbft_hash = self.pbft_topic.hash();

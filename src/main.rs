@@ -9573,11 +9573,36 @@ async fn connect_and_warmup(
     Ok(())
 }
 
+/// Cuántos vecinos intentar mantener.
+///
+/// Antes salía de la cantidad de semillas del manifiesto, topado en 3. Eso
+/// mezclaba dos cosas que no tienen relación: **cuántos puntos de entrada
+/// conozco** y **cuántos vecinos necesito**. Con una sola semilla activa el
+/// objetivo quedaba en 1, así que el nodo dejaba de marcar apenas conseguía un
+/// par, aunque tuviera decenas de direcciones descubiertas esperando en el
+/// peerstore.
+///
+/// A quien tiene el puerto abierto no le importaba: junta vecinos por
+/// conexiones entrantes. A quien no puede abrirlo —detrás de un router que no
+/// controla, que es la mayoría— salir a buscar es la única vía, y era
+/// justamente lo que se apagaba. De ahí que unos vieran 3 o más pares y otros
+/// se quedaran clavados en 1 o 2.
+///
+/// El objetivo ahora es el que pide una malla sana de gossipsub. Y sigue
+/// acotado por las direcciones que realmente se conocen: prometer 6 con 2
+/// direcciones en el pozo solo produciría reintentos contra las mismas.
+///
+/// Esto NO dispara una avalancha de marcados: `maintain_seed_connections`
+/// mantiene su presupuesto de dos intentos por barrido, así que la diferencia
+/// es que sigue intentando en barridos sucesivos en vez de rendirse.
+const HEALTHY_PEER_TARGET: usize = 6;
+
 fn seed_connection_target(unique_seed_nodes: usize, reconnect_addr_count: usize) -> usize {
     if reconnect_addr_count == 0 {
         return 0;
     }
-    unique_seed_nodes.max(1).min(3)
+    let _ = unique_seed_nodes;
+    HEALTHY_PEER_TARGET.min(reconnect_addr_count)
 }
 
 async fn maintain_seed_connections(
@@ -11628,6 +11653,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             .set_connected_peer_addrs(node.connected_peer_addr_pairs())
             .await;
         zoka::api::global_network_runtime().set_gossip_stats(node.gossip_stats());
+        zoka::api::global_network_runtime().set_topic_peer_counts(node.topic_peer_counts());
         zoka::api::global_network_runtime()
             .set_kademlia_routing_peers(node.kademlia_routing_peer_count());
         zoka::api::global_network_runtime()
@@ -17882,12 +17908,28 @@ mod tests {
         assert_eq!(back.mode, "pow");
     }
 
+    /// El objetivo de vecinos no depende de cuantas semillas haya.
+    ///
+    /// Antes salia de ahi y quedaba topado en 3, asi que con una sola semilla
+    /// activa el nodo dejaba de marcar al conseguir UN par -- aunque tuviera
+    /// decenas de direcciones descubiertas sin usar. A quien tiene el puerto
+    /// abierto no le afecta, porque junta vecinos por conexiones entrantes; a
+    /// quien esta detras de un router que no controla, salir a buscar es la
+    /// unica via y era justo lo que se apagaba.
     #[test]
-    fn seed_connection_target_counts_logical_nodes_not_transport_addresses() {
-        // One seed exposed over DNS and onion still resolves to one PeerId.
-        assert_eq!(seed_connection_target(1, 2), 1);
-        assert_eq!(seed_connection_target(3, 6), 3);
-        assert_eq!(seed_connection_target(0, 4), 1);
+    fn peer_target_does_not_shrink_to_the_number_of_seeds() {
+        // Una sola semilla y muchas direcciones conocidas: se apunta a una
+        // malla sana, no a uno.
+        assert_eq!(seed_connection_target(1, 32), HEALTHY_PEER_TARGET);
+        assert_eq!(seed_connection_target(3, 32), HEALTHY_PEER_TARGET);
+    }
+
+    /// Pero no se promete mas de lo que se puede marcar: apuntar a seis con
+    /// dos direcciones en el pozo solo produciria reintentos contra las mismas.
+    #[test]
+    fn peer_target_never_exceeds_the_addresses_actually_known() {
+        assert_eq!(seed_connection_target(1, 2), 2);
+        assert_eq!(seed_connection_target(5, 1), 1);
         assert_eq!(seed_connection_target(1, 0), 0);
     }
 

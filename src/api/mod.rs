@@ -1243,6 +1243,7 @@ pub struct NetworkRuntimeState {
     gossip_publish_err: AtomicU64,
     gossip_last_rx_block_at: AtomicU64,
     gossip_mesh_peer_count: AtomicU64,
+    topic_peer_counts: std::sync::Mutex<Vec<(String, usize, usize)>>,
     kademlia_routing_peers: AtomicU64,
     direct_block_requests_outbound_sent: AtomicU64,
     direct_block_requests_outbound_responses: AtomicU64,
@@ -1338,6 +1339,23 @@ impl NetworkRuntimeState {
                 address: addr.clone(),
             })
             .collect()
+    }
+
+    /// Suscriptores y malla por topico, tal como los ve este nodo.
+    ///
+    /// En un Mutex y no en atomicos porque es una lista de tamano variable.
+    /// Se refresca en el mismo ciclo que el resto de la telemetria de gossip.
+    pub fn set_topic_peer_counts(&self, counts: Vec<(String, usize, usize)>) {
+        if let Ok(mut guard) = self.topic_peer_counts.lock() {
+            *guard = counts;
+        }
+    }
+
+    pub fn topic_peer_counts(&self) -> Vec<(String, usize, usize)> {
+        self.topic_peer_counts
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
     }
 
     pub fn set_gossip_stats(&self, stats: crate::network::p2p::GossipStats) {
@@ -3379,9 +3397,30 @@ async fn get_peers() -> Json<serde_json::Value> {
             _ => other += 1,
         }
     }
+    // Suscriptores y malla por topico.
+    //
+    // Estar conectado no alcanza para recibir lo que se publica en un topico:
+    // hace falta que algun par lo tenga suscrito, y para que un mensaje llegue
+    // con fiabilidad hace falta ademas que este en la malla. Un cliente viejo
+    // sincroniza bloques con normalidad y jamas se suscribe a un topico que no
+    // conoce, asi que "tengo 2 pares" y "no me llegan las ofertas" conviven sin
+    // contradiccion. Este es el numero que lo distingue.
+    let topics = global_network_runtime()
+        .topic_peer_counts()
+        .into_iter()
+        .map(|(nombre, suscritos, malla)| {
+            serde_json::json!({
+                "topic": nombre,
+                "subscribed_peers": suscritos,
+                "mesh_peers": malla,
+            })
+        })
+        .collect::<Vec<_>>();
+
     Json(serde_json::json!({
         "connected_peers": peers.len(),
         "by_transport": { "tor": tor, "direct": direct, "other": other },
+        "topics": topics,
         "peers": peers,
     }))
 }
