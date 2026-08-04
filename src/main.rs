@@ -8349,6 +8349,42 @@ fn direcciones_equivalentes(a: &str, b: &str) -> bool {
     !a.trim().is_empty() && nucleo(a) == nucleo(b)
 }
 
+/// Orden de marcado que respeta la salud que el peerstore ya calculó.
+///
+/// `PeerStore::dial_addrs` ordena por score, última conexión exitosa y fallos
+/// — es decir, ya sabe cuáles direcciones sirven. Ese orden se estaba tirando:
+/// la lista se barajaba entera, así que una semilla muerta con seis fallos y
+/// score −100 salía sorteada tan seguido como un par sano de score 100. Con un
+/// presupuesto de dos intentos por barrido, eso es media ronda regalada.
+///
+/// El barajado igual hace falta: sin él, dos nodos con el mismo peerstore
+/// marcarían siempre en el mismo orden y se amontonarían sobre la misma
+/// dirección. La solución es barajar **dentro** de cada nivel de salud, no
+/// entre niveles.
+///
+/// Una dirección que el peerstore no conoce —una semilla recién agregada a
+/// mano— se coloca en el medio: no se la premia por encima de un par probado,
+/// pero tampoco se la castiga como a uno que ya falló.
+fn ranked_dial_candidates(
+    seed_addrs: &[String],
+    own_addrs: &[String],
+    healthiest_first: &[String],
+) -> Vec<String> {
+    let candidatos = shuffled_peer_addrs_excluding(seed_addrs, own_addrs);
+    let desconocida = healthiest_first.len() / 2;
+    let rango = |addr: &String| {
+        healthiest_first
+            .iter()
+            .position(|conocida| direcciones_equivalentes(addr, conocida))
+            .unwrap_or(desconocida)
+    };
+    let mut ordenados = candidatos;
+    // Estable sobre una lista ya barajada: el orden dentro de cada nivel de
+    // salud queda al azar, y entre niveles manda la salud.
+    ordenados.sort_by_key(rango);
+    ordenados
+}
+
 fn shuffled_peer_addrs(seed_addrs: &[String]) -> Vec<String> {
     shuffled_peer_addrs_excluding(seed_addrs, &[])
 }
@@ -9645,6 +9681,7 @@ async fn maintain_seed_connections(
     seed_addrs: &[String],
     target_peers: usize,
     own_addrs: &[String],
+    healthiest_first: &[String],
 ) -> Option<String> {
     const MAX_DIAL_ATTEMPTS_PER_SWEEP: usize = 2;
 
@@ -9659,7 +9696,7 @@ async fn maintain_seed_connections(
     let initial_peers = node.connected_peer_count();
     let mut failures = Vec::new();
     let mut attempted = 0usize;
-    let shuffled_seed_addrs = shuffled_peer_addrs_excluding(seed_addrs, own_addrs);
+    let shuffled_seed_addrs = ranked_dial_candidates(seed_addrs, own_addrs, healthiest_first);
     // A peerstore may contain dozens of old onion addresses. Never walk the
     // entire set in one maintenance call: even bounded per-address timeouts
     // would add up and starve the libp2p event loop long enough to lose the
@@ -11103,7 +11140,14 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             let target_seed_peers =
                 seed_connection_target(configured_seed_nodes, reconnect_seed_peers.len());
             if let Some(reconnect_event) =
-                maintain_seed_connections(&mut node, &reconnect_seed_peers, target_seed_peers, &external_addrs).await
+                maintain_seed_connections(
+                    &mut node,
+                    &reconnect_seed_peers,
+                    target_seed_peers,
+                    &external_addrs,
+                    &peer_store.dial_addrs(32),
+                )
+                .await
             {
                 last_event = reconnect_event;
             }
@@ -11954,7 +11998,14 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             let target_seed_peers =
                 seed_connection_target(configured_seed_nodes, reconnect_seed_peers.len());
             if let Some(reconnect_event) =
-                maintain_seed_connections(&mut node, &reconnect_seed_peers, target_seed_peers, &external_addrs).await
+                maintain_seed_connections(
+                    &mut node,
+                    &reconnect_seed_peers,
+                    target_seed_peers,
+                    &external_addrs,
+                    &peer_store.dial_addrs(32),
+                )
+                .await
             {
                 last_event = reconnect_event;
             }
@@ -17977,6 +18028,54 @@ mod tests {
     /// abierto no le afecta, porque junta vecinos por conexiones entrantes; a
     /// quien esta detras de un router que no controla, salir a buscar es la
     /// unica via y era justo lo que se apagaba.
+    /// El peerstore ya sabe cuales direcciones sirven: las ordena por score,
+    /// ultima conexion exitosa y fallos. Ese orden se estaba tirando al barajar
+    /// la lista entera, asi que una semilla muerta salia sorteada tan seguido
+    /// como un par sano -- y con dos intentos por barrido, eso es media ronda
+    /// regalada.
+    #[test]
+    fn a_dead_address_is_tried_after_the_healthy_ones() {
+        let sana_a = "/onion3/aaa:28080".to_string();
+        let sana_b = "/onion3/bbb:28080".to_string();
+        let muerta = "/dns4/seed-muerta.example/tcp/28080".to_string();
+        // Tal como lo devuelve dial_addrs: de mas sana a menos.
+        let por_salud = vec![sana_a.clone(), sana_b.clone(), muerta.clone()];
+
+        let orden = ranked_dial_candidates(
+            &[muerta.clone(), sana_a.clone(), sana_b.clone()],
+            &[],
+            &por_salud,
+        );
+
+        assert_eq!(orden.len(), 3);
+        assert_eq!(
+            orden.last(),
+            Some(&muerta),
+            "la direccion con peor salud tiene que quedar ultima: {orden:?}"
+        );
+    }
+
+    /// Una direccion recien agregada a mano no esta en el peerstore. No se la
+    /// premia sobre un par probado, pero tampoco se la castiga como a uno que
+    /// ya fallo: va al medio.
+    #[test]
+    fn an_unknown_address_outranks_a_failing_one() {
+        let sana = "/onion3/aaa:28080".to_string();
+        let muerta = "/onion3/zzz:28080".to_string();
+        let nueva = "/onion3/nueva:28080".to_string();
+        let por_salud = vec![sana.clone(), "/onion3/bbb:28080".to_string(), muerta.clone()];
+
+        let orden = ranked_dial_candidates(
+            &[muerta.clone(), nueva.clone(), sana.clone()],
+            &[],
+            &por_salud,
+        );
+
+        let pos = |a: &String| orden.iter().position(|x| x == a).unwrap();
+        assert!(pos(&sana) < pos(&nueva), "la probada va antes: {orden:?}");
+        assert!(pos(&nueva) < pos(&muerta), "la nueva va antes que la muerta: {orden:?}");
+    }
+
     /// Marcar la direccion propia falla siempre con "tried to dial local peer
     /// id", y con dos intentos por barrido se lleva media ronda sin ninguna
     /// posibilidad. Un nodo con onion publicada la tiene en su propio
