@@ -4211,6 +4211,29 @@ impl Node {
     }
 
     /// Return peer addresses and protocol metadata learned through Identify.
+    /// Direcciones de los pares que ya están conectados.
+    ///
+    /// Marcar de nuevo a un par conectado no suma un vecino: el marcado
+    /// "funciona" al instante porque la conexión ya existe, pero la cuenta no
+    /// se mueve, así que la espera posterior vence y se contabiliza como
+    /// fallo. Con un presupuesto de dos intentos por barrido, un solo par
+    /// conectado se lleva la mitad de cada ronda para siempre, y las
+    /// direcciones a las que todavía NO estamos conectados no reciben ni un
+    /// intento. Ese es exactamente el estado en que un nodo se queda clavado
+    /// en un vecino y no sube nunca.
+    pub fn connected_peer_addrs(&self) -> Vec<String> {
+        let conectados = self
+            .connected_peer_ids()
+            .into_iter()
+            .map(|peer| peer.to_string())
+            .collect::<std::collections::HashSet<_>>();
+        self.observed_peer_records()
+            .into_iter()
+            .filter(|record| conectados.contains(&record.peer_id))
+            .map(|record| record.addr)
+            .collect()
+    }
+
     pub fn observed_peer_records(&self) -> Vec<ObservedPeerRecord> {
         self.observed_peer_addrs
             .iter()

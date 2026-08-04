@@ -9696,7 +9696,18 @@ async fn maintain_seed_connections(
     let initial_peers = node.connected_peer_count();
     let mut failures = Vec::new();
     let mut attempted = 0usize;
-    let shuffled_seed_addrs = ranked_dial_candidates(seed_addrs, own_addrs, healthiest_first);
+    // Nunca gastar un intento en un par que ya esta conectado. El marcado
+    // "funciona" al instante porque la conexion existe, pero la cuenta de
+    // vecinos no se mueve, la espera posterior vence, y se anota como fallo.
+    // Con dos intentos por barrido, un unico par conectado se lleva media
+    // ronda para siempre y las direcciones a las que todavia NO estamos
+    // conectados no reciben ninguno: el nodo queda clavado en un vecino.
+    let mut excluidas = own_addrs.to_vec();
+    excluidas.extend(node.connected_peer_addrs());
+    let shuffled_seed_addrs = ranked_dial_candidates(seed_addrs, &excluidas, healthiest_first);
+    if shuffled_seed_addrs.is_empty() {
+        return None;
+    }
     // A peerstore may contain dozens of old onion addresses. Never walk the
     // entire set in one maintenance call: even bounded per-address timeouts
     // would add up and starve the libp2p event loop long enough to lose the
@@ -18028,6 +18039,38 @@ mod tests {
     /// abierto no le afecta, porque junta vecinos por conexiones entrantes; a
     /// quien esta detras de un router que no controla, salir a buscar es la
     /// unica via y era justo lo que se apagaba.
+    /// Remarcar a un par ya conectado no suma un vecino: el marcado funciona
+    /// al instante porque la conexion existe, la cuenta no se mueve, la espera
+    /// vence y se anota como fallo. Con dos intentos por barrido, un solo par
+    /// conectado se lleva media ronda para siempre y las direcciones a las que
+    /// todavia NO estamos conectados no reciben ninguno.
+    ///
+    /// Es el estado en que un nodo se queda clavado en un vecino y no sube
+    /// nunca, por mas que el objetivo sea seis y tenga direcciones sanas
+    /// guardadas.
+    #[test]
+    fn an_already_connected_peer_never_consumes_a_dial_attempt() {
+        let conectado = "/onion3/pwhjqtjv:28080".to_string();
+        let libre_a = "/onion3/qh6t3c7u:28080".to_string();
+        let libre_b = "/onion3/qckkck62:28080".to_string();
+
+        let orden = ranked_dial_candidates(
+            &[conectado.clone(), libre_a.clone(), libre_b.clone()],
+            &[conectado.clone()],
+            &[],
+        );
+
+        assert!(
+            !orden.contains(&conectado),
+            "no se remarca al que ya esta conectado: {orden:?}"
+        );
+        assert_eq!(
+            orden.len(),
+            2,
+            "los dos intentos van a direcciones sin conectar: {orden:?}"
+        );
+    }
+
     /// El peerstore ya sabe cuales direcciones sirven: las ordena por score,
     /// ultima conexion exitosa y fallos. Ese orden se estaba tirando al barajar
     /// la lista entera, asi que una semilla muerta salia sorteada tan seguido
