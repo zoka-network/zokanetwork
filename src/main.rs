@@ -8312,10 +8312,45 @@ fn append_unique_peer_addrs(
     added
 }
 
-fn shuffled_peer_addrs(seed_addrs: &[String]) -> Vec<String> {
-    let mut shuffled = seed_addrs.to_vec();
+/// Orden en que se intentan las direcciones al reconectar.
+///
+/// Se baraja para no golpear siempre a la misma, pero **primero se descartan
+/// las propias**: marcar la dirección de uno mismo falla siempre con "tried to
+/// dial local peer id", y como el presupuesto es de dos intentos por barrido,
+/// una dirección propia se lleva la mitad de la ronda sin ninguna posibilidad.
+/// Un nodo con onion publicada la tiene en su propio manifiesto, así que el
+/// caso es la norma y no la excepción.
+fn shuffled_peer_addrs_excluding(seed_addrs: &[String], propias: &[String]) -> Vec<String> {
+    let mut shuffled = seed_addrs
+        .iter()
+        .filter(|addr| !propias.iter().any(|propia| direcciones_equivalentes(addr, propia)))
+        .cloned()
+        .collect::<Vec<_>>();
     shuffled.shuffle(&mut rand::thread_rng());
     shuffled
+}
+
+/// Dos multiaddr apuntan al mismo sitio.
+///
+/// Comparación textual tras normalizar: la misma onion puede venir del
+/// manifiesto y de la línea de comandos con distinto formato de sufijo, y
+/// bastaría esa diferencia para que el filtro no la reconociera.
+fn direcciones_equivalentes(a: &str, b: &str) -> bool {
+    fn nucleo(addr: &str) -> String {
+        addr.trim()
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+            .replace("/p2p/", "|")
+            .split('|')
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+    !a.trim().is_empty() && nucleo(a) == nucleo(b)
+}
+
+fn shuffled_peer_addrs(seed_addrs: &[String]) -> Vec<String> {
+    shuffled_peer_addrs_excluding(seed_addrs, &[])
 }
 
 fn reconnect_delay_with_jitter(
@@ -9609,6 +9644,7 @@ async fn maintain_seed_connections(
     node: &mut Node,
     seed_addrs: &[String],
     target_peers: usize,
+    own_addrs: &[String],
 ) -> Option<String> {
     const MAX_DIAL_ATTEMPTS_PER_SWEEP: usize = 2;
 
@@ -9623,7 +9659,7 @@ async fn maintain_seed_connections(
     let initial_peers = node.connected_peer_count();
     let mut failures = Vec::new();
     let mut attempted = 0usize;
-    let shuffled_seed_addrs = shuffled_peer_addrs(seed_addrs);
+    let shuffled_seed_addrs = shuffled_peer_addrs_excluding(seed_addrs, own_addrs);
     // A peerstore may contain dozens of old onion addresses. Never walk the
     // entire set in one maintenance call: even bounded per-address timeouts
     // would add up and starve the libp2p event loop long enough to lose the
@@ -9635,9 +9671,34 @@ async fn maintain_seed_connections(
         // loop inside the SOCKS handshake for roughly a minute. While blocked,
         // existing libp2p connections are not pumped and healthy peers time
         // out as collateral damage. Keep every maintenance dial bounded.
-        match timeout(Duration::from_secs(6), node.connect_to_peer(seed)).await {
+        // Presupuestos medidos para Tor, no para clearnet.
+        //
+        // Estaban en 6s para marcar y 4s para confirmar. Un circuito Tor tarda
+        // varios segundos solo en armarse, asi que por onion practicamente
+        // todo intento vencia antes de completarse y se contaba como fallo
+        // aunque la conexion terminara estableciendose despues. El nodo
+        // marcaba sin descanso y no sumaba vecinos.
+        //
+        // Este mismo archivo ya habia aprendido la leccion para las peticiones
+        // de bloques -- ahi los presupuestos se subieron a 30s citando
+        // exactamente este motivo -- pero el camino de reconexion quedo con
+        // los numeros viejos.
+        //
+        // Sigue acotado: una onion muerta no puede retener el bucle mas de lo
+        // que dice este numero, que es la razon por la que el limite existe.
+        let dial_budget = if seed.contains("/onion3/") || seed.contains("/onion/") {
+            Duration::from_secs(20)
+        } else {
+            Duration::from_secs(6)
+        };
+        let warmup_budget = if seed.contains("/onion3/") || seed.contains("/onion/") {
+            Duration::from_secs(15)
+        } else {
+            Duration::from_secs(4)
+        };
+        match timeout(dial_budget, node.connect_to_peer(seed)).await {
             Err(_) => {
-                let err = "dial timeout after 6s";
+                let err = "dial timeout";
                 tracing::warn!(
                     target: "zoka.network",
                     peer = %seed,
@@ -9649,7 +9710,7 @@ async fn maintain_seed_connections(
             Ok(Ok(())) => {
                 let next_floor = before.saturating_add(1).min(target_peers).max(1);
                 match node
-                    .wait_for_min_connected_peers(next_floor, Duration::from_secs(4))
+                    .wait_for_min_connected_peers(next_floor, warmup_budget)
                     .await
                 {
                     Ok(()) if node.connected_peer_count() >= target_peers => {
@@ -11042,7 +11103,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             let target_seed_peers =
                 seed_connection_target(configured_seed_nodes, reconnect_seed_peers.len());
             if let Some(reconnect_event) =
-                maintain_seed_connections(&mut node, &reconnect_seed_peers, target_seed_peers).await
+                maintain_seed_connections(&mut node, &reconnect_seed_peers, target_seed_peers, &external_addrs).await
             {
                 last_event = reconnect_event;
             }
@@ -11893,7 +11954,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             let target_seed_peers =
                 seed_connection_target(configured_seed_nodes, reconnect_seed_peers.len());
             if let Some(reconnect_event) =
-                maintain_seed_connections(&mut node, &reconnect_seed_peers, target_seed_peers).await
+                maintain_seed_connections(&mut node, &reconnect_seed_peers, target_seed_peers, &external_addrs).await
             {
                 last_event = reconnect_event;
             }
@@ -17916,6 +17977,34 @@ mod tests {
     /// abierto no le afecta, porque junta vecinos por conexiones entrantes; a
     /// quien esta detras de un router que no controla, salir a buscar es la
     /// unica via y era justo lo que se apagaba.
+    /// Marcar la direccion propia falla siempre con "tried to dial local peer
+    /// id", y con dos intentos por barrido se lleva media ronda sin ninguna
+    /// posibilidad. Un nodo con onion publicada la tiene en su propio
+    /// manifiesto, asi que el caso es la norma.
+    #[test]
+    fn dialing_never_wastes_an_attempt_on_our_own_address() {
+        let propia = "/onion3/d5pk3nhesk5wlvz4f5unbhcozxgtj7u6mhagauyprjrxndzpwbaoeiid:28080";
+        let ajena = "/onion3/qckkck62hvizbwuh2w2ci7xvvacfy2bbqxiosrhyhwjbbsuxkr25ffyd:28080";
+        let orden = shuffled_peer_addrs_excluding(
+            &[propia.to_string(), ajena.to_string()],
+            &[propia.to_string()],
+        );
+        assert_eq!(orden, vec![ajena.to_string()]);
+    }
+
+    /// La misma onion puede venir del manifiesto y de la linea de comandos con
+    /// distinto sufijo; sin normalizar, el filtro no la reconoceria.
+    #[test]
+    fn our_own_address_is_recognised_across_suffix_differences() {
+        assert!(direcciones_equivalentes(
+            "/onion3/abc:28080",
+            "/onion3/abc:28080/p2p/12D3KooWfoo",
+        ));
+        assert!(direcciones_equivalentes("/onion3/ABC:28080/", "/onion3/abc:28080"));
+        assert!(!direcciones_equivalentes("/onion3/abc:28080", "/onion3/xyz:28080"));
+        assert!(!direcciones_equivalentes("", "/onion3/abc:28080"));
+    }
+
     #[test]
     fn peer_target_does_not_shrink_to_the_number_of_seeds() {
         // Una sola semilla y muchas direcciones conocidas: se apunta a una
