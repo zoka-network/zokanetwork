@@ -88,6 +88,16 @@ fn print_usage() {
     println!(
         "  tx-send | tx-pending | private-tx-publish | private-tx-audit | estimate-fee | mine | fullnode | node-status | sync-status"
     );
+    println!("{}", dashboard_section("Team mining", ANSI_CYAN));
+    println!("  team-status [--json]                       (team, members and whether you are hashing)");
+    println!("  team-create [--json]                       (creates a team; prints the invite code to share)");
+    println!("  team-join --code <invite-code> [--json]");
+    println!("  team-leave");
+    println!("  team-start [--threads <n>] | team-stop");
+    println!(
+        "  All of these talk to the node on this machine (127.0.0.1:3000 by default; --rpc to change it).
+  Whole blocks rotate by contributed work and are paid from the chain to each member's own address."
+    );
     println!("{}", dashboard_section("Chain and operators", ANSI_YELLOW));
     println!("  height [--network mainnet|testnet] [--db <path>] [--json]");
     println!(
@@ -15843,6 +15853,154 @@ fn cmd_estimate_fee(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// URL del nodo local para los comandos de equipo.
+///
+/// Deliberadamente el nodo de esta maquina y no un RPC remoto: crear un equipo
+/// o unirse a uno compromete la direccion de cobro de quien ejecuta el comando.
+/// Apuntar sin querer a un nodo ajeno haria que el equipo se armara con la
+/// direccion del otro, y el error no se notaria hasta que las recompensas
+/// llegaran a la persona equivocada. `--rpc` sigue disponible para quien corra
+/// el nodo en otro puerto o en otra maquina suya.
+fn team_rpc_url(args: &[String]) -> String {
+    option_value(args, "--rpc").unwrap_or_else(|| "http://127.0.0.1:3000".to_string())
+}
+
+fn team_timeout(args: &[String]) -> Result<u64, String> {
+    parse_u64_arg(option_value(args, "--timeout-secs"), 5, "--timeout-secs")
+}
+
+/// `zoka team-status [--json]` -- estado del equipo de mineria.
+fn cmd_team_status(args: &[String]) -> Result<(), String> {
+    let rpc = team_rpc_url(args);
+    let estado = rpc_http_get_json(&rpc, "/team-mining/status", team_timeout(args)?)?;
+    if has_flag(args, "--json") {
+        println!("{estado}");
+        return Ok(());
+    }
+    println!("{}", dashboard_title("Team mining", ANSI_CYAN));
+    let cadena = |clave: &str| {
+        estado
+            .get(clave)
+            .and_then(|v| v.as_str())
+            .unwrap_or("-")
+            .to_string()
+    };
+    println!("{}", dashboard_line("Join status", cadena("join_status")));
+    println!("{}", dashboard_line("Team id", cadena("team_id")));
+    println!("{}", dashboard_line("Invite code", cadena("invite_code")));
+    println!("{}", dashboard_line("Coordinator", cadena("coordinator")));
+    let miembros = estado
+        .get("members")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    println!("{}", dashboard_line("Members", miembros));
+    println!(
+        "{}",
+        dashboard_line(
+            "Hashing",
+            yes_no(estado.get("hashing").and_then(|v| v.as_bool()).unwrap_or(false))
+        )
+    );
+    Ok(())
+}
+
+/// `zoka team-create [--json]` -- crea un equipo y devuelve el codigo a repartir.
+fn cmd_team_create(args: &[String]) -> Result<(), String> {
+    let rpc = team_rpc_url(args);
+    let respuesta = rpc_http_post_json(
+        &rpc,
+        "/team-mining/team",
+        &serde_json::json!({}),
+        team_timeout(args)?,
+    )?;
+    if has_flag(args, "--json") {
+        println!("{respuesta}");
+        return Ok(());
+    }
+    let codigo = respuesta
+        .get("invite_code")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
+    println!("Team created. Share this code with whoever should join:");
+    println!("  {codigo}");
+    Ok(())
+}
+
+/// `zoka team-join --code <codigo> [--json]` -- entra a un equipo existente.
+fn cmd_team_join(args: &[String]) -> Result<(), String> {
+    let codigo = option_value(args, "--code")
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| "pass --code <invite-code>".to_string())?;
+    let rpc = team_rpc_url(args);
+    let respuesta = rpc_http_post_json(
+        &rpc,
+        "/team-mining/join",
+        &serde_json::json!({ "invite_code": codigo }),
+        team_timeout(args)?,
+    )?;
+    if has_flag(args, "--json") {
+        println!("{respuesta}");
+        return Ok(());
+    }
+    println!("Join requested. Run `zoka team-status` to see when it is accepted.");
+    Ok(())
+}
+
+/// `zoka team-leave` -- sale del equipo. El coordinador no puede irse: o
+/// traspasa la coordinacion o disuelve el equipo.
+fn cmd_team_leave(args: &[String]) -> Result<(), String> {
+    let rpc = team_rpc_url(args);
+    let respuesta = rpc_http_post_json(
+        &rpc,
+        "/team-mining/leave",
+        &serde_json::json!({}),
+        team_timeout(args)?,
+    )?;
+    if has_flag(args, "--json") {
+        println!("{respuesta}");
+    } else {
+        println!("Left the team.");
+    }
+    Ok(())
+}
+
+/// `zoka team-start [--threads <n>]` / `zoka team-stop` -- prende y apaga el
+/// aporte de computo al equipo.
+fn cmd_team_start(args: &[String]) -> Result<(), String> {
+    let hilos = parse_u64_arg(option_value(args, "--threads"), 1, "--threads")?;
+    let rpc = team_rpc_url(args);
+    let respuesta = rpc_http_post_json(
+        &rpc,
+        "/team-mining/start",
+        &serde_json::json!({ "threads": hilos.max(1) }),
+        team_timeout(args)?,
+    )?;
+    if has_flag(args, "--json") {
+        println!("{respuesta}");
+    } else {
+        println!("Team mining started with {} thread(s).", hilos.max(1));
+    }
+    Ok(())
+}
+
+fn cmd_team_stop(args: &[String]) -> Result<(), String> {
+    let rpc = team_rpc_url(args);
+    let respuesta = rpc_http_post_json(
+        &rpc,
+        "/team-mining/stop",
+        &serde_json::json!({}),
+        team_timeout(args)?,
+    )?;
+    if has_flag(args, "--json") {
+        println!("{respuesta}");
+    } else {
+        println!("Team mining stopped.");
+    }
+    Ok(())
+}
+
 fn cmd_mine_status(args: &[String]) -> Result<(), String> {
     let network = NetworkProfile::from_args(args)?;
     let state = load_user_mining_state_for_display_for_network(network)?;
@@ -16556,6 +16714,12 @@ async fn run() -> Result<(), String> {
         "tx-send-many" => {
             Err("tx-send-many is disabled in unified private wallet mode".to_string())
         }
+        "team-status" => cmd_team_status(tail),
+        "team-create" => cmd_team_create(tail),
+        "team-join" => cmd_team_join(tail),
+        "team-leave" => cmd_team_leave(tail),
+        "team-start" => cmd_team_start(tail),
+        "team-stop" => cmd_team_stop(tail),
         "mine-status" => cmd_mine_status(tail),
         "mine-console" => cmd_mine_console(tail),
         "dashboard" => cmd_status_overview(tail),
@@ -18117,6 +18281,31 @@ mod tests {
         let pos = |a: &String| orden.iter().position(|x| x == a).unwrap();
         assert!(pos(&sana) < pos(&nueva), "la probada va antes: {orden:?}");
         assert!(pos(&nueva) < pos(&muerta), "la nueva va antes que la muerta: {orden:?}");
+    }
+
+    /// Los comandos de equipo hablan con el nodo de ESTA maquina por defecto.
+    ///
+    /// Crear un equipo o unirse compromete la direccion de cobro de quien
+    /// ejecuta el comando: apuntar sin querer a un nodo ajeno armaria el equipo
+    /// con la direccion del otro, y el error no se notaria hasta que las
+    /// recompensas llegaran a la persona equivocada.
+    #[test]
+    fn team_commands_talk_to_this_machine_unless_told_otherwise() {
+        assert_eq!(team_rpc_url(&[]), "http://127.0.0.1:3000");
+        assert_eq!(
+            team_rpc_url(&["--rpc".to_string(), "http://127.0.0.1:4000".to_string()]),
+            "http://127.0.0.1:4000"
+        );
+    }
+
+    /// Unirse sin codigo tiene que fallar con un mensaje que diga que falta,
+    /// no mandar una peticion vacia que el nodo rechace con algo generico.
+    #[test]
+    fn joining_without_a_code_says_what_is_missing() {
+        let err = cmd_team_join(&[]).unwrap_err();
+        assert!(err.contains("--code"), "mensaje poco util: {err}");
+        let vacio = cmd_team_join(&["--code".to_string(), "   ".to_string()]).unwrap_err();
+        assert!(vacio.contains("--code"), "un codigo en blanco es no tener codigo: {vacio}");
     }
 
     /// Marcar la direccion propia falla siempre con "tried to dial local peer
