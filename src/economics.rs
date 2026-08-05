@@ -55,6 +55,29 @@ pub const MAINNET_RECOVERY_CHECKPOINT_10887_HEIGHT: u64 = 10_887;
 pub const MAINNET_RECOVERY_CHECKPOINT_10887_HASH: &str =
     "d30c20100f6405424d32e5c204799bc10a1197ff5cdc1fe0b04c2c538b11086e";
 
+/// Ancla canónica posterior a la bifurcación observada en 10891.
+///
+/// El ancla de 10887 fija ese bloque y nada más: cuatro bloques después la
+/// cadena volvió a partirse en dos candidatos con el mismo padre
+/// (`b8c17acd…`), y ganó `910efde3…` por trabajo acumulado. Un nodo que
+/// arrancó desde un snapshot tomado mientras la semilla estaba en la rama
+/// perdedora hereda esa rama y **no converge solo**: la divergencia queda a
+/// miles de bloques de profundidad y la reorganización por trabajo no llega
+/// tan atrás en la práctica. Sin este pin, el único remedio es borrar la base
+/// y sincronizar de cero.
+///
+/// Con el pin, cualquier cadena que no contenga este bloque viola el
+/// checkpoint y `checkpoint_forced_reorg_required` la abandona sin importar el
+/// trabajo que reclame. Y un snapshot servido desde una rama equivocada se
+/// rechaza al importarlo, así que el problema deja de poder propagarse.
+///
+/// Altura elegida a 3.609 bloques por encima de la bifurcación y 626 por
+/// debajo de la punta al momento de fijarla: lejos de donde todavía puede
+/// haber reorganizaciones legítimas.
+pub const MAINNET_RECOVERY_CHECKPOINT_14500_HEIGHT: u64 = 14500;
+pub const MAINNET_RECOVERY_CHECKPOINT_14500_HASH: &str =
+    "5301997c287e9a14f24700b65d568e915c59cd83b9d88c6cbcd994e22eed010f";
+
 /// Evidence gates for publishing the 1.9.0 recovery release. The checkpoint
 /// is compiled now so candidate binaries can be exercised, but release
 /// artifacts must remain blocked until all thresholds are independently met.
@@ -89,6 +112,10 @@ pub const MAINNET_EMERGENCY_CHECKPOINTS: &[(u64, &str)] = &[
     (
         MAINNET_RECOVERY_CHECKPOINT_10887_HEIGHT,
         MAINNET_RECOVERY_CHECKPOINT_10887_HASH,
+    ),
+    (
+        MAINNET_RECOVERY_CHECKPOINT_14500_HEIGHT,
+        MAINNET_RECOVERY_CHECKPOINT_14500_HASH,
     ),
 ];
 /// Temporary one-miner recovery window after the 1.4.x checkpoint. The cap is
@@ -375,6 +402,34 @@ mod tests {
         assert_eq!(HALVING_INTERVAL_BLOCKS, 1_051_200);
         assert_eq!(TARGET_BLOCK_TIME_SECS, 120);
         assert_eq!(COINBASE_MATURITY_BLOCKS, 60);
+    }
+
+    /// El ancla nueva tiene que estar en la tabla, no solo declarada: la
+    /// constante suelta no la usa nadie, y un pin que no se valida no protege
+    /// de nada. Es exactamente el error que dejaria la bifurcacion sin cerrar
+    /// mientras el codigo aparenta lo contrario.
+    #[test]
+    fn the_14500_anchor_is_actually_enforced() {
+        assert_eq!(MAINNET_RECOVERY_CHECKPOINT_14500_HEIGHT, 14500);
+        assert_eq!(
+            MAINNET_RECOVERY_CHECKPOINT_14500_HASH,
+            "5301997c287e9a14f24700b65d568e915c59cd83b9d88c6cbcd994e22eed010f"
+        );
+        assert!(MAINNET_EMERGENCY_CHECKPOINTS.contains(&(
+            MAINNET_RECOVERY_CHECKPOINT_14500_HEIGHT,
+            MAINNET_RECOVERY_CHECKPOINT_14500_HASH,
+        )));
+    }
+
+    /// Las anclas se recorren en orden y cada una corta ramas por encima de la
+    /// anterior. Fuera de orden, una altura menor se evaluaria despues de una
+    /// mayor y el razonamiento sobre que rama sobrevive deja de valer.
+    #[test]
+    fn anchors_stay_in_ascending_height_order() {
+        let alturas: Vec<u64> = MAINNET_EMERGENCY_CHECKPOINTS.iter().map(|(h, _)| *h).collect();
+        let mut ordenadas = alturas.clone();
+        ordenadas.sort_unstable();
+        assert_eq!(alturas, ordenadas, "anclas fuera de orden: {alturas:?}");
     }
 
     #[test]
