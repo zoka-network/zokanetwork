@@ -135,6 +135,39 @@ impl ExchangeRuntime {
         source_peer: &str,
     ) -> Result<(), crate::p2p_exchange::StoreError> {
         if update.seller_address == self.seller_address {
+            // El comprador suelta su reclamo y la oferta vuelve al mercado.
+            //
+            // Es la unica transicion ajena ademas de Claimed que se acepta, y
+            // solo de quien tiene el reclamo. Sin esto, un comprador que se
+            // arrepiente deja la venta trabada los 45 minutos completos: nadie
+            // mas puede tomarla y el vendedor tampoco puede cancelarla, porque
+            // cancelar exige que este abierta.
+            //
+            // Vale la misma advertencia que para el reclamo: estos mensajes no
+            // van firmados, asi que un tercero podria falsificar una
+            // liberacion. El dano es menor que el de un reclamo falso -- que
+            // traba la oferta -- y el modelo de confianza ya convive con eso.
+            if update.status == crate::p2p_exchange::OfferStatus::Open {
+                let quien = update
+                    .claimed_by
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or(crate::p2p_exchange::StoreError::InvalidTransition)?;
+                let liberada = self
+                    .offer_store
+                    .lock()
+                    .await
+                    .release_claim(&update.offer_id, quien)?;
+                self.queue_message(crate::network::message::ZokaMessage::OfferAnnounce(
+                    crate::network::message::OfferAnnounceMessage {
+                        offer: liberada,
+                        signature: Vec::new(),
+                        timestamp: now_secs(),
+                    },
+                ))
+                .await;
+                return Ok(());
+            }
             if update.status != crate::p2p_exchange::OfferStatus::Claimed {
                 return Err(crate::p2p_exchange::StoreError::InvalidTransition);
             }
@@ -5819,6 +5852,71 @@ async fn report_exchange_payment_failure(
     Ok(Json(serde_json::to_value(report).unwrap_or_default()))
 }
 
+/// `POST /p2p-exchange/offers/:id/release-claim` — el comprador suelta la
+/// oferta que habia tomado y vuelve al mercado para otros.
+///
+/// Existe porque hasta ahora un comprador que se arrepentia dejaba la venta
+/// trabada los 45 minutos completos: nadie mas podia tomarla, y el vendedor
+/// tampoco podia cancelarla porque cancelar exige que este abierta.
+///
+/// Si la oferta es propia se libera aca mismo; si es ajena se avisa al
+/// vendedor, que es quien manda sobre su propia oferta.
+async fn release_exchange_claim(
+    State(app_state): State<Arc<AppState>>,
+    Path(offer_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let exchange = exchange_runtime_or_404(&app_state)?;
+    let offer = {
+        let store = exchange.offer_store.lock().await;
+        store
+            .get(&offer_id)
+            .cloned()
+            .ok_or((StatusCode::NOT_FOUND, "no such offer".to_string()))?
+    };
+    let yo = exchange.seller_address.clone();
+    if offer.claimed_by.as_deref() != Some(yo.as_str()) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "only the buyer holding this claim can release it".to_string(),
+        ));
+    }
+    if offer.status != crate::p2p_exchange::OfferStatus::Claimed {
+        return Err((
+            StatusCode::CONFLICT,
+            "only a claimed offer can be released".to_string(),
+        ));
+    }
+
+    let mensaje = crate::network::message::OfferStatusUpdateMessage {
+        offer_id: offer.id.clone(),
+        seller_address: offer.seller_address.clone(),
+        status: crate::p2p_exchange::OfferStatus::Open,
+        claimed_by: Some(yo.clone()),
+        claim_expires_at: None,
+        signature: Vec::new(),
+        timestamp: now_secs(),
+    };
+
+    if offer.seller_address == yo {
+        exchange
+            .offer_store
+            .lock()
+            .await
+            .release_claim(&offer.id, &yo)
+            .map_err(|error| (StatusCode::CONFLICT, format!("{error:?}")))?;
+    }
+    exchange
+        .queue_message(crate::network::message::ZokaMessage::OfferStatusUpdate(
+            mensaje,
+        ))
+        .await;
+
+    Ok(Json(serde_json::json!({
+        "offer_id": offer.id,
+        "released": true,
+    })))
+}
+
 async fn cancel_exchange_offer(
     State(app_state): State<Arc<AppState>>,
     Path(offer_id): Path<String>,
@@ -6706,6 +6804,12 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         .route(
             "/p2p-exchange/offers/:id/cancel",
             post(cancel_exchange_offer),
+        )
+        // El comprador suelta la oferta que habia tomado. Sin esto, arrepentirse
+        // trababa la venta los 45 minutos completos para todos.
+        .route(
+            "/p2p-exchange/offers/:id/release-claim",
+            post(release_exchange_claim),
         )
         .route("/state/snapshot", post(create_snapshot))
         .route("/state/snapshots", get(list_snapshots))

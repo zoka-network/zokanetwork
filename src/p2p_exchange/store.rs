@@ -280,6 +280,38 @@ impl OfferStore {
         Ok(claimed)
     }
 
+    /// Devuelve al mercado una oferta que el comprador solto.
+    ///
+    /// Solo el que tiene el reclamo puede soltarlo, y solo mientras la oferta
+    /// siga en Claimed. Sin esto, un comprador que se arrepiente deja la venta
+    /// bloqueada los 45 minutos completos: nadie mas puede tomarla y el
+    /// vendedor no puede cancelarla porque ya no esta abierta.
+    ///
+    /// La reserva del vendedor no se toca: el ZKA sigue respaldando la oferta,
+    /// que vuelve a estar disponible tal como se publico.
+    pub fn release_claim(&mut self, offer_id: &str, buyer: &str) -> Result<Offer, StoreError> {
+        let offer = self
+            .offers
+            .get_mut(offer_id)
+            .ok_or(StoreError::UnknownOffer)?;
+        if offer.status != OfferStatus::Claimed {
+            return Err(StoreError::InvalidTransition);
+        }
+        if offer.claimed_by.as_deref() != Some(buyer) {
+            return Err(StoreError::InvalidTransition);
+        }
+        let previous = offer.clone();
+        offer.status = OfferStatus::Open;
+        offer.claimed_by = None;
+        offer.claim_expires_at = None;
+        let liberada = offer.clone();
+        if let Err(error) = self.persist() {
+            self.offers.insert(offer_id.to_string(), previous);
+            return Err(error);
+        }
+        Ok(liberada)
+    }
+
     /// Moves an offer to a new status.
     pub fn set_status(&mut self, offer_id: &str, status: OfferStatus) -> Result<(), StoreError> {
         let offer = self
@@ -382,6 +414,34 @@ mod tests {
             reserved_atoms: 0,
             tron_network: None,
         }
+    }
+
+    /// Sin soltar el reclamo, un comprador arrepentido dejaba la venta trabada
+    /// los 45 minutos completos: nadie mas podia tomarla y el vendedor tampoco
+    /// podia cancelarla, porque cancelar exige que este abierta.
+    #[test]
+    fn a_buyer_can_hand_the_offer_back_to_the_market() {
+        let mut store = OfferStore::open(&temp_path("release")).unwrap();
+        store.insert_local(offer("offer-1", "zka1vendedor")).unwrap();
+        store.claim("offer-1", "zka1comprador", 1_751_000_000).unwrap();
+
+        let liberada = store.release_claim("offer-1", "zka1comprador").unwrap();
+
+        assert_eq!(liberada.status, OfferStatus::Open);
+        assert_eq!(liberada.claimed_by, None);
+        assert_eq!(liberada.claim_expires_at, None);
+    }
+
+    /// Solo quien tiene el reclamo puede soltarlo. Si cualquiera pudiera, se
+    /// convertiria en una forma de sacarle la compra a otro.
+    #[test]
+    fn only_the_claim_holder_can_release_it() {
+        let mut store = OfferStore::open(&temp_path("release-holder")).unwrap();
+        store.insert_local(offer("offer-1", "zka1vendedor")).unwrap();
+        store.claim("offer-1", "zka1comprador", 1_751_000_000).unwrap();
+
+        assert!(store.release_claim("offer-1", "zka1otro").is_err());
+        assert_eq!(store.get("offer-1").unwrap().status, OfferStatus::Claimed);
     }
 
     #[test]
