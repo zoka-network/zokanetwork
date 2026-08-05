@@ -34,7 +34,7 @@
     "Bugs found on testnet must be fixed in shared code, not testnet-only blockchain paths.",
     "No recovery/checkpoint gate here on purpose: mainnet quarantines a node whose history does not match a signed checkpoint, which is exactly the safety net a testnet must not have if it is going to be reset and rebuilt freely."
   ],
-  "minimum_client_version": "2.0.0",
+  "minimum_client_version": "2.0.1",
   "desktop": {
     "local_rpc_url": "http://127.0.0.1:3000"
   },

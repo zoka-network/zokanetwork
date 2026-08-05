@@ -3,7 +3,7 @@
   "status": "release-candidate",
   "chain_id": "zoka-mainnet-zenith-v1",
   "protocol_freeze_id": "/zoka/1.9.0-mainnet-recovery",
-  "minimum_client_version": "2.0.0",
+  "minimum_client_version": "2.0.1",
   "recovery": {
     "policy_version": "zoka-mainnet-recovery-v1",
     "checkpoint": {

@@ -74,6 +74,13 @@ pub const MAINNET_RECOVERY_CHECKPOINT_10887_HASH: &str =
 /// Altura elegida a 3.609 bloques por encima de la bifurcación y 626 por
 /// debajo de la punta al momento de fijarla: lejos de donde todavía puede
 /// haber reorganizaciones legítimas.
+///
+/// Verificado idéntico en dos nodos con bases de datos independientes antes de
+/// fijarlo — hash, padre, nonce y timestamp coincidentes en los cuatro campos.
+/// Ambos comparten vecinos, así que la comprobación es más débil que la de dos
+/// infraestructuras separadas: dos máquinas que sincronizan de los mismos dos
+/// pares heredarían el mismo error. La confirmación de que 10891 canónico es
+/// `910efde3…` sí vino de nodos de otra red.
 pub const MAINNET_RECOVERY_CHECKPOINT_14500_HEIGHT: u64 = 14500;
 pub const MAINNET_RECOVERY_CHECKPOINT_14500_HASH: &str =
     "5301997c287e9a14f24700b65d568e915c59cd83b9d88c6cbcd994e22eed010f";
