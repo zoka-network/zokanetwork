@@ -2217,7 +2217,30 @@ impl Node {
                         .block_request_response_stats
                         .outbound_responses
                         .saturating_add(1);
-                    self.record_direct_block_success(response_peer.clone(), latency);
+                    // Un "no tengo ese bloque" NO es una respuesta util.
+                    //
+                    // Se puntuaba como exito cualquier respuesta que llegara,
+                    // sin mirar que decia. Un nodo recien instalado, que no
+                    // tiene la altura pedida, contestaba NotFound y sumaba +10
+                    // igual que uno que entrego el bloque. Como los pares se
+                    // ordenan por puntaje para elegir a quien preguntarle, esos
+                    // nodos subian al tope y se les volvia a preguntar primero:
+                    // un bucle que se refuerza solo.
+                    //
+                    // El sintoma era un nodo que recibia miles de respuestas
+                    // por minuto sin avanzar un bloque, porque todas eran
+                    // NotFound. Con quince pares y la mayoria sincronizando
+                    // todavia, la cola de preferidos se llenaba justamente con
+                    // los que no podian servir nada.
+                    let entrego_bloque = matches!(
+                        response,
+                        crate::network::block_request_response::BlockBodyResponse::Found(_)
+                    );
+                    if entrego_bloque {
+                        self.record_direct_block_success(response_peer.clone(), latency);
+                    } else {
+                        self.record_direct_block_failure(response_peer.clone());
+                    }
                     self.received_block_body_responses
                         .push_back(ReceivedBlockBodyResponse {
                             request_id,
@@ -4501,6 +4524,34 @@ impl Node {
 
 #[cfg(test)]
 mod tests {
+
+    /// Un "no tengo ese bloque" no puede puntuar como si lo hubiera entregado.
+    ///
+    /// Se puntuaba como exito cualquier respuesta que llegara. Un nodo recien
+    /// instalado, que todavia no tiene la altura pedida, contestaba NotFound y
+    /// sumaba reputacion igual que uno que entrego el bloque. Como los pares se
+    /// ordenan por puntaje para decidir a quien preguntarle, esos nodos subian
+    /// al tope y se les volvia a preguntar primero: un bucle que se refuerza
+    /// solo, con miles de respuestas por minuto y cero bloques aplicados.
+    #[test]
+    fn only_a_delivered_block_counts_as_a_useful_response() {
+        use crate::network::block_request_response::BlockBodyResponse;
+
+        let no_lo_tengo = BlockBodyResponse::NotFound {
+            block_height: 15642,
+            block_hash: None,
+            reason: "canonical block not found".to_string(),
+        };
+        let rechazado = BlockBodyResponse::Rejected {
+            block_height: 15642,
+            block_hash: None,
+            reason: "read failed".to_string(),
+        };
+
+        let util = |r: &BlockBodyResponse| matches!(r, BlockBodyResponse::Found(_));
+        assert!(!util(&no_lo_tengo), "NotFound no sirve para avanzar");
+        assert!(!util(&rechazado), "Rejected tampoco");
+    }
     use super::*;
     use crate::consensus::{PbftMessage, PbftMessageType};
     use crate::network::message::{PingMessage, PrivateOutputMessage};
