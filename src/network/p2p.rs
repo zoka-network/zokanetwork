@@ -2584,8 +2584,30 @@ impl Node {
             return peers;
         };
         if strict_peer_affinity {
-            peers.retain(|peer| peer == preferred_peer);
-            return peers;
+            let solo_el_preferido: Vec<PeerId> = peers
+                .iter()
+                .filter(|peer| *peer == preferred_peer)
+                .cloned()
+                .collect();
+            // Quedarse sin nadie a quien preguntarle no es fidelidad a una
+            // rama: es no sincronizar.
+            //
+            // El par preferido sale de los que ANUNCIARON una altura, que no
+            // son necesariamente los CONECTADOS. Cuando ese par no esta
+            // conectado, filtrar la lista dejaba cero candidatos y el pedido
+            // moria con "no connected peers available for direct block
+            // request" -- teniendo pares sanos al lado. Medido en un nodo con
+            // la base recien creada: no pudo bajar ni el bloque 3, con dos
+            // pares conectados.
+            //
+            // La afinidad estricta existe para no mezclar ramas preguntandole
+            // a cualquiera. Si el par de esa rama no esta, preguntar a otro es
+            // estrictamente mejor que no preguntar: la respuesta se valida
+            // igual -- contra el hash fijado cuando lo hay, y contra las
+            // reglas de cadena siempre.
+            if !solo_el_preferido.is_empty() {
+                return solo_el_preferido;
+            }
         }
         if let Some(position) = peers.iter().position(|peer| peer == preferred_peer) {
             let preferred = peers.remove(position);
@@ -4524,6 +4546,47 @@ impl Node {
 
 #[cfg(test)]
 mod tests {
+
+    /// Quedarse sin nadie a quien preguntarle no es fidelidad a una rama.
+    ///
+    /// El par preferido sale de los que ANUNCIARON altura, que no son
+    /// necesariamente los CONECTADOS. Con afinidad estricta la lista se
+    /// filtraba dejando solo a ese par, y si no estaba conectado quedaba
+    /// vacia: el pedido moria con "no connected peers available" teniendo
+    /// pares sanos al lado. Medido en un nodo con la base recien creada: no
+    /// bajo ni el bloque 3, con dos pares conectados.
+    #[test]
+    fn strict_affinity_never_leaves_the_node_with_nobody_to_ask() {
+        let conectados = vec![PeerId::random(), PeerId::random()];
+        let preferido_desconectado = PeerId::random();
+
+        let elegir = |preferido: &PeerId, estricta: bool| -> Vec<PeerId> {
+            let mut peers = conectados.clone();
+            if estricta {
+                let solo: Vec<PeerId> =
+                    peers.iter().filter(|p| *p == preferido).cloned().collect();
+                if !solo.is_empty() {
+                    return solo;
+                }
+            } else if let Some(pos) = peers.iter().position(|p| p == preferido) {
+                let p = peers.remove(pos);
+                peers.insert(0, p);
+            }
+            peers
+        };
+
+        // El preferido no esta conectado: se pregunta a los que si estan.
+        let elegidos = elegir(&preferido_desconectado, true);
+        assert_eq!(
+            elegidos.len(),
+            2,
+            "sin el preferido hay que preguntarle a los conectados, no a nadie"
+        );
+
+        // El preferido si esta conectado: la afinidad estricta se respeta.
+        let elegidos = elegir(&conectados[1], true);
+        assert_eq!(elegidos, vec![conectados[1]]);
+    }
 
     /// Un "no tengo ese bloque" no puede puntuar como si lo hubiera entregado.
     ///
