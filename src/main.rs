@@ -8597,8 +8597,20 @@ async fn run_ibd_body_prefetch_step(
         // run_sync_step's normal single-height path handle it.
         return Ok(None);
     }
+    // Presupuesto medido para Tor, no para clearnet.
+    //
+    // Estaba en 8s, y el protocolo de peticion/respuesta ya usa 30 por este
+    // mismo motivo: un circuito Tor agrega varios segundos de ida y vuelta, y
+    // cada peticion abre un substream nuevo. Con 8s, las respuestas llegaban
+    // DESPUES de que la peticion venciera -- el contador de respuestas
+    // recibidas subia de a miles mientras la altura local no se movia ni un
+    // bloque. Descargar y descartar, en bucle.
+    //
+    // El comentario que documenta los 30s en la configuracion del behaviour
+    // dice textualmente que con presupuestos de 8-15s "IBD block fetches would
+    // time out and retry forever". Esta llamada se los volvia a imponer.
     let results = node
-        .request_blocks_batch_direct(&heights, Duration::from_secs(8))
+        .request_blocks_batch_direct(&heights, Duration::from_secs(30))
         .await;
     let requested = heights.len();
     let mut fetched = 0u64;
