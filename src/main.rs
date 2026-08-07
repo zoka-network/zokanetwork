@@ -8761,6 +8761,12 @@ async fn run_sync_step(
                 (sourced.response, Some(sourced.source), source_label)
             }
             Err(err) => {
+                if next_request.expected_hash.is_none() {
+                    // Pedido hacia adelante que no llego. Si se repite, es la
+                    // senal de que los pares podaron esta altura y recien ahi
+                    // conviene caminar la ancestria hacia atras.
+                    peer_view.record_forward_gap_failure();
+                }
                 let reset_note = if next_request.expected_hash.is_some()
                     && peer_view.record_branch_backfill_request_failure()
                 {

@@ -39,6 +39,19 @@ const MAX_PENDING_BLOCKS_PER_HEIGHT: usize = 4;
 const MAX_PENDING_BLOCK_AHEAD: u64 = 512;
 const MAX_BRANCH_BACKFILL_REQUEST_FAILURES: u8 = 4;
 
+/// Cuantas veces tiene que fallar el pedido hacia adelante antes de aceptar
+/// que el camino directo no sirve y ponerse a caminar la ancestria hacia
+/// atras.
+///
+/// El paseo hacia atras existe para un caso real pero raro: que los pares
+/// hayan podado `local_head + 1` y ya no lo tengan. La poda en Zoka es un
+/// comando manual (`chain-prune`), asi que casi nadie la corre; sin embargo
+/// el paseo era el camino por defecto de un nodo simplemente atrasado, que es
+/// el caso comun. Pedir la altura siguiente y ver si llega distingue los dos
+/// casos sin adivinar, y tres intentos alcanzan para no confundir un par
+/// lento con uno que podo.
+const FORWARD_GAP_FAILURES_BEFORE_BACKWARD_WALK: u8 = 3;
+
 #[derive(Debug, Clone)]
 struct PeerChainTip {
     height: u64,
@@ -84,6 +97,7 @@ pub struct PeerChainView {
     branch_tip_hash: Option<String>,
     branch_cumulative_work: Option<u128>,
     branch_backfill_request_failures: u8,
+    forward_gap_failures: u8,
     recovery_mode: bool,
     peer_tips: HashMap<PeerId, PeerChainTip>,
     rejected_sources: HashSet<PeerId>,
@@ -272,6 +286,8 @@ impl PeerChainView {
         }
         match outcome {
             SyncOutcome::Applied(head) => {
+                // El camino hacia adelante entrego: deja de ser sospechoso.
+                self.clear_forward_gap_failures();
                 if self.matches_or_learns_branch_hash(head.height, &head.hash, source.as_ref()) {
                     self.advance_branch_backfill(head.height);
                 }
@@ -301,7 +317,24 @@ impl PeerChainView {
                 // parent hash and walk backward until a known ancestor is
                 // found. Unsourced callers retain the conservative forward
                 // IBD behaviour.
-                if source.is_some() {
+                //
+                // Pero solo despues de que el camino directo demuestre que no
+                // sirve. GapAhead significa "me llego un bloque mas alto que
+                // mi cabeza", o sea SIEMPRE que el nodo va atrasado -- no que
+                // haya una bifurcacion. Disparar el paseo aca lo convertia en
+                // el camino por defecto del caso comun: un nodo atrasado 240
+                // bloques recorria la ancestria de a uno desde la punta, ~50s
+                // por paso sobre Tor, para descubrir un enganche que la altura
+                // siguiente le habria dado en un pedido. Medido: 16 horas y
+                // media sin aplicar un bloque, con la cadena local sana.
+                //
+                // El paseo sigue intacto para lo que fue pensado -- pares que
+                // podaron local_head + 1 -- solo que ahora se llega ahi por
+                // evidencia (tres pedidos hacia adelante sin respuesta) en vez
+                // de por suposicion. Una bifurcacion de verdad no depende de
+                // este contador: la delata MissingParent, mas abajo, que
+                // arranca el paseo de inmediato.
+                if source.is_some() && self.forward_path_looks_unavailable() {
                     self.record_branch_parent(
                         *local_head,
                         *candidate,
@@ -614,6 +647,23 @@ impl PeerChainView {
                 self.perceived_max_height_observed_at = None;
             }
         }
+    }
+
+    /// Un pedido hacia adelante (altura siguiente, sin hash fijado) que no
+    /// llego. Si se repite, es la senal de que los pares podaron ese bloque y
+    /// hay que buscar la ancestria hacia atras.
+    pub fn record_forward_gap_failure(&mut self) {
+        self.forward_gap_failures = self.forward_gap_failures.saturating_add(1);
+    }
+
+    /// Si el camino hacia adelante entrego algo, deja de ser sospechoso.
+    pub fn clear_forward_gap_failures(&mut self) {
+        self.forward_gap_failures = 0;
+    }
+
+    /// Si conviene dejar de insistir hacia adelante y caminar hacia atras.
+    pub fn forward_path_looks_unavailable(&self) -> bool {
+        self.forward_gap_failures >= FORWARD_GAP_FAILURES_BEFORE_BACKWARD_WALK
     }
 
     pub fn record_branch_backfill_request_failure(&mut self) -> bool {
@@ -2109,6 +2159,117 @@ mod tests {
         assert_eq!(next, Some(1));
     }
 
+    /// Ir atrasado no es estar bifurcado, y no puede disparar la caminata.
+    ///
+    /// GapAhead significa "me llego un bloque mas alto que mi cabeza", o sea
+    /// SIEMPRE que el nodo va atrasado. Arrancar ahi el paseo hacia atras lo
+    /// volvia el camino por defecto del caso comun: un nodo atrasado 240
+    /// bloques recorria la ancestria de a uno desde la punta, ~50s por paso
+    /// sobre Tor, para descubrir un enganche que la altura siguiente le
+    /// habria dado en un pedido. Medido en una PC: 16 horas y media sin
+    /// aplicar un bloque, con la cadena local sana.
+    #[test]
+    fn a_plain_gap_no_longer_starts_a_backward_walk() {
+        let mut view = PeerChainView::default();
+        let source = Some(PeerId::random());
+        view.observe(15882, 15643);
+
+        view.record_sync_outcome_from(
+            source,
+            &SyncOutcome::GapAhead {
+                local_head: 15643,
+                candidate: 15881,
+                candidate_hash: "h15881".to_string(),
+                parent_hash: "h15880".to_string(),
+            },
+        );
+
+        assert_eq!(
+            view.branch_backfill_height, None,
+            "estar atrasado se resuelve pidiendo la altura siguiente"
+        );
+    }
+
+    /// Pero el paseo sigue disponible para lo que fue pensado: pares que
+    /// podaron `local_head + 1` y ya no lo tienen. Ahora se llega ahi por
+    /// evidencia -- pedidos hacia adelante que no llegan -- en vez de por
+    /// suposicion.
+    #[test]
+    fn a_pruned_peer_still_triggers_the_backward_walk() {
+        let mut view = PeerChainView::default();
+        let source = Some(PeerId::random());
+        view.observe(15882, 15643);
+
+        let gap = SyncOutcome::GapAhead {
+            local_head: 15643,
+            candidate: 15881,
+            candidate_hash: "h15881".to_string(),
+            parent_hash: "h15880".to_string(),
+        };
+
+        // Dos fallos todavia no alcanzan: puede ser un par lento.
+        view.record_forward_gap_failure();
+        view.record_forward_gap_failure();
+        view.record_sync_outcome_from(source, &gap);
+        assert_eq!(view.branch_backfill_height, None);
+
+        // Al tercero se acepta que esa altura no la sirve nadie.
+        view.record_forward_gap_failure();
+        view.record_sync_outcome_from(source, &gap);
+        assert_eq!(
+            view.branch_backfill_height,
+            Some(15880),
+            "sin camino directo hay que buscar la ancestria hacia atras"
+        );
+    }
+
+    /// Una bifurcacion de verdad no depende de ese contador: la delata
+    /// MissingParent, que arranca el paseo de inmediato.
+    #[test]
+    fn a_real_fork_still_walks_back_immediately() {
+        let mut view = PeerChainView::default();
+        let source = Some(PeerId::random());
+        view.observe(15882, 15643);
+
+        view.record_sync_outcome_from(
+            source,
+            &SyncOutcome::MissingParent {
+                local_head: 15643,
+                candidate: 15644,
+                candidate_hash: "h15644".to_string(),
+                parent_hash: "otra-rama".to_string(),
+            },
+        );
+
+        assert_eq!(
+            view.branch_backfill_height,
+            Some(15643),
+            "un padre que no engancha es evidencia de rama distinta, no hay que esperar"
+        );
+    }
+
+    /// Y un bloque aplicado limpia la sospecha: el camino directo funciona.
+    #[test]
+    fn applying_a_block_clears_the_forward_suspicion() {
+        let mut view = PeerChainView::default();
+        view.record_forward_gap_failure();
+        view.record_forward_gap_failure();
+        view.record_forward_gap_failure();
+        assert!(view.forward_path_looks_unavailable());
+
+        view.record_sync_outcome(&SyncOutcome::Applied(crate::state::chain::ChainHead {
+            height: 15644,
+            hash: "h15644".to_string(),
+            total_supply_emitted: 0,
+            cumulative_work: 1,
+        }));
+
+        assert!(
+            !view.forward_path_looks_unavailable(),
+            "si entrego, deja de ser sospechoso"
+        );
+    }
+
     #[test]
     fn next_required_height_prefers_branch_backfill() {
         let (storage, _dir) = open_temp_storage();
@@ -2263,6 +2424,14 @@ mod tests {
         let source = PeerId::random();
         view.observe_trusted_height_from(source, 5);
 
+        // El paseo hacia atras ya no arranca por el solo hecho de ir
+        // atrasado: hace falta que el camino directo falle. Este test es
+        // sobre como se comporta el paseo una vez activo, asi que se lo
+        // enciende explicitamente.
+        view.record_forward_gap_failure();
+        view.record_forward_gap_failure();
+        view.record_forward_gap_failure();
+
         view.record_sync_outcome_from(
             Some(source),
             &SyncOutcome::GapAhead {
@@ -2291,6 +2460,13 @@ mod tests {
         let mut view = PeerChainView::default();
         let source = PeerId::random();
         view.observe_trusted_height_from(source, 7);
+        // El paseo hacia atras ya no arranca por el solo hecho de ir
+        // atrasado: hace falta que el camino directo falle. Este test es
+        // sobre como se comporta el paseo una vez activo, asi que se lo
+        // enciende explicitamente.
+        view.record_forward_gap_failure();
+        view.record_forward_gap_failure();
+        view.record_forward_gap_failure();
         view.record_sync_outcome_from(
             Some(source),
             &SyncOutcome::GapAhead {
@@ -2332,6 +2508,14 @@ mod tests {
         let peer_b = PeerId::random();
         view.observe_trusted_height_from(peer_a, 12);
         view.observe_trusted_height_from(peer_b, 12);
+
+        // El paseo hacia atras ya no arranca por el solo hecho de ir
+        // atrasado: hace falta que el camino directo falle. Este test es
+        // sobre como se comporta el paseo una vez activo, asi que se lo
+        // enciende explicitamente.
+        view.record_forward_gap_failure();
+        view.record_forward_gap_failure();
+        view.record_forward_gap_failure();
 
         view.record_sync_outcome_from(
             Some(peer_a),
