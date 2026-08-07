@@ -52,6 +52,20 @@ const MAX_BRANCH_BACKFILL_REQUEST_FAILURES: u8 = 4;
 /// lento con uno que podo.
 const FORWARD_GAP_FAILURES_BEFORE_BACKWARD_WALK: u8 = 3;
 
+/// Hasta que distancia por encima de la cabeza local vale la pena caminar la
+/// ancestria hacia atras.
+///
+/// Contar fallos no alcanza: lo que decide si el paseo sirve no es cuantas
+/// veces fallo el pedido directo, sino que tan largo seria el paseo. Cuatro
+/// timeouts sobre Tor son normales y alcanzaban para disparar una caminata
+/// desde la punta -- cien pasos o mil, de a un bloque, mientras la cadena
+/// avanza. Eso no es recuperarse: es el mismo pozo por otra puerta.
+///
+/// El caso que el paseo si resuelve es corto por definicion: unos pocos
+/// bloques que los pares ya no tienen. Cuando el candidato esta mucho mas
+/// arriba, ningun paseo va a alcanzarlo -- hace falta un snapshot.
+const MAX_BACKWARD_WALK_DISTANCE: u64 = 64;
+
 #[derive(Debug, Clone)]
 struct PeerChainTip {
     height: u64,
@@ -334,7 +348,9 @@ impl PeerChainView {
                 // de por suposicion. Una bifurcacion de verdad no depende de
                 // este contador: la delata MissingParent, mas abajo, que
                 // arranca el paseo de inmediato.
-                if source.is_some() && self.forward_path_looks_unavailable() {
+                let paseo_corto = *candidate
+                    <= local_head.saturating_add(MAX_BACKWARD_WALK_DISTANCE);
+                if source.is_some() && self.forward_path_looks_unavailable() && paseo_corto {
                     self.record_branch_parent(
                         *local_head,
                         *candidate,
@@ -2190,6 +2206,40 @@ mod tests {
         );
     }
 
+    /// Un paseo largo nunca es la respuesta, por mas que el pedido directo
+    /// falle.
+    ///
+    /// Contar fallos no alcanzaba: cuatro timeouts sobre Tor son normales y
+    /// disparaban una caminata desde la punta, cien pasos o mil, de a un
+    /// bloque, mientras la cadena avanza. Medido en la PC: con la cabeza en
+    /// 15816 y la punta en 15927, el nodo se puso a caminar hacia atras y el
+    /// atraso crecio en vez de cerrarse.
+    #[test]
+    fn a_far_away_candidate_never_starts_a_backward_walk() {
+        let mut view = PeerChainView::default();
+        let source = Some(PeerId::random());
+        view.observe(15927, 15816);
+        // El camino directo ya se dio por perdido.
+        view.record_forward_gap_failure();
+        view.record_forward_gap_failure();
+        view.record_forward_gap_failure();
+
+        view.record_sync_outcome_from(
+            source,
+            &SyncOutcome::GapAhead {
+                local_head: 15816,
+                candidate: 15926,
+                candidate_hash: "h15926".to_string(),
+                parent_hash: "h15925".to_string(),
+            },
+        );
+
+        assert_eq!(
+            view.branch_backfill_height, None,
+            "110 pasos hacia atras no recuperan a nadie; hace falta un snapshot"
+        );
+    }
+
     /// Pero el paseo sigue disponible para lo que fue pensado: pares que
     /// podaron `local_head + 1` y ya no lo tienen. Ahora se llega ahi por
     /// evidencia -- pedidos hacia adelante que no llegan -- en vez de por
@@ -2200,11 +2250,14 @@ mod tests {
         let source = Some(PeerId::random());
         view.observe(15882, 15643);
 
+        // Cerca de la cabeza: es el escenario real de poda -- faltan unos
+        // pocos bloques, no doscientos. Un paseo largo esta descartado por
+        // MAX_BACKWARD_WALK_DISTANCE y tiene su propio test.
         let gap = SyncOutcome::GapAhead {
             local_head: 15643,
-            candidate: 15881,
-            candidate_hash: "h15881".to_string(),
-            parent_hash: "h15880".to_string(),
+            candidate: 15650,
+            candidate_hash: "h15650".to_string(),
+            parent_hash: "h15649".to_string(),
         };
 
         // Dos fallos todavia no alcanzan: puede ser un par lento.
@@ -2218,7 +2271,7 @@ mod tests {
         view.record_sync_outcome_from(source, &gap);
         assert_eq!(
             view.branch_backfill_height,
-            Some(15880),
+            Some(15649),
             "sin camino directo hay que buscar la ancestria hacia atras"
         );
     }
