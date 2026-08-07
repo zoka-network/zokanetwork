@@ -8559,6 +8559,37 @@ fn sync_outcome_to_event(outcome: zoka::state::sync::SyncOutcome) -> String {
 /// parallelizes the network fetch.
 const IBD_PARALLEL_BODY_WORKERS: usize = 8;
 
+/// Que alturas conviene bajar en paralelo, dado donde esta la cabeza local y
+/// donde va el paseo hacia atras (si hay uno activo).
+///
+/// Devuelve `None` cuando no hay nada util que adelantar.
+fn ibd_prefetch_window(
+    local_height: u64,
+    backfill_height: Option<u64>,
+    perceived_max_height: u64,
+    ventana: u64,
+) -> Option<(u64, u64)> {
+    if ventana == 0 || local_height >= perceived_max_height {
+        return None;
+    }
+    let primera = local_height.saturating_add(1);
+    match backfill_height {
+        // El paseo ya esta pidiendo su altura actual; adelantamos las de
+        // abajo, que son las que va a necesitar a continuacion.
+        Some(paseo) if paseo > primera => {
+            let tope = paseo.saturating_sub(1);
+            Some((tope.saturating_sub(ventana - 1).max(primera), tope))
+        }
+        // El paseo esta por engancharse con la cabeza local: no queda nada
+        // por debajo que adelantar.
+        Some(_) => None,
+        None => Some((
+            primera,
+            perceived_max_height.min(local_height.saturating_add(ventana)),
+        )),
+    }
+}
+
 async fn run_ibd_body_prefetch_step(
     node: &mut Node,
     chain_db_path: Option<&str>,
@@ -8567,12 +8598,6 @@ async fn run_ibd_body_prefetch_step(
     let Some(path) = chain_db_path else {
         return Ok(None);
     };
-    // Branch backfill walks backward hash-by-hash on a side branch; that
-    // flow is deliberately single-height and hash-pinned, so leave it to
-    // run_sync_step untouched rather than prefetching speculatively.
-    if peer_view.branch_backfill_height.is_some() {
-        return Ok(None);
-    }
     if node.connected_peer_count() == 0 {
         return Ok(None);
     }
@@ -8586,10 +8611,37 @@ async fn run_ibd_body_prefetch_step(
     if local_height >= peer_view.perceived_max_height {
         return Ok(None);
     }
-    let ceiling = peer_view
-        .perceived_max_height
-        .min(local_height.saturating_add(IBD_PARALLEL_BODY_WORKERS as u64));
-    let heights: Vec<u64> = ((local_height + 1)..=ceiling)
+    // Que un nodo este atrasado no puede apagarle la descarga en paralelo.
+    //
+    // Este paso se salteaba entero mientras hubiera un branch backfill
+    // activo. Pero backfill no significa "bifurcacion": arranca cada vez que
+    // llega un bloque por encima de la cabeza local, o sea SIEMPRE que el
+    // nodo va atrasado. El efecto medido: el prefetch corria cero veces y la
+    // sincronizacion quedaba en un pedido por bloque, secuencial, ~50s cada
+    // uno sobre Tor. Eso da ~1,2 bloques por minuto contra los ~2 que produce
+    // la red: el nodo se atrasaba mas rapido de lo que avanzaba y no alcanzaba
+    // la punta nunca. Un nodo estuvo 16 horas sin aplicar un solo bloque.
+    //
+    // Ahora la ventana acompaña al paseo hacia atras en vez de apagarse. El
+    // paseo sigue siendo de a un bloque y sigue anclado por hash -- lo unico
+    // que cambia es que encuentra el bloque ya descargado en vez de esperar
+    // una vuelta de red.
+    //
+    // Se piden por altura, sin hash, porque el hash del abuelo todavia no se
+    // conoce. Eso es seguro: el cache esta indexado por hash y el paseo lo
+    // consulta con el hash que espera, asi que un bloque que no sea el de su
+    // rama simplemente no se encuentra y se pide por red igual que hoy. En una
+    // bifurcacion real degrada sola, sin aceptar nada que no aceptaria ahora.
+    let Some((desde, hasta)) = ibd_prefetch_window(
+        local_height,
+        peer_view.branch_backfill_height,
+        peer_view.perceived_max_height,
+        IBD_PARALLEL_BODY_WORKERS as u64,
+    ) else {
+        return Ok(None);
+    };
+    let ceiling = hasta;
+    let heights: Vec<u64> = (desde..=hasta)
         .filter(|h| !peer_view.has_pending_block_response(*h))
         .collect();
     if heights.len() < 2 {
@@ -8628,8 +8680,7 @@ async fn run_ibd_body_prefetch_step(
         return Ok(None);
     }
     Ok(Some(format!(
-        "IBD prefetch: {fetched}/{requested} block bodies fetched in parallel for heights {}..{ceiling}",
-        local_height + 1
+        "IBD prefetch: {fetched}/{requested} block bodies fetched in parallel for heights {desde}..{ceiling}"
     )))
 }
 
@@ -18042,6 +18093,53 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Ir atrasado no puede apagar la descarga en paralelo.
+    ///
+    /// El paso de prefetch se salteaba entero mientras hubiera un branch
+    /// backfill activo. Pero backfill no significa "bifurcacion": arranca cada
+    /// vez que llega un bloque por encima de la cabeza local, o sea siempre
+    /// que el nodo va atrasado. Resultado medido: cero prefetch, un pedido por
+    /// bloque a ~50s sobre Tor, ~1,2 bloques/min contra los ~2 que produce la
+    /// red. El nodo se atrasaba mas rapido de lo que avanzaba y no alcanzaba
+    /// la punta nunca; uno estuvo 16 horas sin aplicar un bloque.
+    #[test]
+    fn a_backward_walk_no_longer_disables_parallel_prefetch() {
+        // Caso real: cabeza 15641, el paseo bajando por 15720.
+        let ventana = super::ibd_prefetch_window(15641, Some(15720), 15884, 8);
+        assert_eq!(
+            ventana,
+            Some((15712, 15719)),
+            "hay que adelantar las ocho alturas que el paseo pedira despues"
+        );
+    }
+
+    #[test]
+    fn the_prefetch_window_stops_at_the_local_head() {
+        // El paseo esta a cuatro bloques de engancharse: no inventar alturas
+        // por debajo de la cabeza local, que ya estan aplicadas.
+        assert_eq!(
+            super::ibd_prefetch_window(15641, Some(15645), 15884, 8),
+            Some((15642, 15644))
+        );
+        // Ya enganchado: no queda nada por debajo que adelantar.
+        assert_eq!(super::ibd_prefetch_window(15641, Some(15642), 15884, 8), None);
+    }
+
+    #[test]
+    fn without_a_backward_walk_the_window_still_runs_forward() {
+        assert_eq!(
+            super::ibd_prefetch_window(15641, None, 15884, 8),
+            Some((15642, 15649))
+        );
+        // Al dia: nada que bajar.
+        assert_eq!(super::ibd_prefetch_window(15884, None, 15884, 8), None);
+        // Cerca de la punta, la ventana se recorta y no la pasa.
+        assert_eq!(
+            super::ibd_prefetch_window(15881, None, 15884, 8),
+            Some((15882, 15884))
+        );
+    }
     use super::*;
 
     fn temp_db_arg() -> (tempfile::TempDir, String) {
