@@ -1179,7 +1179,22 @@ pub fn next_required_block(
     Ok(Some(SyncRequest {
         height: next_height,
         expected_hash: None,
-        strict_peer_affinity: preferred_peer.is_some(),
+        // Preferir al par que anuncio mas trabajo, pero no atarse a el.
+        //
+        // Esto era afinidad estricta: si el par preferido existia,
+        // select_block_request_peers_with_affinity devolvia SOLO ese par,
+        // sin importar cuantos otros estuvieran conectados y sanos. Medido
+        // en la PC: un par preferido que tardaba en contestar dejaba al nodo
+        // reintentandole a el solo, minutos seguidos, con 6-7 pares mas
+        // esperando al lado sin que se les preguntara nada.
+        //
+        // A diferencia del paseo por bifurcacion -- donde la afinidad evita
+        // mezclar ramas -- aca no hay ninguna altura con hash fijado
+        // todavia (`expected_hash: None`); la respuesta se valida contra las
+        // reglas de cadena al aplicarla, sin importar que par la trajo. La
+        // preferencia por el par mas al dia sigue existiendo (queda primero
+        // en la lista), solo que ahora es un orden, no un candado.
+        strict_peer_affinity: false,
         preferred_peer,
     }))
 }
@@ -2264,8 +2279,16 @@ mod tests {
         assert_eq!(next, Some(1));
     }
 
+    /// El pedido normal PREFIERE al par que anuncio mas trabajo, pero no se
+    /// ata a el en exclusiva: si ese par tarda o falla, cualquier otro par
+    /// conectado tiene que poder servir la misma altura sin hash fijado, sin
+    /// esperar a que el preferido responda.
+    ///
+    /// Antes esto era al reves (afinidad estricta por defecto) y el sintoma
+    /// medido era un nodo con 6-7 pares sanos clavado minutos porque
+    /// insistia solo con el par preferido.
     #[test]
-    fn normal_forward_request_is_affined_to_preferred_peer() {
+    fn normal_forward_request_prefers_but_does_not_lock_to_one_peer() {
         let (storage, _dir) = open_temp_storage();
         let mut view = PeerChainView::default();
         let source = PeerId::random();
@@ -2276,8 +2299,15 @@ mod tests {
             .expect("forward request");
         assert_eq!(request.height, 1);
         assert_eq!(request.expected_hash, None);
-        assert_eq!(request.preferred_peer, Some(source));
-        assert!(request.strict_peer_affinity);
+        assert_eq!(
+            request.preferred_peer,
+            Some(source),
+            "la preferencia por el par mas al dia se mantiene como orden"
+        );
+        assert!(
+            !request.strict_peer_affinity,
+            "pero ya no puede ser un candado que deje afuera a los demas pares"
+        );
     }
 
     #[test]
