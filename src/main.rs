@@ -8559,6 +8559,160 @@ fn sync_outcome_to_event(outcome: zoka::state::sync::SyncOutcome) -> String {
 /// parallelizes the network fetch.
 const IBD_PARALLEL_BODY_WORKERS: usize = 8;
 
+/// Manda un `GetHeaders` cuando hay un paseo activo que todavia no lo pidio.
+///
+/// El paseo hacia atras descubria el ancestro comun de a un bloque: cada
+/// body completo que bajaba solo revelaba el hash del padre, el dato que
+/// hace falta para pedir el siguiente. Medido en la PC: una bifurcacion de
+/// ~60 bloques tardo horas en resolverse asi, con una tasa de fallo de
+/// pedidos directos del 74% sobre Tor.
+///
+/// Un `GetHeaders` devuelve hasta 512 alturas -- livianas, sin los bodies --
+/// en una sola vuelta. Con eso alcanza para cubrir de punta a punta el
+/// paseo mas largo que este nodo esta dispuesto a caminar
+/// (`MAX_BACKWARD_WALK_DISTANCE` = 64) en un solo pedido.
+///
+/// Es una aceleracion, nunca un requisito: si no hay pares, si el pedido
+/// falla, o si la respuesta no sirve, el paseo de a un bloque -- ya probado
+/// en produccion -- sigue funcionando igual que antes. Esta funcion nunca
+/// bloquea ese camino, solo intenta acortarlo.
+async fn run_branch_header_probe_step(
+    node: &mut zoka::network::p2p::Node,
+    chain_db_path: Option<&str>,
+    peer_view: &mut zoka::state::sync::PeerChainView,
+) -> Result<Option<String>, String> {
+    if !peer_view.needs_header_probe() {
+        return Ok(None);
+    }
+    let Some(path) = chain_db_path else {
+        return Ok(None);
+    };
+    let storage = match RocksDbStorage::new(path) {
+        Ok(storage) => storage,
+        Err(_) => return Ok(None),
+    };
+    let locator = zoka::state::sync::build_chain_locator(&storage);
+    if locator.is_empty() {
+        return Ok(None);
+    }
+
+    // Preferir al par que origino la rama -- ya sabemos que tiene la
+    // ancestria -- pero cualquier par conectado puede responder un
+    // GetHeaders: la respuesta se valida estructuralmente igual, y si no
+    // conecta con lo que ya sabiamos simplemente se descarta.
+    let connected = node.connected_peer_ids();
+    if connected.is_empty() {
+        return Ok(None);
+    }
+    let peer = peer_view
+        .active_branch_source()
+        .filter(|source| connected.contains(source))
+        .unwrap_or(connected[0]);
+
+    let request = zoka::network::header_request_response::GetHeaders {
+        locator,
+        max: 512,
+        stop_hash: None,
+    };
+    match node.send_header_request(&peer, request) {
+        Some(_) => {
+            peer_view.mark_header_probe_sent();
+            Ok(Some(format!(
+                "Pedido de cabeceras enviado a {peer} para acelerar el paseo hacia atras."
+            )))
+        }
+        None => {
+            // El par elegido no esta conectado despues de todo (se cayo
+            // entre el chequeo y el pedido); se reintenta en la proxima
+            // vuelta con quien este disponible entonces.
+            Ok(None)
+        }
+    }
+}
+
+/// Drena las `HeadersResponse` recibidas y, si hay un paseo activo, las
+/// aplica para resolver el rango entero de una vez.
+fn drain_header_responses(
+    node: &mut zoka::network::p2p::Node,
+    chain_db_path: Option<&str>,
+    peer_view: &mut zoka::state::sync::PeerChainView,
+) -> Result<Option<String>, String> {
+    use zoka::network::header_request_response::HeadersResponse;
+    use zoka::state::sync::HeaderChainOutcome;
+
+    let mut last_event = None;
+    while let Some(received) = node.take_received_headers_response() {
+        let headers = match received.response {
+            HeadersResponse::Headers {
+                headers,
+                common_ancestor,
+            } => (headers, common_ancestor),
+            HeadersResponse::NotFound { reason } => {
+                last_event = Some(format!(
+                    "Cabeceras no disponibles en {}: {reason}. Sigue el paseo de a un bloque.",
+                    received.peer
+                ));
+                continue;
+            }
+        };
+        let (headers, common_ancestor_hash) = headers;
+        if common_ancestor_hash.is_empty() {
+            last_event = Some(
+                "El par no reconocio ningun hash del locator; sigue el paseo de a un bloque."
+                    .to_string(),
+            );
+            continue;
+        }
+        let Some(path) = chain_db_path else {
+            continue;
+        };
+        let storage = match RocksDbStorage::new(path) {
+            Ok(storage) => storage,
+            Err(_) => continue,
+        };
+        // El locator salio de nuestro propio storage, asi que el hash que el
+        // par reconocio ya es un hash que tenemos: buscamos su altura ahi.
+        let common_ancestor_height = match storage.get_block(&common_ancestor_hash) {
+            Ok(Some(block)) => block.header.block_height,
+            _ => {
+                last_event = Some(
+                    "El ancestro comun que devolvio el par no esta en nuestro storage; sigue \
+                     el paseo de a un bloque."
+                        .to_string(),
+                );
+                continue;
+            }
+        };
+        let local_work = storage.get_cumulative_work().unwrap_or(0);
+
+        let outcome = peer_view.apply_header_chain(
+            common_ancestor_height,
+            &common_ancestor_hash,
+            &headers,
+            local_work,
+        );
+        last_event = Some(match outcome {
+            HeaderChainOutcome::Adopted {
+                from_height,
+                through_height,
+            } => format!(
+                "Cabeceras aplicadas: rango {from_height}..{through_height} resuelto de una \
+                 vez (antes: un body por altura)."
+            ),
+            HeaderChainOutcome::NotHeavier => {
+                "La rama competidora pesa menos que la local; paseo abandonado sin bajar \
+                 bodies."
+                    .to_string()
+            }
+            HeaderChainOutcome::Invalid(reason) => {
+                format!("Cabeceras invalidas de {}: {reason}", received.peer)
+            }
+            HeaderChainOutcome::NotActive => continue,
+        });
+    }
+    Ok(last_event)
+}
+
 /// Que alturas conviene bajar en paralelo, dado donde esta la cabeza local y
 /// donde va el paseo hacia atras (si hay uno activo).
 ///
@@ -12017,6 +12171,22 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         }
 
         if !mining_active && tokio::time::Instant::now() >= next_ibd_at {
+            if let Some(header_event) = drain_header_responses(
+                &mut node,
+                db_path.as_deref(),
+                &mut peer_chain_view,
+            )? {
+                last_event = header_event;
+            }
+            if let Some(probe_event) = run_branch_header_probe_step(
+                &mut node,
+                db_path.as_deref(),
+                &mut peer_chain_view,
+            )
+            .await?
+            {
+                last_event = probe_event;
+            }
             if let Some(prefetch_event) =
                 run_ibd_body_prefetch_step(&mut node, db_path.as_deref(), &mut peer_chain_view)
                     .await?

@@ -112,6 +112,10 @@ pub struct PeerChainView {
     branch_cumulative_work: Option<u128>,
     branch_backfill_request_failures: u8,
     forward_gap_failures: u8,
+    /// Si ya se mando (o se decidio no mandar) un pedido de cabeceras para
+    /// el episodio de paseo actual. Evita mandar el mismo pedido en cada
+    /// vuelta del bucle mientras se espera la respuesta.
+    branch_headers_probe_sent: bool,
     recovery_mode: bool,
     peer_tips: HashMap<PeerId, PeerChainTip>,
     rejected_sources: HashSet<PeerId>,
@@ -572,6 +576,7 @@ impl PeerChainView {
         self.branch_tip_hash = None;
         self.branch_cumulative_work = None;
         self.branch_backfill_request_failures = 0;
+        self.branch_headers_probe_sent = false;
         was_active
     }
 
@@ -579,6 +584,104 @@ impl PeerChainView {
         self.branch_backfill_ceiling.is_some()
             || self.branch_backfill_height.is_some()
             || !self.branch_expected_hashes.is_empty()
+    }
+
+    /// Si conviene mandar un `GetHeaders` para el episodio de paseo actual.
+    ///
+    /// El paseo hoy descubre el ancestro comun de a un bloque: cada bloque
+    /// completo que baja solo sirve para revelar el hash del padre, que es
+    /// el dato que hace falta para pedir el siguiente. Es la parte mas lenta
+    /// de recuperarse de una bifurcacion -- un round-trip completo de body
+    /// por altura, sobre Tor, con la tasa de fallo que tenga la red ese dia.
+    ///
+    /// Un pedido de cabeceras devuelve hasta 512 alturas en una sola vuelta,
+    /// livianas (el limite de la respuesta es 8 MB, no por body). Con eso se
+    /// puede saltar directo al ancestro comun en vez de caminar hacia el.
+    pub fn needs_header_probe(&self) -> bool {
+        self.has_active_branch_backfill() && !self.branch_headers_probe_sent
+    }
+
+    /// Marca que ya se mando (o se decidio no mandar) el pedido de cabeceras
+    /// para este episodio, para no repetirlo en cada vuelta del bucle
+    /// mientras se espera la respuesta.
+    pub fn mark_header_probe_sent(&mut self) {
+        self.branch_headers_probe_sent = true;
+    }
+
+    /// Aplica una `HeadersResponse::Headers` recibida mientras hay un paseo
+    /// activo.
+    ///
+    /// `common_ancestor_height` es la altura local (ya conocida por este
+    /// nodo, porque el locator que la origino salio de su propio storage) del
+    /// hash que el par reconocio. `local_cumulative_work` es el trabajo
+    /// acumulado de la cabeza local -- o de la rama en curso si ya se
+    /// conocia una -- contra el que se mide si vale la pena seguir.
+    ///
+    /// Si la respuesta no es mejor que lo que ya se tiene, abandona el paseo
+    /// ahi mismo: ni un body se descarga para una rama que de todas formas
+    /// iba a perder la comparacion de trabajo al final. Si es mejor, deja
+    /// `branch_expected_hashes` con el hash de cada altura del rango entero,
+    /// asi el paso de descubrimiento (antes: un body por altura) se resuelve
+    /// en una sola vuelta.
+    pub fn apply_header_chain(
+        &mut self,
+        common_ancestor_height: u64,
+        common_ancestor_hash: &str,
+        headers: &[crate::network::header_request_response::HeaderSummary],
+        local_cumulative_work: u128,
+    ) -> HeaderChainOutcome {
+        if !self.has_active_branch_backfill() {
+            return HeaderChainOutcome::NotActive;
+        }
+        if headers.is_empty() {
+            return HeaderChainOutcome::Invalid("el par no devolvio cabeceras".to_string());
+        }
+        if let Err(reason) = validate_header_chain(headers, common_ancestor_hash) {
+            return HeaderChainOutcome::Invalid(reason);
+        }
+        let first_height = headers[0].header.block_height;
+        if first_height != common_ancestor_height.saturating_add(1) {
+            return HeaderChainOutcome::Invalid(format!(
+                "el primer header ({first_height}) no arranca justo despues \
+                 del ancestro comun ({common_ancestor_height})"
+            ));
+        }
+
+        let chain_work = headers
+            .last()
+            .map(|summary| summary.cumulative_work)
+            .unwrap_or(0);
+        if chain_work <= local_cumulative_work {
+            // Ni un body vale la pena para una rama que ya se sabe que
+            // pierde la comparacion de trabajo. Esto es lo que antes costaba
+            // horas de caminata para descubrir recien al final.
+            self.abandon_branch_backfill();
+            return HeaderChainOutcome::NotHeavier;
+        }
+
+        for summary in headers {
+            self.branch_expected_hashes
+                .insert(summary.header.block_height, summary.header.hash.clone());
+        }
+        self.branch_expected_hashes
+            .insert(common_ancestor_height, common_ancestor_hash.to_string());
+
+        let through_height = headers
+            .last()
+            .map(|summary| summary.header.block_height)
+            .unwrap_or(common_ancestor_height);
+        self.branch_backfill_ceiling = Some(
+            self.branch_backfill_ceiling
+                .map(|ceiling| ceiling.max(through_height))
+                .unwrap_or(through_height),
+        );
+        self.branch_backfill_height = Some(common_ancestor_height.saturating_add(1));
+        self.branch_backfill_request_failures = 0;
+
+        HeaderChainOutcome::Adopted {
+            from_height: common_ancestor_height.saturating_add(1),
+            through_height,
+        }
     }
 
     pub fn mining_pause_target(&self, local_height: u64) -> Option<u64> {
@@ -775,6 +878,10 @@ impl PeerChainView {
 
         let starting_branch = self.branch_backfill_ceiling.is_none();
         if starting_branch {
+            // Un episodio nuevo merece su propio intento de cabeceras: la
+            // ultima vez que se pidieron pudo haber sido para una rama que ya
+            // se abandono.
+            self.branch_headers_probe_sent = false;
             self.branch_source = source;
             if let Some(source) = self.branch_source.as_ref() {
                 if let Some(tip) = self.peer_tips.get(source) {
@@ -839,6 +946,24 @@ impl PeerChainView {
             }
         }
     }
+}
+
+/// Resultado de darle una `HeadersResponse` a
+/// [`PeerChainView::apply_header_chain`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeaderChainOutcome {
+    /// No hay paseo activo ahora mismo; la respuesta llego tarde o para un
+    /// episodio que ya se abandono.
+    NotActive,
+    /// La cadena de cabeceras no encaja estructuralmente (no contigua, no
+    /// arranca donde deberia, o el trabajo no es creciente).
+    Invalid(String),
+    /// El par no tiene mas trabajo que la cabeza local: no vale la pena
+    /// descargar ni un body.
+    NotHeavier,
+    /// Se adopto el rango completo; `branch_expected_hashes` ya tiene el
+    /// hash de cada altura entre `from_height` y `through_height`.
+    Adopted { from_height: u64, through_height: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2173,6 +2298,183 @@ mod tests {
 
         let next = next_required_height(&storage, &view).expect("query");
         assert_eq!(next, Some(1));
+    }
+
+    fn dummy_header_summary(
+        height: u64,
+        hash: &str,
+        prev_hash: &str,
+        cumulative_work: u128,
+    ) -> crate::network::header_request_response::HeaderSummary {
+        crate::network::header_request_response::HeaderSummary {
+            header: BlockHeader {
+                hash: hash.to_string(),
+                prev_hash: prev_hash.to_string(),
+                merkle_root: "mr".to_string(),
+                state_root: "sr".to_string(),
+                timestamp: height * 120,
+                nonce: 0,
+                block_height: height,
+                validator: PublicKey(b"v".to_vec()),
+                seal: Signature(b"s".to_vec()),
+            },
+            difficulty_bits: 20,
+            cumulative_work,
+        }
+    }
+
+    /// Sin paseo activo no hay nada que acelerar.
+    #[test]
+    fn header_probe_not_needed_without_an_active_walk() {
+        let view = PeerChainView::default();
+        assert!(!view.needs_header_probe());
+    }
+
+    /// Arrancar un paseo pide cabeceras una sola vez, no en cada vuelta del
+    /// bucle mientras se espera la respuesta.
+    #[test]
+    fn a_new_branch_needs_a_header_probe_until_one_is_sent() {
+        let mut view = PeerChainView::default();
+        let source = Some(PeerId::random());
+
+        view.record_sync_outcome_from(
+            source,
+            &SyncOutcome::MissingParent {
+                local_head: 100,
+                candidate: 101,
+                candidate_hash: "h101".to_string(),
+                parent_hash: "otra-rama".to_string(),
+            },
+        );
+        assert!(view.has_active_branch_backfill());
+        assert!(
+            view.needs_header_probe(),
+            "un paseo recien arrancado deberia pedir cabeceras"
+        );
+
+        view.mark_header_probe_sent();
+        assert!(
+            !view.needs_header_probe(),
+            "no hay que repetir el pedido mientras se espera la respuesta"
+        );
+    }
+
+    /// El caso que mas tiempo ahorra: una rama competidora con menos trabajo
+    /// se descarta con las cabeceras solas, sin bajar ni un body.
+    ///
+    /// Antes, el nodo solo se enteraba de que una rama pesaba menos DESPUES
+    /// de caminarla entera hacia atras y volver a aplicar todo hacia
+    /// adelante -- horas de descargas para terminar descartandola igual.
+    #[test]
+    fn a_lighter_competing_branch_gets_abandoned_without_downloading_a_single_body() {
+        let mut view = PeerChainView::default();
+        let source = Some(PeerId::random());
+        view.record_sync_outcome_from(
+            source,
+            &SyncOutcome::MissingParent {
+                local_head: 100,
+                candidate: 101,
+                candidate_hash: "h101".to_string(),
+                parent_hash: "ancestro".to_string(),
+            },
+        );
+        assert!(view.has_active_branch_backfill());
+
+        let headers = vec![dummy_header_summary(101, "h101", "ancestro", 500)];
+        let outcome = view.apply_header_chain(100, "ancestro", &headers, /* local_work */ 900);
+
+        assert_eq!(outcome, HeaderChainOutcome::NotHeavier);
+        assert!(
+            !view.has_active_branch_backfill(),
+            "una rama mas liviana no merece seguir caminandose"
+        );
+    }
+
+    /// El caso principal: una cadena de cabeceras valida y mas pesada
+    /// resuelve el rango entero en una sola vuelta, no una por altura.
+    #[test]
+    fn a_heavier_header_chain_resolves_the_whole_range_in_one_shot() {
+        let mut view = PeerChainView::default();
+        let source = Some(PeerId::random());
+        view.record_sync_outcome_from(
+            source,
+            &SyncOutcome::MissingParent {
+                local_head: 100,
+                candidate: 101,
+                candidate_hash: "h101".to_string(),
+                parent_hash: "ancestro".to_string(),
+            },
+        );
+
+        let headers = vec![
+            dummy_header_summary(101, "h101", "ancestro", 1_100),
+            dummy_header_summary(102, "h102", "h101", 1_200),
+            dummy_header_summary(103, "h103", "h102", 1_300),
+        ];
+        let outcome = view.apply_header_chain(100, "ancestro", &headers, /* local_work */ 1_000);
+
+        assert_eq!(
+            outcome,
+            HeaderChainOutcome::Adopted {
+                from_height: 101,
+                through_height: 103,
+            }
+        );
+        assert_eq!(view.branch_backfill_height, Some(101));
+        assert_eq!(view.branch_backfill_ceiling, Some(103));
+        for (height, hash) in [(101, "h101"), (102, "h102"), (103, "h103")] {
+            assert_eq!(
+                view.branch_expected_hashes.get(&height).map(String::as_str),
+                Some(hash),
+                "cada altura del rango tiene que quedar con su hash, no solo la primera"
+            );
+        }
+    }
+
+    /// Una cadena de cabeceras que no encaja (un salto de altura, un hash que
+    /// no conecta) se rechaza sin tocar el paseo que ya estaba en curso.
+    #[test]
+    fn an_invalid_header_chain_is_rejected_without_touching_the_walk() {
+        let mut view = PeerChainView::default();
+        let source = Some(PeerId::random());
+        view.record_sync_outcome_from(
+            source,
+            &SyncOutcome::MissingParent {
+                local_head: 100,
+                candidate: 101,
+                candidate_hash: "h101".to_string(),
+                parent_hash: "ancestro".to_string(),
+            },
+        );
+        let pin_antes = view.branch_expected_hashes.clone();
+
+        // Un salto: 101 seguido de 103, sin el 102.
+        let headers = vec![
+            dummy_header_summary(101, "h101", "ancestro", 1_100),
+            dummy_header_summary(103, "h103", "h101", 1_300),
+        ];
+        let outcome = view.apply_header_chain(100, "ancestro", &headers, 1_000);
+
+        assert!(matches!(outcome, HeaderChainOutcome::Invalid(_)));
+        assert!(
+            view.has_active_branch_backfill(),
+            "una respuesta invalida no puede tirar abajo el paseo que ya andaba"
+        );
+        assert_eq!(
+            view.branch_expected_hashes, pin_antes,
+            "el pin original queda intacto ante una respuesta que no sirve"
+        );
+    }
+
+    /// Una respuesta que llega tarde, para un episodio que ya se cerro, se
+    /// ignora en vez de reabrir algo.
+    #[test]
+    fn apply_header_chain_does_nothing_without_an_active_walk() {
+        let mut view = PeerChainView::default();
+        let headers = vec![dummy_header_summary(101, "h101", "ancestro", 1_100)];
+        let outcome = view.apply_header_chain(100, "ancestro", &headers, 1_000);
+        assert_eq!(outcome, HeaderChainOutcome::NotActive);
+        assert!(!view.has_active_branch_backfill());
     }
 
     /// Ir atrasado no es estar bifurcado, y no puede disparar la caminata.
