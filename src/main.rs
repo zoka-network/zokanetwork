@@ -7359,6 +7359,19 @@ fn serve_pending_snapshot_manifest_requests(
     }
 }
 
+/// Cuanto atraso tolera el nodo antes de dejar de buscar cuerpos de tx
+/// privadas y reservar el canal para sincronizar.
+///
+/// El fetch de un cuerpo existe para que el minero local lo incluya en un
+/// bloque; un nodo atrasado no mina, asi que ese trabajo no tiene destino y
+/// compite por los mismos circuitos Tor que los bloques. Por encima de este
+/// margen la sincronizacion tiene prioridad.
+///
+/// El valor es generoso a proposito: cubre de sobra la variacion normal de
+/// unos pocos bloques cerca de la punta -- donde el nodo si mina y si
+/// necesita los cuerpos -- y solo corta cuando el atraso es real.
+const PRIVATE_TX_FETCH_MAX_LAG: u64 = 32;
+
 async fn handle_fullnode_network_message(
     node: &mut Node,
     message: &zoka::network::message::ZokaMessage,
@@ -7593,6 +7606,37 @@ async fn handle_fullnode_network_message(
                     )),
                 },
                 Ok(None) => {
+                    // Un nodo atrasado no gasta el canal en cuerpos que no
+                    // puede usar.
+                    //
+                    // Este fetch existe para que el MINERO local pueda incluir
+                    // la tx en un bloque. Pero un nodo atrasado no mina --
+                    // `ready_to_mine` es false justamente hasta alcanzar la
+                    // punta -- asi que el cuerpo no tiene a quien servirle
+                    // todavia. Mientras tanto compite por el mismo camino
+                    // directo y los mismos circuitos Tor que los bloques que
+                    // si hacen falta: hasta 3 reintentos de 4s cada uno, por
+                    // anuncio.
+                    //
+                    // Medido en la PC con ~250 bloques de atraso: 2.585
+                    // eventos de tx privada en el log mientras la latencia de
+                    // los pedidos de bloque subia de 2.180 ms a 6.020 ms.
+                    //
+                    // No se pierde nada: el anuncio queda registrado, y la tx
+                    // llega igual dentro del bloque que la incluya cuando la
+                    // cadena se ponga al dia. Si el nodo esta cerca de la
+                    // punta -- el caso normal -- el fetch corre como siempre.
+                    let local_height = storage.get_chain_height().unwrap_or(0);
+                    let atraso = peer_view
+                        .perceived_max_height
+                        .saturating_sub(local_height);
+                    if atraso > PRIVATE_TX_FETCH_MAX_LAG {
+                        return Some(format!(
+                            "Private tx announce {} diferido: el nodo esta {atraso} bloques \
+                             atrasado y el canal se reserva para sincronizar.",
+                            truncate_dashboard_text(hash, 16)
+                        ));
+                    }
                     drop(storage);
                     zoka::api::global_network_runtime()
                         .record_private_tx_announced_without_body();
