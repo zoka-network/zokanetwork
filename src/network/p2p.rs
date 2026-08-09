@@ -128,6 +128,58 @@ const MAX_GOSSIP_BLOCK_RESPONSE_BYTES: usize = 900 * 1024;
 /// into unbounded memory growth.
 const MAX_INBOUND_QUEUE: usize = 4096;
 
+/// Cuantos identificadores "ya lo vi" se recuerdan por canal de la capa de
+/// anonimato.
+///
+/// Sirven para no reenviar dos veces el mismo lote del mixer ni la misma ruta
+/// de Dandelion. Los duplicados llegan en segundos, asi que recordar decenas
+/// de miles cubre de sobra la ventana util; lo que no se puede es recordarlos
+/// para siempre.
+const MAX_SEEN_GOSSIP_IDS: usize = 50_000;
+
+/// Conjunto de "ya lo vi" con techo y desalojo por antiguedad.
+///
+/// Reemplaza a un `HashSet` que solo crecia. Un nodo reporto 22,6 GB de RSS y
+/// dos muertes por falta de memoria con 16 pares, y estos dos conjuntos --
+/// lotes del mixer y rutas de Dandelion -- eran los unicos candidatos que
+/// quedaban en pie tras descartar la cola de entrada (acotada) y el dataset de
+/// RandomX (compartido por Arc, no por hilo): se insertaban en cada mensaje y
+/// no se limpiaban nunca. Crecen con el trafico, o sea mas rapido cuantos mas
+/// pares hay, que es exactamente lo que el reporte describia.
+///
+/// Se desaloja el mas viejo, no uno al azar: un identificador recien visto es
+/// el que mas probabilidad tiene de volver a aparecer.
+#[derive(Debug, Default)]
+struct SeenIdSet {
+    ids: HashSet<String>,
+    orden: VecDeque<String>,
+}
+
+impl SeenIdSet {
+    fn contains(&self, id: &str) -> bool {
+        self.ids.contains(id)
+    }
+
+    /// Devuelve `true` si el identificador es nuevo, igual que `HashSet::insert`.
+    fn insert(&mut self, id: String) -> bool {
+        if !self.ids.insert(id.clone()) {
+            return false;
+        }
+        self.orden.push_back(id);
+        while self.orden.len() > MAX_SEEN_GOSSIP_IDS {
+            if let Some(viejo) = self.orden.pop_front() {
+                self.ids.remove(&viejo);
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+}
+
 /// Returns the message unchanged when it fits a gossip frame, or with its
 /// private tx bodies stripped (plus the count dropped) when the encoded size
 /// would exceed the safe gossip ceiling. Kept pure and separate from the
@@ -680,11 +732,11 @@ pub struct Node {
     /// Pending local private txs waiting to be batched.
     mixer_batcher: MixerBatcher,
     /// Dedup cache for processed mixer batches.
-    seen_mixer_batches: HashSet<String>,
+    seen_mixer_batches: SeenIdSet,
     /// Per-peer rate limit buckets for mixer batches.
     mixer_peer_buckets: HashMap<PeerId, (u64, u32)>,
     /// Dedup cache for processed stem routes.
-    seen_stem_routes: HashSet<String>,
+    seen_stem_routes: SeenIdSet,
     /// Round-robin cursor for relay hint selection.
     stem_relay_cursor: usize,
     /// Peers observed with incompatible identify protocol version.
@@ -1927,9 +1979,9 @@ impl Node {
             inbound_queue: VecDeque::new(),
             inbound_queue_keys: HashSet::new(),
             mixer_batcher: MixerBatcher::new(),
-            seen_mixer_batches: HashSet::new(),
+            seen_mixer_batches: SeenIdSet::default(),
             mixer_peer_buckets: HashMap::new(),
-            seen_stem_routes: HashSet::new(),
+            seen_stem_routes: SeenIdSet::default(),
             stem_relay_cursor: 0,
             incompatible_protocol_peers: HashSet::new(),
             protocol_freeze_enforce,
@@ -4546,6 +4598,58 @@ impl Node {
 
 #[cfg(test)]
 mod tests {
+
+    /// Los conjuntos de "ya lo vi" de la capa de anonimato tienen que tener
+    /// techo.
+    ///
+    /// Eran `HashSet` que solo crecian: se insertaba un identificador por cada
+    /// lote del mixer y por cada ruta de Dandelion, y nunca se limpiaba nada.
+    /// Un nodo reporto 22,6 GB de RSS y dos muertes por falta de memoria con
+    /// 16 pares; estos dos eran los unicos candidatos que quedaban tras
+    /// descartar la cola de entrada (ya acotada) y el dataset de RandomX
+    /// (compartido, no por hilo).
+    #[test]
+    fn seen_ids_stop_growing_at_the_cap() {
+        let mut vistos = SeenIdSet::default();
+        for n in 0..(MAX_SEEN_GOSSIP_IDS + 5_000) {
+            assert!(vistos.insert(format!("id-{n}")), "cada id es nuevo");
+        }
+        assert_eq!(
+            vistos.len(),
+            MAX_SEEN_GOSSIP_IDS,
+            "por encima del techo se desaloja, no se acumula"
+        );
+    }
+
+    /// Y el desalojo tiene que ser por antiguedad: lo recien visto es lo que
+    /// mas probabilidad tiene de volver a llegar duplicado, asi que es lo
+    /// ultimo que conviene olvidar.
+    #[test]
+    fn the_oldest_seen_id_is_the_one_forgotten() {
+        let mut vistos = SeenIdSet::default();
+        for n in 0..MAX_SEEN_GOSSIP_IDS {
+            vistos.insert(format!("id-{n}"));
+        }
+        assert!(vistos.contains("id-0"), "todavia entra sin desalojar");
+
+        vistos.insert("id-nuevo".to_string());
+
+        assert!(!vistos.contains("id-0"), "el mas viejo es el que sale");
+        assert!(vistos.contains("id-nuevo"), "el recien llegado queda");
+        assert!(
+            vistos.contains(&format!("id-{}", MAX_SEEN_GOSSIP_IDS - 1)),
+            "el anteultimo sigue adentro"
+        );
+    }
+
+    /// Un duplicado no puede consumir lugar ni empujar a nadie afuera.
+    #[test]
+    fn a_repeated_id_does_not_evict_anything() {
+        let mut vistos = SeenIdSet::default();
+        assert!(vistos.insert("mismo".to_string()));
+        assert!(!vistos.insert("mismo".to_string()), "el repetido se rechaza");
+        assert_eq!(vistos.len(), 1);
+    }
 
     /// Quedarse sin nadie a quien preguntarle no es fidelidad a una rama.
     ///
