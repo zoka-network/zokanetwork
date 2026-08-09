@@ -74,6 +74,9 @@ fn print_usage() {
     println!(
         "  zoka node [--network mainnet|testnet] [--password <pwd>|--password-env <var>|--password-stdin] [--seed <multiaddr> ...] [--power low|normal|max] [--tor-proxy host:port] [--tor-only] [--external-addr <multiaddr> ...]"
     );
+    println!(
+        "  zoka node --sync-only [--network mainnet|testnet]  (descarga y valida bloques sin abrir ninguna wallet: no mina, no publica ofertas y no escanea tx privadas)"
+    );
     println!("  zoka node-status [--db <path>] [--password <pwd>]");
     println!("  zoka status");
     println!("  Wallet files stay local under .zoka/<network>/private_wallets");
@@ -10435,6 +10438,22 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let use_network_config = !has_flag(args, "--no-network-config");
     let allow_clearnet_seeds = has_flag(args, "--allow-clearnet-seeds");
     let allow_isolated_start = has_flag(args, "--allow-isolated-start");
+    // Bajar bloques sin abrir ninguna wallet.
+    //
+    // Existe para que ZSilent empiece a sincronizar apenas se abre el
+    // programa, mientras el usuario todavia esta en la pantalla de login: sin
+    // esto el nodo no arranca hasta que se escribe la contrasena, y esos
+    // minutos se pierden.
+    //
+    // El nodo normal abre (o crea) una wallet privada al arrancar para la
+    // direccion de recompensas, el exchange y el escaneo de tx privadas, y sin
+    // contrasena eso falla. En este modo no se toca ninguna wallet: no se
+    // desbloquea, no se crea y no se escribe nada. Solo se descargan y validan
+    // bloques, que es trabajo que no depende de tener claves.
+    //
+    // Cuando el usuario inicia sesion, ZSilent reinicia el nodo en modo
+    // completo. Para entonces la cadena ya avanzo.
+    let sync_only = has_flag(args, "--sync-only");
     let tor_proxy = option_value(args, "--tor-proxy")
         .or_else(|| std::env::var("ZOKA_TOR_PROXY").ok())
         .map(|value| value.trim().to_string())
@@ -10485,7 +10504,10 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     .clamp(0, 300);
     let mine_blocks =
         parse_u64_arg(option_value(args, "--mine-blocks"), 1, "--mine-blocks")?.clamp(1, 32);
-    let auto_mine = !has_flag(args, "--no-mine");
+    // Sin wallet abierta no hay direccion a la que pagarle la recompensa, asi
+    // que minar en modo solo-sincronizar seria tirar el trabajo. Se apaga acá
+    // en vez de confiar en que el llamador pase tambien --no-mine.
+    let auto_mine = !has_flag(args, "--no-mine") && !sync_only;
     let min_mine_peers_arg = option_value(args, "--min-mine-peers");
     let mut min_mine_peers =
         parse_u64_arg(min_mine_peers_arg.clone(), 0, "--min-mine-peers")?.clamp(0, 128) as usize;
@@ -10549,18 +10571,30 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     }
 
     let storage = wallet_storage_for_network(network)?;
-    let (mut private_wallet_manager, wallet_name, created) = select_or_create_private_node_wallet(
-        &storage,
-        password.as_deref(),
-        wallet_selector.as_deref(),
-        true,
-        network,
-    )?;
-    let wallet = private_wallet_manager
-        .get_private_wallet(&wallet_name)
-        .ok_or_else(|| format!("wallet not found after selection: {wallet_name}"))?;
-    let export = private_wallet_secrets_export(wallet);
-    let wallet_address = export.user_address.clone();
+    let (mut private_wallet_manager, wallet_name, created, export) = if sync_only {
+        // Ni desbloquear ni crear: el gestor arranca vacio a proposito. Bajar
+        // bloques no necesita claves, y sin contrasena cualquier intento de
+        // abrir la wallet fallaria (o, peor, pediria crear una nueva).
+        (PrivateWalletManager::new(), String::new(), false, None)
+    } else {
+        let (mut manager, name, created) = select_or_create_private_node_wallet(
+            &storage,
+            password.as_deref(),
+            wallet_selector.as_deref(),
+            true,
+            network,
+        )?;
+        let wallet = manager
+            .get_private_wallet(&name)
+            .ok_or_else(|| format!("wallet not found after selection: {name}"))?;
+        let export = private_wallet_secrets_export(wallet);
+        let _ = &mut manager;
+        (manager, name, created, Some(export))
+    };
+    let wallet_address = export
+        .as_ref()
+        .map(|export| export.user_address.clone())
+        .unwrap_or_default();
     if let Some(path) = ready_file.as_deref() {
         write_fullnode_ready_file(
             path,
@@ -10575,29 +10609,33 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         )?;
     }
 
-    if created {
-        println!("Node wallet created automatically.");
-    } else {
-        println!("Node wallet loaded.");
-    }
-    println!("Wallet address: {}", wallet_address);
-    println!(
-        "Wallet file: {}",
-        private_wallet_file_path_text(&storage, &wallet_name)
-    );
-    if created {
-        println!(
-            "Wallet saved encrypted. Back up the recovery phrase from the Wallets menu before relying on large balances."
-        );
-    }
-    if show_keys {
-        if let Some(mnemonic) = export.mnemonic.as_deref() {
-            println!("Recovery phrase: {}", mnemonic);
+    if let Some(export) = export.as_ref() {
+        if created {
+            println!("Node wallet created automatically.");
         } else {
-            println!("Recovery phrase: unavailable");
+            println!("Node wallet loaded.");
         }
-        println!("Scan private key (hex): {}", export.scan_private_key_hex);
-        println!("Spend private key (hex): {}", export.spend_private_key_hex);
+        println!("Wallet address: {}", wallet_address);
+        println!(
+            "Wallet file: {}",
+            private_wallet_file_path_text(&storage, &wallet_name)
+        );
+        if created {
+            println!(
+                "Wallet saved encrypted. Back up the recovery phrase from the Wallets menu before relying on large balances."
+            );
+        }
+        if show_keys {
+            if let Some(mnemonic) = export.mnemonic.as_deref() {
+                println!("Recovery phrase: {}", mnemonic);
+            } else {
+                println!("Recovery phrase: unavailable");
+            }
+            println!("Scan private key (hex): {}", export.scan_private_key_hex);
+            println!("Spend private key (hex): {}", export.spend_private_key_hex);
+        }
+    } else {
+        println!("Sync-only mode: no wallet opened. Blocks download and validate; mining, exchange and private scanning stay off until the wallet session starts.");
     }
     let mut startup_notes = vec![
         format!("Network profile: {} ({}).", network.label(), chain_id),
@@ -10626,6 +10664,11 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         .join("offers.json");
     let mut offer_store = zoka::p2p_exchange::OfferStore::open(&offer_store_path)
         .map_err(|error| format!("failed to open P2P exchange store: {error:?}"))?;
+    // Con `--sync-only` el gestor de wallets esta vacio a proposito, asi que
+    // `reserved_note_ids` viene vacio y la reconciliacion no encuentra nada
+    // que liberar: las notas huerfanas se derivan de lo que la WALLET tiene
+    // reservado, no de lo que las ofertas reclaman. El camino se recorre igual
+    // y no toca nada.
     let reserved_note_ids = private_wallet_manager.reserved_note_ids();
     let reconciliation = offer_store
         .reconcile(&reserved_note_ids, now_secs())
@@ -11408,8 +11451,13 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             now = tokio::time::Instant::now();
         }
         if now >= next_warmup_offer_announce_at {
-            if let Err(error) = announce_local_exchange_offers(&mut node, &exchange_runtime).await {
-                last_event = error;
+            // Sin wallet abierta no hay notas que respalden una oferta, asi
+            // que anunciarla seria ofrecer algo que este proceso no puede
+            // liberar. En modo solo-sincronizar el mercado no se toca.
+            if !sync_only {
+                if let Err(error) = announce_local_exchange_offers(&mut node, &exchange_runtime).await {
+                    last_event = error;
+                }
             }
             next_warmup_offer_announce_at = tokio::time::Instant::now() + Duration::from_secs(30);
             now = tokio::time::Instant::now();
@@ -11818,8 +11866,11 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             next_exchange_process_at = tokio::time::Instant::now() + Duration::from_secs(10);
         }
         if tokio::time::Instant::now() >= next_offer_announce_at {
-            if let Err(error) = announce_local_exchange_offers(&mut node, &exchange_runtime).await {
-                last_event = error;
+            // Mismo motivo que en el calentamiento: sin wallet no hay respaldo.
+            if !sync_only {
+                if let Err(error) = announce_local_exchange_offers(&mut node, &exchange_runtime).await {
+                    last_event = error;
+                }
             }
             next_offer_announce_at = tokio::time::Instant::now() + Duration::from_secs(30);
         }

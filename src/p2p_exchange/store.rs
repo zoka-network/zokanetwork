@@ -652,6 +652,39 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Arrancar sin abrir la wallet no puede soltar las reservas de nadie.
+    ///
+    /// `--sync-only` existe para que ZSilent empiece a bajar bloques mientras
+    /// el usuario todavia esta en el login. En ese modo el gestor de wallets
+    /// esta vacio a proposito, asi que la reconciliacion del arranque corre
+    /// con una lista de notas reservadas vacia.
+    ///
+    /// Lo que se fija aca es que eso no toque las ofertas abiertas: las notas
+    /// huerfanas se derivan de lo que la WALLET tiene reservado, no de lo que
+    /// las ofertas reclaman. Si algun dia se invirtiera esa direccion, un
+    /// arranque sin contrasena liberaria las reservas de todas las ofertas del
+    /// usuario -- y este test lo cazaria antes de que llegue a nadie.
+    #[test]
+    fn a_locked_wallet_at_startup_releases_nothing() {
+        let mut store = OfferStore::open(&temp_path("sync-only-reconcile")).expect("open");
+        let offer = offer("oferta-viva", "zk1vendedor");
+        store.insert_local(offer).expect("insert");
+
+        // Arranque en modo solo-sincronizar: la wallet nunca se abrio.
+        let sin_wallet: Vec<String> = Vec::new();
+        let reporte = store.reconcile(&sin_wallet, 0).expect("reconcile");
+
+        assert!(
+            reporte.orphaned_note_ids.is_empty(),
+            "una wallet cerrada no puede declarar huerfana ninguna reserva"
+        );
+        assert_eq!(
+            store.open_offers().len(),
+            1,
+            "la oferta abierta sigue en pie tras un arranque sin wallet"
+        );
+    }
+
     #[test]
     fn reconcile_reports_notes_whose_offer_is_gone() {
         // The worst outcome this feature can produce: a reserved note with no
