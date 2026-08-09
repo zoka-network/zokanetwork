@@ -87,6 +87,32 @@ jobs:
           key: zoka-chain-${{ github.run_id }}
           restore-keys: zoka-chain-
 
+      # Sin Tor este nodo no alcanza la red, y entonces publica el pasado.
+      #
+      # El manifiesto declara tres caminos y en un runner de GitHub no sirve
+      # ninguno: la semilla DNS `seed1.zoka.network` no existe, la onion
+      # necesita Tor, y el endpoint iroh depende de que la maquina que lo
+      # sirve este encendida. Sin ningun par al que conectarse el nodo
+      # arrancaba aislado, se declaraba al dia sobre la base cacheada y
+      # publicaba una altura de hace semanas -- con el workflow reportando
+      # exito.
+      #
+      # La onion es hoy el unico punto de entrada estable de esta red, asi
+      # que el publicador tiene que hablar Tor como cualquier otro nodo.
+      - name: Start Tor
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tor
+          sudo systemctl start tor || sudo service tor start || true
+          for i in $(seq 1 30); do
+            if curl -s --socks5-hostname 127.0.0.1:9050 --max-time 5 -o /dev/null https://check.torproject.org/ 2>/dev/null; then
+              echo "tor listo tras ${i} intentos"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "tor no llego a levantar; el chequeo de altura lo cazara"
+
       - name: Start the node
         # Force RandomX light mode. Full mode builds a ~2 GB dataset that takes
         # about a minute, and rebuilds it on every epoch change — importing ten
@@ -112,6 +138,7 @@ jobs:
             --network-config "$GITHUB_WORKSPACE/docs/mainnet-network.v1.json" \
             --no-mine \
             --allow-isolated-start \
+            --tor-proxy 127.0.0.1:9050 \
             --password "${{ secrets.NODE_PASSWORD || 'zoka-publisher-ci' }}" \
             > node.log 2>&1 &
           echo "NODE_PID=$!" >> "$GITHUB_ENV"
@@ -144,8 +171,23 @@ jobs:
             status=$(curl -s --max-time 10 http://127.0.0.1:3000/sync/status || echo '{}')
             state=$(echo "$status" | python3 -c "import sys,json;print(json.load(sys.stdin).get('status','?'))" 2>/dev/null || echo '?')
             height=$(echo "$status" | python3 -c "import sys,json;print(json.load(sys.stdin).get('local_height',0))" 2>/dev/null || echo 0)
-            if [ "$state" = "caught_up" ] && [ "$height" -gt 0 ]; then
-              echo "[$i] caught up at height $height"
+            peers=$(echo "$status" | python3 -c "import sys,json;print(json.load(sys.stdin).get('connected_peers',0))" 2>/dev/null || echo 0)
+            target=$(echo "$status" | python3 -c "import sys,json;print(json.load(sys.stdin).get('target_height',0))" 2>/dev/null || echo 0)
+            # "Al dia" sin un solo par no significa nada.
+            #
+            # `target_height` es `max(anunciado, local)`, asi que un nodo
+            # aislado se compara contra si mismo, da atraso cero y se declara
+            # sincronizado. Este publicador lo creyo: al segundo intento, en
+            # quince segundos, reporto "caught up at height 12060" -- una
+            # altura de diecisiete dias atras, leida de la base cacheada --
+            # y publico eso como el presente durante semanas, con el workflow
+            # en verde.
+            #
+            # Exigir un par conectado y una punta anunciada por alguien mas
+            # convierte ese silencio en una espera, y si nadie aparece la
+            # corrida falla en vez de mentir.
+            if [ "$state" = "caught_up" ] && [ "$height" -gt 0 ]                && [ "$peers" -gt 0 ] && [ "$target" -gt 0 ]; then
+              echo "[$i] caught up at height $height (target $target, $peers peer(s))"
               exit 0
             fi
             # Every couple of minutes, say what the node is actually doing, so a
