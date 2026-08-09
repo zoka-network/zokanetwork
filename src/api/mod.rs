@@ -1476,10 +1476,8 @@ impl NetworkRuntimeState {
     ) -> SyncStatusSnapshot {
         let startup = global_startup_status().snapshot();
         let runtime = self.snapshot().await;
-        let target_height = self
-            .sync_target_height
-            .load(Ordering::Relaxed)
-            .max(local_height);
+        let observed_target = self.sync_target_height.load(Ordering::Relaxed);
+        let target_height = observed_target.max(local_height);
         let lag = target_height.saturating_sub(local_height);
         let min_peers = self.sync_min_peers.load(Ordering::Relaxed);
         let connected_peers = runtime.connected_peers;
@@ -1488,7 +1486,25 @@ impl NetworkRuntimeState {
         let last_sync_source = self.sync_last_source.read().await.clone();
         let last_sync_event = self.sync_last_event.read().await.clone();
         let last_sync_error = self.sync_last_error.read().await.clone();
+        // No se puede estar al dia con una punta que nadie anuncio todavia.
+        //
+        // `lag` sale de `target_height`, que a su vez es `max(anunciado,
+        // local)`. Con la base recien creada y ningun anuncio recibido, eso da
+        // `max(0, 1) = 1` y el lag queda en cero: el nodo se comparaba contra
+        // si mismo y se declaraba sincronizado. Observado en la PC durante una
+        // reconstruccion desde cero: altura 1, objetivo 1, `ready_to_mine`
+        // true, con dos pares conectados que aun no habian dicho su altura.
+        //
+        // Un usuario con auto-minado encendido se habria puesto a minar sobre
+        // el bloque 1, tirando el trabajo y ensuciando la red con una rama
+        // muerta.
+        //
+        // La excepcion son los nodos deliberadamente aislados (`min_peers` en
+        // cero y sin pares): ahi no hay a quien esperarle, y quien arranca una
+        // red nueva necesita poder minar el primer bloque.
+        let network_tip_known = observed_target > 0 || connected_peers == 0;
         let ready_to_mine = startup.ready
+            && network_tip_known
             && lag == 0
             && connected_peers >= min_peers
             && !matches!(mode.as_str(), "loading" | "starting" | "error");
