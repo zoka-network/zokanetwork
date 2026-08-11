@@ -844,6 +844,19 @@ pub struct NodeBehaviour {
     ping: libp2p::ping::Behaviour,
 }
 
+/// Si el sistema tiene una configuracion de DNS que libp2p pueda leer.
+///
+/// En Unix eso es `/etc/resolv.conf`, que Android no trae: sus consultas van
+/// por el sistema, no por un archivo. Windows la guarda en el registro y
+/// siempre esta. Se comprueba el archivo en vez de mirar el sistema operativo
+/// porque hay Linux embebidos que tampoco lo tienen.
+fn dns_del_sistema_disponible() -> bool {
+    if cfg!(windows) {
+        return true;
+    }
+    std::path::Path::new("/etc/resolv.conf").exists()
+}
+
 impl Node {
     fn node_identity_path() -> Option<PathBuf> {
         if cfg!(test) && std::env::var_os("ZOKA_NODE_KEY_PATH").is_none() {
@@ -1860,7 +1873,7 @@ impl Node {
         let team_mining_topic_for_behaviour = team_mining_topic.clone();
         let tor_proxy_for_transport = tor_proxy.clone();
 
-        let swarm = SwarmBuilder::with_existing_identity(local_key)
+        let base_transporte = SwarmBuilder::with_existing_identity(local_key)
             .with_tokio()
             .with_tcp(
                 tcp::Config::default(),
@@ -1870,13 +1883,22 @@ impl Node {
             .with_other_transport(move |key| {
                 build_tor_socks_transport(key, tor_proxy_for_transport.clone())
             })?
-            // Wrap the TCP transport in a DNS resolver so `/dns4/<host>/tcp/<port>`
-            // seed multiaddrs dial correctly. Without this the swarm rejects DNS
-            // multiaddrs outright, which would pin the network manifest to raw
-            // IPs forever — seeds must be re-pointable via DNS records, not new
-            // binary releases (the 2026-07 DigitalOcean shutdown proved why).
-            .with_dns()?
-            .with_behaviour(move |key| {
+            ;
+        // El resolutor de DNS del sistema no existe en todas partes.
+        //
+        // `with_dns()` lee la configuracion del sistema al construirse: en
+        // Unix, `/etc/resolv.conf`. Android no tiene ese archivo, asi que la
+        // creacion entera del swarm moria con "No such file or directory"
+        // antes de tocar la red -- el nodo no llegaba ni a existir.
+        //
+        // Donde no hay configuracion se arma un resolutor vacio en vez de
+        // cablear uno publico. Las semillas onion no necesitan DNS (las
+        // resuelve Tor del otro lado del proxy), y mandarle las consultas a
+        // un resolutor de terceros le contaria a ese tercero que este
+        // telefono habla con Zoka, que es exactamente lo que el protocolo
+        // existe para evitar. Se pierden las semillas `/dns4/`, que en un
+        // telefono no se usan.
+        let comportamiento = move |key: &identity::Keypair| {
                 let local_peer_id = PeerId::from(key.public());
 
                 let kademlia = kad::Behaviour::with_config(
@@ -1976,20 +1998,32 @@ impl Node {
                     // so the peer link stays up between sparse block gossip.
                     ping: libp2p::ping::Behaviour::new(libp2p::ping::Config::new()),
                 })
-            })?
-            .with_swarm_config(|cfg| {
-                // libp2p 0.53+ defaults idle_connection_timeout to 0, closing a
-                // connection the instant it has no active stream. Block sync
-                // opens a fresh request/response substream per block with gaps
-                // in between; over Tor -- where re-dialing an onion peer costs
-                // many seconds of circuit build -- that made the connection
-                // drop after a block or two and IBD stall (observed: a fresh
-                // node stuck at height ~2 while the peer stayed "connected").
-                // Keep idle connections alive for several minutes so one peer
-                // stays usable across the whole sync.
-                cfg.with_idle_connection_timeout(Duration::from_secs(300))
-            })
-            .build();
+        };
+        let configurar_swarm = |cfg: libp2p::swarm::Config| {
+            // libp2p 0.53+ cierra la conexion apenas se queda sin flujos
+            // activos. El sync abre un flujo por bloque con huecos entre
+            // medio, y sobre Tor volver a marcar una onion cuesta muchos
+            // segundos de circuito: asi la conexion se caia despues de un
+            // bloque o dos y el sync quedaba clavado.
+            cfg.with_idle_connection_timeout(Duration::from_secs(300))
+        };
+
+        let swarm = if dns_del_sistema_disponible() {
+            base_transporte
+                .with_dns()?
+                .with_behaviour(comportamiento)?
+                .with_swarm_config(configurar_swarm)
+                .build()
+        } else {
+            base_transporte
+                .with_dns_config(
+                    libp2p::dns::ResolverConfig::new(),
+                    libp2p::dns::ResolverOpts::default(),
+                )
+                .with_behaviour(comportamiento)?
+                .with_swarm_config(configurar_swarm)
+                .build()
+        };
 
         let privacy_config = tor_proxy
             .filter(|proxy| !proxy.trim().is_empty())

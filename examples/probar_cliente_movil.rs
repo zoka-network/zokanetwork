@@ -103,6 +103,16 @@ fn main() {
         if clave.is_file() { "SI" } else { "NO -- se escribio en otro lado" }
     );
 
+    // Si se pasa un hash, se le pide el cuerpo a los pares. Es la unica forma
+    // de saber si una transaccion privada propago de verdad: la red anuncia el
+    // hash y solo entrega el cuerpo a quien lo pide, asi que si un par ajeno
+    // puede darlo, el anuncio llego y alguien mas la tiene.
+    if let Some(hash) = std::env::args().nth(2) {
+        paso(&format!("pedirle a la red el cuerpo de {}", &hash[..8.min(hash.len())]), || {
+            mobile_net::private_tx_body_json(&hash).map(|j| format!("la tiene ({} bytes)", j.len()))
+        });
+    }
+
     paso("estado final", mobile_net::status_json);
     let _ = mobile_net::disconnect();
 }
