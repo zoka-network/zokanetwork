@@ -219,6 +219,37 @@ pub struct StateManager {
     state_history: Arc<RwLock<Vec<(u64, State)>>>, // (height, state) snapshots for rollback
 }
 
+/// Que le paso a una transaccion privada, segun la cadena y no segun lo que
+/// diga la propia transaccion.
+///
+/// El campo `status` que viaja dentro del cuerpo lo estampa quien la crea y no
+/// se actualiza nunca: dice "pendiente" para siempre, este confirmada o
+/// rechazada. Esto se calcula.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateTxChainState {
+    /// Entro en la cadena, en ese bloque.
+    Confirmada { altura: u64 },
+    /// Su nota ya la habia gastado otra transaccion en ese bloque. Ningun
+    /// minero la va a incluir, y esperar no cambia nada.
+    GastoDoble { altura: u64 },
+    /// Todavia no entro, pero nada impide que entre.
+    Pendiente,
+    /// El nodo no tiene el cuerpo, asi que no puede decir nada.
+    Desconocida,
+}
+
+impl PrivateTxChainState {
+    /// Como se le cuenta a una wallet, en el mismo vocabulario que ya usa.
+    pub fn etiqueta(&self) -> &'static str {
+        match self {
+            Self::Confirmada { .. } => "Confirmed",
+            Self::GastoDoble { .. } => "Rejected",
+            Self::Pendiente => "Pending",
+            Self::Desconocida => "Unknown",
+        }
+    }
+}
+
 impl StateManager {
     /// Create a new state manager with storage
     pub fn new(storage: Arc<RocksDbStorage>) -> Self {
@@ -591,12 +622,25 @@ impl StateManager {
             .map_err(|e| StateError::StorageError(e.to_string()))
     }
 
-    /// Return whether the chain already commits this private transaction hash.
-    /// Whether a private transaction with `hash` is already committed
-    /// on-chain. Best-effort convenience for the API (pending-list filtering
-    /// and submission de-dup), NOT a consensus check — the canonical
-    /// no-double-spend rule lives in
-    /// `state::chain::validate_private_nullifiers`.
+    /// Si esta transaccion ya no tiene nada que hacer en el conjunto de
+    /// pendientes.
+    ///
+    /// **No significa "esta confirmada", aunque el nombre lo sugiera.** Lo que
+    /// comprueba es que la nota que gasta ya fue gastada, sin averiguar por
+    /// quien: da `true` tanto si entro en la cadena como si otra transaccion
+    /// se le adelanto. Para filtrar pendientes eso es justo lo que se quiere
+    /// -- en los dos casos ningun minero puede incluirla --, pero para
+    /// contarle algo a un usuario no alcanza: mostrar un doble gasto como
+    /// "enviado" es peor que no mostrar nada. Para eso esta
+    /// [`Self::private_transaction_chain_state`], que si distingue.
+    ///
+    /// No es una comprobacion de consenso; la regla canonica de no-doble-gasto
+    /// vive en `state::chain::validate_private_nullifiers`.
+    ///
+    /// Se resuelve por el indice de nulificadores, que es O(1). La version
+    /// anterior deserializaba cada bloque de RocksDB en cada llamada y el
+    /// manejador de `/private/pending` la invocaba una vez por hash pendiente,
+    /// asi que el sondeo normal de un minero clavaba la CPU del nodo.
     ///
     /// Resolved through the O(1) spent-nullifier index rather than an
     /// O(chain-height) block scan: every canonical block records its private
@@ -606,6 +650,70 @@ impl StateManager {
     /// block from RocksDB on each call, and the `/private/pending` handler
     /// invoked it once per pending hash, so ordinary miner polling pegged the
     /// node's CPU (both runtime workers stuck in `get_block_by_height`).
+    /// Que le paso de verdad a una transaccion privada en la cadena.
+    ///
+    /// Mirar solo el indice de nulificadores no alcanza para saberlo: ese
+    /// indice dice que la nota se gasto, no *quien* la gasto. Para una
+    /// transaccion legitima da lo mismo, pero para un doble gasto no --
+    /// el nulificador lo consumio otra transaccion, y responder "confirmada"
+    /// hace que una wallet muestre como enviado un dinero que nunca salio.
+    ///
+    /// Asi que cuando el nulificador figura gastado se mira el bloque donde
+    /// se gasto y se comprueba si esta transaccion es la que esta ahi. Cuesta
+    /// una lectura de bloque, y solo en el caso raro.
+    pub async fn private_transaction_chain_state(
+        &self,
+        hash: &str,
+    ) -> Result<PrivateTxChainState, StateError> {
+        let Some(bytes) = self.get_private_transaction_bytes(hash)? else {
+            return Ok(PrivateTxChainState::Desconocida);
+        };
+        let tx: crate::private_wallet::PrivateTransaction = match serde_json::from_slice(&bytes) {
+            Ok(tx) => tx,
+            Err(_) => return Ok(PrivateTxChainState::Desconocida),
+        };
+
+        let mut tags: Vec<&str> = Vec::with_capacity(1 + tx.input_nullifiers.len());
+        let primary = tx.nullifier.trim();
+        if !primary.is_empty() {
+            tags.push(primary);
+        }
+        for tag in &tx.input_nullifiers {
+            let tag = tag.trim();
+            if !tag.is_empty() {
+                tags.push(tag);
+            }
+        }
+
+        for tag in tags {
+            let Some(altura) = self
+                .storage
+                .spent_nullifier_height(tag)
+                .map_err(|e| StateError::StorageError(e.to_string()))?
+            else {
+                continue;
+            };
+            // El nulificador esta gastado. La pregunta es por quien.
+            let bloque = self
+                .storage
+                .get_block_by_height(altura)
+                .map_err(|e| StateError::StorageError(e.to_string()))?;
+            let fue_esta = bloque
+                .as_ref()
+                .map(|b| b.private_tx_hashes.iter().any(|h| h.trim() == hash.trim()))
+                // Sin el bloque a mano no se puede acusar a nadie de doble
+                // gasto: se asume que fue esta, que es la lectura conservadora
+                // (deja la transaccion tranquila en vez de darla por muerta).
+                .unwrap_or(true);
+            return Ok(if fue_esta {
+                PrivateTxChainState::Confirmada { altura }
+            } else {
+                PrivateTxChainState::GastoDoble { altura }
+            });
+        }
+        Ok(PrivateTxChainState::Pendiente)
+    }
+
     pub async fn has_private_transaction_hash(&self, hash: &str) -> Result<bool, StateError> {
         // Body not held locally → can't derive the nullifier. Treat as
         // not-yet-committed: both callers are best-effort and safe with a
@@ -1106,6 +1214,73 @@ mod tests {
 
         assert_eq!(alice.balance, 900);
         assert_eq!(bob.balance, 100);
+
+        let _ = fs::remove_dir_all(test_dir);
+    }
+
+    #[tokio::test]
+    async fn un_gasto_doble_no_se_reporta_como_confirmada() {
+        // Dos transacciones que gastan la MISMA nota. Una entro en un bloque;
+        // la otra llego tarde. Mirar solo el indice de nulificadores las hace
+        // ver identicas -- "esa nota ya se gasto" -- y esa confusion es la que
+        // hacia que una wallet mostrara como enviada una transaccion que
+        // ningun minero puede incluir.
+        let test_dir = ".zoka/test-suite/.test_gasto_doble_vs_confirmada";
+        let _ = fs::remove_dir_all(test_dir);
+        let storage = Arc::new(RocksDbStorage::new(test_dir).unwrap());
+        let manager = StateManager::new(storage.clone());
+
+        let cuerpo = |hash: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "tx_hash": hash,
+                "commitment": "c",
+                "private_proof_version": 2,
+                "private_proof_profile": "private_tx_v2_i1",
+                "nullifier": "NULL-compartido",
+                "zk_proof": null,
+                "timestamp": 1,
+                "status": "Pending"
+            }))
+            .unwrap()
+        };
+        storage
+            .save_private_transaction_bytes("la-que-entro", &cuerpo("la-que-entro"))
+            .unwrap();
+        storage
+            .save_private_transaction_bytes("la-que-llego-tarde", &cuerpo("la-que-llego-tarde"))
+            .unwrap();
+
+        // El bloque 9 commitea solo la primera, y el indice anota que ahi se
+        // gasto la nota.
+        let mut bloque = Block::new(
+            "parent".to_string(),
+            1,
+            0,
+            9,
+            Vec::new(),
+            crate::types::PublicKey(Vec::new()),
+            crate::types::Signature(Vec::new()),
+        );
+        bloque.private_tx_hashes = vec!["la-que-entro".to_string()];
+        storage.save_block(&bloque).unwrap();
+        storage.save_spent_nullifier("NULL-compartido", 9).unwrap();
+
+        assert_eq!(
+            manager
+                .private_transaction_chain_state("la-que-entro")
+                .await
+                .unwrap(),
+            PrivateTxChainState::Confirmada { altura: 9 },
+            "la que esta en el bloque tiene que leerse como confirmada"
+        );
+        assert_eq!(
+            manager
+                .private_transaction_chain_state("la-que-llego-tarde")
+                .await
+                .unwrap(),
+            PrivateTxChainState::GastoDoble { altura: 9 },
+            "la que reusa la nota no esta confirmada: es un gasto doble, y              esperarla es esperar para siempre"
+        );
 
         let _ = fs::remove_dir_all(test_dir);
     }

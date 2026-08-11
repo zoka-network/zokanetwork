@@ -3915,12 +3915,45 @@ async fn get_private_tx_by_hash(
                 format!("failed to parse private tx: {}", e),
             )
         })?;
-    Ok(Json(serde_json::to_value(tx).map_err(|e| {
+    let mut valor = serde_json::to_value(tx).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to serialize private tx: {}", e),
         )
-    })?))
+    })?;
+
+    // El `status` que trae el cuerpo lo estampo quien creo la transaccion y no
+    // se actualiza nunca: dice "pendiente" para siempre, este confirmada o
+    // rechazada. Se reemplaza por lo que dice la cadena.
+    //
+    // La diferencia importa sobre todo para un doble gasto: una wallet que ve
+    // "pendiente" espera, y va a esperar para siempre por algo que ningun
+    // minero puede incluir. Con "Rejected" puede decirle al usuario que esa
+    // transaccion no va a salir y que sus fondos siguen donde estaban.
+    if let Ok(estado) = app_state
+        .state_manager
+        .private_transaction_chain_state(&hash)
+        .await
+    {
+        if let Some(obj) = valor.as_object_mut() {
+            obj.insert("status".to_string(), serde_json::json!(estado.etiqueta()));
+            match estado {
+                crate::state::PrivateTxChainState::Confirmada { altura } => {
+                    obj.insert("block_height".to_string(), serde_json::json!(altura));
+                }
+                crate::state::PrivateTxChainState::GastoDoble { altura } => {
+                    obj.insert(
+                        "rejected_reason".to_string(),
+                        serde_json::json!(format!(
+                            "la nota que gasta ya fue gastada por otra transaccion en el bloque {altura}"
+                        )),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(Json(valor))
 }
 
 /// List the node's still-pending (un-mined) private transactions, each with

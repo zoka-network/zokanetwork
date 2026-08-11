@@ -393,6 +393,29 @@ impl RocksDbStorage {
         self.put_raw(&key, height.to_le_bytes().to_vec())
     }
 
+    /// Altura del bloque donde se gasto `nullifier`, si esta gastado.
+    ///
+    /// El indice ya guardaba la altura; solo faltaba poder leerla. Sirve para
+    /// distinguir dos casos que `is_nullifier_spent` mezcla: que la
+    /// transaccion propia haya entrado en la cadena, o que otra se haya
+    /// llevado antes esa misma nota.
+    pub fn spent_nullifier_height(&self, nullifier: &str) -> Result<Option<u64>, StorageError> {
+        let nullifier = nullifier.trim();
+        if nullifier.is_empty() {
+            return Ok(None);
+        }
+        let key = format!("{SPENT_NULLIFIER_PREFIX}{nullifier}");
+        let Some(bytes) = self.get_raw(&key)? else {
+            return Ok(None);
+        };
+        let ocho: [u8; 8] = bytes.as_slice().try_into().map_err(|_| {
+            StorageError::SerializationError(format!(
+                "spent nullifier {nullifier} has a malformed height"
+            ))
+        })?;
+        Ok(Some(u64::from_le_bytes(ocho)))
+    }
+
     /// Return true if `nullifier` was already committed in a prior block.
     pub fn is_nullifier_spent(&self, nullifier: &str) -> Result<bool, StorageError> {
         let nullifier = nullifier.trim();
