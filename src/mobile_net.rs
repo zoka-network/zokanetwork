@@ -44,15 +44,6 @@ const PUMP_SLICE: Duration = Duration::from_millis(250);
 /// al usuario a reintentar cuando solo hacia falta esperar.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// Cuanto esperar un anuncio de bloque antes de admitir que no sabemos la
-/// altura de la red.
-///
-/// La altura se aprende escuchando: los pares anuncian cada bloque que aceptan.
-/// No hay forma de preguntarla -- el protocolo de cabeceras responde desde el
-/// genesis, no desde la punta --, asi que hay que esperar a que caiga uno. A
-/// dos bloques por minuto, dos minutos cubren varios intentos.
-const HEIGHT_WAIT: Duration = Duration::from_secs(120);
-
 /// Cuanto esperar las respuestas de un lote de bloques.
 const BLOCKS_WAIT: Duration = Duration::from_secs(60);
 
@@ -275,7 +266,7 @@ fn pedir<T>(
 /// Puede tardar recien conectado: hasta que no pase un bloque nuevo nadie
 /// anuncia nada, y despues hay que tantear hasta donde llega el par.
 pub fn chain_height_json() -> Result<String, String> {
-    let (servible, anunciada) = pedir(Cmd::Height, HEIGHT_WAIT + Duration::from_secs(90))??;
+    let (servible, anunciada) = pedir(Cmd::Height, Duration::from_secs(240))??;
     Ok(format!(
         r#"{{"height":{servible},"announced_height":{anunciada}}}"#
     ))
@@ -403,79 +394,104 @@ async fn tiene_bloque(node: &mut Node, altura: u64) -> bool {
     matches!(respuestas.get(&altura), Some(Ok(_)))
 }
 
-/// Hasta donde pueden servir de verdad los pares conectados.
+/// Cuanto se le da a la conexion para tener un par antes de pedirle algo.
 ///
-/// No es lo mismo que la altura anunciada, y la diferencia importa. Gossip
-/// propaga los anuncios por toda la malla: un par atrasado reenvia la punta que
-/// mino otro sin tener el bloque. Si la wallet escaneara hasta lo anunciado,
-/// fallaria entera por unos bloques que nadie a su alcance puede darle --
-/// medido contra la red real, la semilla anunciaba 17325 y solo servia hasta
-/// 17061.
-///
-/// Un saldo calculado hasta unos bloques atras es lo normal en cualquier
-/// wallet; no poder mostrar saldo no lo es.
-///
-/// El caso sano cuesta un solo pedido. Cuando el par esta atrasado, se retrocede
-/// a saltos crecientes hasta encontrar terreno firme y despues se afina por
-/// mitades, que son unos pocos pedidos mas y quedan cacheados.
-async fn altura_servible(node: &mut Node, anunciada: u64, cache: &mut u64) -> u64 {
-    if anunciada == 0 {
-        return 0;
-    }
-    if tiene_bloque(node, anunciada).await {
-        *cache = anunciada;
-        return anunciada;
-    }
+/// `connect` vuelve en cuanto la semilla acepta el marcado, pero el apreton de
+/// manos de libp2p termina despues, dentro del bucle de eventos. Preguntarle
+/// algo a la red en ese hueco no falla por falta de red: falla porque todavia
+/// no hay a quien preguntarle.
+const PEER_WAIT: Duration = Duration::from_secs(90);
 
-    let mut ultimo_fallo = anunciada;
-    let mut piso = 0u64;
-    let mut salto = 16u64;
-    while salto < anunciada {
-        let candidato = anunciada - salto;
-        if candidato <= *cache {
-            break;
-        }
-        if tiene_bloque(node, candidato).await {
-            piso = candidato;
-            break;
-        }
-        ultimo_fallo = candidato;
-        salto *= 4;
-    }
-    if piso == 0 && *cache > 0 && tiene_bloque(node, *cache).await {
-        piso = *cache;
-    }
+/// Cada cuanto se vuelve a marcar mientras no haya ningun par.
+const REDIAL_INTERVAL: Duration = Duration::from_secs(15);
 
-    // Afinar entre el ultimo que si estaba y el primero que no.
-    let (mut bajo, mut alto) = (piso, ultimo_fallo.saturating_sub(1));
-    while bajo < alto {
-        let medio = bajo + (alto - bajo + 1) / 2;
-        if tiene_bloque(node, medio).await {
-            bajo = medio;
-        } else {
-            alto = medio - 1;
+/// Espera a tener al menos un par, volviendo a marcar a las semillas si hace
+/// falta.
+///
+/// Un telefono pierde conexiones todo el tiempo: el circuito Tor se cae, la
+/// red cambia de wifi a datos, la pantalla se apaga. Sin volver a marcar, la
+/// wallet queda muerta hasta que el usuario reinicie la aplicacion, y ni
+/// siquiera sabe por que. Reconectar es parte del trabajo, no un extra.
+///
+/// Devuelve `false` si se acabo el tiempo sin conseguir ninguno.
+async fn esperar_par(node: &mut Node, seeds: &[String]) -> bool {
+    if node.connected_peer_count() > 0 {
+        return true;
+    }
+    let limite = tokio::time::Instant::now() + PEER_WAIT;
+    let mut proximo_marcado = tokio::time::Instant::now();
+    while tokio::time::Instant::now() < limite {
+        if tokio::time::Instant::now() >= proximo_marcado {
+            for seed in seeds {
+                let _ = node.connect_to_peer(seed).await;
+            }
+            proximo_marcado = tokio::time::Instant::now() + REDIAL_INTERVAL;
+        }
+        let _ = node.pump_for(PUMP_SLICE).await;
+        anotar_pares(node.connected_peer_count());
+        if node.connected_peer_count() > 0 {
+            return true;
         }
     }
-    *cache = bajo;
-    bajo
+    false
 }
 
-/// Espera a que algun par anuncie un bloque, bombeando mientras tanto.
-async fn esperar_altura(node: &mut Node) -> Result<u64, String> {
-    if node.highest_announced_height() > 0 {
-        return Ok(node.highest_announced_height());
+/// Descubre hasta donde llegan los pares preguntandoles, sin esperar a que
+/// anuncien nada.
+///
+/// Esperar un anuncio era fragil por una razon medible: los bloques de esta
+/// red tardan unos 138 segundos de mediana, con picos de media hora. Cualquier
+/// espera fija o es mas corta que el intervalo -- y entonces la wallet falla
+/// aunque todo funcione -- o es tan larga que el usuario cree que se colgo. Y
+/// con la cadena quieta no hay espera que alcance.
+///
+/// Preguntar no tiene ese problema: los pares contestan al instante si tienen
+/// el bloque. Se sube a saltos que se duplican hasta encontrar uno que no
+/// tienen, y despues se afina por mitades. Son unos quince pedidos la primera
+/// vez y queda cacheado; el anuncio, cuando lo hay, se usa como atajo.
+async fn descubrir_altura(node: &mut Node, pista: u64, cache: &mut u64) -> u64 {
+    // El atajo: si algun par anuncio una punta y resulta que la tiene, listo.
+    if pista > 0 && tiene_bloque(node, pista).await {
+        *cache = pista;
+        return pista;
     }
-    let limite = tokio::time::Instant::now() + HEIGHT_WAIT;
-    while tokio::time::Instant::now() < limite {
-        let _ = node.pump_for(PUMP_SLICE).await;
-        if node.highest_announced_height() > 0 {
-            return Ok(node.highest_announced_height());
+
+    let mut buena = 0u64;
+    let mut mala = pista;
+
+    if mala == 0 {
+        // Sin pista hay que encontrar un techo: subir duplicando hasta fallar.
+        let mut altura = if *cache > 0 { *cache } else { 1 };
+        loop {
+            if tiene_bloque(node, altura).await {
+                buena = altura;
+            } else {
+                break;
+            }
+            match altura.checked_mul(2) {
+                Some(siguiente) => altura = siguiente,
+                None => break,
+            }
+        }
+        mala = altura;
+        if buena == 0 {
+            // Ni el bloque 1: no hay ningun par util del otro lado.
+            return 0;
+        }
+    } else if *cache > 0 && *cache < mala && tiene_bloque(node, *cache).await {
+        buena = *cache;
+    }
+
+    while buena + 1 < mala {
+        let medio = buena + (mala - buena) / 2;
+        if tiene_bloque(node, medio).await {
+            buena = medio;
+        } else {
+            mala = medio;
         }
     }
-    Err(format!(
-        "ningun par anuncio un bloque en {} segundos; puede que la conexion se haya caido",
-        HEIGHT_WAIT.as_secs()
-    ))
+    *cache = buena;
+    buena
 }
 
 /// Baja el rango pedido en tandas y lo devuelve con la forma que el escaner
@@ -615,22 +631,40 @@ async fn run_client(
             biased;
             cmd = cmd_rx.recv() => match cmd {
                 Some(Cmd::PublishPrivateTx(tx, resp)) => {
-                    let r = publicar_tx_privada(&mut node, &tx).await;
+                    let r = if esperar_par(&mut node, &seeds).await {
+                        publicar_tx_privada(&mut node, &tx).await
+                    } else {
+                        Err("ningun par completo la conexion; la transaccion no se publico"
+                            .to_string())
+                    };
                     let _ = resp.send(r);
                 }
                 Some(Cmd::Height(resp)) => {
-                    let r = match esperar_altura(&mut node).await {
-                        Ok(anunciada) => {
-                            let servible =
-                                altura_servible(&mut node, anunciada, &mut tope_servible).await;
-                            Ok((servible, anunciada))
-                        }
-                        Err(e) => Err(e),
+                    if !esperar_par(&mut node, &seeds).await {
+                        let _ = resp.send(Err(format!(
+                            "ningun par completo la conexion en {} segundos; revisa Tor",
+                            PEER_WAIT.as_secs()
+                        )));
+                        continue;
+                    }
+                    // El anuncio es una pista gratis, no un requisito: se lee
+                    // lo que haya llegado y se sigue sin esperar.
+                    let anunciada = node.highest_announced_height();
+                    let servible =
+                        descubrir_altura(&mut node, anunciada, &mut tope_servible).await;
+                    let r = if servible == 0 {
+                        Err("ningun par pudo entregar un bloque; revisa la conexion".to_string())
+                    } else {
+                        Ok((servible, anunciada.max(servible)))
                     };
                     let _ = resp.send(r);
                 }
                 Some(Cmd::Blocks(from, to, resp)) => {
-                    let r = traer_bloques(&mut node, &mut cache, from, to).await;
+                    let r = if esperar_par(&mut node, &seeds).await {
+                        traer_bloques(&mut node, &mut cache, from, to).await
+                    } else {
+                        Err("ningun par completo la conexion; revisa Tor".to_string())
+                    };
                     let _ = resp.send(r);
                 }
                 Some(Cmd::PrivateTxBody(hash, resp)) => {
