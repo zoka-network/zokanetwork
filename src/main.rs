@@ -3665,6 +3665,25 @@ fn import_sidecar_private_txs_with_summary(
         if private_tx_hash_is_confirmed(storage, &tx_hash)
             || private_tx_has_spent_onchain_tag(storage, &tx)
         {
+            // Dos motivos muy distintos caen aca: que la transaccion ya entro
+            // en la cadena, o que otra se llevo antes la nota que gasta. El
+            // primero es el final feliz; el segundo es un gasto doble que
+            // ningun minero podra incluir jamas.
+            //
+            // Se guarda el cuerpo antes de borrar la cola. Sin eso, la unica
+            // copia desaparecia y `/private/tx/<hash>` respondia 404: quien
+            // envio se quedaba mirando "pendiente" sin forma de averiguar que
+            // su transaccion estaba muerta. Guardarlo cuesta unos kilobytes y
+            // permite que el nodo explique que paso.
+            if !private_tx_hash_is_confirmed(storage, &tx_hash) {
+                let _ = storage.save_private_transaction_bytes(&tx_hash, &bytes);
+                tracing::warn!(
+                    "descartando la transaccion privada {tx_hash} de la cola: la nota que \
+                     gasta ya fue gastada por otra transaccion. No la va a incluir ningun \
+                     minero -- la wallet que la creo esta ofreciendo una nota que ya no \
+                     tiene, y le conviene reescanear."
+                );
+            }
             let _ = storage.delete_pending_private_transaction_hash(&tx_hash);
             if std::fs::remove_file(&path).is_ok() {
                 summary.removed_confirmed = summary.removed_confirmed.saturating_add(1);
