@@ -855,8 +855,14 @@ impl Node {
             .or_else(|| Some(PathBuf::from(".zoka/node_key")))
     }
 
-    fn load_or_generate_identity_key() -> Result<identity::Keypair, Box<dyn Error>> {
-        let Some(path) = Self::node_identity_path() else {
+    fn load_or_generate_identity_key(
+        override_path: Option<PathBuf>,
+    ) -> Result<identity::Keypair, Box<dyn Error>> {
+        let ruta = match override_path {
+            Some(ruta) => Some(ruta),
+            None => Self::node_identity_path(),
+        };
+        let Some(path) = ruta else {
             return Ok(identity::Keypair::generate_ed25519());
         };
 
@@ -1807,10 +1813,27 @@ impl Node {
 
     /// Create a new node and include a Tor SOCKS transport for onion dials when configured.
     pub async fn new_with_tor_proxy(
-        _listen_port: u16,
+        listen_port: u16,
         tor_proxy: Option<String>,
     ) -> Result<Self, Box<dyn Error>> {
-        let local_key = Self::load_or_generate_identity_key()?;
+        Self::new_with_tor_proxy_at(listen_port, tor_proxy, None).await
+    }
+
+    /// Igual que [`Node::new_with_tor_proxy`], pero permite decirle donde
+    /// guardar la identidad de red.
+    ///
+    /// Por defecto va a `.zoka/node_key`, **relativa al directorio de trabajo**.
+    /// En un servidor eso es el directorio del nodo y funciona; en Android el
+    /// directorio de trabajo es `/`, que es de solo lectura, y el nodo ni
+    /// siquiera llega a arrancar: falla con "Read-only file system". Una
+    /// aplicacion tiene que poder decir donde escribe, porque el unico lugar al
+    /// que puede es su propio directorio privado.
+    pub async fn new_with_tor_proxy_at(
+        _listen_port: u16,
+        tor_proxy: Option<String>,
+        identity_path: Option<PathBuf>,
+    ) -> Result<Self, Box<dyn Error>> {
+        let local_key = Self::load_or_generate_identity_key(identity_path)?;
         let peer_id = PeerId::from(local_key.public());
         info!("Local PeerId: {}", peer_id);
         let protocol_freeze_enforce = protocol_freeze_enforce_from_env();

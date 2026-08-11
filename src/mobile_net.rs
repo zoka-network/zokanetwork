@@ -78,6 +78,14 @@ pub struct MobileNetConfig {
     /// proceso.
     #[serde(default)]
     pub tor_proxy: Option<String>,
+    /// Directorio propio de la aplicacion donde el nodo puede escribir.
+    ///
+    /// Hace falta decirselo. El nodo guarda su identidad de red en
+    /// `.zoka/node_key` **relativa al directorio de trabajo**, que en un
+    /// servidor es su propio directorio pero en Android es `/`, de solo
+    /// lectura: sin esto el nodo ni arranca.
+    #[serde(default)]
+    pub data_dir: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -103,7 +111,7 @@ fn anotar_pares(n: usize) {
 
 enum Cmd {
     PublishPrivateTx(Box<PrivateTransaction>, std_mpsc::Sender<Result<(), String>>),
-    Height(std_mpsc::Sender<Result<u64, String>>),
+    Height(std_mpsc::Sender<Result<(u64, u64), String>>),
     Blocks(u64, u64, std_mpsc::Sender<Result<String, String>>),
     PrivateTxBody(String, std_mpsc::Sender<Result<String, String>>),
     Shutdown,
@@ -142,6 +150,10 @@ pub fn connect_json(config_json: &str) -> Result<String, String> {
     let (listo_tx, listo_rx) = std_mpsc::channel();
     let seeds = config.seeds.clone();
     let tor_proxy = config.tor_proxy.clone();
+    let identity_path = config
+        .data_dir
+        .as_ref()
+        .map(|dir| std::path::PathBuf::from(dir).join("zoka-red").join("node_key"));
 
     // El nodo vive en un hilo propio con su runtime de un solo hilo, no en un
     // pool compartido.
@@ -164,7 +176,7 @@ pub fn connect_json(config_json: &str) -> Result<String, String> {
                     return;
                 }
             };
-            rt.block_on(run_client(seeds, tor_proxy, cmd_rx, listo_tx));
+            rt.block_on(run_client(seeds, tor_proxy, identity_path, cmd_rx, listo_tx));
         })
         .map_err(|e| format!("no pude crear el hilo de red: {e}"))?;
 
@@ -253,13 +265,20 @@ fn pedir<T>(
         .map_err(|_| "el hilo de red no respondio a tiempo".to_string())
 }
 
-/// Altura de la punta de la red, aprendida escuchando anuncios de bloque.
+/// Hasta donde puede leer la cadena este cliente.
 ///
-/// Devuelve `{"height":N}`. Puede tardar hasta un par de minutos recien
-/// conectado: hasta que no pase un bloque nuevo, nadie anuncia nada.
+/// Devuelve `{"height":N,"announced_height":M}`, donde `N` es lo que los pares
+/// conectados pueden entregar de verdad y `M` lo que la red anuncia. Suelen
+/// coincidir; cuando no, la wallet tiene que escanear hasta `N` -- pedir `M` le
+/// falla entero por unos bloques que su par no tiene.
+///
+/// Puede tardar recien conectado: hasta que no pase un bloque nuevo nadie
+/// anuncia nada, y despues hay que tantear hasta donde llega el par.
 pub fn chain_height_json() -> Result<String, String> {
-    let altura = pedir(Cmd::Height, HEIGHT_WAIT + Duration::from_secs(15))??;
-    Ok(format!(r#"{{"height":{altura}}}"#))
+    let (servible, anunciada) = pedir(Cmd::Height, HEIGHT_WAIT + Duration::from_secs(90))??;
+    Ok(format!(
+        r#"{{"height":{servible},"announced_height":{anunciada}}}"#
+    ))
 }
 
 /// Bloques crudos de `from` a `to`, en el mismo formato que devolvia la API
@@ -372,6 +391,75 @@ impl CacheCuerpos {
     }
 }
 
+/// Cuanto esperar un bloque suelto mientras se tantea hasta donde llega un par.
+///
+/// Corto a proposito: se hacen varios sondeos seguidos y lo que interesa es si
+/// el par tiene el bloque, no exprimirle una respuesta lenta.
+const PROBE_WAIT: Duration = Duration::from_secs(20);
+
+/// Si un par tiene realmente el bloque de esa altura.
+async fn tiene_bloque(node: &mut Node, altura: u64) -> bool {
+    let respuestas = node.request_blocks_batch_direct(&[altura], PROBE_WAIT).await;
+    matches!(respuestas.get(&altura), Some(Ok(_)))
+}
+
+/// Hasta donde pueden servir de verdad los pares conectados.
+///
+/// No es lo mismo que la altura anunciada, y la diferencia importa. Gossip
+/// propaga los anuncios por toda la malla: un par atrasado reenvia la punta que
+/// mino otro sin tener el bloque. Si la wallet escaneara hasta lo anunciado,
+/// fallaria entera por unos bloques que nadie a su alcance puede darle --
+/// medido contra la red real, la semilla anunciaba 17325 y solo servia hasta
+/// 17061.
+///
+/// Un saldo calculado hasta unos bloques atras es lo normal en cualquier
+/// wallet; no poder mostrar saldo no lo es.
+///
+/// El caso sano cuesta un solo pedido. Cuando el par esta atrasado, se retrocede
+/// a saltos crecientes hasta encontrar terreno firme y despues se afina por
+/// mitades, que son unos pocos pedidos mas y quedan cacheados.
+async fn altura_servible(node: &mut Node, anunciada: u64, cache: &mut u64) -> u64 {
+    if anunciada == 0 {
+        return 0;
+    }
+    if tiene_bloque(node, anunciada).await {
+        *cache = anunciada;
+        return anunciada;
+    }
+
+    let mut ultimo_fallo = anunciada;
+    let mut piso = 0u64;
+    let mut salto = 16u64;
+    while salto < anunciada {
+        let candidato = anunciada - salto;
+        if candidato <= *cache {
+            break;
+        }
+        if tiene_bloque(node, candidato).await {
+            piso = candidato;
+            break;
+        }
+        ultimo_fallo = candidato;
+        salto *= 4;
+    }
+    if piso == 0 && *cache > 0 && tiene_bloque(node, *cache).await {
+        piso = *cache;
+    }
+
+    // Afinar entre el ultimo que si estaba y el primero que no.
+    let (mut bajo, mut alto) = (piso, ultimo_fallo.saturating_sub(1));
+    while bajo < alto {
+        let medio = bajo + (alto - bajo + 1) / 2;
+        if tiene_bloque(node, medio).await {
+            bajo = medio;
+        } else {
+            alto = medio - 1;
+        }
+    }
+    *cache = bajo;
+    bajo
+}
+
 /// Espera a que algun par anuncie un bloque, bombeando mientras tanto.
 async fn esperar_altura(node: &mut Node) -> Result<u64, String> {
     if node.highest_announced_height() > 0 {
@@ -478,12 +566,13 @@ async fn traer_cuerpo_privado(
 async fn run_client(
     seeds: Vec<String>,
     tor_proxy: Option<String>,
+    identity_path: Option<std::path::PathBuf>,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     listo_tx: std_mpsc::Sender<Result<(), String>>,
 ) {
     // Puerto 0: este cliente no escucha. Un telefono no es alcanzable desde
     // afuera y no tiene por que serlo -- solo necesita salir.
-    let mut node = match Node::new_with_tor_proxy(0, tor_proxy).await {
+    let mut node = match Node::new_with_tor_proxy_at(0, tor_proxy, identity_path).await {
         Ok(node) => node,
         Err(err) => {
             let _ = listo_tx.send(Err(format!("no pude crear el nodo: {err}")));
@@ -510,8 +599,18 @@ async fn run_client(
     anotar_pares(node.connected_peer_count());
     let _ = listo_tx.send(Ok(()));
     let mut cache = CacheCuerpos::default();
+    // Hasta donde se sabe que los pares pueden servir. Se recuerda entre
+    // llamadas para no re-tantear la cadena entera cada vez.
+    let mut tope_servible = 0u64;
 
     loop {
+        // Se anota aca y no dentro de una rama del select: cuando llega un
+        // comando, `select!` descarta el futuro de la otra rama a mitad de
+        // camino, asi que cualquier cosa escrita despues del bombeo casi nunca
+        // corre. Eso hacia que el estado dijera "cero pares" mientras el
+        // cliente estaba bajando bloques de un par.
+        anotar_pares(node.connected_peer_count());
+
         tokio::select! {
             biased;
             cmd = cmd_rx.recv() => match cmd {
@@ -520,7 +619,14 @@ async fn run_client(
                     let _ = resp.send(r);
                 }
                 Some(Cmd::Height(resp)) => {
-                    let r = esperar_altura(&mut node).await;
+                    let r = match esperar_altura(&mut node).await {
+                        Ok(anunciada) => {
+                            let servible =
+                                altura_servible(&mut node, anunciada, &mut tope_servible).await;
+                            Ok((servible, anunciada))
+                        }
+                        Err(e) => Err(e),
+                    };
                     let _ = resp.send(r);
                 }
                 Some(Cmd::Blocks(from, to, resp)) => {
@@ -535,9 +641,7 @@ async fn run_client(
             },
             _ = async {
                 let _ = node.pump_for(PUMP_SLICE).await;
-            } => {
-                anotar_pares(node.connected_peer_count());
-            }
+            } => {}
         }
     }
 }
