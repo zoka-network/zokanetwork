@@ -762,6 +762,13 @@ pub struct Node {
     /// (height, hash) so a sweep can retry them on a backoff instead of
     /// silently dropping the block if the first gossip request is lost.
     pending_block_announce_retries: HashMap<(u64, String), BlockAnnounceRetry>,
+    /// Altura mas alta anunciada por algun par desde que arranco el nodo.
+    ///
+    /// Es una observacion pasiva: anotarla no cambia ninguna decision del nodo
+    /// completo, que sigue derivando su objetivo de sincronizacion como
+    /// siempre. Existe para el cliente movil, que no guarda cadena y necesita
+    /// saber hasta donde escanear sin preguntarle la altura a ningun servidor.
+    highest_announced_height: u64,
     /// Direct block body responses received while the caller was not waiting.
     received_block_body_responses: VecDeque<ReceivedBlockBodyResponse>,
     /// Direct block body request failures received from libp2p.
@@ -1991,6 +1998,7 @@ impl Node {
             pending_block_body_requests: VecDeque::new(),
             pending_outbound_block_body_requests: HashMap::new(),
             pending_block_announce_retries: HashMap::new(),
+            highest_announced_height: 0,
             received_block_body_responses: VecDeque::new(),
             block_body_request_failures: VecDeque::new(),
             block_request_response_stats: BlockRequestResponseStats::default(),
@@ -3178,6 +3186,9 @@ impl Node {
                             if let Err(err) = self.validate_inbound_message(&msg) {
                                 warn!("discarding invalid message while pumping swarm: {}", err);
                             } else {
+                                if let ZokaMessage::BlockAnnounce(announce) = &msg {
+                                    self.record_announced_height(announce.block_height);
+                                }
                                 self.preserve_pumped_message(
                                     propagation_source,
                                     message_source,
@@ -4367,6 +4378,28 @@ impl Node {
     /// Return number of peers blocked by protocol-freeze compatibility rules.
     pub fn incompatible_peer_count(&self) -> usize {
         self.incompatible_protocol_peers.len()
+    }
+
+    /// Anota la altura de un anuncio si es la mas alta vista hasta ahora.
+    pub fn record_announced_height(&mut self, height: u64) {
+        if height > self.highest_announced_height {
+            self.highest_announced_height = height;
+        }
+    }
+
+    /// La altura mas alta que algun par haya anunciado, o 0 si todavia no llego
+    /// ningun anuncio.
+    ///
+    /// Cero no significa "la cadena esta vacia" sino "todavia no se". Quien la
+    /// use tiene que distinguir los dos casos: escanear hasta 0 no es lo mismo
+    /// que no tener nada que escanear.
+    ///
+    /// No es un dato verificado: un par mentiroso puede anunciar una altura
+    /// inventada. Lo peor que consigue es que un cliente liviano pida bloques
+    /// que nadie tiene y le falle el escaneo -- no le hace creer un saldo que
+    /// no existe, porque los bloques si se piden y se leen de verdad.
+    pub fn highest_announced_height(&self) -> u64 {
+        self.highest_announced_height
     }
 
     /// Start (or restart) tracking a BlockAnnounce-triggered fetch so a

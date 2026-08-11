@@ -44,6 +44,31 @@ const PUMP_SLICE: Duration = Duration::from_millis(250);
 /// al usuario a reintentar cuando solo hacia falta esperar.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Cuanto esperar un anuncio de bloque antes de admitir que no sabemos la
+/// altura de la red.
+///
+/// La altura se aprende escuchando: los pares anuncian cada bloque que aceptan.
+/// No hay forma de preguntarla -- el protocolo de cabeceras responde desde el
+/// genesis, no desde la punta --, asi que hay que esperar a que caiga uno. A
+/// dos bloques por minuto, dos minutos cubren varios intentos.
+const HEIGHT_WAIT: Duration = Duration::from_secs(120);
+
+/// Cuanto esperar las respuestas de un lote de bloques.
+const BLOCKS_WAIT: Duration = Duration::from_secs(60);
+
+/// Cuantos bloques pedir de una. El escaner pide rangos de 250, pero cada
+/// bloque es un pedido punto a punto: mandarlos todos juntos abre 250 flujos
+/// simultaneos sobre un circuito Tor, que es justo como se pierde una tanda
+/// entera. De a 32 el rango tarda un poco mas y llega.
+const BLOCKS_BATCH: usize = 32;
+
+/// Techo del cache de cuerpos de transacciones privadas.
+///
+/// Los cuerpos llegan de arriba con los bloques y se sirven al escaner sin otra
+/// vuelta a la red. Sin techo, un escaneo largo los acumularia todos en la
+/// memoria del telefono.
+const MAX_CACHED_BODIES: usize = 4096;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct MobileNetConfig {
     /// Direcciones a las que marcar al arrancar. Onions del manifiesto o las
@@ -63,9 +88,24 @@ pub struct MobileNetStatus {
     pub error: Option<String>,
 }
 
+/// Cuantos pares tiene el nodo, publicado fuera del canal de comandos.
+///
+/// El estado no viaja por el canal a proposito. Pedir bloques o esperar la
+/// altura ocupa el hilo del nodo durante minutos, y si preguntar "hay red?"
+/// tuviera que hacer cola detras de eso, dos pantallas refrescando a la vez se
+/// romperian entre si: la segunda veria "no responde" y concluiria que se
+/// perdio la conexion justo cuando la primera la esta usando.
+static PARES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn anotar_pares(n: usize) {
+    PARES.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
 enum Cmd {
-    Status(std_mpsc::Sender<MobileNetStatus>),
     PublishPrivateTx(Box<PrivateTransaction>, std_mpsc::Sender<Result<(), String>>),
+    Height(std_mpsc::Sender<Result<u64, String>>),
+    Blocks(u64, u64, std_mpsc::Sender<Result<String, String>>),
+    PrivateTxBody(String, std_mpsc::Sender<Result<String, String>>),
     Shutdown,
 }
 
@@ -143,25 +183,26 @@ pub fn connect_json(config_json: &str) -> Result<String, String> {
 }
 
 /// Estado actual: si hay red y con cuantos pares.
+///
+/// Se responde al instante leyendo lo que el hilo de red dejo anotado, sin
+/// mandarle nada. Preguntar por el estado nunca puede quedarse esperando a que
+/// termine una descarga de bloques.
 pub fn status_json() -> Result<String, String> {
-    let slot = handle_slot().lock().map_err(|_| "estado envenenado".to_string())?;
-    let Some(handle) = slot.as_ref() else {
-        return serde_json::to_string(&MobileNetStatus {
-            connected: false,
-            peers: 0,
-            error: None,
-        })
-        .map_err(|e| e.to_string());
+    let arriba = handle_slot()
+        .lock()
+        .map_err(|_| "estado envenenado".to_string())?
+        .is_some();
+    let pares = if arriba {
+        PARES.load(std::sync::atomic::Ordering::Relaxed)
+    } else {
+        0
     };
-    let (tx, rx) = std_mpsc::channel();
-    handle
-        .cmd_tx
-        .send(Cmd::Status(tx))
-        .map_err(|_| "el cliente de red se detuvo".to_string())?;
-    let estado = rx
-        .recv_timeout(Duration::from_secs(10))
-        .map_err(|_| "el cliente de red no responde".to_string())?;
-    serde_json::to_string(&estado).map_err(|e| e.to_string())
+    serde_json::to_string(&MobileNetStatus {
+        connected: arriba && pares > 0,
+        peers: pares,
+        error: None,
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// Publica una transaccion privada ya construida y probada localmente.
@@ -195,11 +236,68 @@ pub fn publish_private_tx_json(tx_json: &str) -> Result<String, String> {
 /// Corta la red y libera el nodo. La wallet la llama al pasar a segundo plano:
 /// mantener circuitos Tor abiertos con la pantalla apagada gasta bateria sin
 /// que nadie mire el resultado.
+/// Manda un comando al hilo de red y espera su respuesta.
+fn pedir<T>(
+    armar: impl FnOnce(std_mpsc::Sender<T>) -> Cmd,
+    espera: Duration,
+) -> Result<T, String> {
+    let slot = handle_slot().lock().map_err(|_| "estado envenenado".to_string())?;
+    let handle = slot.as_ref().ok_or("la red no esta conectada")?;
+    let (tx, rx) = std_mpsc::channel();
+    handle
+        .cmd_tx
+        .send(armar(tx))
+        .map_err(|_| "el hilo de red murio".to_string())?;
+    drop(slot);
+    rx.recv_timeout(espera)
+        .map_err(|_| "el hilo de red no respondio a tiempo".to_string())
+}
+
+/// Altura de la punta de la red, aprendida escuchando anuncios de bloque.
+///
+/// Devuelve `{"height":N}`. Puede tardar hasta un par de minutos recien
+/// conectado: hasta que no pase un bloque nuevo, nadie anuncia nada.
+pub fn chain_height_json() -> Result<String, String> {
+    let altura = pedir(Cmd::Height, HEIGHT_WAIT + Duration::from_secs(15))??;
+    Ok(format!(r#"{{"height":{altura}}}"#))
+}
+
+/// Bloques crudos de `from` a `to`, en el mismo formato que devolvia la API
+/// REST para que el escaner no note la diferencia.
+///
+/// **Confianza.** Este es un cliente liviano: no valida la prueba de trabajo ni
+/// reconstruye la cadena, asi que se cree lo que le mandan. No es peor que
+/// antes -- la version REST le creia a un unico servidor central --, pero
+/// conviene decirlo: aca los bloques se piden repartidos entre los pares
+/// conectados, no a uno solo.
+pub fn blocks_range_json(from: u64, to: u64) -> Result<String, String> {
+    if from > to {
+        return Err(format!("rango invalido: {from} > {to}"));
+    }
+    let espera = BLOCKS_WAIT * (((to - from) as u32 / BLOCKS_BATCH as u32) + 2);
+    pedir(
+        |tx| Cmd::Blocks(from, to, tx),
+        espera + Duration::from_secs(15),
+    )?
+}
+
+/// Cuerpo de una transaccion privada por su hash, en JSON.
+///
+/// Primero mira el cache que dejaron los bloques ya bajados; solo sale a la red
+/// si el cuerpo no vino con su bloque.
+pub fn private_tx_body_json(tx_hash: &str) -> Result<String, String> {
+    pedir(
+        |tx| Cmd::PrivateTxBody(tx_hash.to_string(), tx),
+        BLOCKS_WAIT + Duration::from_secs(15),
+    )?
+}
+
 pub fn disconnect() -> Result<String, String> {
     let mut slot = handle_slot().lock().map_err(|_| "estado envenenado".to_string())?;
     if let Some(handle) = slot.take() {
         let _ = handle.cmd_tx.send(Cmd::Shutdown);
     }
+    anotar_pares(0);
     Ok(r#"{"connected":false}"#.to_string())
 }
 
@@ -244,6 +342,139 @@ async fn publicar_tx_privada(node: &mut Node, tx: &PrivateTransaction) -> Result
     Ok(())
 }
 
+/// Cuerpos de transacciones privadas que llegaron pegados a sus bloques.
+///
+/// El escaner necesita el cuerpo de cada transaccion confirmada. Como el
+/// bloque ya los trae, guardarlos evita una vuelta a la red por cada uno --
+/// sobre Tor, la diferencia entre un escaneo de minutos y uno de horas.
+#[derive(Default)]
+struct CacheCuerpos {
+    por_hash: std::collections::HashMap<String, Vec<u8>>,
+    orden: std::collections::VecDeque<String>,
+}
+
+impl CacheCuerpos {
+    fn guardar(&mut self, hash: String, cuerpo: Vec<u8>) {
+        if self.por_hash.contains_key(&hash) {
+            return;
+        }
+        while self.orden.len() >= MAX_CACHED_BODIES {
+            if let Some(viejo) = self.orden.pop_front() {
+                self.por_hash.remove(&viejo);
+            }
+        }
+        self.orden.push_back(hash.clone());
+        self.por_hash.insert(hash, cuerpo);
+    }
+
+    fn buscar(&self, hash: &str) -> Option<&Vec<u8>> {
+        self.por_hash.get(hash)
+    }
+}
+
+/// Espera a que algun par anuncie un bloque, bombeando mientras tanto.
+async fn esperar_altura(node: &mut Node) -> Result<u64, String> {
+    if node.highest_announced_height() > 0 {
+        return Ok(node.highest_announced_height());
+    }
+    let limite = tokio::time::Instant::now() + HEIGHT_WAIT;
+    while tokio::time::Instant::now() < limite {
+        let _ = node.pump_for(PUMP_SLICE).await;
+        if node.highest_announced_height() > 0 {
+            return Ok(node.highest_announced_height());
+        }
+    }
+    Err(format!(
+        "ningun par anuncio un bloque en {} segundos; puede que la conexion se haya caido",
+        HEIGHT_WAIT.as_secs()
+    ))
+}
+
+/// Baja el rango pedido en tandas y lo devuelve con la forma que el escaner
+/// espera.
+async fn traer_bloques(
+    node: &mut Node,
+    cache: &mut CacheCuerpos,
+    from: u64,
+    to: u64,
+) -> Result<String, String> {
+    let mut bloques: Vec<serde_json::Value> = Vec::new();
+
+    // El genesis no lo tiene nadie que pedir: es el mismo para toda la red y se
+    // deriva localmente, igual que hacia el servidor.
+    let mut altura = from;
+    if altura == 0 {
+        let genesis = crate::state::chain::genesis_parent_for(crate::economics::MAINNET_CHAIN_ID);
+        bloques.push(
+            serde_json::to_value(&genesis)
+                .map_err(|e| format!("no pude serializar el genesis: {e}"))?,
+        );
+        altura = 1;
+    }
+
+    while altura <= to {
+        let hasta = (altura + BLOCKS_BATCH as u64 - 1).min(to);
+        let alturas: Vec<u64> = (altura..=hasta).collect();
+        let respuestas = node.request_blocks_batch_direct(&alturas, BLOCKS_WAIT).await;
+
+        for h in &alturas {
+            let respuesta = match respuestas.get(h) {
+                Some(Ok(r)) => r,
+                Some(Err(e)) => return Err(format!("el bloque {h} no llego: {e}")),
+                None => {
+                    return Err(format!(
+                        "ningun par respondio por el bloque {h}; probablemente se corto la red"
+                    ))
+                }
+            };
+
+            // Pasar por `Block` no es ceremonia: valida que lo que mando el par
+            // tenga la forma de un bloque antes de que el escaner lo mire.
+            let bloque: crate::types::Block =
+                serde_json::from_slice(&respuesta.response.encrypted_block)
+                    .map_err(|e| format!("el par mando un bloque {h} ilegible: {e}"))?;
+
+            for cuerpo in &respuesta.response.private_tx_bodies {
+                if let Ok(tx) = serde_json::from_slice::<serde_json::Value>(cuerpo) {
+                    if let Some(hash) = tx.get("tx_hash").and_then(|v| v.as_str()) {
+                        cache.guardar(hash.to_string(), cuerpo.clone());
+                    }
+                }
+            }
+
+            bloques.push(
+                serde_json::to_value(&bloque)
+                    .map_err(|e| format!("no pude reserializar el bloque {h}: {e}"))?,
+            );
+        }
+        altura = hasta + 1;
+    }
+
+    serde_json::to_string(&serde_json::json!({
+        "from_height": from,
+        "to_height": to,
+        "blocks_count": bloques.len(),
+        "blocks": bloques,
+    }))
+    .map_err(|e| format!("no pude armar la respuesta: {e}"))
+}
+
+/// Devuelve el cuerpo de una transaccion privada, del cache o de la red.
+async fn traer_cuerpo_privado(
+    node: &mut Node,
+    cache: &CacheCuerpos,
+    hash: &str,
+) -> Result<String, String> {
+    let crudo = match cache.buscar(hash) {
+        Some(cuerpo) => cuerpo.clone(),
+        None => node
+            .request_private_tx_body_with_retry(hash, 3, BLOCKS_WAIT)
+            .await
+            .map_err(|e| format!("no pude conseguir el cuerpo de {hash}: {e}"))?,
+    };
+    String::from_utf8(crudo).map_err(|e| format!("el cuerpo de {hash} no es texto valido: {e}"))
+}
+
 async fn run_client(
     seeds: Vec<String>,
     tor_proxy: Option<String>,
@@ -276,28 +507,37 @@ async fn run_client(
         ));
         return;
     }
+    anotar_pares(node.connected_peer_count());
     let _ = listo_tx.send(Ok(()));
+    let mut cache = CacheCuerpos::default();
 
     loop {
         tokio::select! {
             biased;
             cmd = cmd_rx.recv() => match cmd {
-                Some(Cmd::Status(resp)) => {
-                    let _ = resp.send(MobileNetStatus {
-                        connected: node.connected_peer_count() > 0,
-                        peers: node.connected_peer_count(),
-                        error: None,
-                    });
-                }
                 Some(Cmd::PublishPrivateTx(tx, resp)) => {
                     let r = publicar_tx_privada(&mut node, &tx).await;
+                    let _ = resp.send(r);
+                }
+                Some(Cmd::Height(resp)) => {
+                    let r = esperar_altura(&mut node).await;
+                    let _ = resp.send(r);
+                }
+                Some(Cmd::Blocks(from, to, resp)) => {
+                    let r = traer_bloques(&mut node, &mut cache, from, to).await;
+                    let _ = resp.send(r);
+                }
+                Some(Cmd::PrivateTxBody(hash, resp)) => {
+                    let r = traer_cuerpo_privado(&mut node, &cache, &hash).await;
                     let _ = resp.send(r);
                 }
                 Some(Cmd::Shutdown) | None => return,
             },
             _ = async {
                 let _ = node.pump_for(PUMP_SLICE).await;
-            } => {}
+            } => {
+                anotar_pares(node.connected_peer_count());
+            }
         }
     }
 }
