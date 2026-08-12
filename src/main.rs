@@ -14545,10 +14545,37 @@ fn cmd_private_send(args: &[String]) -> Result<(), String> {
     // Si la base de la cadena no esta a mano (la tiene tomada el nodo) no se
     // puede comprobar y se sigue igual: es mejor un envio que quizas falle que
     // no poder enviar nunca.
-    if let Some(path) = db_path.as_deref() {
-        if let Ok(chain) = open_storage(path) {
+    {
+        // Se prueban dos caminos porque en la practica solo uno esta abierto.
+        //
+        // Leer el indice directo es lo mas rapido, pero la base la tiene tomada
+        // el nodo mientras corre -- o sea siempre. La primera version de esto
+        // solo intentaba abrirla y seguia de largo si fallaba: quedo codigo
+        // muerto que nunca corrio, y la wallet siguio armando envios que
+        // gastaban notas inexistentes. Por eso el segundo camino: preguntarle al
+        // nodo por RPC, que es quien tiene la base.
+        let chain = db_path.as_deref().and_then(|path| open_storage(path).ok());
+        let rpc = if chain.is_none() {
+            configured_local_rpc_url(network)
+        } else {
+            None
+        };
+        if chain.is_some() || rpc.is_some() {
             let corregidas = manager.reconciliar_notas_gastadas(|nullifier| {
-                chain.is_nullifier_spent(nullifier).unwrap_or(false)
+                if let Some(chain) = chain.as_ref() {
+                    return chain.is_nullifier_spent(nullifier).unwrap_or(false);
+                }
+                let Some(rpc) = rpc.as_deref() else {
+                    return false;
+                };
+                // Ante la duda, NO marcar gastada: si el nodo no contesta,
+                // inventar que una nota se gasto le borraria saldo real al
+                // usuario. El error seguro es el otro -- dejarla pasar y que la
+                // red la rechace.
+                rpc_http_get_json(rpc, &format!("/private/nullifier/{nullifier}"), 5)
+                    .ok()
+                    .and_then(|v| v.get("spent").and_then(|b| b.as_bool()))
+                    .unwrap_or(false)
             });
             if corregidas > 0 {
                 println!(

@@ -3873,23 +3873,84 @@ async fn get_latest_block(
 /// zk proof â€” **never** plaintext sender/receiver/amount. If this node
 /// has no `private_wallet_manager` wired (typical for tests), the
 /// endpoint 404s rather than lying.
+/// Reemplaza el `status` del cuerpo por lo que dice la cadena.
+///
+/// El que viaja dentro lo estampa quien crea la transaccion y no se actualiza
+/// nunca: dice "pendiente" para siempre, este confirmada o rechazada. La
+/// diferencia importa sobre todo para un gasto doble: una wallet que ve
+/// "pendiente" espera, y va a esperar para siempre por algo que ningun minero
+/// puede incluir. Con "Rejected" puede decirle al usuario que esa transaccion
+/// no va a salir y que sus fondos siguen donde estaban.
+async fn con_estado_de_cadena(
+    app_state: &Arc<AppState>,
+    hash: &str,
+    mut valor: serde_json::Value,
+) -> serde_json::Value {
+    let Ok(estado) = app_state
+        .state_manager
+        .private_transaction_chain_state(hash)
+        .await
+    else {
+        return valor;
+    };
+    let Some(obj) = valor.as_object_mut() else {
+        return valor;
+    };
+    obj.insert("status".to_string(), serde_json::json!(estado.etiqueta()));
+    match estado {
+        crate::state::PrivateTxChainState::Confirmada { altura } => {
+            obj.insert("block_height".to_string(), serde_json::json!(altura));
+        }
+        crate::state::PrivateTxChainState::GastoDoble { altura } => {
+            obj.insert(
+                "rejected_reason".to_string(),
+                serde_json::json!(format!(
+                    "la nota que gasta ya fue gastada por otra transaccion en el bloque {altura}"
+                )),
+            );
+        }
+        crate::state::PrivateTxChainState::Gastada => {
+            obj.insert(
+                "rejected_reason".to_string(),
+                serde_json::json!(
+                    "la nota que gasta ya no existe, pero el nodo no sabe en que bloque se                      consumio"
+                ),
+            );
+        }
+        _ => {}
+    }
+    valor
+}
+
 async fn get_private_tx_by_hash(
     State(app_state): State<Arc<AppState>>,
     Path(hash): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    if let Some(manager) = &app_state.private_wallet_manager {
+    // El cuerpo puede venir del pool en memoria o del almacenamiento. Los dos
+    // caminos siguen despues a la correccion de estado: cuando el del pool
+    // devolvia aqui mismo, se saltaba esa correccion y una transaccion muerta
+    // se reportaba "pendiente" para siempre. Es el mismo bug dos veces, y la
+    // segunda costo mas de encontrar porque el arreglo ya estaba escrito.
+    let del_pool = if let Some(manager) = &app_state.private_wallet_manager {
         let manager = manager.read().await;
-        if let Some(tx) = manager.get_private_transaction(&hash) {
-            // Serialize with serde_json; the type is serde-derive-friendly
-            // and its wire shape already omits sender/receiver/amount
-            // clear fields (they don't exist on `PrivateTransaction`).
-            return Ok(Json(serde_json::to_value(tx).map_err(|e| {
+        // Serialize with serde_json; the type is serde-derive-friendly and its
+        // wire shape already omits sender/receiver/amount clear fields (they
+        // don't exist on `PrivateTransaction`).
+        manager
+            .get_private_transaction(&hash)
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("failed to serialize private tx: {}", e),
                 )
-            })?));
-        }
+            })?
+    } else {
+        None
+    };
+    if let Some(valor) = del_pool {
+        return Ok(Json(con_estado_de_cadena(&app_state, &hash, valor).await));
     }
 
     let Some(bytes) = app_state
@@ -3922,38 +3983,47 @@ async fn get_private_tx_by_hash(
         )
     })?;
 
-    // El `status` que trae el cuerpo lo estampo quien creo la transaccion y no
-    // se actualiza nunca: dice "pendiente" para siempre, este confirmada o
-    // rechazada. Se reemplaza por lo que dice la cadena.
-    //
-    // La diferencia importa sobre todo para un doble gasto: una wallet que ve
-    // "pendiente" espera, y va a esperar para siempre por algo que ningun
-    // minero puede incluir. Con "Rejected" puede decirle al usuario que esa
-    // transaccion no va a salir y que sus fondos siguen donde estaban.
-    if let Ok(estado) = app_state
-        .state_manager
-        .private_transaction_chain_state(&hash)
-        .await
-    {
-        if let Some(obj) = valor.as_object_mut() {
-            obj.insert("status".to_string(), serde_json::json!(estado.etiqueta()));
-            match estado {
-                crate::state::PrivateTxChainState::Confirmada { altura } => {
-                    obj.insert("block_height".to_string(), serde_json::json!(altura));
-                }
-                crate::state::PrivateTxChainState::GastoDoble { altura } => {
-                    obj.insert(
-                        "rejected_reason".to_string(),
-                        serde_json::json!(format!(
-                            "la nota que gasta ya fue gastada por otra transaccion en el bloque {altura}"
-                        )),
-                    );
-                }
-                _ => {}
-            }
-        }
+    Ok(Json(con_estado_de_cadena(&app_state, &hash, valor).await))
+}
+
+/// Si un nulificador ya fue gastado en la cadena, y a que altura.
+///
+/// Existe porque una wallet no puede averiguarlo sola. El indice vive en la
+/// base de la cadena, y esa base la tiene tomada el nodo mientras corre --
+/// siempre, en la practica. Una wallet que intente abrirla para comprobar sus
+/// notas falla, y si el fallo es silencioso termina construyendo transacciones
+/// que gastan notas que ya no existen: la red las propaga, ningun minero puede
+/// incluirlas, y el usuario espera un envio que jamas va a salir. Paso de
+/// verdad, dos veces.
+///
+/// **Privacidad.** Un nulificador es un dato publico: viaja en el bloque que lo
+/// consume. Responder si esta gastado no revela nada que no este ya en la
+/// cadena. Lo unico que se filtra es que a quien pregunta le interesa esa nota,
+/// y por eso solo tiene sentido preguntarle a un nodo propio.
+async fn get_nullifier_spent(
+    State(app_state): State<Arc<AppState>>,
+    Path(tag): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let tag = tag.trim().to_string();
+    if tag.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "empty nullifier".to_string()));
     }
-    Ok(Json(valor))
+    let (spent, height) = app_state
+        .state_manager
+        .nullifier_spent_with_height(&tag)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to read nullifier index: {e}"),
+            )
+        })?;
+    Ok(Json(serde_json::json!({
+        "nullifier": tag,
+        "spent": spent,
+        // Puede faltar aunque este gastado: entradas viejas del indice pueden no
+        // llevar la altura. Que falte no debilita el "spent".
+        "height": height,
+    })))
 }
 
 /// List the node's still-pending (un-mined) private transactions, each with
@@ -6817,6 +6887,7 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         .route("/private/view-scan", post(post_private_view_scan))
         .route("/private/view-scan-key", post(post_private_view_scan_key))
         .route("/private/pending", get(get_pending_private_txs))
+        .route("/private/nullifier/:tag", get(get_nullifier_spent))
         .route("/private/tx/:hash", get(get_private_tx_by_hash))
         .route("/blocks/range/:from/:to", get(get_blocks_range))
         .route(

@@ -232,6 +232,15 @@ pub enum PrivateTxChainState {
     /// Su nota ya la habia gastado otra transaccion en ese bloque. Ningun
     /// minero la va a incluir, y esperar no cambia nada.
     GastoDoble { altura: u64 },
+    /// La nota que gasta ya no existe, pero el indice no dice en que bloque se
+    /// consumio, asi que no se puede saber si fue esta transaccion u otra.
+    ///
+    /// Se distingue de las dos anteriores a proposito. Decir "confirmada" seria
+    /// prometer un envio que quizas nunca salio; decir "rechazada" seria
+    /// enterrar uno que quizas si entro. Una wallet que no reconozca esta
+    /// etiqueta cae en su propia comprobacion contra los bloques, que es
+    /// exactamente lo que corresponde cuando el indice no alcanza.
+    Gastada,
     /// Todavia no entro, pero nada impide que entre.
     Pendiente,
     /// El nodo no tiene el cuerpo, asi que no puede decir nada.
@@ -244,6 +253,7 @@ impl PrivateTxChainState {
         match self {
             Self::Confirmada { .. } => "Confirmed",
             Self::GastoDoble { .. } => "Rejected",
+            Self::Gastada => "Spent",
             Self::Pendiente => "Pending",
             Self::Desconocida => "Unknown",
         }
@@ -650,6 +660,29 @@ impl StateManager {
     /// block from RocksDB on each call, and the `/private/pending` handler
     /// invoked it once per pending hash, so ordinary miner polling pegged the
     /// node's CPU (both runtime workers stuck in `get_block_by_height`).
+    /// Si un nulificador figura gastado, y a que altura si se sabe.
+    ///
+    /// Se devuelven las dos cosas por separado a proposito: la altura puede
+    /// faltar en entradas viejas del indice, y que falte no debilita el
+    /// "gastado". Mezclarlas -- tratar "no se la altura" como "no esta
+    /// gastado" -- convertiria un dato incompleto en una respuesta falsa, del
+    /// lado peligroso: dejaria pasar un gasto doble.
+    pub fn nullifier_spent_with_height(
+        &self,
+        nullifier: &str,
+    ) -> Result<(bool, Option<u64>), StateError> {
+        let gastado = self
+            .storage
+            .is_nullifier_spent(nullifier)
+            .map_err(|e| StateError::StorageError(e.to_string()))?;
+        if !gastado {
+            return Ok((false, None));
+        }
+        // La altura es un extra: si no se puede leer, sigue estando gastado.
+        let altura = self.storage.spent_nullifier_height(nullifier).ok().flatten();
+        Ok((true, altura))
+    }
+
     /// Que le paso de verdad a una transaccion privada en la cadena.
     ///
     /// Mirar solo el indice de nulificadores no alcanza para saberlo: ese
@@ -686,12 +719,17 @@ impl StateManager {
         }
 
         for tag in tags {
-            let Some(altura) = self
-                .storage
-                .spent_nullifier_height(tag)
-                .map_err(|e| StateError::StorageError(e.to_string()))?
-            else {
+            let (gastado, altura) = self.nullifier_spent_with_height(tag)?;
+            if !gastado {
                 continue;
+            }
+            // Gastado pero sin altura: no hay bloque que mirar, asi que no se
+            // puede decir quien lo gasto. Antes esto reventaba en un error que
+            // el manejador de la API se comia en silencio, y la transaccion
+            // quedaba reportada como "pendiente" para siempre -- justo el
+            // problema que este codigo venia a resolver.
+            let Some(altura) = altura else {
+                return Ok(PrivateTxChainState::Gastada);
             };
             // El nulificador esta gastado. La pregunta es por quien.
             let bloque = self
