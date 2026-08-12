@@ -14532,6 +14532,45 @@ fn cmd_private_send(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("failed to lock wallet directory: {e}"))?;
     let mut manager =
         load_private_wallet_manager_for_network(&storage, password.as_deref(), network)?;
+
+    // Antes de elegir que gastar, preguntarle a la cadena.
+    //
+    // La wallet decide con una marca propia que se pone cuando ve pasar la
+    // transaccion que consume la nota. Si nunca la vio -- restaurada de un
+    // respaldo, escaneo corto, nodo atrasado -- la nota le queda viva para
+    // siempre y arma un envio que reusa un nulificador ya gastado. La red lo
+    // propaga, ningun minero puede incluirlo, y el usuario espera un envio que
+    // jamas va a salir. Paso de verdad.
+    //
+    // Si la base de la cadena no esta a mano (la tiene tomada el nodo) no se
+    // puede comprobar y se sigue igual: es mejor un envio que quizas falle que
+    // no poder enviar nunca.
+    if let Some(path) = db_path.as_deref() {
+        if let Ok(chain) = open_storage(path) {
+            let corregidas = manager.reconciliar_notas_gastadas(|nullifier| {
+                chain.is_nullifier_spent(nullifier).unwrap_or(false)
+            });
+            if corregidas > 0 {
+                println!(
+                    "Aviso: {corregidas} nota(s) figuraban disponibles pero ya estaban gastadas \
+                     en la cadena. Se corrigieron, asi que tu saldo real puede ser menor que el \
+                     que veias."
+                );
+                // Se guarda con `save_private_wallet` y no con
+                // `persist_private_wallet`: esta ultima vuelve a tomar el
+                // candado del directorio, que ya lo tenemos agarrado unas
+                // lineas mas arriba.
+                for (nombre, _, _, _) in manager.list_private_wallets() {
+                    if let Some(wallet) = manager.get_private_wallet(&nombre) {
+                        if let Err(e) = storage.save_private_wallet(wallet, password.as_deref()) {
+                            eprintln!("no pude guardar la correccion en {nombre}: {e}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let (from_wallet, from_commitment) =
         resolve_network_wallet_address_required(&manager, &storage, &from_raw, "--from")?;
     let sender = manager

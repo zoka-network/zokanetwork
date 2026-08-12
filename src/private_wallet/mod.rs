@@ -3535,6 +3535,58 @@ impl PrivateWalletManager {
         }
     }
 
+    /// Marca como gastadas las notas cuyo nulificador ya figura en la cadena.
+    ///
+    /// La wallet decide que puede gastar mirando una marca propia
+    /// (`note.spent`), que se pone cuando ve pasar la transaccion que consume
+    /// la nota. Si nunca la vio -- la wallet se restauro de un respaldo, el
+    /// escaneo quedo corto, el nodo estaba atrasado -- la nota queda viva para
+    /// siempre en su registro aunque el mundo entero sepa que se gasto.
+    ///
+    /// El resultado no es solo un saldo de mas en pantalla: la wallet construye
+    /// una transaccion que reusa ese nulificador, la red la propaga, ningun
+    /// minero puede incluirla y el usuario espera un envio que jamas va a
+    /// salir. Paso de verdad.
+    ///
+    /// `ya_gastado` responde si un nulificador figura gastado en la cadena. Se
+    /// pasa como funcion para que esto no necesite saber nada del
+    /// almacenamiento: quien llama tiene el indice a mano.
+    ///
+    /// Devuelve cuantas notas se corrigieron.
+    pub fn reconciliar_notas_gastadas<F>(&mut self, ya_gastado: F) -> usize
+    where
+        F: Fn(&str) -> bool,
+    {
+        let momento = current_timestamp();
+        let mut corregidas = 0usize;
+        for wallet in self.private_wallets.values_mut() {
+            for note in &mut wallet.private_notes {
+                if note.spent {
+                    continue;
+                }
+                let nullifier =
+                    derive_note_nullifier(&wallet.spending_key, &note.note_id, &note.commitment);
+                if !ya_gastado(&nullifier) {
+                    continue;
+                }
+                note.spent = true;
+                note.spent_at = Some(momento);
+                // La cadena manda: cualquier reserva local sobre esta nota es
+                // sobre algo que ya no existe.
+                note.reserved = false;
+                note.reserved_by_tx = None;
+                if !wallet.spent_nullifiers.contains(&nullifier) {
+                    wallet.spent_nullifiers.push(nullifier);
+                }
+                corregidas += 1;
+            }
+        }
+        if corregidas > 0 {
+            self.rebuild_nullifier_set();
+        }
+        corregidas
+    }
+
     /// Rebuild the in-memory NullifierSet from all loaded wallets' persisted
     /// spent_nullifiers. Call this after loading wallets from disk so that
     /// double-spend protection survives node restarts.
@@ -5856,6 +5908,45 @@ mod tests {
         let original = manager.create_private_wallet("alice").unwrap();
         let rotated = manager.rotate_private_wallet_key("alice").unwrap();
         assert_ne!(original, rotated);
+    }
+
+    #[test]
+    fn reconciliar_marca_las_notas_que_la_cadena_ya_dio_por_gastadas() {
+        // La wallet cree tener dos notas. La cadena sabe que una ya se gasto,
+        // pero la wallet nunca vio esa transaccion -- se restauro de un
+        // respaldo, o el escaneo quedo corto. Sin reconciliar, la ofrece para
+        // gastar y arma un envio que ningun minero puede incluir.
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        manager.deposit_to_private_wallet("alice", 30).unwrap();
+        manager.deposit_to_private_wallet("alice", 20).unwrap();
+
+        let (clave, notas): (Vec<u8>, Vec<(String, String)>) = {
+            let w = manager.get_private_wallet("alice").unwrap();
+            (
+                w.spending_key.clone(),
+                w.private_notes
+                    .iter()
+                    .map(|n| (n.note_id.clone(), n.commitment.clone()))
+                    .collect(),
+            )
+        };
+        assert_eq!(notas.len(), 2);
+        let gastada = derive_note_nullifier(&clave, &notas[0].0, &notas[0].1);
+
+        let corregidas = manager.reconciliar_notas_gastadas(|n| n == gastada);
+        assert_eq!(corregidas, 1, "solo la nota que la cadena marco");
+
+        let w = manager.get_private_wallet("alice").unwrap();
+        assert!(w.private_notes[0].spent, "la nota gastada queda marcada");
+        assert!(!w.private_notes[1].spent, "la otra sigue disponible");
+        assert!(
+            w.spent_nullifiers.contains(&gastada),
+            "el nulificador se guarda para que sobreviva al reinicio"
+        );
+
+        // Correr de nuevo no corrige nada: ya esta.
+        assert_eq!(manager.reconciliar_notas_gastadas(|n| n == gastada), 0);
     }
 
     #[test]
