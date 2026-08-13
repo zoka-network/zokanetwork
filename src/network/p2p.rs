@@ -37,6 +37,10 @@ use crate::network::block_request_response::{
     BlockRequestResponseCodec,
 };
 use crate::network::handler::MessageHandler;
+use crate::network::wallet_digest_request_response::{
+    protocol_name as wallet_digest_protocol, BlockDigest, GetWalletDigests,
+    WalletDigestRequestResponseCodec, WalletDigestsResponse,
+};
 use crate::network::header_request_response::{
     protocol_name as header_request_response_protocol, GetHeaders, HeaderRequestResponseCodec,
     HeadersResponse,
@@ -136,6 +140,9 @@ const MAX_INBOUND_QUEUE: usize = 4096;
 /// de miles cubre de sobra la ventana util; lo que no se puede es recordarlos
 /// para siempre.
 const MAX_SEEN_GOSSIP_IDS: usize = 50_000;
+
+/// Cuanto se bombea el bucle entre revisiones al esperar resumenes.
+const PUMP_SLICE_DIGESTS: Duration = Duration::from_millis(200);
 
 /// Conjunto de "ya lo vi" con techo y desalojo por antiguedad.
 ///
@@ -803,6 +810,8 @@ pub struct Node {
     pending_header_requests: VecDeque<PendingHeaderRequest>,
     /// Outbound GetHeaders responses received while the caller was not waiting.
     received_header_responses: VecDeque<ReceivedHeadersResponse>,
+    /// Resumenes de bloque recibidos, esperando a que alguien los recoja.
+    received_wallet_digests: VecDeque<(PeerId, WalletDigestsResponse)>,
     /// Inbound snapshot manifest requests.
     pending_snapshot_requests: VecDeque<PendingSnapshotManifestRequest>,
     /// Outbound snapshot manifest responses received from peers.
@@ -818,6 +827,9 @@ pub struct Node {
     block_body_responder: Option<Box<dyn Fn(&BlockBodyRequest) -> BlockBodyResponse + Send>>,
     #[allow(clippy::type_complexity)]
     header_responder: Option<Box<dyn Fn(&GetHeaders) -> HeadersResponse + Send>>,
+    #[allow(clippy::type_complexity)]
+    wallet_digest_responder:
+        Option<Box<dyn Fn(&GetWalletDigests) -> WalletDigestsResponse + Send>>,
 }
 
 /// Behaviour set for the node.
@@ -835,6 +847,7 @@ pub struct NodeBehaviour {
     private_tx_request_response: request_response::Behaviour<PrivateTxRequestResponseCodec>,
     /// Header chain request/response for headers-first IBD.
     header_request_response: request_response::Behaviour<HeaderRequestResponseCodec>,
+    wallet_digest_request_response: request_response::Behaviour<WalletDigestRequestResponseCodec>,
     /// Snapshot manifest discovery.
     snapshot_request_response: request_response::Behaviour<SnapshotRequestResponseCodec>,
     /// Liveness keepalive. Without it, a quiet connection over Tor idles until
@@ -1972,6 +1985,15 @@ impl Node {
                     request_response::Config::default()
                         .with_request_timeout(Duration::from_secs(30)),
                 );
+                let wallet_digest_request_response = request_response::Behaviour::with_codec(
+                    WalletDigestRequestResponseCodec,
+                    [(
+                        wallet_digest_protocol(),
+                        request_response::ProtocolSupport::Full,
+                    )],
+                    request_response::Config::default()
+                        .with_request_timeout(Duration::from_secs(45)),
+                );
                 let snapshot_request_response = request_response::Behaviour::with_codec(
                     SnapshotRequestResponseCodec,
                     [(
@@ -1992,6 +2014,7 @@ impl Node {
                     block_request_response,
                     private_tx_request_response,
                     header_request_response,
+                    wallet_digest_request_response,
                     snapshot_request_response,
                     // Default: ping every 15s, 20s timeout. Well under the
                     // libp2p idle timeout (300s) and Tor's circuit idle window,
@@ -2072,10 +2095,12 @@ impl Node {
             block_request_peer_stats: HashMap::new(),
             pending_header_requests: VecDeque::new(),
             received_header_responses: VecDeque::new(),
+            received_wallet_digests: VecDeque::new(),
             pending_snapshot_requests: VecDeque::new(),
             received_snapshot_manifests: VecDeque::new(),
             block_body_responder: None,
             header_responder: None,
+            wallet_digest_responder: None,
         })
     }
 
@@ -2593,6 +2618,111 @@ impl Node {
             .header_request_response
             .send_request(peer, request);
         Some(id)
+    }
+
+    fn handle_wallet_digest_event(
+        &mut self,
+        event: request_response::Event<GetWalletDigests, WalletDigestsResponse>,
+    ) {
+        match event {
+            request_response::Event::Message { peer, message } => match message {
+                request_response::Message::Request {
+                    request, channel, ..
+                } => {
+                    // Sin responder configurado se contesta que no, en vez de
+                    // dejar el pedido colgado: quien pregunta cae enseguida al
+                    // protocolo de bloques enteros en lugar de esperar el
+                    // tiempo de espera completo. Un cliente liviano no tiene
+                    // cadena que servir y este es su caso normal.
+                    let respuesta = match self.wallet_digest_responder.as_ref() {
+                        Some(responder) => responder(&request),
+                        None => WalletDigestsResponse::NotFound {
+                            reason: "este par no sirve resumenes".to_string(),
+                        },
+                    };
+                    let _ = self
+                        .swarm
+                        .behaviour_mut()
+                        .wallet_digest_request_response
+                        .send_response(channel, respuesta);
+                }
+                request_response::Message::Response { response, .. } => {
+                    self.received_wallet_digests.push_back((peer, response));
+                }
+            },
+            request_response::Event::OutboundFailure { peer, error, .. } => {
+                warn!("wallet digest outbound failure from {}: {}", peer, error);
+                // Un fallo tiene que llegar a quien espera, si no se queda
+                // esperando algo que nunca va a venir en vez de caer al
+                // camino lento. Un par viejo que no conoce el protocolo entra
+                // por aca.
+                self.received_wallet_digests.push_back((
+                    peer,
+                    WalletDigestsResponse::NotFound {
+                        reason: format!("el par no respondio: {error}"),
+                    },
+                ));
+            }
+            request_response::Event::InboundFailure { peer, error, .. } => {
+                warn!("wallet digest inbound failure from {}: {}", peer, error);
+            }
+            request_response::Event::ResponseSent { .. } => {}
+        }
+    }
+
+    /// Quien responde los pedidos de resumen. Lo cablea el nodo completo a su
+    /// almacenamiento; un cliente liviano lo deja sin poner.
+    #[allow(clippy::type_complexity)]
+    pub fn set_wallet_digest_responder(
+        &mut self,
+        responder: Box<dyn Fn(&GetWalletDigests) -> WalletDigestsResponse + Send>,
+    ) {
+        self.wallet_digest_responder = Some(responder);
+    }
+
+    /// Pide los resumenes de un tramo y espera la respuesta.
+    ///
+    /// Devuelve `None` si ningun par contesto a tiempo o si el que contesto no
+    /// sirve resumenes. Quien llama tiene que caer al protocolo de bloques
+    /// enteros en ese caso: los pares viejos no conocen este mensaje y la
+    /// wallet tiene que seguir funcionando con ellos.
+    pub async fn request_wallet_digests(
+        &mut self,
+        from_height: u64,
+        to_height: u64,
+        max_wait: Duration,
+    ) -> Option<Vec<BlockDigest>> {
+        let peers = self.select_block_request_peers();
+        let peer = peers.first()?.clone();
+        if !self.swarm.is_connected(&peer) {
+            return None;
+        }
+        self.received_wallet_digests.clear();
+        self.swarm
+            .behaviour_mut()
+            .wallet_digest_request_response
+            .send_request(
+                &peer,
+                GetWalletDigests {
+                    from_height,
+                    to_height,
+                },
+            );
+
+        let deadline = tokio::time::Instant::now() + max_wait;
+        while tokio::time::Instant::now() < deadline {
+            let _ = self.pump_for(PUMP_SLICE_DIGESTS).await;
+            while let Some((_, respuesta)) = self.received_wallet_digests.pop_front() {
+                match respuesta {
+                    WalletDigestsResponse::Digests { digests } => return Some(digests),
+                    WalletDigestsResponse::NotFound { reason } => {
+                        info!("el par no sirve resumenes ({reason}); se usan bloques enteros");
+                        return None;
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn handle_snapshot_request_response_event(
@@ -3274,6 +3404,9 @@ impl Node {
                         }
                         SwarmEvent::Behaviour(NodeBehaviourEvent::HeaderRequestResponse(event)) => {
                             self.handle_header_request_response_event(event);
+                        }
+                        SwarmEvent::Behaviour(NodeBehaviourEvent::WalletDigestRequestResponse(event)) => {
+                            self.handle_wallet_digest_event(event);
                         }
                         SwarmEvent::Behaviour(NodeBehaviourEvent::SnapshotRequestResponse(event)) => {
                             self.handle_snapshot_request_response_event(event);
@@ -4270,6 +4403,9 @@ impl Node {
                 }
                 SwarmEvent::Behaviour(NodeBehaviourEvent::HeaderRequestResponse(event)) => {
                     self.handle_header_request_response_event(event);
+                }
+                SwarmEvent::Behaviour(NodeBehaviourEvent::WalletDigestRequestResponse(event)) => {
+                    self.handle_wallet_digest_event(event);
                 }
                 SwarmEvent::Behaviour(NodeBehaviourEvent::SnapshotRequestResponse(event)) => {
                     self.handle_snapshot_request_response_event(event);
@@ -5902,6 +6038,146 @@ mod tests {
         assert_eq!(stem.stem_hops, DEFAULT_STEM_HOPS);
         assert_eq!(stem.padding.len(), expected_padding);
         assert!(!stem.route_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dos_nodos_se_pasan_resumenes_de_bloque() {
+        // Dos nodos de verdad hablando por TCP local. Es la unica forma de
+        // probar un protocolo nuevo sin desplegarlo en la red de alguien: que
+        // el codigo compile no dice nada sobre si los pares se entienden.
+        let mut servidor = Node::new(0).await.expect("nodo servidor");
+        servidor
+            .listen("/ip4/127.0.0.1/tcp/0")
+            .await
+            .expect("escuchar");
+        servidor.set_wallet_digest_responder(Box::new(|pedido| {
+            let mut digests = Vec::new();
+            for altura in pedido.from_height..=pedido.to_height {
+                digests.push(BlockDigest {
+                    block_height: altura,
+                    block_hash: format!("hash-{altura}"),
+                    timestamp: 1000 + altura,
+                    coinbase_recipient: Some("zka1destino".to_string()),
+                    coinbase_amount: Some(12_000_000),
+                    coinbase_output_id: Some(format!("out-{altura}")),
+                    coinbase_commitment: Some(format!("commit-{altura}")),
+                    coinbase_unlock_height: Some(altura + 100),
+                    private_tx_hashes: vec![],
+                    private_nullifiers: vec![],
+                });
+            }
+            WalletDigestsResponse::Digests { digests }
+        }));
+
+        // Dejar que el servidor publique su direccion de escucha.
+        let mut direccion = None;
+        for _ in 0..40 {
+            let _ = servidor.pump_for(Duration::from_millis(50)).await;
+            if let Some(addr) = servidor.swarm.listeners().next() {
+                direccion = Some(addr.clone());
+                break;
+            }
+        }
+        let direccion = direccion.expect("el servidor tiene que escuchar en algun lado");
+        let addr_con_peer = format!("{direccion}/p2p/{}", servidor.peer_id());
+
+        let mut cliente = Node::new(0).await.expect("nodo cliente");
+        cliente
+            .connect_to_peer(&addr_con_peer)
+            .await
+            .expect("marcar al servidor");
+
+        // Los dos tienen que bombear: el apreton de manos ocurre en los dos
+        // bucles de eventos, no en el que llama.
+        for _ in 0..60 {
+            let _ = cliente.pump_for(Duration::from_millis(30)).await;
+            let _ = servidor.pump_for(Duration::from_millis(30)).await;
+            if cliente.connected_peer_count() > 0 {
+                break;
+            }
+        }
+        assert!(
+            cliente.connected_peer_count() > 0,
+            "los nodos tienen que conectarse antes de pedirse nada"
+        );
+
+        // El servidor tiene que seguir atendiendo mientras el cliente espera.
+        let atender = tokio::spawn(async move {
+            for _ in 0..200 {
+                let _ = servidor.pump_for(Duration::from_millis(25)).await;
+            }
+            servidor
+        });
+
+        let resumenes = cliente
+            .request_wallet_digests(10, 14, Duration::from_secs(10))
+            .await
+            .expect("el par sirve resumenes");
+        let _ = atender.await;
+
+        assert_eq!(resumenes.len(), 5, "cinco alturas pedidas, cinco resumenes");
+        assert_eq!(resumenes[0].block_height, 10);
+        assert_eq!(resumenes[4].block_height, 14);
+        assert_eq!(
+            resumenes[2].coinbase_output_id.as_deref(),
+            Some("out-12"),
+            "el resumen tiene que traer la identidad de la nota del coinbase"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_par_sin_resumenes_deja_caer_a_bloques_enteros() {
+        // Un nodo sin responder -- un cliente liviano, o cualquier nodo viejo
+        // que no conozca el protocolo -- tiene que contestar que no en vez de
+        // dejar la peticion colgada. Si se quedara callado, quien pregunta
+        // esperaria el tiempo completo antes de caer al camino lento, y una
+        // wallet parece congelada.
+        let mut servidor = Node::new(0).await.expect("nodo servidor");
+        servidor
+            .listen("/ip4/127.0.0.1/tcp/0")
+            .await
+            .expect("escuchar");
+
+        let mut direccion = None;
+        for _ in 0..40 {
+            let _ = servidor.pump_for(Duration::from_millis(50)).await;
+            if let Some(addr) = servidor.swarm.listeners().next() {
+                direccion = Some(addr.clone());
+                break;
+            }
+        }
+        let direccion = direccion.expect("el servidor escucha");
+        let addr_con_peer = format!("{direccion}/p2p/{}", servidor.peer_id());
+
+        let mut cliente = Node::new(0).await.expect("nodo cliente");
+        cliente
+            .connect_to_peer(&addr_con_peer)
+            .await
+            .expect("marcar");
+        for _ in 0..60 {
+            let _ = cliente.pump_for(Duration::from_millis(30)).await;
+            let _ = servidor.pump_for(Duration::from_millis(30)).await;
+            if cliente.connected_peer_count() > 0 {
+                break;
+            }
+        }
+        assert!(cliente.connected_peer_count() > 0);
+
+        let atender = tokio::spawn(async move {
+            for _ in 0..200 {
+                let _ = servidor.pump_for(Duration::from_millis(25)).await;
+            }
+            servidor
+        });
+        let resumenes = cliente
+            .request_wallet_digests(1, 5, Duration::from_secs(10))
+            .await;
+        let _ = atender.await;
+
+        assert!(
+            resumenes.is_none(),
+            "sin responder tiene que devolver None para que quien pregunta use bloques enteros"
+        );
     }
 
     #[tokio::test]

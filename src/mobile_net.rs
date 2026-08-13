@@ -53,6 +53,11 @@ const BLOCKS_WAIT: Duration = Duration::from_secs(60);
 /// entera. De a 32 el rango tarda un poco mas y llega.
 const BLOCKS_BATCH: usize = 32;
 
+/// Cuantos resumenes pedir de una. Son un pedido solo -- no uno por bloque --
+/// asi que el limite lo pone el tamaño de la respuesta, no la cantidad de
+/// flujos. Mil resumenes son medio mega.
+const DIGESTS_BATCH: usize = 1000;
+
 /// Techo del cache de cuerpos de transacciones privadas.
 ///
 /// Los cuerpos llegan de arriba con los bloques y se sirven al escaner sin otra
@@ -104,6 +109,7 @@ enum Cmd {
     PublishPrivateTx(Box<PrivateTransaction>, std_mpsc::Sender<Result<(), String>>),
     Height(std_mpsc::Sender<Result<(u64, u64), String>>),
     Blocks(u64, u64, std_mpsc::Sender<Result<String, String>>),
+    Digests(u64, u64, std_mpsc::Sender<Result<String, String>>),
     PrivateTxBody(String, std_mpsc::Sender<Result<String, String>>),
     Shutdown,
 }
@@ -287,6 +293,27 @@ pub fn blocks_range_json(from: u64, to: u64) -> Result<String, String> {
     let espera = BLOCKS_WAIT * (((to - from) as u32 / BLOCKS_BATCH as u32) + 2);
     pedir(
         |tx| Cmd::Blocks(from, to, tx),
+        espera + Duration::from_secs(15),
+    )?
+}
+
+/// Resumenes de bloque de `from` a `to`: lo justo para escanear un saldo.
+///
+/// Un bloque entero pesa unos 4.500 bytes y el 56% es la prueba de rango del
+/// coinbase, que solo hace falta para gastar la nota -- o sea, en los poquisimos
+/// bloques donde el coinbase es propio. Bajar la cadena entera asi son 77 MB y
+/// cincuenta minutos sobre Tor. Un resumen son unos 500 bytes.
+///
+/// Si el par no conoce el protocolo se cae a bloques enteros, que es lento pero
+/// funciona con cualquier nodo. La wallet no puede quedarse sin saldo solo
+/// porque le toco un par viejo.
+pub fn blocks_digest_range_json(from: u64, to: u64) -> Result<String, String> {
+    if from > to {
+        return Err(format!("rango invalido: {from} > {to}"));
+    }
+    let espera = BLOCKS_WAIT * (((to - from) as u32 / DIGESTS_BATCH as u32) + 2);
+    pedir(
+        |tx| Cmd::Digests(from, to, tx),
         espera + Duration::from_secs(15),
     )?
 }
@@ -563,6 +590,74 @@ async fn traer_bloques(
     .map_err(|e| format!("no pude armar la respuesta: {e}"))
 }
 
+/// Baja los resumenes del tramo, cayendo a bloques enteros si el par no los
+/// sirve.
+///
+/// La forma de la respuesta es la misma en los dos casos, para que el escaner
+/// no tenga que saber por cual vino: los campos que un resumen no trae -- la
+/// prueba de rango, las transacciones publicas -- son justo los que el escaneo
+/// no mira.
+async fn traer_resumenes(
+    node: &mut Node,
+    cache: &mut CacheCuerpos,
+    from: u64,
+    to: u64,
+) -> Result<String, String> {
+    let mut bloques: Vec<serde_json::Value> = Vec::new();
+    let mut altura = from.max(1);
+
+    while altura <= to {
+        let hasta = (altura + DIGESTS_BATCH as u64 - 1).min(to);
+        let Some(resumenes) = node
+            .request_wallet_digests(altura, hasta, BLOCKS_WAIT)
+            .await
+        else {
+            // El par no sirve resumenes: se baja el tramo entero como siempre.
+            // Lento, pero es la unica forma de que la wallet funcione contra
+            // nodos que no conocen el protocolo nuevo.
+            return traer_bloques(node, cache, from, to).await;
+        };
+        if resumenes.is_empty() && hasta >= altura {
+            return traer_bloques(node, cache, from, to).await;
+        }
+        for r in resumenes {
+            bloques.push(serde_json::json!({
+                "header": {
+                    "block_height": r.block_height,
+                    "hash": r.block_hash,
+                    "timestamp": r.timestamp,
+                },
+                // El escaner mira `transactions[0]` para reconocer un coinbase
+                // suyo, asi que el resumen se presenta con esa misma forma.
+                "transactions": match (&r.coinbase_recipient, r.coinbase_amount) {
+                    (Some(receiver), Some(amount)) => serde_json::json!([{
+                        "receiver": receiver,
+                        "amount": amount,
+                    }]),
+                    _ => serde_json::json!([]),
+                },
+                "private_coinbase": r.coinbase_output_id.as_ref().map(|id| serde_json::json!({
+                    "output_id": id,
+                    "commitment": r.coinbase_commitment.clone().unwrap_or_default(),
+                    "unlock_height": r.coinbase_unlock_height.unwrap_or(0),
+                    "recipient_address": r.coinbase_recipient.clone().unwrap_or_default(),
+                })),
+                "private_tx_hashes": r.private_tx_hashes,
+                "private_nullifiers": r.private_nullifiers,
+            }));
+        }
+        altura = hasta + 1;
+    }
+
+    serde_json::to_string(&serde_json::json!({
+        "from_height": from,
+        "to_height": to,
+        "blocks_count": bloques.len(),
+        "blocks": bloques,
+    }))
+    .map_err(|e| format!("no pude armar la respuesta: {e}"))
+}
+
 /// Devuelve el cuerpo de una transaccion privada, del cache o de la red.
 async fn traer_cuerpo_privado(
     node: &mut Node,
@@ -656,6 +751,14 @@ async fn run_client(
                         Err("ningun par pudo entregar un bloque; revisa la conexion".to_string())
                     } else {
                         Ok((servible, anunciada.max(servible)))
+                    };
+                    let _ = resp.send(r);
+                }
+                Some(Cmd::Digests(from, to, resp)) => {
+                    let r = if esperar_par(&mut node, &seeds).await {
+                        traer_resumenes(&mut node, &mut cache, from, to).await
+                    } else {
+                        Err("ningun par completo la conexion; revisa Tor".to_string())
                     };
                     let _ = resp.send(r);
                 }

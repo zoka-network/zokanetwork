@@ -6961,6 +6961,42 @@ fn serve_pending_private_tx_body_requests(
 }
 
 /// Build a `HeadersResponse` for an inbound `GetHeaders` request from local storage.
+/// Sirve resumenes de bloque a wallets livianas.
+///
+/// Un resumen lleva lo que hace falta para escanear un saldo y omite lo que
+/// solo sirve para gastar -- sobre todo la prueba de rango del coinbase, que es
+/// el 56% de cada bloque. Quien reconozca un coinbase propio pide ESE bloque
+/// entero por el protocolo de siempre.
+fn wallet_digests_from_storage(
+    storage: &RocksDbStorage,
+    request: &zoka::network::wallet_digest_request_response::GetWalletDigests,
+) -> zoka::network::wallet_digest_request_response::WalletDigestsResponse {
+    use zoka::network::wallet_digest_request_response::{
+        BlockDigest, WalletDigestsResponse, MAX_DIGESTS_PER_RESPONSE,
+    };
+
+    if request.from_height > request.to_height {
+        return WalletDigestsResponse::NotFound {
+            reason: "rango invalido".to_string(),
+        };
+    }
+    // Se acota lo que un par puede hacer trabajar a otro de una sola vez.
+    let hasta = request
+        .to_height
+        .min(request.from_height + MAX_DIGESTS_PER_RESPONSE - 1);
+
+    let mut digests = Vec::new();
+    for altura in request.from_height.max(1)..=hasta {
+        match storage.get_block_by_height(altura) {
+            Ok(Some(block)) => digests.push(BlockDigest::from_block(&block)),
+            // Un hueco corta la respuesta en vez de devolverla con faltantes:
+            // quien pregunta necesita saber hasta donde llego de verdad.
+            _ => break,
+        }
+    }
+    WalletDigestsResponse::Digests { digests }
+}
+
 fn headers_response_from_storage(
     storage: &RocksDbStorage,
     request: &zoka::network::header_request_response::GetHeaders,
@@ -11039,6 +11075,10 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         node.set_header_responder(move |request| {
             headers_response_from_storage(&header_storage, request)
         });
+        let digest_storage = storage.clone();
+        node.set_wallet_digest_responder(Box::new(move |request| {
+            wallet_digests_from_storage(&digest_storage, request)
+        }));
     }
     // Optionally also serve this node's chain as an iroh snapshot so fresh
     // nodes can bootstrap in a single transfer (QUIC + n0 hole-punching, no

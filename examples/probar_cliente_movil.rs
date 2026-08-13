@@ -35,8 +35,13 @@ fn main() {
     let data_dir = std::env::temp_dir().join("zoka-prueba-movil");
     let _ = std::fs::create_dir_all(&data_dir);
     let data_dir_json = data_dir.display().to_string().replace('\\', "\\\\");
+    // Se puede apuntar a otra semilla para probar contra un nodo propio: el
+    // protocolo de resumenes solo lo sirven los nodos actualizados, y hasta que
+    // la red se actualice el unico que lo tiene es el de al lado.
+    let seed = std::env::var("ZOKA_SEED").unwrap_or_else(|_| SEED.to_string());
+    println!("semilla: {seed}");
     let config = format!(
-        r#"{{"seeds":["{SEED}"],"tor_proxy":"{proxy}","data_dir":"{data_dir_json}"}}"#
+        r#"{{"seeds":["{seed}"],"tor_proxy":"{proxy}","data_dir":"{data_dir_json}"}}"#
     );
     println!("directorio de datos: {}", data_dir.display());
 
@@ -111,6 +116,32 @@ fn main() {
         paso(&format!("pedirle a la red el cuerpo de {}", &hash[..8.min(hash.len())]), || {
             mobile_net::private_tx_body_json(&hash).map(|j| format!("la tiene ({} bytes)", j.len()))
         });
+    }
+
+    // Comparar los dos caminos sobre el mismo tramo: es la unica forma de saber
+    // si el protocolo nuevo vale lo que cuesta.
+    if altura > 1200 {
+        let (desde, hasta) = (altura - 1000, altura - 1);
+        let mut pesos = (0usize, 0usize);
+        if let Some(j) = paso(&format!("resumenes {desde}..{hasta}"), || {
+            mobile_net::blocks_digest_range_json(desde, hasta)
+                .map(|j| format!("{} bloques, {} bytes", j.matches("block_height").count(), j.len()))
+        }) {
+            pesos.0 = j.split(", ").nth(1).and_then(|x| x.trim_end_matches(" bytes").parse().ok()).unwrap_or(0);
+        }
+        if let Some(j) = paso(&format!("bloques enteros {desde}..{hasta}"), || {
+            mobile_net::blocks_range_json(desde, hasta)
+                .map(|j| format!("{} bloques, {} bytes", j.matches("block_height").count(), j.len()))
+        }) {
+            pesos.1 = j.split(", ").nth(1).and_then(|x| x.trim_end_matches(" bytes").parse().ok()).unwrap_or(0);
+        }
+        if pesos.0 > 0 && pesos.1 > 0 {
+            println!(
+                "
+AHORRO: {:.1}x menos datos ({} vs {} bytes)",
+                pesos.1 as f64 / pesos.0 as f64, pesos.0, pesos.1
+            );
+        }
     }
 
     paso("estado final", mobile_net::status_json);
