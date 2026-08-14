@@ -20,7 +20,9 @@
 //! asi que no hace falta instalar ninguna otra aplicacion.
 
 use crate::network::message::ZokaMessage;
-use crate::network::p2p::Node;
+use crate::network::p2p::{
+    MobileBlockProbe, Node, MOBILE_P2P_OPERATION_WAIT, PUBLISH_RETRY_PAUSE,
+};
 use crate::private_wallet::PrivateTransaction;
 use serde::{Deserialize, Serialize};
 use std::sync::mpsc as std_mpsc;
@@ -45,7 +47,7 @@ const PUMP_SLICE: Duration = Duration::from_millis(250);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Cuanto esperar las respuestas de un lote de bloques.
-const BLOCKS_WAIT: Duration = Duration::from_secs(60);
+const BLOCKS_WAIT: Duration = MOBILE_P2P_OPERATION_WAIT;
 
 /// Cuantos bloques pedir de una. El escaner pide rangos de 250, pero cada
 /// bloque es un pedido punto a punto: mandarlos todos juntos abre 250 flujos
@@ -58,12 +60,103 @@ const BLOCKS_BATCH: usize = 32;
 /// flujos. Mil resumenes son medio mega.
 const DIGESTS_BATCH: usize = 1000;
 
+/// A coherent mobile chunk is tried against at most two peers. The shared
+/// deadline is divided among the candidates that remain, so an unresponsive
+/// first peer cannot consume the second peer's opportunity.
+const COHERENT_BLOCK_PEER_ATTEMPTS: usize = 2;
+const HEIGHT_PROBE_PEER_ATTEMPTS: usize = 3;
+const MOBILE_CALL_SLACK: Duration = Duration::from_secs(15);
+const PRIVATE_TX_ANNOUNCE_PUBLISH_ATTEMPTS: u32 = 10;
+const PRIVATE_TX_FULL_PUBLISH_ATTEMPTS: u32 = 5;
+/// Round the deterministic 4.5s retry ceiling up to five seconds.
+const PUBLISH_RETRY_BUDGET_SLACK: Duration = Duration::from_millis(500);
+/// Height probing is bounded separately from reconnect so its synchronous JNI
+/// caller has a finite, derivable outer timeout.
+const HEIGHT_DISCOVERY_WAIT: Duration = Duration::from_secs(120);
+
 /// Techo del cache de cuerpos de transacciones privadas.
 ///
 /// Los cuerpos llegan de arriba con los bloques y se sirven al escaner sin otra
 /// vuelta a la red. Sin techo, un escaneo largo los acumularia todos en la
 /// memoria del telefono.
 const MAX_CACHED_BODIES: usize = 4096;
+
+fn range_batch_count(from: u64, to: u64, batch_size: usize) -> u32 {
+    if from > to || batch_size == 0 {
+        return 0;
+    }
+    let count = to.saturating_sub(from).saturating_add(1);
+    let batches = count.saturating_add(batch_size as u64 - 1) / batch_size as u64;
+    u32::try_from(batches).unwrap_or(u32::MAX)
+}
+
+fn network_work_budget(batch_count: u32) -> Duration {
+    BLOCKS_WAIT
+        .checked_mul(batch_count)
+        .unwrap_or(Duration::MAX)
+}
+
+fn coherent_block_attempt_budget(remaining: Duration, candidates_left: usize) -> Duration {
+    remaining
+        .checked_div(candidates_left.max(1) as u32)
+        .unwrap_or(remaining)
+}
+
+fn blocks_call_timeout(from: u64, to: u64) -> Duration {
+    PEER_WAIT
+        .saturating_add(network_work_budget(range_batch_count(
+            from,
+            to,
+            BLOCKS_BATCH,
+        )))
+        .saturating_add(MOBILE_CALL_SLACK)
+}
+
+fn digests_call_timeout(from: u64, to: u64) -> Duration {
+    // Worst case: several digest chunks succeeded, the last provider is
+    // legacy/invalid, and the call restarts the complete range with blocks.
+    PEER_WAIT
+        .saturating_add(network_work_budget(range_batch_count(
+            from,
+            to,
+            DIGESTS_BATCH,
+        )))
+        .saturating_add(network_work_budget(range_batch_count(
+            from,
+            to,
+            BLOCKS_BATCH,
+        )))
+        .saturating_add(MOBILE_CALL_SLACK)
+}
+
+fn private_body_call_timeout() -> Duration {
+    PEER_WAIT
+        .saturating_add(BLOCKS_WAIT)
+        .saturating_add(MOBILE_CALL_SLACK)
+}
+
+fn maximum_publish_retry_work() -> Duration {
+    PUMP_SLICE
+        .saturating_add(PUBLISH_RETRY_PAUSE)
+        .checked_mul(
+            PRIVATE_TX_ANNOUNCE_PUBLISH_ATTEMPTS
+                .saturating_add(PRIVATE_TX_FULL_PUBLISH_ATTEMPTS),
+        )
+        .unwrap_or(Duration::MAX)
+}
+
+fn publish_call_timeout() -> Duration {
+    PEER_WAIT
+        .saturating_add(maximum_publish_retry_work())
+        .saturating_add(PUBLISH_RETRY_BUDGET_SLACK)
+        .saturating_add(MOBILE_CALL_SLACK)
+}
+
+fn chain_height_call_timeout() -> Duration {
+    PEER_WAIT
+        .saturating_add(HEIGHT_DISCOVERY_WAIT)
+        .saturating_add(MOBILE_CALL_SLACK)
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MobileNetConfig {
@@ -106,7 +199,10 @@ fn anotar_pares(n: usize) {
 }
 
 enum Cmd {
-    PublishPrivateTx(Box<PrivateTransaction>, std_mpsc::Sender<Result<(), String>>),
+    PublishPrivateTx(
+        Box<PrivateTransaction>,
+        std_mpsc::Sender<Result<(), String>>,
+    ),
     Height(std_mpsc::Sender<Result<(u64, u64), String>>),
     Blocks(u64, u64, std_mpsc::Sender<Result<String, String>>),
     Digests(u64, u64, std_mpsc::Sender<Result<String, String>>),
@@ -137,7 +233,9 @@ pub fn connect_json(config_json: &str) -> Result<String, String> {
         return Err("no hay semillas a las que conectarse".to_string());
     }
 
-    let mut slot = handle_slot().lock().map_err(|_| "estado envenenado".to_string())?;
+    let mut slot = handle_slot()
+        .lock()
+        .map_err(|_| "estado envenenado".to_string())?;
     if slot.is_some() {
         drop(slot);
         return status_json();
@@ -147,10 +245,11 @@ pub fn connect_json(config_json: &str) -> Result<String, String> {
     let (listo_tx, listo_rx) = std_mpsc::channel();
     let seeds = config.seeds.clone();
     let tor_proxy = config.tor_proxy.clone();
-    let identity_path = config
-        .data_dir
-        .as_ref()
-        .map(|dir| std::path::PathBuf::from(dir).join("zoka-red").join("node_key"));
+    let identity_path = config.data_dir.as_ref().map(|dir| {
+        std::path::PathBuf::from(dir)
+            .join("zoka-red")
+            .join("node_key")
+    });
 
     // El nodo vive en un hilo propio con su runtime de un solo hilo, no en un
     // pool compartido.
@@ -173,13 +272,22 @@ pub fn connect_json(config_json: &str) -> Result<String, String> {
                     return;
                 }
             };
-            rt.block_on(run_client(seeds, tor_proxy, identity_path, cmd_rx, listo_tx));
+            rt.block_on(run_client(
+                seeds,
+                tor_proxy,
+                identity_path,
+                cmd_rx,
+                listo_tx,
+            ));
         })
         .map_err(|e| format!("no pude crear el hilo de red: {e}"))?;
 
     match listo_rx.recv_timeout(CONNECT_TIMEOUT) {
         Ok(Ok(())) => {
-            *slot = Some(Handle { cmd_tx, _hilo: hilo });
+            *slot = Some(Handle {
+                cmd_tx,
+                _hilo: hilo,
+            });
             drop(slot);
             status_json()
         }
@@ -222,8 +330,11 @@ pub fn status_json() -> Result<String, String> {
 pub fn publish_private_tx_json(tx_json: &str) -> Result<String, String> {
     let tx: PrivateTransaction =
         serde_json::from_str(tx_json).map_err(|e| format!("transaccion invalida: {e}"))?;
+    let tx_hash = tx.tx_hash.clone();
 
-    let slot = handle_slot().lock().map_err(|_| "estado envenenado".to_string())?;
+    let slot = handle_slot()
+        .lock()
+        .map_err(|_| "estado envenenado".to_string())?;
     let handle = slot
         .as_ref()
         .ok_or_else(|| "la red no esta conectada".to_string())?;
@@ -235,8 +346,12 @@ pub fn publish_private_tx_json(tx_json: &str) -> Result<String, String> {
         .map_err(|_| "el cliente de red se detuvo".to_string())?;
     drop(slot);
 
-    match rx_resp.recv_timeout(Duration::from_secs(60)) {
-        Ok(Ok(())) => Ok(r#"{"published":true}"#.to_string()),
+    match rx_resp.recv_timeout(publish_call_timeout()) {
+        Ok(Ok(())) => serde_json::to_string(&serde_json::json!({
+            "published": true,
+            "hash": tx_hash,
+        }))
+        .map_err(|e| format!("no pude serializar la confirmacion: {e}")),
         Ok(Err(err)) => Err(err),
         Err(_) => Err("la publicacion no confirmo a tiempo".to_string()),
     }
@@ -246,11 +361,10 @@ pub fn publish_private_tx_json(tx_json: &str) -> Result<String, String> {
 /// mantener circuitos Tor abiertos con la pantalla apagada gasta bateria sin
 /// que nadie mire el resultado.
 /// Manda un comando al hilo de red y espera su respuesta.
-fn pedir<T>(
-    armar: impl FnOnce(std_mpsc::Sender<T>) -> Cmd,
-    espera: Duration,
-) -> Result<T, String> {
-    let slot = handle_slot().lock().map_err(|_| "estado envenenado".to_string())?;
+fn pedir<T>(armar: impl FnOnce(std_mpsc::Sender<T>) -> Cmd, espera: Duration) -> Result<T, String> {
+    let slot = handle_slot()
+        .lock()
+        .map_err(|_| "estado envenenado".to_string())?;
     let handle = slot.as_ref().ok_or("la red no esta conectada")?;
     let (tx, rx) = std_mpsc::channel();
     handle
@@ -272,7 +386,7 @@ fn pedir<T>(
 /// Puede tardar recien conectado: hasta que no pase un bloque nuevo nadie
 /// anuncia nada, y despues hay que tantear hasta donde llega el par.
 pub fn chain_height_json() -> Result<String, String> {
-    let (servible, anunciada) = pedir(Cmd::Height, Duration::from_secs(240))??;
+    let (servible, anunciada) = pedir(Cmd::Height, chain_height_call_timeout())??;
     Ok(format!(
         r#"{{"height":{servible},"announced_height":{anunciada}}}"#
     ))
@@ -290,10 +404,9 @@ pub fn blocks_range_json(from: u64, to: u64) -> Result<String, String> {
     if from > to {
         return Err(format!("rango invalido: {from} > {to}"));
     }
-    let espera = BLOCKS_WAIT * (((to - from) as u32 / BLOCKS_BATCH as u32) + 2);
     pedir(
         |tx| Cmd::Blocks(from, to, tx),
-        espera + Duration::from_secs(15),
+        blocks_call_timeout(from, to),
     )?
 }
 
@@ -311,10 +424,9 @@ pub fn blocks_digest_range_json(from: u64, to: u64) -> Result<String, String> {
     if from > to {
         return Err(format!("rango invalido: {from} > {to}"));
     }
-    let espera = BLOCKS_WAIT * (((to - from) as u32 / DIGESTS_BATCH as u32) + 2);
     pedir(
         |tx| Cmd::Digests(from, to, tx),
-        espera + Duration::from_secs(15),
+        digests_call_timeout(from, to),
     )?
 }
 
@@ -325,19 +437,20 @@ pub fn blocks_digest_range_json(from: u64, to: u64) -> Result<String, String> {
 pub fn private_tx_body_json(tx_hash: &str) -> Result<String, String> {
     pedir(
         |tx| Cmd::PrivateTxBody(tx_hash.to_string(), tx),
-        BLOCKS_WAIT + Duration::from_secs(15),
+        private_body_call_timeout(),
     )?
 }
 
 pub fn disconnect() -> Result<String, String> {
-    let mut slot = handle_slot().lock().map_err(|_| "estado envenenado".to_string())?;
+    let mut slot = handle_slot()
+        .lock()
+        .map_err(|_| "estado envenenado".to_string())?;
     if let Some(handle) = slot.take() {
         let _ = handle.cmd_tx.send(Cmd::Shutdown);
     }
     anotar_pares(0);
     Ok(r#"{"connected":false}"#.to_string())
 }
-
 
 /// Publica una transaccion privada por el mismo camino que usa el nodo
 /// completo, que son tres pasos y no uno.
@@ -366,15 +479,23 @@ async fn publicar_tx_privada(node: &mut Node, tx: &PrivateTransaction) -> Result
     // Reintentar bombeando entre intentos: gossipsub rechaza publicar mientras
     // el tema todavia no tiene pares en la malla, y sobre Tor eso tarda unos
     // segundos en armarse despues de conectar.
-    node.publish_message_with_retry(&ZokaMessage::PrivateTxAnnounce(anuncio), 10, PUMP_SLICE)
-        .await
-        .map_err(|e| format!("no pude anunciar la tx: {e}"))?;
+    node.publish_message_with_retry(
+        &ZokaMessage::PrivateTxAnnounce(anuncio),
+        PRIVATE_TX_ANNOUNCE_PUBLISH_ATTEMPTS,
+        PUMP_SLICE,
+    )
+    .await
+    .map_err(|e| format!("no pude anunciar la tx: {e}"))?;
 
     // La transaccion completa es el segundo camino, no el principal: si el
     // anuncio llego, la red ya puede pedir el cuerpo. Un fallo aca no invalida
     // la publicacion.
     let _ = node
-        .publish_message_with_retry(&ZokaMessage::PrivateTransaction(msg), 5, PUMP_SLICE)
+        .publish_message_with_retry(
+            &ZokaMessage::PrivateTransaction(msg),
+            PRIVATE_TX_FULL_PUBLISH_ATTEMPTS,
+            PUMP_SLICE,
+        )
         .await;
     Ok(())
 }
@@ -415,10 +536,104 @@ impl CacheCuerpos {
 /// el par tiene el bloque, no exprimirle una respuesta lenta.
 const PROBE_WAIT: Duration = Duration::from_secs(20);
 
-/// Si un par tiene realmente el bloque de esa altura.
-async fn tiene_bloque(node: &mut Node, altura: u64) -> bool {
-    let respuestas = node.request_blocks_batch_direct(&[altura], PROBE_WAIT).await;
-    matches!(respuestas.get(&altura), Some(Ok(_)))
+fn validar_bloque_sondeado(
+    altura: u64,
+    respuesta: &crate::network::p2p::SourcedBlockResponse,
+) -> Result<(), String> {
+    let bloque: crate::types::Block = serde_json::from_slice(&respuesta.response.encrypted_block)
+        .map_err(|error| {
+            format!(
+                "el par {} mando un bloque {altura} ilegible: {error}",
+                respuesta.source
+            )
+        })?;
+    if respuesta.response.block_height != altura
+        || bloque.header.block_height != altura
+        || bloque.header.hash != respuesta.response.block_hash
+        || bloque.compute_hash() != bloque.header.hash
+        || bloque.compute_merkle_root() != bloque.header.merkle_root
+    {
+        return Err(format!(
+            "el bloque {altura} del par {} no coincide con sus compromisos",
+            respuesta.source
+        ));
+    }
+    Ok(())
+}
+
+/// Si los pares tienen realmente el bloque de esa altura.
+///
+/// Los candidatos se prueban de a uno: un nodo atrasado puede contestar
+/// `NotFound` sin tapar a otro que si tiene el bloque. Solo se devuelve `false`
+/// si todos los candidatos seleccionados respondieron `NotFound`; fallos,
+/// rechazos, cuerpos invalidos y deadlines son inconclusos y fallan cerrados.
+async fn tiene_bloque_antes(
+    node: &mut Node,
+    altura: u64,
+    deadline: tokio::time::Instant,
+) -> Result<bool, String> {
+    let now = tokio::time::Instant::now();
+    let probe_deadline = deadline.min(now + PROBE_WAIT);
+    if probe_deadline <= now {
+        return Err(height_discovery_timeout_error());
+    }
+
+    let mut peers = node.mobile_block_request_peers();
+    peers.truncate(HEIGHT_PROBE_PEER_ATTEMPTS);
+    if peers.is_empty() {
+        return Err(format!(
+            "el sondeo de altura {altura} no tiene pares elegibles"
+        ));
+    }
+
+    let peer_count = peers.len();
+    let mut not_found = 0usize;
+    let mut errores = Vec::new();
+    for (peer_index, peer) in peers.into_iter().enumerate() {
+        let remaining = probe_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            errores.push(height_discovery_timeout_error());
+            break;
+        }
+        let attempt_budget =
+            coherent_block_attempt_budget(remaining, peer_count - peer_index);
+        match node
+            .request_mobile_block_probe_from_peer(altura, &peer, attempt_budget)
+            .await
+        {
+            Ok(MobileBlockProbe::Found(respuesta)) => {
+                match validar_bloque_sondeado(altura, &respuesta) {
+                    Ok(()) => return Ok(true),
+                    Err(error) => {
+                        node.penalize_block_sync_peer(respuesta.source);
+                        errores.push(error);
+                    }
+                }
+            }
+            Ok(MobileBlockProbe::NotFound) => not_found = not_found.saturating_add(1),
+            Err(error) => errores.push(format!("el par {peer}: {error}")),
+        }
+    }
+
+    if not_found == peer_count {
+        Ok(false)
+    } else {
+        let detalle = if errores.is_empty() {
+            height_discovery_timeout_error()
+        } else {
+            errores.join("; ")
+        };
+        Err(format!(
+            "el sondeo de altura {altura} fue inconcluso ({not_found}/{peer_count} NotFound): {detalle}"
+        ))
+    }
+}
+
+fn height_discovery_timeout_error() -> String {
+    format!(
+        "la busqueda de altura no termino en {} segundos; reintenta",
+        HEIGHT_DISCOVERY_WAIT.as_secs()
+    )
 }
 
 /// Cuanto se le da a la conexion para tener un par antes de pedirle algo.
@@ -476,49 +691,66 @@ async fn esperar_par(node: &mut Node, seeds: &[String]) -> bool {
 /// el bloque. Se sube a saltos que se duplican hasta encontrar uno que no
 /// tienen, y despues se afina por mitades. Son unos quince pedidos la primera
 /// vez y queda cacheado; el anuncio, cuando lo hay, se usa como atajo.
-async fn descubrir_altura(node: &mut Node, pista: u64, cache: &mut u64) -> u64 {
-    // El atajo: si algun par anuncio una punta y resulta que la tiene, listo.
-    if pista > 0 && tiene_bloque(node, pista).await {
-        *cache = pista;
-        return pista;
-    }
+async fn descubrir_altura(
+    node: &mut Node,
+    pista: u64,
+    cache: &mut u64,
+) -> Result<u64, String> {
+    let deadline = tokio::time::Instant::now() + HEIGHT_DISCOVERY_WAIT;
+    descubrir_altura_antes(node, pista, cache, deadline).await
+}
 
+async fn descubrir_altura_antes(
+    node: &mut Node,
+    pista: u64,
+    cache: &mut u64,
+    deadline: tokio::time::Instant,
+) -> Result<u64, String> {
     let mut buena = 0u64;
-    let mut mala = pista;
+    let mut mala = 0u64;
+    // Tanto el anuncio como el cache son pistas, no una punta demostrada. La
+    // altura solo es exacta despues de encontrar el primer bloque ausente.
+    let inicial = pista.max(*cache).max(1);
+    if tiene_bloque_antes(node, inicial, deadline).await? {
+        buena = inicial;
+    } else {
+        mala = inicial;
+    }
 
     if mala == 0 {
-        // Sin pista hay que encontrar un techo: subir duplicando hasta fallar.
-        let mut altura = if *cache > 0 { *cache } else { 1 };
+        if buena == u64::MAX {
+            *cache = buena;
+            return Ok(buena);
+        }
+
+        // Probar primero el sucesor hace barato el caso normal: el anuncio ya
+        // era la punta. Si tambien existe, se busca un techo duplicando.
+        let mut altura = buena.saturating_add(1);
         loop {
-            if tiene_bloque(node, altura).await {
+            if tiene_bloque_antes(node, altura, deadline).await? {
                 buena = altura;
+                if buena == u64::MAX {
+                    *cache = buena;
+                    return Ok(buena);
+                }
+                altura = buena.checked_mul(2).unwrap_or(u64::MAX);
             } else {
+                mala = altura;
                 break;
             }
-            match altura.checked_mul(2) {
-                Some(siguiente) => altura = siguiente,
-                None => break,
-            }
         }
-        mala = altura;
-        if buena == 0 {
-            // Ni el bloque 1: no hay ningun par util del otro lado.
-            return 0;
-        }
-    } else if *cache > 0 && *cache < mala && tiene_bloque(node, *cache).await {
-        buena = *cache;
     }
 
-    while buena + 1 < mala {
+    while buena.saturating_add(1) < mala {
         let medio = buena + (mala - buena) / 2;
-        if tiene_bloque(node, medio).await {
+        if tiene_bloque_antes(node, medio, deadline).await? {
             buena = medio;
         } else {
             mala = medio;
         }
     }
     *cache = buena;
-    buena
+    Ok(buena)
 }
 
 /// Baja el rango pedido en tandas y lo devuelve con la forma que el escaner
@@ -530,12 +762,15 @@ async fn traer_bloques(
     to: u64,
 ) -> Result<String, String> {
     let mut bloques: Vec<serde_json::Value> = Vec::new();
+    let mut hash_anterior: Option<String> = None;
+    let mut peer_anterior: Option<libp2p::PeerId> = None;
 
     // El genesis no lo tiene nadie que pedir: es el mismo para toda la red y se
     // deriva localmente, igual que hacia el servidor.
     let mut altura = from;
     if altura == 0 {
         let genesis = crate::state::chain::genesis_parent_for(crate::economics::MAINNET_CHAIN_ID);
+        hash_anterior = Some(genesis.header.hash.clone());
         bloques.push(
             serde_json::to_value(&genesis)
                 .map_err(|e| format!("no pude serializar el genesis: {e}"))?,
@@ -544,41 +779,136 @@ async fn traer_bloques(
     }
 
     while altura <= to {
-        let hasta = (altura + BLOCKS_BATCH as u64 - 1).min(to);
+        let hasta = altura.saturating_add(BLOCKS_BATCH as u64 - 1).min(to);
         let alturas: Vec<u64> = (altura..=hasta).collect();
-        let respuestas = node.request_blocks_batch_direct(&alturas, BLOCKS_WAIT).await;
+        let mut peers = node.mobile_block_request_peers();
+        if let Some(preferred) = peer_anterior.as_ref() {
+            if let Some(position) = peers.iter().position(|peer| peer == preferred) {
+                peers.swap(0, position);
+            }
+        }
+        peers.truncate(COHERENT_BLOCK_PEER_ATTEMPTS);
+        if peers.is_empty() {
+            return Err(format!(
+                "no hay pares conectados para los bloques {altura}..{hasta}"
+            ));
+        }
 
-        for h in &alturas {
-            let respuesta = match respuestas.get(h) {
-                Some(Ok(r)) => r,
-                Some(Err(e)) => return Err(format!("el bloque {h} no llego: {e}")),
-                None => {
-                    return Err(format!(
-                        "ningun par respondio por el bloque {h}; probablemente se corto la red"
-                    ))
+        let chunk_deadline = tokio::time::Instant::now() + BLOCKS_WAIT;
+        let mut lote_valido = None;
+        let mut proveedor_valido = None;
+        let mut ultimo_error = String::new();
+
+        let peer_count = peers.len();
+        for (peer_index, peer) in peers.into_iter().enumerate() {
+            let remaining = chunk_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let attempt_budget =
+                coherent_block_attempt_budget(remaining, peer_count - peer_index);
+            if attempt_budget.is_zero() {
+                continue;
+            }
+            let respuestas = node
+                .request_blocks_batch_direct_from_peer(&alturas, &peer, attempt_budget)
+                .await;
+            let mut candidato = Vec::with_capacity(alturas.len());
+            let mut candidato_anterior = hash_anterior.clone();
+            let mut candidato_error = None;
+
+            for h in &alturas {
+                let respuesta = match respuestas.get(h) {
+                    Some(Ok(response)) => response.response.clone(),
+                    Some(Err(error)) => {
+                        candidato_error = Some(format!("el bloque {h} no llego: {error}"));
+                        break;
+                    }
+                    None => {
+                        candidato_error =
+                            Some(format!("el par {peer} no respondio por el bloque {h}"));
+                        break;
+                    }
+                };
+
+                // La validacion ocurre antes de aceptar al proveedor para que
+                // un peer corrupto no gane la carrera y anule el failover.
+                let bloque: crate::types::Block =
+                    match serde_json::from_slice(&respuesta.encrypted_block) {
+                        Ok(block) => block,
+                        Err(error) => {
+                            node.penalize_block_sync_peer(peer.clone());
+                            candidato_error = Some(format!(
+                                "el par {peer} mando un bloque {h} ilegible: {error}"
+                            ));
+                            break;
+                        }
+                    };
+                if bloque.header.block_height != *h
+                    || bloque.header.hash != respuesta.block_hash
+                    || bloque.compute_hash() != bloque.header.hash
+                    || bloque.compute_merkle_root() != bloque.header.merkle_root
+                {
+                    node.penalize_block_sync_peer(peer.clone());
+                    candidato_error = Some(format!(
+                        "el bloque {h} del par {peer} no coincide con sus compromisos"
+                    ));
+                    break;
                 }
-            };
+                if let Some(anterior) = candidato_anterior.as_ref() {
+                    if bloque.header.prev_hash != *anterior {
+                        candidato_error = Some(format!(
+                            "el par {peer} entrego otra rama entre {} y {h}",
+                            h.saturating_sub(1)
+                        ));
+                        break;
+                    }
+                }
+                candidato_anterior = Some(bloque.header.hash.clone());
+                candidato.push((respuesta, bloque));
+            }
 
-            // Pasar por `Block` no es ceremonia: valida que lo que mando el par
-            // tenga la forma de un bloque antes de que el escaner lo mire.
-            let bloque: crate::types::Block =
-                serde_json::from_slice(&respuesta.response.encrypted_block)
-                    .map_err(|e| format!("el par mando un bloque {h} ilegible: {e}"))?;
+            if let Some(error) = candidato_error {
+                ultimo_error = error;
+                continue;
+            }
+            if candidato.len() == alturas.len() {
+                lote_valido = Some(candidato);
+                proveedor_valido = Some(peer);
+                hash_anterior = candidato_anterior;
+                break;
+            }
+        }
 
-            for cuerpo in &respuesta.response.private_tx_bodies {
-                if let Ok(tx) = serde_json::from_slice::<serde_json::Value>(cuerpo) {
-                    if let Some(hash) = tx.get("tx_hash").and_then(|v| v.as_str()) {
-                        cache.guardar(hash.to_string(), cuerpo.clone());
+        let lote_valido = lote_valido.ok_or_else(|| {
+            if ultimo_error.is_empty() {
+                format!("ningun par completo el tramo {altura}..{hasta}")
+            } else {
+                ultimo_error
+            }
+        })?;
+        peer_anterior = proveedor_valido;
+
+        for (respuesta, bloque) in lote_valido {
+            for cuerpo in &respuesta.private_tx_bodies {
+                if let Ok(tx) = serde_json::from_slice::<PrivateTransaction>(cuerpo) {
+                    if bloque.private_tx_hashes.contains(&tx.tx_hash)
+                        && crate::private_wallet::expected_private_tx_hash(&tx) == tx.tx_hash
+                    {
+                        cache.guardar(tx.tx_hash.clone(), cuerpo.clone());
                     }
                 }
             }
 
             bloques.push(
                 serde_json::to_value(&bloque)
-                    .map_err(|e| format!("no pude reserializar el bloque {h}: {e}"))?,
+                    .map_err(|e| format!("no pude reserializar un bloque: {e}"))?,
             );
         }
-        altura = hasta + 1;
+        if hasta == to {
+            break;
+        }
+        altura = hasta.saturating_add(1);
     }
 
     serde_json::to_string(&serde_json::json!({
@@ -605,11 +935,17 @@ async fn traer_resumenes(
 ) -> Result<String, String> {
     let mut bloques: Vec<serde_json::Value> = Vec::new();
     let mut altura = from.max(1);
+    let mut hash_anterior: Option<String> = None;
 
     while altura <= to {
-        let hasta = (altura + DIGESTS_BATCH as u64 - 1).min(to);
+        let hasta = altura.saturating_add(DIGESTS_BATCH as u64 - 1).min(to);
         let Some(resumenes) = node
-            .request_wallet_digests(altura, hasta, BLOCKS_WAIT)
+            .request_wallet_digests_with_anchor(
+                altura,
+                hasta,
+                hash_anterior.as_deref(),
+                BLOCKS_WAIT,
+            )
             .await
         else {
             // El par no sirve resumenes: se baja el tramo entero como siempre.
@@ -617,14 +953,38 @@ async fn traer_resumenes(
             // nodos que no conocen el protocolo nuevo.
             return traer_bloques(node, cache, from, to).await;
         };
-        if resumenes.is_empty() && hasta >= altura {
+        if resumenes.len() != (hasta - altura + 1) as usize {
             return traer_bloques(node, cache, from, to).await;
         }
+        let mut por_altura = std::collections::BTreeMap::new();
         for r in resumenes {
+            if r.block_height < altura
+                || r.block_height > hasta
+                || r.block_hash.trim().is_empty()
+                || por_altura.insert(r.block_height, r).is_some()
+            {
+                return traer_bloques(node, cache, from, to).await;
+            }
+        }
+        for esperada in altura..=hasta {
+            let Some(r) = por_altura.remove(&esperada) else {
+                return traer_bloques(node, cache, from, to).await;
+            };
+            if let Some(anterior) = hash_anterior.as_ref() {
+                if r.prev_hash != *anterior {
+                    return Err(format!(
+                        "los resumenes mezclan ramas entre los bloques {} y {}",
+                        esperada.saturating_sub(1),
+                        esperada
+                    ));
+                }
+            }
+            hash_anterior = Some(r.block_hash.clone());
             bloques.push(serde_json::json!({
                 "header": {
                     "block_height": r.block_height,
                     "hash": r.block_hash,
+                    "prev_hash": r.prev_hash,
                     "timestamp": r.timestamp,
                 },
                 // El escaner mira `transactions[0]` para reconocer un coinbase
@@ -646,7 +1006,10 @@ async fn traer_resumenes(
                 "private_nullifiers": r.private_nullifiers,
             }));
         }
-        altura = hasta + 1;
+        if hasta == to {
+            break;
+        }
+        altura = hasta.saturating_add(1);
     }
 
     serde_json::to_string(&serde_json::json!({
@@ -671,7 +1034,22 @@ async fn traer_cuerpo_privado(
             .await
             .map_err(|e| format!("no pude conseguir el cuerpo de {hash}: {e}"))?,
     };
-    String::from_utf8(crudo).map_err(|e| format!("el cuerpo de {hash} no es texto valido: {e}"))
+    let cuerpo: PrivateTransaction = serde_json::from_slice(&crudo)
+        .map_err(|e| format!("el cuerpo de {hash} no es una transaccion privada valida: {e}"))?;
+    if cuerpo.tx_hash != hash {
+        return Err(format!(
+            "el par devolvio la transaccion {} cuando se pidio {hash}",
+            cuerpo.tx_hash
+        ));
+    }
+    let hash_esperado = crate::private_wallet::expected_private_tx_hash(&cuerpo);
+    if cuerpo.tx_hash != hash_esperado {
+        return Err(format!(
+            "el cuerpo de {hash} no coincide con su hash canonico"
+        ));
+    }
+    serde_json::to_string(&cuerpo)
+        .map_err(|e| format!("no pude serializar el cuerpo de {hash}: {e}"))
 }
 
 async fn run_client(
@@ -745,12 +1123,16 @@ async fn run_client(
                     // El anuncio es una pista gratis, no un requisito: se lee
                     // lo que haya llegado y se sigue sin esperar.
                     let anunciada = node.highest_announced_height();
-                    let servible =
-                        descubrir_altura(&mut node, anunciada, &mut tope_servible).await;
-                    let r = if servible == 0 {
-                        Err("ningun par pudo entregar un bloque; revisa la conexion".to_string())
-                    } else {
-                        Ok((servible, anunciada.max(servible)))
+                    let r = match descubrir_altura(
+                        &mut node,
+                        anunciada,
+                        &mut tope_servible,
+                    ).await {
+                        Ok(0) => Err(
+                            "ningun par pudo entregar un bloque; revisa la conexion".to_string()
+                        ),
+                        Ok(servible) => Ok((servible, anunciada.max(servible))),
+                        Err(error) => Err(error),
                     };
                     let _ = resp.send(r);
                 }
@@ -771,7 +1153,13 @@ async fn run_client(
                     let _ = resp.send(r);
                 }
                 Some(Cmd::PrivateTxBody(hash, resp)) => {
-                    let r = traer_cuerpo_privado(&mut node, &cache, &hash).await;
+                    let r = if cache.buscar(&hash).is_some() {
+                        traer_cuerpo_privado(&mut node, &cache, &hash).await
+                    } else if esperar_par(&mut node, &seeds).await {
+                        traer_cuerpo_privado(&mut node, &cache, &hash).await
+                    } else {
+                        Err("ningun par completo la conexion; revisa Tor".to_string())
+                    };
                     let _ = resp.send(r);
                 }
                 Some(Cmd::Shutdown) | None => return,
@@ -780,5 +1168,213 @@ async fn run_client(
                 let _ = node.pump_for(PUMP_SLICE).await;
             } => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network::block_request_response::BlockBodyResponse;
+    use crate::network::message::BlockResponseMessage;
+    use crate::types::{Block, PublicKey, Signature};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    async fn run_multi_peer_height_probe(
+        found_on_second_peer: bool,
+    ) -> (Result<bool, String>, Vec<Arc<AtomicUsize>>) {
+        let mut servers = vec![
+            Node::new(0).await.expect("first probe server"),
+            Node::new(0).await.expect("second probe server"),
+        ];
+        let mut order = [0usize, 1usize];
+        order.sort_by_key(|index| servers[*index].peer_id().to_string());
+        let found_index = found_on_second_peer.then_some(order[1]);
+        let block = Block::new(
+            "probe-parent".to_string(),
+            1_000,
+            7,
+            42,
+            Vec::new(),
+            PublicKey(Vec::new()),
+            Signature(Vec::new()),
+        );
+        let found = BlockResponseMessage {
+            block_height: block.header.block_height,
+            encrypted_block: serde_json::to_vec(&block).expect("serialize probe block"),
+            block_hash: block.header.hash.clone(),
+            difficulty_bits: None,
+            private_tx_bodies: Vec::new(),
+            timestamp: block.header.timestamp,
+        };
+        let calls = vec![Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+
+        for (index, server) in servers.iter_mut().enumerate() {
+            let calls = calls[index].clone();
+            let found = found.clone();
+            let serves_block = found_index == Some(index);
+            server.set_block_body_responder(move |request| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                if serves_block {
+                    BlockBodyResponse::Found(found.clone())
+                } else {
+                    BlockBodyResponse::NotFound {
+                        block_height: request.block_height,
+                        block_hash: request.block_hash.clone(),
+                        reason: "peer atrasado".to_string(),
+                    }
+                }
+            });
+            server
+                .listen("/ip4/127.0.0.1/tcp/0")
+                .await
+                .expect("listen probe server");
+        }
+
+        let mut addresses = Vec::new();
+        for server in &mut servers {
+            let address = tokio::time::timeout(
+                Duration::from_secs(2),
+                server.wait_for_listen_addr(),
+            )
+            .await
+            .expect("probe server listen deadline")
+            .expect("probe server listen address");
+            addresses.push(format!("{address}/p2p/{}", server.peer_id()));
+        }
+
+        let mut client = Node::new(0).await.expect("height probe client");
+        for address in &addresses {
+            client.connect_to_peer(address).await.expect("dial probe server");
+        }
+        for _ in 0..100 {
+            let _ = client.pump_for(Duration::from_millis(5)).await;
+            for server in &mut servers {
+                let _ = server.pump_for(Duration::from_millis(5)).await;
+            }
+            if client.connected_peer_count() == servers.len() {
+                break;
+            }
+        }
+        assert_eq!(client.connected_peer_count(), servers.len());
+
+        let serving = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            while tokio::time::Instant::now() < deadline {
+                for server in &mut servers {
+                    let _ = server.pump_for(Duration::from_millis(2)).await;
+                }
+            }
+        });
+        let result = tiene_bloque_antes(
+            &mut client,
+            42,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await;
+        serving.abort();
+        let _ = serving.await;
+        (result, calls)
+    }
+
+    #[test]
+    fn range_batch_count_uses_inclusive_ranges_without_wrapping() {
+        assert_eq!(range_batch_count(1, 1, BLOCKS_BATCH), 1);
+        assert_eq!(range_batch_count(1, 32, BLOCKS_BATCH), 1);
+        assert_eq!(range_batch_count(1, 33, BLOCKS_BATCH), 2);
+        assert_eq!(range_batch_count(9, 8, BLOCKS_BATCH), 0);
+        assert_eq!(range_batch_count(u64::MAX, u64::MAX, BLOCKS_BATCH), 1);
+    }
+
+    #[test]
+    fn public_timeouts_cover_reconnect_and_bounded_network_work() {
+        assert_eq!(BLOCKS_WAIT, MOBILE_P2P_OPERATION_WAIT);
+        assert_eq!(
+            blocks_call_timeout(1, 32),
+            PEER_WAIT + BLOCKS_WAIT + MOBILE_CALL_SLACK
+        );
+        assert_eq!(
+            digests_call_timeout(1, 1_000),
+            PEER_WAIT + BLOCKS_WAIT + (BLOCKS_WAIT * 32) + MOBILE_CALL_SLACK
+        );
+        assert_eq!(
+            private_body_call_timeout(),
+            PEER_WAIT + BLOCKS_WAIT + MOBILE_CALL_SLACK
+        );
+        assert_eq!(
+            publish_call_timeout(),
+            PEER_WAIT
+                + maximum_publish_retry_work()
+                + PUBLISH_RETRY_BUDGET_SLACK
+                + MOBILE_CALL_SLACK
+        );
+        assert_eq!(maximum_publish_retry_work(), Duration::from_millis(4_500));
+        assert_eq!(
+            maximum_publish_retry_work() + PUBLISH_RETRY_BUDGET_SLACK,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            chain_height_call_timeout(),
+            PEER_WAIT + HEIGHT_DISCOVERY_WAIT + MOBILE_CALL_SLACK
+        );
+        assert!(
+            publish_call_timeout()
+                > PEER_WAIT + maximum_publish_retry_work() + PUBLISH_RETRY_BUDGET_SLACK
+        );
+        assert!(chain_height_call_timeout() > PEER_WAIT + HEIGHT_DISCOVERY_WAIT);
+    }
+
+    #[test]
+    fn coherent_block_deadline_reserves_time_for_the_second_peer() {
+        assert_eq!(
+            coherent_block_attempt_budget(BLOCKS_WAIT, 2),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            coherent_block_attempt_budget(Duration::from_secs(30), 1),
+            Duration::from_secs(30),
+            "the last candidate receives all of the remaining deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn height_discovery_deadline_fails_closed_without_overwriting_cache() {
+        let mut node = Node::new(0).await.expect("test node");
+        let mut cache = 123;
+        let result = descubrir_altura_antes(
+            &mut node,
+            200,
+            &mut cache,
+            tokio::time::Instant::now(),
+        )
+        .await;
+
+        assert!(result.is_err(), "an expired search cannot return a lower bound");
+        assert_eq!(cache, 123, "an incomplete search cannot replace the exact cache");
+    }
+
+    #[tokio::test]
+    async fn height_probe_reaches_found_peer_after_lagging_peer_not_found() {
+        let (result, calls) = run_multi_peer_height_probe(true).await;
+
+        assert_eq!(result, Ok(true));
+        assert_eq!(calls.iter().map(|calls| calls.load(Ordering::SeqCst)).sum::<usize>(), 2);
+        assert!(calls.iter().all(|calls| calls.load(Ordering::SeqCst) == 1));
+    }
+
+    #[tokio::test]
+    async fn height_probe_returns_false_only_after_all_peers_not_found() {
+        let (result, calls) = run_multi_peer_height_probe(false).await;
+
+        assert_eq!(result, Ok(false));
+        assert_eq!(calls.iter().map(|calls| calls.load(Ordering::SeqCst)).sum::<usize>(), 2);
+        assert!(calls.iter().all(|calls| calls.load(Ordering::SeqCst) == 1));
+    }
+
+    #[test]
+    fn private_body_cache_can_be_checked_without_a_peer() {
+        let mut cache = CacheCuerpos::default();
+        cache.guardar("tx-1".to_string(), b"body".to_vec());
+        assert_eq!(cache.buscar("tx-1").map(Vec::as_slice), Some(&b"body"[..]));
     }
 }

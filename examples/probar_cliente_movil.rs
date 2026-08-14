@@ -47,21 +47,36 @@ fn main() {
 
     paso("conectar a la semilla", || mobile_net::connect_json(&config));
 
-    let altura = match paso("pedir la altura de la red", mobile_net::chain_height_json) {
-        Some(json) => json
-            .split("\"height\":")
-            .nth(1)
-            .map(|resto| {
-                resto
-                    .trim_start()
-                    .chars()
-                    .take_while(char::is_ascii_digit)
-                    .collect::<String>()
-            })
-            .and_then(|d| d.parse::<u64>().ok())
-            .unwrap_or(0),
-        None => 0,
-    };
+    // En diagnosticos contra un nodo local ya conocemos su altura por la API
+    // read-only. Fijarla evita que la busqueda P2P de punta haga decenas de
+    // sondas justo antes de medir el protocolo que nos interesa.
+    let altura_fija = std::env::var("ZOKA_DIAG_HEIGHT")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0);
+    let altura = altura_fija.unwrap_or_else(|| {
+        match paso("pedir la altura de la red", mobile_net::chain_height_json) {
+            Some(json) => json
+                .split("\"height\":")
+                .nth(1)
+                .map(|resto| {
+                    resto
+                        .trim_start()
+                        .chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                })
+                .and_then(|d| d.parse::<u64>().ok())
+                .unwrap_or(0),
+            None => 0,
+        }
+    });
+    if altura_fija.is_some() {
+        println!("altura de diagnostico fijada: {altura}");
+    }
+    let solo_resumenes = std::env::var("ZOKA_DIAG_ONLY_DIGESTS")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
 
     // Un rango corto y reciente: alcanza para saber si los bloques llegan y se
     // leen. Bajar la cadena entera es trabajo del escaner, no de esta prueba.
@@ -69,8 +84,8 @@ fn main() {
     // anunciar por gossip un bloque que todavia no guardo como canonico, o
     // relayar anuncios de otros sin tener esos bloques: en ese caso lo reciente
     // falla y lo viejo anda, y conviene saber cual de los dos casos es.
-    for atras in [0u64, 4, 100] {
-        if altura <= atras + 2 {
+    for atras in if solo_resumenes { &[][..] } else { &[0u64, 4, 100][..] } {
+        if altura <= *atras + 2 {
             continue;
         }
         let hasta = altura - atras;
@@ -86,7 +101,7 @@ fn main() {
     // Hasta donde puede servir de verdad el par, que no tiene por que ser lo
     // que anuncia: gossip propaga los anuncios de toda la malla, asi que un par
     // atrasado reenvia alturas que el mismo no guardo.
-    if altura > 0 {
+    if altura > 0 && !solo_resumenes && altura_fija.is_none() {
         print!("{:.<44}", "punta real que puede servir el par");
         use std::io::Write;
         let _ = std::io::stdout().flush();
@@ -120,8 +135,13 @@ fn main() {
 
     // Comparar los dos caminos sobre el mismo tramo: es la unica forma de saber
     // si el protocolo nuevo vale lo que cuesta.
-    if altura > 1200 {
-        let (desde, hasta) = (altura - 1000, altura - 1);
+    let diagnostic_blocks = std::env::var("ZOKA_DIAG_BLOCKS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1000);
+    if diagnostic_blocks < altura.saturating_sub(1) {
+        let (desde, hasta) = (altura - diagnostic_blocks, altura - 1);
         let mut pesos = (0usize, 0usize);
         if let Some(j) = paso(&format!("resumenes {desde}..{hasta}"), || {
             mobile_net::blocks_digest_range_json(desde, hasta)

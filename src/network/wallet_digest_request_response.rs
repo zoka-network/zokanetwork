@@ -52,6 +52,12 @@ pub struct GetWalletDigests {
 pub struct BlockDigest {
     pub block_height: u64,
     pub block_hash: String,
+    /// Encadena los resumenes sin cargar el resto del encabezado. Un cliente
+    /// liviano puede detectar huecos o una mezcla de ramas entre respuestas.
+    /// `default` conserva lectura de respuestas emitidas por el v1 original;
+    /// el cliente trata el valor vacio como protocolo legacy y usa bloques.
+    #[serde(default)]
+    pub prev_hash: String,
     pub timestamp: u64,
     /// Destinatario y monto del coinbase, en claro como ya estan en el bloque.
     /// Es lo que deja reconocer "este es mio" sin bajar nada mas.
@@ -173,6 +179,7 @@ impl BlockDigest {
         BlockDigest {
             block_height: block.header.block_height,
             block_hash: block.header.hash.clone(),
+            prev_hash: block.header.prev_hash.clone(),
             timestamp: block.header.timestamp,
             coinbase_recipient: coinbase_tx.map(|tx| tx.receiver.clone()),
             coinbase_amount: coinbase_tx.map(|tx| tx.amount),
@@ -182,5 +189,23 @@ impl BlockDigest {
             private_tx_hashes: block.private_tx_hashes.clone(),
             private_nullifiers: block.private_nullifiers.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn digest_v1_legacy_without_prev_hash_still_decodes() {
+        let legacy = serde_json::json!({
+            "block_height": 7,
+            "block_hash": "hash-7",
+            "timestamp": 1234
+        });
+        let digest: BlockDigest = serde_json::from_value(legacy).expect("legacy v1 digest");
+
+        assert_eq!(digest.block_height, 7);
+        assert!(digest.prev_hash.is_empty());
     }
 }

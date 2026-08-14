@@ -92,7 +92,9 @@ fn print_usage() {
         "  tx-send | tx-pending | private-tx-publish | private-tx-audit | estimate-fee | mine | fullnode | node-status | sync-status"
     );
     println!("{}", dashboard_section("Team mining", ANSI_CYAN));
-    println!("  team-status [--json]                       (team, members and whether you are hashing)");
+    println!(
+        "  team-status [--json]                       (team, members and whether you are hashing)"
+    );
     println!("  team-create [--json]                       (creates a team; prints the invite code to share)");
     println!("  team-join --code <invite-code> [--json]");
     println!("  team-leave");
@@ -2683,9 +2685,7 @@ fn solve_team_share(
                                 hashes_attempted.fetch_add(local_hashes, Ordering::Relaxed);
                             }
                             found.store(true, Ordering::Relaxed);
-                            let _ = sender.send(Err(format!(
-                                "team share hashing failed: {error}"
-                            )));
+                            let _ = sender.send(Err(format!("team share hashing failed: {error}")));
                             return;
                         }
                     };
@@ -2737,9 +2737,7 @@ fn solve_team_share(
                         found.store(true, Ordering::Relaxed);
                         return Err("team share work cancelled".to_string());
                     }
-                    if zoka::api::global_network_runtime().local_chain_height()
-                        >= template.height
-                    {
+                    if zoka::api::global_network_runtime().local_chain_height() >= template.height {
                         found.store(true, Ordering::Relaxed);
                         return Err(format!(
                             "stale team template: chain advanced past height {}",
@@ -2796,10 +2794,7 @@ fn verify_team_solution_for_candidate(
         .calculate_hash(&input)
         .map_err(|error| format!("team solution PoW recomputation failed: {error}"))?;
     if recomputed != claimed_hash
-        || !zoka::mining::pow::hash_meets_difficulty(
-            &recomputed,
-            expected_difficulty_bits,
-        )
+        || !zoka::mining::pow::hash_meets_difficulty(&recomputed, expected_difficulty_bits)
     {
         return Err("mining-team solution does not satisfy its canonical template".to_string());
     }
@@ -4441,13 +4436,15 @@ fn claim_private_fee_rewards_from_block(
         .claim_private_fees_from_block_claims(wallet_name, &block.private_fee_claims)
     {
         Ok(outcome) => outcome,
-        Err(error) if error.to_string().contains("No valid private fee claims found") => {
+        Err(error)
+            if error
+                .to_string()
+                .contains("No valid private fee claims found") =>
+        {
             return Ok(0);
         }
         Err(error) => {
-            return Err(format!(
-                "failed to scan private mining fee claims: {error}"
-            ));
+            return Err(format!("failed to scan private mining fee claims: {error}"));
         }
     };
     Ok(outcome.claimed_tx_hashes.len())
@@ -4563,8 +4560,9 @@ fn sync_private_coinbase_outputs_from_rpc(
         let to = from.saturating_add(255).min(chain_height);
         let responses = fetch_rpc_block_range(rpc, from, to)?;
         for response in responses {
-            let mut block: zoka::types::Block = serde_json::from_slice(&response.encrypted_block)
-                .map_err(|e| format!("RPC private coinbase block decode failed: {e}"))?;
+            let mut block: zoka::types::Block =
+                serde_json::from_slice(&response.encrypted_block)
+                    .map_err(|e| format!("RPC private coinbase block decode failed: {e}"))?;
             if block.private_tx_bodies.is_empty() {
                 block.private_tx_bodies = response.private_tx_bodies;
             }
@@ -6093,43 +6091,44 @@ fn run_mining_batch_with_progress(
                 estimated_hashrate_hps: config.hashrate_hps as f64,
             })?;
         }
-        let (pow_hash_bytes, found_nonce, block_hashes, solve_secs) =
-            if let Some(solution) = team_solution {
-                let recomputed = verify_team_solution_for_candidate(
-                    solution,
-                    &config.chain_id,
-                    height,
-                    &prev_hash,
-                    expected_difficulty_bits,
-                )?;
-                mining_log(&format!(
-                    "assembling verified team solution for height={} recipient={} difficulty_bits={}",
-                    height, payout_address, difficulty_bits
-                ));
-                (recomputed, solution.share.nonce, 0, 0.0)
-            } else {
-                mining_log(&format!(
-                    "starting PoW solve for height={} difficulty_bits={} threads={}",
-                    height, difficulty_bits, config.threads
-                ));
-                solve_pow_nonce(
-                    &config.chain_id,
-                    height,
-                    difficulty_bits,
-                    &prev_hash,
-                    &wallet_address,
-                    timestamp,
-                    config.threads,
-                    config.hashrate_hps,
-                    config.honor_local_mining_control,
-                    |snapshot| {
-                        if let Some(callback) = progress.as_deref_mut() {
-                            callback(snapshot)?;
-                        }
-                        Ok(())
-                    },
-                )?
-            };
+        let (pow_hash_bytes, found_nonce, block_hashes, solve_secs) = if let Some(solution) =
+            team_solution
+        {
+            let recomputed = verify_team_solution_for_candidate(
+                solution,
+                &config.chain_id,
+                height,
+                &prev_hash,
+                expected_difficulty_bits,
+            )?;
+            mining_log(&format!(
+                "assembling verified team solution for height={} recipient={} difficulty_bits={}",
+                height, payout_address, difficulty_bits
+            ));
+            (recomputed, solution.share.nonce, 0, 0.0)
+        } else {
+            mining_log(&format!(
+                "starting PoW solve for height={} difficulty_bits={} threads={}",
+                height, difficulty_bits, config.threads
+            ));
+            solve_pow_nonce(
+                &config.chain_id,
+                height,
+                difficulty_bits,
+                &prev_hash,
+                &wallet_address,
+                timestamp,
+                config.threads,
+                config.hashrate_hps,
+                config.honor_local_mining_control,
+                |snapshot| {
+                    if let Some(callback) = progress.as_deref_mut() {
+                        callback(snapshot)?;
+                    }
+                    Ok(())
+                },
+            )?
+        };
         mining_log(&format!(
             "solved height={} in {:.2}s ({} hashes, ~{:.0} H/s)",
             height,
@@ -6229,23 +6228,21 @@ fn run_mining_batch_with_progress(
             },
             _ => Vec::new(),
         };
-        let payout_commitment =
-            zoka::private_wallet::canonical_payment_address(&payout_address)
-                .map_err(|e| format!("invalid mining payout address: {e}"))?;
+        let payout_commitment = zoka::private_wallet::canonical_payment_address(&payout_address)
+            .map_err(|e| format!("invalid mining payout address: {e}"))?;
         let private_fee_claims_for_block = private_manager
             .create_local_private_fee_claims_for_block(
                 &private_tx_hashes_for_block,
                 &payout_commitment,
             )
             .map_err(|e| format!("failed to build private fee claims: {e}"))?;
-        let private_coinbase =
-            zoka::private_wallet::create_private_coinbase_output_for_recipient(
-                reward_for_block,
-                height,
-                &payout_address,
-                height.saturating_add(COINBASE_MATURITY_BLOCKS),
-            )
-            .map_err(|e| format!("failed to build private coinbase output: {e}"))?;
+        let private_coinbase = zoka::private_wallet::create_private_coinbase_output_for_recipient(
+            reward_for_block,
+            height,
+            &payout_address,
+            height.saturating_add(COINBASE_MATURITY_BLOCKS),
+        )
+        .map_err(|e| format!("failed to build private coinbase output: {e}"))?;
         if private_coinbase.recipient_commitment != payout_commitment {
             return Err("private coinbase recipient mismatch".to_string());
         }
@@ -6981,9 +6978,11 @@ fn wallet_digests_from_storage(
         };
     }
     // Se acota lo que un par puede hacer trabajar a otro de una sola vez.
-    let hasta = request
-        .to_height
-        .min(request.from_height + MAX_DIGESTS_PER_RESPONSE - 1);
+    let hasta = request.to_height.min(
+        request
+            .from_height
+            .saturating_add(MAX_DIGESTS_PER_RESPONSE - 1),
+    );
 
     let mut digests = Vec::new();
     for altura in request.from_height.max(1)..=hasta {
@@ -6993,6 +6992,11 @@ fn wallet_digests_from_storage(
             // quien pregunta necesita saber hasta donde llego de verdad.
             _ => break,
         }
+    }
+    if digests.len() != (hasta.saturating_sub(request.from_height.max(1)) + 1) as usize {
+        return WalletDigestsResponse::NotFound {
+            reason: "el nodo no tiene el rango completo".to_string(),
+        };
     }
     WalletDigestsResponse::Digests { digests }
 }
@@ -7500,17 +7504,10 @@ async fn handle_fullnode_network_message(
                 );
             };
             match team_mining_runtime
-                .observe_advertisement(
-                    advertisement.clone(),
-                    source.to_string(),
-                    now_secs(),
-                )
+                .observe_advertisement(advertisement.clone(), source.to_string(), now_secs())
                 .await
             {
-                Ok(()) => Some(format!(
-                    "Mining team {} is online.",
-                    advertisement.team_id
-                )),
+                Ok(()) => Some(format!("Mining team {} is online.", advertisement.team_id)),
                 Err(error) => Some(format!(
                     "Ignored mining team {}: {error}",
                     advertisement.team_id
@@ -7532,9 +7529,7 @@ async fn handle_fullnode_network_message(
                     "Mining-team membership updated for {}.",
                     membership.member_address
                 )),
-                Err(error) => Some(format!(
-                    "Ignored mining-team membership request: {error}"
-                )),
+                Err(error) => Some(format!("Ignored mining-team membership request: {error}")),
             }
         }
         zoka::network::message::ZokaMessage::ShareSubmit(share) => {
@@ -8113,9 +8108,8 @@ async fn current_team_mining_template(
     if team.coordinator != status.local_address {
         return Ok(team.active_template);
     }
-    let storage = storage.ok_or_else(|| {
-        "team mining requires the fullnode canonical chain database".to_string()
-    })?;
+    let storage = storage
+        .ok_or_else(|| "team mining requires the fullnode canonical chain database".to_string())?;
     let head = zoka::state::chain::read_chain_head(storage)
         .map_err(|error| format!("team mining failed to read chain head: {error}"))?;
     let (height, prev_hash) = match head {
@@ -8435,7 +8429,11 @@ fn append_unique_peer_addrs(
 fn shuffled_peer_addrs_excluding(seed_addrs: &[String], propias: &[String]) -> Vec<String> {
     let mut shuffled = seed_addrs
         .iter()
-        .filter(|addr| !propias.iter().any(|propia| direcciones_equivalentes(addr, propia)))
+        .filter(|addr| {
+            !propias
+                .iter()
+                .any(|propia| direcciones_equivalentes(addr, propia))
+        })
         .cloned()
         .collect::<Vec<_>>();
     shuffled.shuffle(&mut rand::thread_rng());
@@ -11514,7 +11512,9 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             // que anunciarla seria ofrecer algo que este proceso no puede
             // liberar. En modo solo-sincronizar el mercado no se toca.
             if !sync_only {
-                if let Err(error) = announce_local_exchange_offers(&mut node, &exchange_runtime).await {
+                if let Err(error) =
+                    announce_local_exchange_offers(&mut node, &exchange_runtime).await
+                {
                     last_event = error;
                 }
             }
@@ -11522,27 +11522,24 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             now = tokio::time::Instant::now();
         }
         if now >= next_warmup_team_tick_at {
-            if let Err(error) =
-                publish_team_mining_messages(&mut node, &team_mining_runtime).await
+            if let Err(error) = publish_team_mining_messages(&mut node, &team_mining_runtime).await
             {
                 last_event = error;
             }
-            next_warmup_team_tick_at =
-                tokio::time::Instant::now() + Duration::from_secs(1);
+            next_warmup_team_tick_at = tokio::time::Instant::now() + Duration::from_secs(1);
             now = tokio::time::Instant::now();
         }
         if now >= next_warmup_seed_reconnect_at {
             let target_seed_peers =
                 seed_connection_target(configured_seed_nodes, reconnect_seed_peers.len());
-            if let Some(reconnect_event) =
-                maintain_seed_connections(
-                    &mut node,
-                    &reconnect_seed_peers,
-                    target_seed_peers,
-                    &external_addrs,
-                    &peer_store.dial_addrs(32),
-                )
-                .await
+            if let Some(reconnect_event) = maintain_seed_connections(
+                &mut node,
+                &reconnect_seed_peers,
+                target_seed_peers,
+                &external_addrs,
+                &peer_store.dial_addrs(32),
+            )
+            .await
             {
                 last_event = reconnect_event;
             }
@@ -11883,8 +11880,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut next_private_pull_at = tokio::time::Instant::now();
     // Arranca corrido un intervalo: al levantar el nodo el gossip todavia no
     // tiene peers suscritos, y reenviar en ese momento es tirar el intento.
-    let mut next_private_regossip_at = tokio::time::Instant::now()
-        + Duration::from_secs(PRIVATE_TX_REGOSSIP_INTERVAL_SECS);
+    let mut next_private_regossip_at =
+        tokio::time::Instant::now() + Duration::from_secs(PRIVATE_TX_REGOSSIP_INTERVAL_SECS);
     let mut next_private_body_pull_at = tokio::time::Instant::now();
     let mut last_private_body_scan_height = 0u64;
     let mut heartbeat_last_status_log = HashMap::<String, bool>::new();
@@ -11927,15 +11924,16 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         if tokio::time::Instant::now() >= next_offer_announce_at {
             // Mismo motivo que en el calentamiento: sin wallet no hay respaldo.
             if !sync_only {
-                if let Err(error) = announce_local_exchange_offers(&mut node, &exchange_runtime).await {
+                if let Err(error) =
+                    announce_local_exchange_offers(&mut node, &exchange_runtime).await
+                {
                     last_event = error;
                 }
             }
             next_offer_announce_at = tokio::time::Instant::now() + Duration::from_secs(30);
         }
         if tokio::time::Instant::now() >= next_team_tick_at {
-            if let Err(error) =
-                publish_team_mining_messages(&mut node, &team_mining_runtime).await
+            if let Err(error) = publish_team_mining_messages(&mut node, &team_mining_runtime).await
             {
                 last_event = error;
             }
@@ -11987,9 +11985,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             }
         }
 
-        if !checkpoint_quarantine
-            && tokio::time::Instant::now() >= next_team_work_at
-        {
+        if !checkpoint_quarantine && tokio::time::Instant::now() >= next_team_work_at {
             if let Err(error) = current_team_mining_template(
                 &team_mining_runtime,
                 &chain_id,
@@ -12119,9 +12115,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         let mining_active = mining_task.is_some();
         let mining_control = zoka::api::global_local_mining_control().snapshot();
         let runtime_mining_enabled =
-            !checkpoint_quarantine
-                && !team_status.enabled
-                && (auto_mine || mining_control.enabled);
+            !checkpoint_quarantine && !team_status.enabled && (auto_mine || mining_control.enabled);
         let runtime_mining_threads = if mining_control.threads > 0 {
             mining_control.threads.clamp(1, 128) as usize
         } else {
@@ -12325,19 +12319,14 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         }
 
         if !mining_active && tokio::time::Instant::now() >= next_ibd_at {
-            if let Some(header_event) = drain_header_responses(
-                &mut node,
-                db_path.as_deref(),
-                &mut peer_chain_view,
-            )? {
+            if let Some(header_event) =
+                drain_header_responses(&mut node, db_path.as_deref(), &mut peer_chain_view)?
+            {
                 last_event = header_event;
             }
-            if let Some(probe_event) = run_branch_header_probe_step(
-                &mut node,
-                db_path.as_deref(),
-                &mut peer_chain_view,
-            )
-            .await?
+            if let Some(probe_event) =
+                run_branch_header_probe_step(&mut node, db_path.as_deref(), &mut peer_chain_view)
+                    .await?
             {
                 last_event = probe_event;
             }
@@ -12411,15 +12400,14 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         if tokio::time::Instant::now() >= next_seed_reconnect_at {
             let target_seed_peers =
                 seed_connection_target(configured_seed_nodes, reconnect_seed_peers.len());
-            if let Some(reconnect_event) =
-                maintain_seed_connections(
-                    &mut node,
-                    &reconnect_seed_peers,
-                    target_seed_peers,
-                    &external_addrs,
-                    &peer_store.dial_addrs(32),
-                )
-                .await
+            if let Some(reconnect_event) = maintain_seed_connections(
+                &mut node,
+                &reconnect_seed_peers,
+                target_seed_peers,
+                &external_addrs,
+                &peer_store.dial_addrs(32),
+            )
+            .await
             {
                 last_event = reconnect_event;
             }
@@ -12626,9 +12614,9 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     };
                     node.cache_private_tx_body(&hash, bytes.clone());
                     let converted = serde_json::to_value(&tx).and_then(|v| {
-                        serde_json::from_value::<
-                            zoka::network::message::PrivateTransactionMessage,
-                        >(v)
+                        serde_json::from_value::<zoka::network::message::PrivateTransactionMessage>(
+                            v,
+                        )
                     });
                     let Ok(msg) = converted else { continue };
                     let announce =
@@ -16358,7 +16346,12 @@ fn cmd_team_status(args: &[String]) -> Result<(), String> {
         "{}",
         dashboard_line(
             "Hashing",
-            yes_no(estado.get("hashing").and_then(|v| v.as_bool()).unwrap_or(false))
+            yes_no(
+                estado
+                    .get("hashing")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            )
         )
     );
     Ok(())
@@ -18519,7 +18512,10 @@ mod tests {
             Some((15642, 15644))
         );
         // Ya enganchado: no queda nada por debajo que adelantar.
-        assert_eq!(super::ibd_prefetch_window(15641, Some(15642), 15884, 8), None);
+        assert_eq!(
+            super::ibd_prefetch_window(15641, Some(15642), 15884, 8),
+            None
+        );
     }
 
     #[test]
@@ -18653,7 +18649,11 @@ mod tests {
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
-        assert_eq!(logs.len(), 1, "solo la copia rotada deberia quedar: {logs:?}");
+        assert_eq!(
+            logs.len(),
+            1,
+            "solo la copia rotada deberia quedar: {logs:?}"
+        );
     }
 
     #[test]
@@ -18776,7 +18776,11 @@ mod tests {
         let sana = "/onion3/aaa:28080".to_string();
         let muerta = "/onion3/zzz:28080".to_string();
         let nueva = "/onion3/nueva:28080".to_string();
-        let por_salud = vec![sana.clone(), "/onion3/bbb:28080".to_string(), muerta.clone()];
+        let por_salud = vec![
+            sana.clone(),
+            "/onion3/bbb:28080".to_string(),
+            muerta.clone(),
+        ];
 
         let orden = ranked_dial_candidates(
             &[muerta.clone(), nueva.clone(), sana.clone()],
@@ -18786,7 +18790,10 @@ mod tests {
 
         let pos = |a: &String| orden.iter().position(|x| x == a).unwrap();
         assert!(pos(&sana) < pos(&nueva), "la probada va antes: {orden:?}");
-        assert!(pos(&nueva) < pos(&muerta), "la nueva va antes que la muerta: {orden:?}");
+        assert!(
+            pos(&nueva) < pos(&muerta),
+            "la nueva va antes que la muerta: {orden:?}"
+        );
     }
 
     /// Los comandos de equipo hablan con el nodo de ESTA maquina por defecto.
@@ -18811,7 +18818,10 @@ mod tests {
         let err = cmd_team_join(&[]).unwrap_err();
         assert!(err.contains("--code"), "mensaje poco util: {err}");
         let vacio = cmd_team_join(&["--code".to_string(), "   ".to_string()]).unwrap_err();
-        assert!(vacio.contains("--code"), "un codigo en blanco es no tener codigo: {vacio}");
+        assert!(
+            vacio.contains("--code"),
+            "un codigo en blanco es no tener codigo: {vacio}"
+        );
     }
 
     /// Marcar la direccion propia falla siempre con "tried to dial local peer
@@ -18837,8 +18847,14 @@ mod tests {
             "/onion3/abc:28080",
             "/onion3/abc:28080/p2p/12D3KooWfoo",
         ));
-        assert!(direcciones_equivalentes("/onion3/ABC:28080/", "/onion3/abc:28080"));
-        assert!(!direcciones_equivalentes("/onion3/abc:28080", "/onion3/xyz:28080"));
+        assert!(direcciones_equivalentes(
+            "/onion3/ABC:28080/",
+            "/onion3/abc:28080"
+        ));
+        assert!(!direcciones_equivalentes(
+            "/onion3/abc:28080",
+            "/onion3/xyz:28080"
+        ));
         assert!(!direcciones_equivalentes("", "/onion3/abc:28080"));
     }
 
@@ -19173,8 +19189,7 @@ mod tests {
     #[test]
     fn team_share_worker_solves_the_exact_coordinator_template() {
         let address = make_valid_zka1();
-        let mut team =
-            zoka::team_mining::TeamState::create(address.clone(), now_secs()).unwrap();
+        let mut team = zoka::team_mining::TeamState::create(address.clone(), now_secs()).unwrap();
         let template = team
             .set_template(
                 "zoka-dev-team".to_string(),
@@ -19184,11 +19199,7 @@ mod tests {
                 1,
             )
             .unwrap();
-        let difficulty = team
-            .members
-            .get(&address)
-            .unwrap()
-            .share_difficulty_bits;
+        let difficulty = team.members.get(&address).unwrap().share_difficulty_bits;
         let solved = solve_team_share(
             template.clone(),
             address,
@@ -19233,9 +19244,7 @@ mod tests {
         manager.create_private_wallet("sender").unwrap();
         let receiver = manager.create_private_wallet("receiver").unwrap();
         let team_recipient = manager.create_private_wallet("team-recipient").unwrap();
-        manager
-            .deposit_to_private_wallet("sender", 40)
-            .unwrap();
+        manager.deposit_to_private_wallet("sender", 40).unwrap();
         let tx_hash = manager
             .send_private_transaction_with_fee("sender", receiver, 10, 3)
             .unwrap();
@@ -19255,9 +19264,8 @@ mod tests {
             zoka::types::Signature(Vec::new()),
         );
         block.private_fee_claims = claims;
-        block.private_tx_bodies = vec![
-            serde_json::to_vec(&manager.get_private_transaction(&tx_hash).unwrap()).unwrap(),
-        ];
+        block.private_tx_bodies =
+            vec![serde_json::to_vec(&manager.get_private_transaction(&tx_hash).unwrap()).unwrap()];
 
         assert_eq!(
             claim_private_fee_rewards_from_block(&mut manager, "receiver", &block).unwrap(),

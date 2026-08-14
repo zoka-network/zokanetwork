@@ -37,10 +37,6 @@ use crate::network::block_request_response::{
     BlockRequestResponseCodec,
 };
 use crate::network::handler::MessageHandler;
-use crate::network::wallet_digest_request_response::{
-    protocol_name as wallet_digest_protocol, BlockDigest, GetWalletDigests,
-    WalletDigestRequestResponseCodec, WalletDigestsResponse,
-};
 use crate::network::header_request_response::{
     protocol_name as header_request_response_protocol, GetHeaders, HeaderRequestResponseCodec,
     HeadersResponse,
@@ -58,6 +54,11 @@ use crate::network::snapshot_request_response::{
     protocol_name as snapshot_request_response_protocol, GetSnapshotManifests,
     SnapshotManifestsResponse, SnapshotRequestResponseCodec,
 };
+use crate::network::wallet_digest_request_response::{
+    protocol_name as wallet_digest_protocol, BlockDigest, GetWalletDigests,
+    WalletDigestRequestResponseCodec, WalletDigestsResponse,
+};
+use crate::private_wallet::PrivateTransaction;
 
 pub const GENERAL_TOPIC_NAME: &str = "zoka/messages/v1";
 pub const PBFT_TOPIC_NAME: &str = "zoka/pbft/v1";
@@ -75,8 +76,49 @@ pub const OFFERS_TOPIC_NAME: &str = "zoka/offers/v1";
 /// Older nodes never subscribe, so high-frequency shares do not become
 /// decode warnings or bandwidth on nodes that did not opt into the protocol.
 pub const TEAM_MINING_TOPIC_NAME: &str = "zoka/team-mining/v1";
+/// Shared outer budget for one mobile P2P data operation. The request/response
+/// handler timeout below must outlive it so caller-side failover owns expiry.
+pub(crate) const MOBILE_P2P_OPERATION_WAIT: Duration = Duration::from_secs(60);
+pub(crate) const PUBLISH_RETRY_PAUSE: Duration = Duration::from_millis(50);
+const DATA_REQUEST_RESPONSE_SLACK: Duration = Duration::from_secs(15);
+const DATA_REQUEST_RESPONSE_TIMEOUT: Duration =
+    MOBILE_P2P_OPERATION_WAIT.saturating_add(DATA_REQUEST_RESPONSE_SLACK);
 const PRIVATE_TX_BODY_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const PRIVATE_TX_BODY_CACHE_MAX: usize = 2048;
+/// Request/response events can arrive after their synchronous caller timed out.
+/// Keep those events bounded until the caller gets a chance to discard them.
+const MAX_DEFERRED_DIRECT_RESPONSES: usize = 256;
+const MAX_DEFERRED_WALLET_DIGEST_RESPONSES: usize = 32;
+/// Keep digest failover useful over Tor without letting one request walk the
+/// whole peer set. Rotation still gives every peer a turn across calls.
+const MAX_WALLET_DIGEST_PEER_ATTEMPTS: usize = 3;
+
+fn push_bounded<T>(queue: &mut VecDeque<T>, value: T, max_len: usize) {
+    while queue.len() >= max_len {
+        queue.pop_front();
+    }
+    queue.push_back(value);
+}
+
+fn rotate_and_limit_wallet_digest_peers(mut peers: Vec<PeerId>, cursor: usize) -> Vec<PeerId> {
+    if peers.is_empty() {
+        return peers;
+    }
+    let rotation = cursor % peers.len();
+    peers.rotate_left(rotation);
+    peers.truncate(MAX_WALLET_DIGEST_PEER_ATTEMPTS);
+    peers
+}
+
+fn wallet_digest_attempt_budget(remaining: Duration, candidates_left: usize) -> Duration {
+    remaining
+        .checked_div(candidates_left.max(1) as u32)
+        .unwrap_or(remaining)
+}
+
+fn data_request_response_config() -> request_response::Config {
+    request_response::Config::default().with_request_timeout(DATA_REQUEST_RESPONSE_TIMEOUT)
+}
 // Bumped for each release that requires a hard minimum-version cutover: any
 // peer running an older binary reports the old id and gets disconnected
 // during the libp2p identify handshake (enforce_protocol_freeze_for_peer),
@@ -377,6 +419,20 @@ struct ReceivedBlockBodyResponse {
     latency: Duration,
 }
 
+#[derive(Clone, Debug)]
+struct ReceivedWalletDigestsResponse {
+    request_id: request_response::OutboundRequestId,
+    peer: PeerId,
+    response: WalletDigestsResponse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WalletDigestValidationError {
+    MissingPrevHash,
+    InvalidRange,
+    BrokenChain,
+}
+
 /// A validated gossip message together with its signed libp2p author. Local
 /// fanout/interception may use `None`. The author, rather than the immediate
 /// mesh relay, identifies the node that can serve the block's ancestry.
@@ -393,6 +449,12 @@ pub struct SourcedZokaMessage {
 pub struct SourcedBlockResponse {
     pub source: PeerId,
     pub response: BlockResponseMessage,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum MobileBlockProbe {
+    Found(SourcedBlockResponse),
+    NotFound,
 }
 
 #[derive(Clone, Debug)]
@@ -810,8 +872,14 @@ pub struct Node {
     pending_header_requests: VecDeque<PendingHeaderRequest>,
     /// Outbound GetHeaders responses received while the caller was not waiting.
     received_header_responses: VecDeque<ReceivedHeadersResponse>,
+    /// Digest requests that are still owned by the active sequential failover.
+    /// Removing an id marks late libp2p events as stale so the handler drops them.
+    pending_outbound_wallet_digest_requests: HashMap<request_response::OutboundRequestId, PeerId>,
     /// Resumenes de bloque recibidos, esperando a que alguien los recoja.
-    received_wallet_digests: VecDeque<(PeerId, WalletDigestsResponse)>,
+    received_wallet_digests: VecDeque<ReceivedWalletDigestsResponse>,
+    /// Rotates the first digest provider between chunks without fanning a chunk
+    /// out to every connected peer.
+    wallet_digest_peer_cursor: usize,
     /// Inbound snapshot manifest requests.
     pending_snapshot_requests: VecDeque<PendingSnapshotManifestRequest>,
     /// Outbound snapshot manifest responses received from peers.
@@ -828,8 +896,7 @@ pub struct Node {
     #[allow(clippy::type_complexity)]
     header_responder: Option<Box<dyn Fn(&GetHeaders) -> HeadersResponse + Send>>,
     #[allow(clippy::type_complexity)]
-    wallet_digest_responder:
-        Option<Box<dyn Fn(&GetWalletDigests) -> WalletDigestsResponse + Send>>,
+    wallet_digest_responder: Option<Box<dyn Fn(&GetWalletDigests) -> WalletDigestsResponse + Send>>,
 }
 
 /// Behaviour set for the node.
@@ -1895,8 +1962,7 @@ impl Node {
             )?
             .with_other_transport(move |key| {
                 build_tor_socks_transport(key, tor_proxy_for_transport.clone())
-            })?
-            ;
+            })?;
         // El resolutor de DNS del sistema no existe en todas partes.
         //
         // `with_dns()` lee la configuracion del sistema al construirse: en
@@ -1912,115 +1978,107 @@ impl Node {
         // existe para evitar. Se pierden las semillas `/dns4/`, que en un
         // telefono no se usan.
         let comportamiento = move |key: &identity::Keypair| {
-                let local_peer_id = PeerId::from(key.public());
+            let local_peer_id = PeerId::from(key.public());
 
-                let kademlia = kad::Behaviour::with_config(
-                    local_peer_id,
-                    MemoryStore::new(local_peer_id),
-                    kad::Config::default(),
-                );
+            let kademlia = kad::Behaviour::with_config(
+                local_peer_id,
+                MemoryStore::new(local_peer_id),
+                kad::Config::default(),
+            );
 
-                // Mesh size tuned for the current network scale (roughly 2-20
-                // real peers), not libp2p's defaults (mesh_n=6/low=5/high=12),
-                // which are sized for 50+ peer networks. At this scale the
-                // defaults leave every node permanently below mesh_n_low,
-                // causing continuous pointless GRAFT churn every heartbeat.
-                // mesh_outbound_min=1 (down from 2) because a 2-seed-only
-                // topology can't always satisfy 2 outbound mesh slots.
-                let gossipsub_config = gossipsub::ConfigBuilder::default()
-                    .heartbeat_interval(Duration::from_secs(1))
-                    .validation_mode(gossipsub::ValidationMode::Strict)
-                    .flood_publish(true)
-                    .mesh_n(4)
-                    .mesh_n_low(2)
-                    .mesh_n_high(8)
-                    .mesh_outbound_min(1)
-                    .max_transmit_size(GOSSIP_MAX_TRANSMIT_SIZE)
-                    .build()
-                    .map_err(|e| io::Error::other(format!("gossipsub config error: {e}")))?;
+            // Mesh size tuned for the current network scale (roughly 2-20
+            // real peers), not libp2p's defaults (mesh_n=6/low=5/high=12),
+            // which are sized for 50+ peer networks. At this scale the
+            // defaults leave every node permanently below mesh_n_low,
+            // causing continuous pointless GRAFT churn every heartbeat.
+            // mesh_outbound_min=1 (down from 2) because a 2-seed-only
+            // topology can't always satisfy 2 outbound mesh slots.
+            let gossipsub_config = gossipsub::ConfigBuilder::default()
+                .heartbeat_interval(Duration::from_secs(1))
+                .validation_mode(gossipsub::ValidationMode::Strict)
+                .flood_publish(true)
+                .mesh_n(4)
+                .mesh_n_low(2)
+                .mesh_n_high(8)
+                .mesh_outbound_min(1)
+                .max_transmit_size(GOSSIP_MAX_TRANSMIT_SIZE)
+                .build()
+                .map_err(|e| io::Error::other(format!("gossipsub config error: {e}")))?;
 
-                let mut gossipsub = gossipsub::Behaviour::new(
-                    gossipsub::MessageAuthenticity::Signed(key.clone()),
-                    gossipsub_config,
-                )?;
+            let mut gossipsub = gossipsub::Behaviour::new(
+                gossipsub::MessageAuthenticity::Signed(key.clone()),
+                gossipsub_config,
+            )?;
 
-                gossipsub.subscribe(&general_topic_for_behaviour)?;
-                gossipsub.subscribe(&pbft_topic_for_behaviour)?;
-                gossipsub.subscribe(&stem_topic_for_behaviour)?;
-                gossipsub.subscribe(&mixer_topic_for_behaviour)?;
-                gossipsub.subscribe(&offers_topic_for_behaviour)?;
-                gossipsub.subscribe(&team_mining_topic_for_behaviour)?;
-                // Request/response timeouts are sized for onion transport:
-                // a Tor circuit adds several seconds of round-trip latency and
-                // each request opens a fresh substream (multistream-select +
-                // the round trip). The old 8-15s budgets were fine for
-                // clearnet but too tight once the network's only reliable path
-                // is Tor, so IBD block fetches would time out and retry
-                // forever. 30s gives comfortable headroom over Tor while still
-                // failing a genuinely dead peer in bounded time.
-                let block_request_response = request_response::Behaviour::with_codec(
-                    BlockRequestResponseCodec,
-                    [(
-                        block_request_response_protocol(),
-                        request_response::ProtocolSupport::Full,
-                    )],
-                    request_response::Config::default()
-                        .with_request_timeout(Duration::from_secs(30)),
-                );
-                let private_tx_request_response = request_response::Behaviour::with_codec(
-                    PrivateTxRequestResponseCodec,
-                    [(
-                        private_tx_request_response_protocol(),
-                        request_response::ProtocolSupport::Full,
-                    )],
-                    request_response::Config::default()
-                        .with_request_timeout(Duration::from_secs(20)),
-                );
-                let header_request_response = request_response::Behaviour::with_codec(
-                    HeaderRequestResponseCodec,
-                    [(
-                        header_request_response_protocol(),
-                        request_response::ProtocolSupport::Full,
-                    )],
-                    request_response::Config::default()
-                        .with_request_timeout(Duration::from_secs(30)),
-                );
-                let wallet_digest_request_response = request_response::Behaviour::with_codec(
-                    WalletDigestRequestResponseCodec,
-                    [(
-                        wallet_digest_protocol(),
-                        request_response::ProtocolSupport::Full,
-                    )],
-                    request_response::Config::default()
-                        .with_request_timeout(Duration::from_secs(45)),
-                );
-                let snapshot_request_response = request_response::Behaviour::with_codec(
-                    SnapshotRequestResponseCodec,
-                    [(
-                        snapshot_request_response_protocol(),
-                        request_response::ProtocolSupport::Full,
-                    )],
-                    request_response::Config::default()
-                        .with_request_timeout(Duration::from_secs(30)),
-                );
+            gossipsub.subscribe(&general_topic_for_behaviour)?;
+            gossipsub.subscribe(&pbft_topic_for_behaviour)?;
+            gossipsub.subscribe(&stem_topic_for_behaviour)?;
+            gossipsub.subscribe(&mixer_topic_for_behaviour)?;
+            gossipsub.subscribe(&offers_topic_for_behaviour)?;
+            gossipsub.subscribe(&team_mining_topic_for_behaviour)?;
+            // In libp2p-request-response 0.26.3 this timeout bounds the
+            // read/write task after substream negotiation, in both directions.
+            // It is separate from dialing and must exceed the mobile caller's
+            // 60s deadline; otherwise the behaviour reports failure before the
+            // caller can finish its own sequential failover policy.
+            let block_request_response = request_response::Behaviour::with_codec(
+                BlockRequestResponseCodec,
+                [(
+                    block_request_response_protocol(),
+                    request_response::ProtocolSupport::Full,
+                )],
+                data_request_response_config(),
+            );
+            let private_tx_request_response = request_response::Behaviour::with_codec(
+                PrivateTxRequestResponseCodec,
+                [(
+                    private_tx_request_response_protocol(),
+                    request_response::ProtocolSupport::Full,
+                )],
+                data_request_response_config(),
+            );
+            let header_request_response = request_response::Behaviour::with_codec(
+                HeaderRequestResponseCodec,
+                [(
+                    header_request_response_protocol(),
+                    request_response::ProtocolSupport::Full,
+                )],
+                request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
+            );
+            let wallet_digest_request_response = request_response::Behaviour::with_codec(
+                WalletDigestRequestResponseCodec,
+                [(
+                    wallet_digest_protocol(),
+                    request_response::ProtocolSupport::Full,
+                )],
+                data_request_response_config(),
+            );
+            let snapshot_request_response = request_response::Behaviour::with_codec(
+                SnapshotRequestResponseCodec,
+                [(
+                    snapshot_request_response_protocol(),
+                    request_response::ProtocolSupport::Full,
+                )],
+                request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
+            );
 
-                Ok(NodeBehaviour {
-                    identify: identify::Behaviour::new(identify::Config::new(
-                        identify_protocol_version.clone(),
-                        key.public(),
-                    )),
-                    kademlia,
-                    gossipsub,
-                    block_request_response,
-                    private_tx_request_response,
-                    header_request_response,
-                    wallet_digest_request_response,
-                    snapshot_request_response,
-                    // Default: ping every 15s, 20s timeout. Well under the
-                    // libp2p idle timeout (300s) and Tor's circuit idle window,
-                    // so the peer link stays up between sparse block gossip.
-                    ping: libp2p::ping::Behaviour::new(libp2p::ping::Config::new()),
-                })
+            Ok(NodeBehaviour {
+                identify: identify::Behaviour::new(identify::Config::new(
+                    identify_protocol_version.clone(),
+                    key.public(),
+                )),
+                kademlia,
+                gossipsub,
+                block_request_response,
+                private_tx_request_response,
+                header_request_response,
+                wallet_digest_request_response,
+                snapshot_request_response,
+                // Default: ping every 15s, 20s timeout. Well under the
+                // libp2p idle timeout (300s) and Tor's circuit idle window,
+                // so the peer link stays up between sparse block gossip.
+                ping: libp2p::ping::Behaviour::new(libp2p::ping::Config::new()),
+            })
         };
         let configurar_swarm = |cfg: libp2p::swarm::Config| {
             // libp2p 0.53+ cierra la conexion apenas se queda sin flujos
@@ -2095,7 +2153,9 @@ impl Node {
             block_request_peer_stats: HashMap::new(),
             pending_header_requests: VecDeque::new(),
             received_header_responses: VecDeque::new(),
+            pending_outbound_wallet_digest_requests: HashMap::new(),
             received_wallet_digests: VecDeque::new(),
+            wallet_digest_peer_cursor: 0,
             pending_snapshot_requests: VecDeque::new(),
             received_snapshot_manifests: VecDeque::new(),
             block_body_responder: None,
@@ -2328,33 +2388,30 @@ impl Node {
                     request_id,
                     response,
                 } => {
-                    let pending = self
+                    let Some(pending) = self
                         .pending_outbound_block_body_requests
-                        .remove(&request_id);
-                    let latency = pending
-                        .as_ref()
-                        .map(|pending| pending.started_at.elapsed())
-                        .unwrap_or_default();
-                    let response_peer = pending
-                        .as_ref()
-                        .map(|pending| pending.peer.clone())
-                        .unwrap_or_else(|| peer.clone());
-                    let requested_height =
-                        pending.as_ref().map(|pending| pending.request.block_height);
+                        .remove(&request_id)
+                    else {
+                        debug!(
+                            "discarding stale direct block response: request_id={request_id:?} peer={peer}"
+                        );
+                        return;
+                    };
+                    let latency = pending.started_at.elapsed();
+                    let response_peer = pending.peer.clone();
+                    let requested_height = pending.request.block_height;
                     if response_peer != peer {
                         warn!(
                             "direct block response peer mismatch: request_id={request_id:?} expected={} got={}",
                             response_peer, peer
                         );
                     }
-                    if let Some(height) = requested_height {
-                        debug!(
-                            "direct block response received: request_id={request_id:?} peer={} height={} latency_ms={}",
-                            response_peer,
-                            height,
-                            latency.as_millis()
-                        );
-                    }
+                    debug!(
+                        "direct block response received: request_id={request_id:?} peer={} height={} latency_ms={}",
+                        response_peer,
+                        requested_height,
+                        latency.as_millis()
+                    );
                     self.block_request_response_stats.outbound_responses = self
                         .block_request_response_stats
                         .outbound_responses
@@ -2383,13 +2440,16 @@ impl Node {
                     } else {
                         self.record_direct_block_failure(response_peer.clone());
                     }
-                    self.received_block_body_responses
-                        .push_back(ReceivedBlockBodyResponse {
+                    push_bounded(
+                        &mut self.received_block_body_responses,
+                        ReceivedBlockBodyResponse {
                             request_id,
                             peer: response_peer,
                             response,
                             latency,
-                        });
+                        },
+                        MAX_DEFERRED_DIRECT_RESPONSES,
+                    );
                 }
             },
             request_response::Event::OutboundFailure {
@@ -2397,19 +2457,30 @@ impl Node {
                 request_id,
                 error,
             } => {
-                self.pending_outbound_block_body_requests
-                    .remove(&request_id);
+                if self
+                    .pending_outbound_block_body_requests
+                    .remove(&request_id)
+                    .is_none()
+                {
+                    debug!(
+                        "discarding stale direct block failure: request_id={request_id:?} peer={peer}"
+                    );
+                    return;
+                }
                 self.block_request_response_stats.outbound_failures = self
                     .block_request_response_stats
                     .outbound_failures
                     .saturating_add(1);
                 self.record_direct_block_failure(peer);
-                self.block_body_request_failures
-                    .push_back(BlockBodyRequestFailure {
+                push_bounded(
+                    &mut self.block_body_request_failures,
+                    BlockBodyRequestFailure {
                         request_id,
                         peer,
                         error: error.to_string(),
-                    });
+                    },
+                    MAX_DEFERRED_DIRECT_RESPONSES,
+                );
             }
             request_response::Event::InboundFailure { peer, error, .. } => {
                 self.block_request_response_stats.inbound_failures = self
@@ -2458,37 +2529,37 @@ impl Node {
                     request_id,
                     response,
                 } => {
-                    let pending = self
+                    let Some(pending) = self
                         .pending_outbound_private_tx_body_requests
-                        .remove(&request_id);
-                    let latency = pending
-                        .as_ref()
-                        .map(|pending| pending.started_at.elapsed())
-                        .unwrap_or_default();
-                    let response_peer = pending
-                        .as_ref()
-                        .map(|pending| pending.peer.clone())
-                        .unwrap_or_else(|| peer.clone());
-                    if let Some(request) = pending.as_ref() {
+                        .remove(&request_id)
+                    else {
                         debug!(
-                            "direct private tx response received: request_id={request_id:?} peer={} hash={} latency_ms={}",
-                            response_peer,
-                            request.request.tx_hash,
-                            latency.as_millis()
+                            "discarding stale private tx response: request_id={request_id:?} peer={peer}"
                         );
-                    }
+                        return;
+                    };
+                    let latency = pending.started_at.elapsed();
+                    let response_peer = pending.peer.clone();
+                    debug!(
+                        "direct private tx response received: request_id={request_id:?} peer={} hash={} latency_ms={}",
+                        response_peer,
+                        pending.request.tx_hash,
+                        latency.as_millis()
+                    );
                     self.private_tx_request_response_stats.outbound_responses = self
                         .private_tx_request_response_stats
                         .outbound_responses
                         .saturating_add(1);
                     self.record_private_tx_request_success(response_peer.clone(), latency);
-                    self.received_private_tx_body_responses.push_back(
+                    push_bounded(
+                        &mut self.received_private_tx_body_responses,
                         ReceivedPrivateTxBodyResponse {
                             request_id,
                             peer: response_peer,
                             response,
                             latency,
                         },
+                        MAX_DEFERRED_DIRECT_RESPONSES,
                     );
                 }
             },
@@ -2497,19 +2568,30 @@ impl Node {
                 request_id,
                 error,
             } => {
-                self.pending_outbound_private_tx_body_requests
-                    .remove(&request_id);
+                if self
+                    .pending_outbound_private_tx_body_requests
+                    .remove(&request_id)
+                    .is_none()
+                {
+                    debug!(
+                        "discarding stale private tx failure: request_id={request_id:?} peer={peer}"
+                    );
+                    return;
+                }
                 self.private_tx_request_response_stats.outbound_failures = self
                     .private_tx_request_response_stats
                     .outbound_failures
                     .saturating_add(1);
                 self.record_private_tx_request_failure(peer);
-                self.private_tx_body_request_failures
-                    .push_back(PrivateTxBodyRequestFailure {
+                push_bounded(
+                    &mut self.private_tx_body_request_failures,
+                    PrivateTxBodyRequestFailure {
                         request_id,
                         peer,
                         error: error.to_string(),
-                    });
+                    },
+                    MAX_DEFERRED_DIRECT_RESPONSES,
+                );
             }
             request_response::Event::InboundFailure { peer, error, .. } => {
                 self.private_tx_request_response_stats.inbound_failures = self
@@ -2646,22 +2728,66 @@ impl Node {
                         .wallet_digest_request_response
                         .send_response(channel, respuesta);
                 }
-                request_response::Message::Response { response, .. } => {
-                    self.received_wallet_digests.push_back((peer, response));
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                } => {
+                    let Some(expected_peer) = self
+                        .pending_outbound_wallet_digest_requests
+                        .remove(&request_id)
+                    else {
+                        debug!(
+                            "discarding stale wallet digest response: request_id={request_id:?} peer={peer}"
+                        );
+                        return;
+                    };
+                    if expected_peer != peer {
+                        warn!(
+                            "wallet digest response peer mismatch: request_id={request_id:?} expected={expected_peer} got={peer}"
+                        );
+                    }
+                    push_bounded(
+                        &mut self.received_wallet_digests,
+                        ReceivedWalletDigestsResponse {
+                            request_id,
+                            peer,
+                            response,
+                        },
+                        MAX_DEFERRED_WALLET_DIGEST_RESPONSES,
+                    );
                 }
             },
-            request_response::Event::OutboundFailure { peer, error, .. } => {
+            request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+            } => {
+                if self
+                    .pending_outbound_wallet_digest_requests
+                    .remove(&request_id)
+                    .is_none()
+                {
+                    debug!(
+                        "discarding stale wallet digest failure: request_id={request_id:?} peer={peer}"
+                    );
+                    return;
+                }
                 warn!("wallet digest outbound failure from {}: {}", peer, error);
                 // Un fallo tiene que llegar a quien espera, si no se queda
                 // esperando algo que nunca va a venir en vez de caer al
                 // camino lento. Un par viejo que no conoce el protocolo entra
                 // por aca.
-                self.received_wallet_digests.push_back((
-                    peer,
-                    WalletDigestsResponse::NotFound {
-                        reason: format!("el par no respondio: {error}"),
+                push_bounded(
+                    &mut self.received_wallet_digests,
+                    ReceivedWalletDigestsResponse {
+                        request_id,
+                        peer,
+                        response: WalletDigestsResponse::NotFound {
+                            reason: format!("el par no respondio: {error}"),
+                        },
                     },
-                ));
+                    MAX_DEFERRED_WALLET_DIGEST_RESPONSES,
+                );
             }
             request_response::Event::InboundFailure { peer, error, .. } => {
                 warn!("wallet digest inbound failure from {}: {}", peer, error);
@@ -2686,42 +2812,194 @@ impl Node {
     /// sirve resumenes. Quien llama tiene que caer al protocolo de bloques
     /// enteros en ese caso: los pares viejos no conocen este mensaje y la
     /// wallet tiene que seguir funcionando con ellos.
+    fn validate_wallet_digest_range(
+        mut digests: Vec<BlockDigest>,
+        from_height: u64,
+        to_height: u64,
+        expected_prev_hash: Option<&str>,
+    ) -> Result<Vec<BlockDigest>, WalletDigestValidationError> {
+        let Some(expected_count) = to_height
+            .checked_sub(from_height)
+            .and_then(|distance| distance.checked_add(1))
+            .and_then(|count| usize::try_from(count).ok())
+        else {
+            return Err(WalletDigestValidationError::InvalidRange);
+        };
+        if digests.len() != expected_count {
+            return Err(WalletDigestValidationError::InvalidRange);
+        }
+
+        digests.sort_by_key(|digest| digest.block_height);
+        let mut previous_hash = expected_prev_hash.map(str::to_owned);
+        for (offset, digest) in digests.iter().enumerate() {
+            let Some(expected_height) = from_height.checked_add(offset as u64) else {
+                return Err(WalletDigestValidationError::InvalidRange);
+            };
+            if digest.block_height != expected_height || digest.block_hash.trim().is_empty() {
+                return Err(WalletDigestValidationError::InvalidRange);
+            }
+            // `prev_hash` was added compatibly to protocol v1. An empty value
+            // means the remote peer encoded the older v1 shape: do not confuse
+            // that with a valid unanchored one-block response.
+            if digest.prev_hash.trim().is_empty() {
+                return Err(WalletDigestValidationError::MissingPrevHash);
+            }
+            if let Some(previous_hash) = previous_hash.as_deref() {
+                if digest.prev_hash != previous_hash {
+                    return Err(WalletDigestValidationError::BrokenChain);
+                }
+            }
+            previous_hash = Some(digest.block_hash.clone());
+        }
+        Ok(digests)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wallet_digests_cover_range(
+        digests: &[BlockDigest],
+        from_height: u64,
+        to_height: u64,
+    ) -> bool {
+        Self::validate_wallet_digest_range(digests.to_vec(), from_height, to_height, None).is_ok()
+    }
+
+    fn take_wallet_digest_response(
+        &mut self,
+        request_id: request_response::OutboundRequestId,
+    ) -> Option<ReceivedWalletDigestsResponse> {
+        while let Some(response) = self.received_wallet_digests.pop_front() {
+            if response.request_id == request_id {
+                return Some(response);
+            }
+            debug!(
+                "discarding unmatched wallet digest response: request_id={:?}",
+                response.request_id
+            );
+        }
+        None
+    }
+
+    fn abandon_wallet_digest_request(&mut self, request_id: request_response::OutboundRequestId) {
+        self.pending_outbound_wallet_digest_requests
+            .remove(&request_id);
+        self.received_wallet_digests
+            .retain(|response| response.request_id != request_id);
+    }
+
     pub async fn request_wallet_digests(
         &mut self,
         from_height: u64,
         to_height: u64,
         max_wait: Duration,
     ) -> Option<Vec<BlockDigest>> {
-        let peers = self.select_block_request_peers();
-        let peer = peers.first()?.clone();
-        if !self.swarm.is_connected(&peer) {
+        self.request_wallet_digests_with_anchor(from_height, to_height, None, max_wait)
+            .await
+    }
+
+    pub async fn request_wallet_digests_with_anchor(
+        &mut self,
+        from_height: u64,
+        to_height: u64,
+        expected_prev_hash: Option<&str>,
+        max_wait: Duration,
+    ) -> Option<Vec<BlockDigest>> {
+        if from_height > to_height
+            || to_height.saturating_sub(from_height)
+                >= crate::network::wallet_digest_request_response::MAX_DIGESTS_PER_RESPONSE
+        {
             return None;
         }
-        self.received_wallet_digests.clear();
-        self.swarm
-            .behaviour_mut()
-            .wallet_digest_request_response
-            .send_request(
-                &peer,
-                GetWalletDigests {
-                    from_height,
-                    to_height,
-                },
-            );
+        let mut peers = self
+            .select_block_request_peers()
+            .into_iter()
+            .filter(|peer| self.swarm.is_connected(peer))
+            .collect::<Vec<_>>();
+        if peers.is_empty() {
+            return None;
+        }
+        peers = rotate_and_limit_wallet_digest_peers(peers, self.wallet_digest_peer_cursor);
+        self.wallet_digest_peer_cursor = self.wallet_digest_peer_cursor.wrapping_add(1);
 
+        // `&mut self` serializa estas llamadas. Todo lo anterior ya vencio:
+        // quitar los ids hace que el handler descarte cualquier llegada tardia.
+        self.pending_outbound_wallet_digest_requests.clear();
+        self.received_wallet_digests.clear();
         let deadline = tokio::time::Instant::now() + max_wait;
-        while tokio::time::Instant::now() < deadline {
-            let _ = self.pump_for(PUMP_SLICE_DIGESTS).await;
-            while let Some((_, respuesta)) = self.received_wallet_digests.pop_front() {
-                match respuesta {
-                    WalletDigestsResponse::Digests { digests } => return Some(digests),
-                    WalletDigestsResponse::NotFound { reason } => {
-                        info!("el par no sirve resumenes ({reason}); se usan bloques enteros");
-                        return None;
+        let peer_count = peers.len();
+
+        for (peer_index, peer) in peers.into_iter().enumerate() {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            // Give every remaining peer a bounded chance. Fast NotFound or
+            // invalid replies immediately hand the unused share to the next.
+            let remaining = deadline.saturating_duration_since(now);
+            let attempt_budget =
+                wallet_digest_attempt_budget(remaining, peer_count - peer_index);
+            let attempt_deadline = now + attempt_budget;
+            let request_id = self
+                .swarm
+                .behaviour_mut()
+                .wallet_digest_request_response
+                .send_request(
+                    &peer,
+                    GetWalletDigests {
+                        from_height,
+                        to_height,
+                    },
+                );
+            self.pending_outbound_wallet_digest_requests
+                .insert(request_id, peer.clone());
+
+            loop {
+                if let Some(recibida) = self.take_wallet_digest_response(request_id) {
+                    self.abandon_wallet_digest_request(request_id);
+                    match recibida.response {
+                        WalletDigestsResponse::Digests { digests } => {
+                            match Self::validate_wallet_digest_range(
+                                digests,
+                                from_height,
+                                to_height,
+                                expected_prev_hash,
+                            ) {
+                                Ok(digests) => return Some(digests),
+                                Err(WalletDigestValidationError::MissingPrevHash) => info!(
+                                    "peer {} serves legacy wallet digests without prev_hash",
+                                    recibida.peer
+                                ),
+                                Err(WalletDigestValidationError::BrokenChain) => warn!(
+                                    "peer {} returned wallet digests from a different or mixed branch",
+                                    recibida.peer
+                                ),
+                                Err(WalletDigestValidationError::InvalidRange) => warn!(
+                                    "peer {} returned an incomplete wallet digest range",
+                                    recibida.peer
+                                ),
+                            }
+                        }
+                        WalletDigestsResponse::NotFound { reason } => {
+                            info!("el par {} no sirve resumenes ({reason})", recibida.peer);
+                        }
                     }
+                    break;
+                }
+
+                let now = tokio::time::Instant::now();
+                if now >= attempt_deadline || now >= deadline {
+                    self.abandon_wallet_digest_request(request_id);
+                    break;
+                }
+                let pump_for =
+                    PUMP_SLICE_DIGESTS.min(attempt_deadline.saturating_duration_since(now));
+                if self.pump_for(pump_for).await.is_err() {
+                    self.abandon_wallet_digest_request(request_id);
+                    break;
                 }
             }
         }
+        self.pending_outbound_wallet_digest_requests.clear();
+        self.received_wallet_digests.clear();
         None
     }
 
@@ -2821,6 +3099,10 @@ impl Node {
         peers
     }
 
+    pub(crate) fn mobile_block_request_peers(&self) -> Vec<PeerId> {
+        self.select_block_request_peers()
+    }
+
     fn select_block_request_peers_with_affinity(
         &self,
         preferred_peer: Option<&PeerId>,
@@ -2908,6 +3190,19 @@ impl Node {
         matched
     }
 
+    fn abandon_block_body_requests(
+        &mut self,
+        request_ids: &HashSet<request_response::OutboundRequestId>,
+    ) {
+        for request_id in request_ids {
+            self.pending_outbound_block_body_requests.remove(request_id);
+        }
+        self.received_block_body_responses
+            .retain(|response| !request_ids.contains(&response.request_id));
+        self.block_body_request_failures
+            .retain(|failure| !request_ids.contains(&failure.request_id));
+    }
+
     fn take_matching_private_tx_body_response(
         &mut self,
         request_ids: &HashSet<request_response::OutboundRequestId>,
@@ -2923,6 +3218,27 @@ impl Node {
         }
         self.received_private_tx_body_responses = deferred;
         matched
+    }
+
+    fn abandon_private_tx_body_requests(
+        &mut self,
+        request_ids: &HashSet<request_response::OutboundRequestId>,
+    ) {
+        for request_id in request_ids {
+            self.pending_outbound_private_tx_body_requests
+                .remove(request_id);
+        }
+        self.received_private_tx_body_responses
+            .retain(|response| !request_ids.contains(&response.request_id));
+        self.private_tx_body_request_failures
+            .retain(|failure| !request_ids.contains(&failure.request_id));
+    }
+
+    fn private_tx_body_matches_hash(tx_hash: &str, body: &[u8]) -> bool {
+        let Ok(tx) = serde_json::from_slice::<PrivateTransaction>(body) else {
+            return false;
+        };
+        tx.tx_hash == tx_hash && crate::private_wallet::expected_private_tx_hash(&tx) == tx.tx_hash
     }
 
     fn take_matching_direct_block_failure(
@@ -3517,7 +3833,7 @@ impl Node {
                 }
             }
             self.pump_for(pump_interval).await?;
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(PUBLISH_RETRY_PAUSE).await;
         }
         Err(Box::new(io::Error::other(format!(
             "publish retries exhausted: {}",
@@ -3705,23 +4021,28 @@ impl Node {
         let mut last_error = String::new();
         loop {
             if let Some(received) = self.take_matching_private_tx_body_response(&request_ids) {
+                request_ids.remove(&received.request_id);
                 match received.response {
                     PrivateTxBodyResponse::Body { tx_hash: got, body } => {
-                        if got != tx_hash || body.is_empty() {
+                        if got != tx_hash
+                            || body.is_empty()
+                            || !Self::private_tx_body_matches_hash(tx_hash, &body)
+                        {
                             self.record_private_tx_invalid_response(received.peer.clone());
                             last_error = format!(
                                 "peer {} returned invalid private tx body for {}",
                                 received.peer, tx_hash
                             );
-                            continue;
+                        } else {
+                            info!(
+                                "direct private tx body response hash={} from {} in {}ms",
+                                tx_hash,
+                                received.peer,
+                                received.latency.as_millis()
+                            );
+                            self.abandon_private_tx_body_requests(&request_ids);
+                            return Ok(body);
                         }
-                        info!(
-                            "direct private tx body response hash={} from {} in {}ms",
-                            tx_hash,
-                            received.peer,
-                            received.latency.as_millis()
-                        );
-                        return Ok(body);
                     }
                     PrivateTxBodyResponse::NotFound { reason, .. } => {
                         self.record_private_tx_request_failure(received.peer.clone());
@@ -3747,10 +4068,20 @@ impl Node {
             }
 
             if let Some(failure) = self.take_matching_private_tx_body_failure(&request_ids) {
+                request_ids.remove(&failure.request_id);
                 last_error = format!(
                     "peer {} private tx body request failed: {}",
                     failure.peer, failure.error
                 );
+            }
+
+            if request_ids.is_empty() {
+                let detail = if last_error.is_empty() {
+                    "no peer returned the requested private tx body".to_string()
+                } else {
+                    last_error
+                };
+                return Err(Box::new(io::Error::new(io::ErrorKind::NotFound, detail)));
             }
 
             if tokio::time::Instant::now() >= deadline {
@@ -3778,6 +4109,10 @@ impl Node {
                         }
                     }
                 }
+                self.received_private_tx_body_responses
+                    .retain(|response| !request_ids.contains(&response.request_id));
+                self.private_tx_body_request_failures
+                    .retain(|failure| !request_ids.contains(&failure.request_id));
                 return Err(Box::new(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("timed out waiting for private tx body response: {detail}"),
@@ -3785,8 +4120,13 @@ impl Node {
             }
 
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            self.pump_for(remaining.min(Duration::from_millis(150)))
-                .await?;
+            if let Err(error) = self
+                .pump_for(remaining.min(Duration::from_millis(150)))
+                .await
+            {
+                self.abandon_private_tx_body_requests(&request_ids);
+                return Err(error);
+            }
         }
     }
 
@@ -3876,6 +4216,7 @@ impl Node {
                             received.peer,
                             received.latency.as_millis()
                         );
+                        self.abandon_block_body_requests(&request_ids);
                         return Ok(SourcedBlockResponse {
                             source: received.peer,
                             response,
@@ -3918,6 +4259,7 @@ impl Node {
                 } else {
                     last_error
                 };
+                self.abandon_block_body_requests(&request_ids);
                 return Err(Box::new(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("timed out waiting for direct block response: {detail}"),
@@ -3925,8 +4267,41 @@ impl Node {
             }
 
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            self.pump_for(remaining.min(Duration::from_millis(150)))
-                .await?;
+            if let Err(error) = self
+                .pump_for(remaining.min(Duration::from_millis(150)))
+                .await
+            {
+                self.abandon_block_body_requests(&request_ids);
+                return Err(error);
+            }
+        }
+    }
+
+    /// Probe one explicitly selected peer without allowing strict-affinity
+    /// fallback to turn a sequential mobile probe into fanout. `NotFound` is
+    /// kept distinct from transport/rejection failures so callers may only
+    /// infer absence after every selected peer answered conclusively.
+    pub(crate) async fn request_mobile_block_probe_from_peer(
+        &mut self,
+        block_height: u64,
+        peer: &PeerId,
+        max_wait: Duration,
+    ) -> Result<MobileBlockProbe, String> {
+        if max_wait.is_zero() {
+            return Err("el sondeo no tiene tiempo restante".to_string());
+        }
+        let mut responses = self
+            .request_blocks_batch_direct_from_peer(&[block_height], peer, max_wait)
+            .await;
+        match responses.remove(&block_height) {
+            Some(Ok(response)) => Ok(MobileBlockProbe::Found(response)),
+            Some(Err(error)) if error.contains(" did not have block:") => {
+                Ok(MobileBlockProbe::NotFound)
+            }
+            Some(Err(error)) => Err(error),
+            None => Err(format!(
+                "el par {peer} no completo el sondeo del bloque {block_height}"
+            )),
         }
     }
 
@@ -3951,11 +4326,39 @@ impl Node {
         heights: &[u64],
         max_wait: Duration,
     ) -> HashMap<u64, Result<SourcedBlockResponse, String>> {
+        let peers = self.select_block_request_peers();
+        self.request_blocks_batch_direct_from_candidates(heights, peers, max_wait)
+            .await
+    }
+
+    /// Mobile scans need a coherent contiguous candidate: all heights are sent
+    /// to one peer concurrently, then the caller can reject the whole candidate
+    /// and retry a second peer within the same chunk deadline.
+    pub(crate) async fn request_blocks_batch_direct_from_peer(
+        &mut self,
+        heights: &[u64],
+        peer: &PeerId,
+        max_wait: Duration,
+    ) -> HashMap<u64, Result<SourcedBlockResponse, String>> {
+        let peers = if self.swarm.is_connected(peer) && !self.is_block_sync_peer_quarantined(peer) {
+            vec![peer.clone()]
+        } else {
+            Vec::new()
+        };
+        self.request_blocks_batch_direct_from_candidates(heights, peers, max_wait)
+            .await
+    }
+
+    async fn request_blocks_batch_direct_from_candidates(
+        &mut self,
+        heights: &[u64],
+        peers: Vec<PeerId>,
+        max_wait: Duration,
+    ) -> HashMap<u64, Result<SourcedBlockResponse, String>> {
         let mut results: HashMap<u64, Result<SourcedBlockResponse, String>> = HashMap::new();
         if heights.is_empty() {
             return results;
         }
-        let peers = self.select_block_request_peers();
         if peers.is_empty() {
             return results;
         }
@@ -4027,15 +4430,30 @@ impl Node {
                             }),
                         );
                     }
-                    BlockBodyResponse::NotFound { reason, .. } => {
-                        self.record_direct_block_failure(received.peer.clone());
-                        results.insert(
-                            height,
-                            Err(format!(
-                                "peer {} did not have block: {reason}",
-                                received.peer
-                            )),
-                        );
+                    BlockBodyResponse::NotFound {
+                        block_height,
+                        reason,
+                        ..
+                    } => {
+                        if block_height != height {
+                            self.record_direct_block_invalid_response(received.peer.clone());
+                            results.insert(
+                                height,
+                                Err(format!(
+                                    "peer {} returned NotFound height {block_height}, expected {height}",
+                                    received.peer
+                                )),
+                            );
+                        } else {
+                            self.record_direct_block_failure(received.peer.clone());
+                            results.insert(
+                                height,
+                                Err(format!(
+                                    "peer {} did not have block: {reason}",
+                                    received.peer
+                                )),
+                            );
+                        }
                     }
                     BlockBodyResponse::Rejected { reason, .. } => {
                         self.record_direct_block_failure(received.peer.clone());
@@ -4073,6 +4491,7 @@ impl Node {
                 break;
             }
         }
+        self.abandon_block_body_requests(&request_ids);
         results
     }
 
@@ -4873,7 +5292,10 @@ mod tests {
     fn a_repeated_id_does_not_evict_anything() {
         let mut vistos = SeenIdSet::default();
         assert!(vistos.insert("mismo".to_string()));
-        assert!(!vistos.insert("mismo".to_string()), "el repetido se rechaza");
+        assert!(
+            !vistos.insert("mismo".to_string()),
+            "el repetido se rechaza"
+        );
         assert_eq!(vistos.len(), 1);
     }
 
@@ -4893,8 +5315,7 @@ mod tests {
         let elegir = |preferido: &PeerId, estricta: bool| -> Vec<PeerId> {
             let mut peers = conectados.clone();
             if estricta {
-                let solo: Vec<PeerId> =
-                    peers.iter().filter(|p| *p == preferido).cloned().collect();
+                let solo: Vec<PeerId> = peers.iter().filter(|p| *p == preferido).cloned().collect();
                 if !solo.is_empty() {
                     return solo;
                 }
@@ -4951,6 +5372,20 @@ mod tests {
     use crate::types::{Signature, Transaction};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn data_protocol_timeout_outlives_mobile_operation_budget() {
+        assert_eq!(MOBILE_P2P_OPERATION_WAIT, Duration::from_secs(60));
+        assert_eq!(DATA_REQUEST_RESPONSE_SLACK, Duration::from_secs(15));
+        assert_eq!(DATA_REQUEST_RESPONSE_TIMEOUT, Duration::from_secs(75));
+        assert!(DATA_REQUEST_RESPONSE_TIMEOUT > MOBILE_P2P_OPERATION_WAIT);
+
+        let config = format!("{:?}", data_request_response_config());
+        assert!(
+            config.contains("request_timeout: 75s"),
+            "data protocol config did not retain its 75s timeout: {config}"
+        );
+    }
 
     async fn spawn_mock_socks5_proxy() -> (String, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -6056,6 +6491,7 @@ mod tests {
                 digests.push(BlockDigest {
                     block_height: altura,
                     block_hash: format!("hash-{altura}"),
+                    prev_hash: format!("hash-{}", altura.saturating_sub(1)),
                     timestamp: 1000 + altura,
                     coinbase_recipient: Some("zka1destino".to_string()),
                     coinbase_amount: Some(12_000_000),
@@ -6123,6 +6559,236 @@ mod tests {
             Some("out-12"),
             "el resumen tiene que traer la identidad de la nota del coinbase"
         );
+    }
+
+    #[tokio::test]
+    async fn resumenes_hacen_failover_secuencial_sin_fanout() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let bad_calls = Arc::new(AtomicUsize::new(0));
+        let good_calls = Arc::new(AtomicUsize::new(0));
+        let unused_calls = Arc::new(AtomicUsize::new(0));
+        let counters = [bad_calls.clone(), good_calls.clone(), unused_calls.clone()];
+        let mut servers = Vec::new();
+
+        for (index, counter) in counters.into_iter().enumerate() {
+            let mut server = Node::new(0).await.expect("digest server");
+            server.listen("/ip4/127.0.0.1/tcp/0").await.expect("listen");
+            server.set_wallet_digest_responder(Box::new(move |request| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let digests = (request.from_height..=request.to_height)
+                    .map(|height| BlockDigest {
+                        block_height: height,
+                        block_hash: format!("hash-{height}"),
+                        prev_hash: if index == 0 && height > request.from_height {
+                            "broken-branch".to_string()
+                        } else {
+                            format!("hash-{}", height.saturating_sub(1))
+                        },
+                        timestamp: height,
+                        coinbase_recipient: None,
+                        coinbase_amount: None,
+                        coinbase_output_id: None,
+                        coinbase_commitment: None,
+                        coinbase_unlock_height: None,
+                        private_tx_hashes: Vec::new(),
+                        private_nullifiers: Vec::new(),
+                    })
+                    .collect();
+                WalletDigestsResponse::Digests { digests }
+            }));
+            servers.push(server);
+        }
+
+        let mut addresses = None;
+        for _ in 0..80 {
+            for server in &mut servers {
+                let _ = server.pump_for(Duration::from_millis(10)).await;
+            }
+            let current = servers
+                .iter()
+                .map(|server| {
+                    server
+                        .swarm
+                        .listeners()
+                        .next()
+                        .map(|address| format!("{address}/p2p/{}", server.peer_id()))
+                })
+                .collect::<Option<Vec<_>>>();
+            if current.is_some() {
+                addresses = current;
+                break;
+            }
+        }
+        let addresses = addresses.expect("all digest servers listen");
+        let peer_ids = servers.iter().map(Node::peer_id).collect::<Vec<_>>();
+
+        let mut client = Node::new(0).await.expect("digest client");
+        for address in &addresses {
+            client.connect_to_peer(address).await.expect("dial server");
+        }
+        for _ in 0..120 {
+            let _ = client.pump_for(Duration::from_millis(10)).await;
+            for server in &mut servers {
+                let _ = server.pump_for(Duration::from_millis(10)).await;
+            }
+            if client.connected_peer_count() == servers.len() {
+                break;
+            }
+        }
+        assert_eq!(client.connected_peer_count(), servers.len());
+
+        client.block_request_peer_scores.insert(peer_ids[0], 100);
+        client.block_request_peer_scores.insert(peer_ids[1], 50);
+        client.block_request_peer_scores.insert(peer_ids[2], 0);
+        client.wallet_digest_peer_cursor = 0;
+
+        let serving = tokio::spawn(async move {
+            for _ in 0..100 {
+                for server in &mut servers {
+                    let _ = server.pump_for(Duration::from_millis(2)).await;
+                }
+            }
+        });
+        let digests = client
+            .request_wallet_digests_with_anchor(10, 12, Some("hash-9"), Duration::from_secs(3))
+            .await
+            .expect("second peer returns a coherent range");
+        serving.await.expect("servers task");
+
+        assert_eq!(digests.len(), 3);
+        assert_eq!(bad_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(good_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            unused_calls.load(Ordering::SeqCst),
+            0,
+            "a successful second peer stops failover instead of fanning out"
+        );
+    }
+
+    #[test]
+    fn resumenes_rotan_pero_solo_intentan_tres_peers() {
+        let peers = (0..5).map(|_| PeerId::random()).collect::<Vec<_>>();
+
+        let selected = rotate_and_limit_wallet_digest_peers(peers.clone(), 4);
+
+        assert_eq!(selected, vec![peers[4], peers[0], peers[1]]);
+        assert_eq!(selected.len(), MAX_WALLET_DIGEST_PEER_ATTEMPTS);
+        assert_eq!(
+            wallet_digest_attempt_budget(Duration::from_secs(60), selected.len()),
+            Duration::from_secs(20),
+            "tres candidatos conservan una ventana Tor util para cada intento"
+        );
+    }
+
+    #[test]
+    fn resumenes_exigen_cobertura_exacta_del_rango() {
+        let digest = |altura| BlockDigest {
+            block_height: altura,
+            block_hash: format!("hash-{altura}"),
+            prev_hash: format!("hash-{}", altura.saturating_sub(1)),
+            timestamp: altura,
+            coinbase_recipient: None,
+            coinbase_amount: None,
+            coinbase_output_id: None,
+            coinbase_commitment: None,
+            coinbase_unlock_height: None,
+            private_tx_hashes: Vec::new(),
+            private_nullifiers: Vec::new(),
+        };
+
+        assert!(Node::wallet_digests_cover_range(
+            &[digest(10), digest(11), digest(12)],
+            10,
+            12
+        ));
+        assert!(!Node::wallet_digests_cover_range(
+            &[digest(10), digest(12)],
+            10,
+            12
+        ));
+        assert!(!Node::wallet_digests_cover_range(
+            &[digest(10), digest(10), digest(12)],
+            10,
+            12
+        ));
+        assert!(!Node::wallet_digests_cover_range(
+            &[digest(9), digest(10), digest(11)],
+            10,
+            12
+        ));
+        assert!(Node::wallet_digests_cover_range(
+            &[digest(12), digest(10), digest(11)],
+            10,
+            12
+        ));
+
+        let mut rama_rota = vec![digest(10), digest(11), digest(12)];
+        rama_rota[1].prev_hash = "otra-rama".to_string();
+        assert!(!Node::wallet_digests_cover_range(&rama_rota, 10, 12));
+
+        let mut legacy = vec![digest(10)];
+        legacy[0].prev_hash.clear();
+        assert!(matches!(
+            Node::validate_wallet_digest_range(legacy, 10, 10, None),
+            Err(WalletDigestValidationError::MissingPrevHash)
+        ));
+
+        assert!(Node::validate_wallet_digest_range(
+            vec![digest(10), digest(11)],
+            10,
+            11,
+            Some("hash-9")
+        )
+        .is_ok());
+        assert!(matches!(
+            Node::validate_wallet_digest_range(
+                vec![digest(10), digest(11)],
+                10,
+                11,
+                Some("fork-9")
+            ),
+            Err(WalletDigestValidationError::BrokenChain)
+        ));
+    }
+
+    #[test]
+    fn deferred_response_queue_is_bounded() {
+        let mut queue = VecDeque::new();
+        for value in 0..10 {
+            push_bounded(&mut queue, value, 3);
+        }
+        assert_eq!(queue.into_iter().collect::<Vec<_>>(), vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn private_tx_body_must_decode_and_match_its_canonical_hash() {
+        let mut tx: PrivateTransaction = serde_json::from_value(serde_json::json!({
+            "tx_hash": "pending",
+            "commitment": "commitment",
+            "nullifier": "nullifier",
+            "zk_proof": null,
+            "timestamp": 1,
+            "status": "Confirmed"
+        }))
+        .expect("minimal private tx");
+        tx.tx_hash = crate::private_wallet::expected_private_tx_hash(&tx);
+        let encoded = serde_json::to_vec(&tx).expect("encode private tx");
+
+        assert!(Node::private_tx_body_matches_hash(&tx.tx_hash, &encoded));
+        assert!(!Node::private_tx_body_matches_hash("otro-hash", &encoded));
+
+        let mut corrupted = tx.clone();
+        corrupted
+            .input_nullifiers
+            .push("nullifier-corrupto".to_string());
+        let corrupted = serde_json::to_vec(&corrupted).expect("encode corrupt tx");
+        assert!(!Node::private_tx_body_matches_hash(&tx.tx_hash, &corrupted));
+        assert!(!Node::private_tx_body_matches_hash(
+            &tx.tx_hash,
+            b"not-json"
+        ));
     }
 
     #[tokio::test]

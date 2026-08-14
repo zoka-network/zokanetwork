@@ -1094,7 +1094,7 @@ fn tx_outputs(tx: &PrivateTransaction) -> Vec<PrivateOutput> {
     }
 }
 
-fn expected_private_tx_hash(tx: &PrivateTransaction) -> String {
+pub(crate) fn expected_private_tx_hash(tx: &PrivateTransaction) -> String {
     let body_hash = private_tx_hash(
         &tx.input_nullifiers,
         &tx.input_commitments,
