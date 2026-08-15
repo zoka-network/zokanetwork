@@ -109,6 +109,58 @@ fn json_encode<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
     serde_json::to_vec(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+/// Marca de formato al frente de una respuesta.
+///
+/// Un resumen son unos 700 bytes y casi todos son texto repetido: cuatro
+/// hashes en hexadecimal, la direccion del destinatario, y los nombres de los
+/// campos JSON repetidos una vez por bloque. Comprimir eso no es una
+/// optimizacion marginal -- es quitar de la linea lo que nunca deberia haber
+/// viajado.
+///
+/// El byte va delante para que quien lee sepa que recibio sin adivinar. Un par
+/// que solo entienda el formato plano recibe algo que no es JSON valido,
+/// responde que no puede, y quien pregunta cae a bloques enteros: lento, pero
+/// nunca un saldo equivocado.
+const FORMATO_JSON_PLANO: u8 = 0;
+const FORMATO_JSON_DEFLATE: u8 = 1;
+
+fn encode_response(res: &WalletDigestsResponse) -> io::Result<Vec<u8>> {
+    use flate2::{write::DeflateEncoder, Compression};
+    use std::io::Write;
+
+    let json = json_encode(res)?;
+    let mut salida = Vec::with_capacity(json.len() / 4 + 1);
+    salida.push(FORMATO_JSON_DEFLATE);
+    let mut encoder = DeflateEncoder::new(salida, Compression::default());
+    encoder.write_all(&json)?;
+    encoder.finish()
+}
+
+fn decode_response(bytes: &[u8]) -> io::Result<WalletDigestsResponse> {
+    let Some((marca, resto)) = bytes.split_first() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "respuesta de resumenes vacia",
+        ));
+    };
+    match *marca {
+        FORMATO_JSON_DEFLATE => {
+            use flate2::read::DeflateDecoder;
+            use std::io::Read;
+            let mut json = Vec::new();
+            DeflateDecoder::new(resto)
+                .take(RESPONSE_SIZE_MAX)
+                .read_to_end(&mut json)?;
+            json_decode(&json)
+        }
+        FORMATO_JSON_PLANO => json_decode(resto),
+        otro => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("formato de resumenes desconocido: {otro}"),
+        )),
+    }
+}
+
 #[async_trait]
 impl request_response::Codec for WalletDigestRequestResponseCodec {
     type Protocol = StreamProtocol;
@@ -138,7 +190,7 @@ impl request_response::Codec for WalletDigestRequestResponseCodec {
     {
         let mut bytes = Vec::new();
         io.take(RESPONSE_SIZE_MAX).read_to_end(&mut bytes).await?;
-        json_decode(&bytes)
+        decode_response(&bytes)
     }
 
     async fn write_request<T>(
@@ -163,7 +215,7 @@ impl request_response::Codec for WalletDigestRequestResponseCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        io.write_all(&json_encode(&res)?).await?;
+        io.write_all(&encode_response(&res)?).await?;
         io.close().await
     }
 }
@@ -189,6 +241,94 @@ impl BlockDigest {
             private_tx_hashes: block.private_tx_hashes.clone(),
             private_nullifiers: block.private_nullifiers.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_compresion {
+    use super::*;
+
+    /// Un resumen con la forma y el tamaño de los reales: hashes de 64
+    /// caracteres, una direccion larga, y los mismos nombres de campo en cada
+    /// bloque. Es justo esa repeticion la que hace que comprimir valga tanto.
+    fn resumen(altura: u64) -> BlockDigest {
+        BlockDigest {
+            block_height: altura,
+            block_hash: format!("{:064x}", altura.wrapping_mul(0x9E3779B97F4A7C15)),
+            prev_hash: format!("{:064x}", altura.wrapping_sub(1).wrapping_mul(0x9E3779B97F4A7C15)),
+            timestamp: 1_786_000_000 + altura,
+            coinbase_recipient: Some(
+                "zka1DvXCzHCQa9iqecNxL5KVpbuodnGyuh8a35WHYQ6HWYrJTRw88JeBYcB1KBCuXGAvwqyzPydEPzShSkTHXf1vMD1R7mWhu"
+                    .to_string(),
+            ),
+            coinbase_amount: Some(12_000_000),
+            coinbase_output_id: Some(format!("{:064x}", altura.wrapping_mul(0xD6E8FEB86659FD93))),
+            coinbase_commitment: Some(format!("{:064x}", altura.wrapping_mul(0xA24BAED4963EE407))),
+            coinbase_unlock_height: Some(altura + 100),
+            private_tx_hashes: Vec::new(),
+            private_nullifiers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn comprimir_los_resumenes_baja_el_costo_de_escanear_sobre_tor() {
+        // El caso real: la wallet pide un tramo y lo recibe por un circuito
+        // Tor a unos 20 KB/s. Cada byte que no viaja son milisegundos que el
+        // usuario no espera mirando una pantalla que parece colgada.
+        let respuesta = WalletDigestsResponse::Digests {
+            digests: (1..=250).map(resumen).collect(),
+        };
+        let plano = json_encode(&respuesta).expect("serializa");
+        let comprimido = encode_response(&respuesta).expect("comprime");
+
+        println!(
+            "250 resumenes: plano {} B ({} por bloque) -> comprimido {} B ({} por bloque), {:.1}x",
+            plano.len(),
+            plano.len() / 250,
+            comprimido.len(),
+            comprimido.len() / 250,
+            plano.len() as f64 / comprimido.len() as f64
+        );
+        assert!(
+            comprimido.len() * 3 < plano.len(),
+            "comprimir tiene que ahorrar al menos tres veces para justificar la              dependencia; plano {} B, comprimido {} B",
+            plano.len(),
+            comprimido.len()
+        );
+
+        // Y lo que llega tiene que ser exactamente lo que se mando: un ahorro
+        // que pierde datos no es un ahorro.
+        let vuelta = decode_response(&comprimido).expect("descomprime");
+        let WalletDigestsResponse::Digests { digests } = vuelta else {
+            panic!("tiene que volver como resumenes");
+        };
+        assert_eq!(digests.len(), 250);
+        assert_eq!(digests[0].block_height, 1);
+        assert_eq!(digests[249].block_height, 250);
+        assert_eq!(digests[120].coinbase_output_id, resumen(121).coinbase_output_id);
+    }
+
+    #[test]
+    fn el_formato_plano_se_sigue_leyendo() {
+        // Un par que todavia mande JSON sin comprimir tiene que poder ser
+        // entendido: el byte de formato existe justo para no tener que adivinar.
+        let respuesta = WalletDigestsResponse::NotFound {
+            reason: "sin cadena".to_string(),
+        };
+        let mut plano = vec![FORMATO_JSON_PLANO];
+        plano.extend_from_slice(&json_encode(&respuesta).expect("serializa"));
+
+        let vuelta = decode_response(&plano).expect("lee el formato plano");
+        let WalletDigestsResponse::NotFound { reason } = vuelta else {
+            panic!("tiene que volver como NotFound");
+        };
+        assert_eq!(reason, "sin cadena");
+    }
+
+    #[test]
+    fn un_formato_desconocido_falla_en_vez_de_inventar() {
+        let basura = vec![99u8, 1, 2, 3];
+        assert!(decode_response(&basura).is_err());
     }
 }
 

@@ -937,6 +937,32 @@ fn dns_del_sistema_disponible() -> bool {
     std::path::Path::new("/etc/resolv.conf").exists()
 }
 
+/// Para que se conecta a la red quien esta usando este nodo.
+///
+/// Un nodo completo participa de todo: consenso, ofertas del intercambio,
+/// mineria en equipo. Una wallet en un telefono solo quiere saber su saldo y
+/// publicar sus transacciones -- suscribirla al resto significa recibir y
+/// **reenviar** mensajes que va a descartar, y en un telefono con Tor eso son
+/// datos, bateria y circuitos gastados en nada.
+///
+/// No saca codigo: el crate es el mismo. Solo deja de pedir lo que no va a
+/// mirar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NodeProfile {
+    /// Todo: consenso, ofertas, mineria en equipo.
+    #[default]
+    Full,
+    /// Lo justo para una wallet: bloques, transacciones privadas y su
+    /// transporte con privacidad.
+    Wallet,
+}
+
+impl NodeProfile {
+    fn subscribes_to_consensus_and_market(&self) -> bool {
+        matches!(self, NodeProfile::Full)
+    }
+}
+
 impl Node {
     fn node_identity_path() -> Option<PathBuf> {
         if cfg!(test) && std::env::var_os("ZOKA_NODE_KEY_PATH").is_none() {
@@ -1922,9 +1948,19 @@ impl Node {
     /// aplicacion tiene que poder decir donde escribe, porque el unico lugar al
     /// que puede es su propio directorio privado.
     pub async fn new_with_tor_proxy_at(
+        listen_port: u16,
+        tor_proxy: Option<String>,
+        identity_path: Option<PathBuf>,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::new_with_profile(listen_port, tor_proxy, identity_path, NodeProfile::Full).await
+    }
+
+    /// Igual, pero eligiendo a que se suscribe segun para que se use.
+    pub async fn new_with_profile(
         _listen_port: u16,
         tor_proxy: Option<String>,
         identity_path: Option<PathBuf>,
+        profile: NodeProfile,
     ) -> Result<Self, Box<dyn Error>> {
         let local_key = Self::load_or_generate_identity_key(identity_path)?;
         let peer_id = PeerId::from(local_key.public());
@@ -2010,12 +2046,20 @@ impl Node {
                 gossipsub_config,
             )?;
 
+            // Lo que cualquiera necesita: anuncios de bloque, transacciones
+            // privadas, y los dos temas por donde una tx propia viaja con
+            // privacidad.
             gossipsub.subscribe(&general_topic_for_behaviour)?;
-            gossipsub.subscribe(&pbft_topic_for_behaviour)?;
             gossipsub.subscribe(&stem_topic_for_behaviour)?;
             gossipsub.subscribe(&mixer_topic_for_behaviour)?;
-            gossipsub.subscribe(&offers_topic_for_behaviour)?;
-            gossipsub.subscribe(&team_mining_topic_for_behaviour)?;
+            // Consenso, ofertas del intercambio y mineria en equipo: una wallet
+            // no participa de nada de eso, y estar suscrita la obligaria a
+            // reenviarlo.
+            if profile.subscribes_to_consensus_and_market() {
+                gossipsub.subscribe(&pbft_topic_for_behaviour)?;
+                gossipsub.subscribe(&offers_topic_for_behaviour)?;
+                gossipsub.subscribe(&team_mining_topic_for_behaviour)?;
+            }
             // In libp2p-request-response 0.26.3 this timeout bounds the
             // read/write task after substream negotiation, in both directions.
             // It is separate from dialing and must exceed the mobile caller's
@@ -6473,6 +6517,60 @@ mod tests {
         assert_eq!(stem.stem_hops, DEFAULT_STEM_HOPS);
         assert_eq!(stem.padding.len(), expected_padding);
         assert!(!stem.route_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn una_wallet_no_se_suscribe_a_lo_que_no_va_a_mirar() {
+        // Estar suscrito a un tema no es gratis: gossipsub obliga a recibir y
+        // **reenviar** lo que pasa por ahi. En un telefono con Tor, reenviar
+        // ofertas del intercambio o mensajes de consenso son datos y bateria
+        // gastados en algo que se descarta.
+        //
+        // Los temas que si necesita no se tocan: sin `general` no se entera de
+        // los bloques, y sin `stem`/`mixer` sus propias transacciones pierden
+        // la capa de privacidad al publicarse.
+        let wallet = Node::new_with_profile(0, None, None, NodeProfile::Wallet)
+            .await
+            .expect("nodo wallet");
+        let completo = Node::new_with_profile(0, None, None, NodeProfile::Full)
+            .await
+            .expect("nodo completo");
+
+        let temas_wallet: Vec<String> = wallet
+            .swarm
+            .behaviour()
+            .gossipsub
+            .topics()
+            .map(|t| t.to_string())
+            .collect();
+        let temas_completo: Vec<String> = completo
+            .swarm
+            .behaviour()
+            .gossipsub
+            .topics()
+            .map(|t| t.to_string())
+            .collect();
+
+        assert!(
+            temas_wallet.len() < temas_completo.len(),
+            "una wallet tiene que escuchar menos que un nodo completo; wallet {temas_wallet:?}, completo {temas_completo:?}"
+        );
+        for imprescindible in ["messages", "stem", "mixer"] {
+            assert!(
+                temas_wallet.iter().any(|t| t.contains(imprescindible)),
+                "sin '{imprescindible}' la wallet no puede ver bloques ni publicar en privado: {temas_wallet:?}"
+            );
+        }
+        for ajeno in ["offer", "pbft", "team"] {
+            assert!(
+                !temas_wallet.iter().any(|t| t.contains(ajeno)),
+                "la wallet no participa de '{ajeno}' y no deberia reenviarlo: {temas_wallet:?}"
+            );
+            assert!(
+                temas_completo.iter().any(|t| t.contains(ajeno)),
+                "un nodo completo si tiene que estar en '{ajeno}': {temas_completo:?}"
+            );
+        }
     }
 
     #[tokio::test]

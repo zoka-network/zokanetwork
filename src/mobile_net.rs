@@ -21,7 +21,7 @@
 
 use crate::network::message::ZokaMessage;
 use crate::network::p2p::{
-    MobileBlockProbe, Node, MOBILE_P2P_OPERATION_WAIT, PUBLISH_RETRY_PAUSE,
+    MobileBlockProbe, Node, NodeProfile, MOBILE_P2P_OPERATION_WAIT, PUBLISH_RETRY_PAUSE,
 };
 use crate::private_wallet::PrivateTransaction;
 use serde::{Deserialize, Serialize};
@@ -250,6 +250,19 @@ pub fn connect_json(config_json: &str) -> Result<String, String> {
             .join("zoka-red")
             .join("node_key")
     });
+    // Los pares aprendidos viven al lado de la identidad, en el directorio
+    // privado de la aplicacion. Sin `data_dir` cae a una ruta relativa, que en
+    // Android no se puede escribir: ahi el almacen no persiste y la wallet
+    // vuelve a depender de las semillas, como antes. Degrada, no rompe.
+    let peer_store_path = config
+        .data_dir
+        .as_ref()
+        .map(|dir| {
+            std::path::PathBuf::from(dir)
+                .join("zoka-red")
+                .join("peer_store.json")
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("peer_store.json"));
 
     // El nodo vive en un hilo propio con su runtime de un solo hilo, no en un
     // pool compartido.
@@ -276,6 +289,7 @@ pub fn connect_json(config_json: &str) -> Result<String, String> {
                 seeds,
                 tor_proxy,
                 identity_path,
+                peer_store_path,
                 cmd_rx,
                 listo_tx,
             ));
@@ -1052,16 +1066,85 @@ async fn traer_cuerpo_privado(
         .map_err(|e| format!("no pude serializar el cuerpo de {hash}: {e}"))
 }
 
+/// Cuantos pares conocidos se marcan al arrancar, ademas de las semillas.
+///
+/// Con uno alcanza para empezar a pedir bloques; el resto llega por
+/// descubrimiento. Marcar de a muchos sobre Tor abre circuitos que cuestan
+/// bateria y no aceleran nada.
+const CANDIDATOS_AL_ARRANCAR: usize = 6;
+
+/// Cada cuanto se anotan los pares que la red fue presentando.
+///
+/// Dos minutos: lo suficiente para no perder lo aprendido si la aplicacion se
+/// cierra, y lo bastante espaciado para no escribir en la memoria del telefono
+/// mas de lo necesario.
+const INTERVALO_APRENDER_PARES: Duration = Duration::from_secs(120);
+
+/// Abre el almacen de pares, o uno vacio si no se puede leer.
+///
+/// Que no se pueda leer no es motivo para no arrancar: se pierde la memoria de
+/// pares, no la capacidad de conectarse. Las semillas siguen ahi.
+fn peer_store_para(path: &std::path::Path) -> crate::network::peer_store::PeerStore {
+    crate::network::peer_store::PeerStore::load_or_default(path).unwrap_or_else(|e| {
+        tracing::info!("no pude leer los pares guardados: {e}");
+        crate::network::peer_store::PeerStore::empty(path)
+    })
+}
+
+/// A quien marcar, en orden: primero lo que ya funciono, despues las semillas.
+///
+/// Las semillas van igual aunque no esten en el almacen -- son la garantia de
+/// que una wallet nueva, o una cuyos pares se cayeron todos, tenga por donde
+/// entrar.
+fn candidatos_a_marcar(
+    conocidos: &crate::network::peer_store::PeerStore,
+    seeds: &[String],
+) -> Vec<String> {
+    let mut lista = conocidos.dial_addrs(CANDIDATOS_AL_ARRANCAR);
+    for seed in seeds {
+        if !lista.iter().any(|a| a == seed) {
+            lista.push(seed.clone());
+        }
+    }
+    lista
+}
+
+/// Anota los pares que la red nos presento y los guarda para la proxima.
+fn aprender_pares(node: &Node, conocidos: &mut crate::network::peer_store::PeerStore) {
+    for record in node.observed_peer_records() {
+        conocidos.mark_identified(
+            &record.addr,
+            Some(&record.peer_id),
+            record.protocol_version.as_deref(),
+            &record.protocols,
+            "identify",
+        );
+    }
+    let _ = guardar_pares(conocidos);
+}
+
+/// Guarda el almacen, podando lo que ya no sirve.
+///
+/// Un telefono no puede acumular pares muertos para siempre: el almacen se
+/// poda solo, quedandose con los que respondieron alguna vez.
+fn guardar_pares(conocidos: &mut crate::network::peer_store::PeerStore) -> Result<(), String> {
+    conocidos.prune();
+    conocidos
+        .save()
+        .map_err(|e| format!("no pude guardar los pares: {e}"))
+}
+
 async fn run_client(
     seeds: Vec<String>,
     tor_proxy: Option<String>,
     identity_path: Option<std::path::PathBuf>,
+    peer_store_path: std::path::PathBuf,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     listo_tx: std_mpsc::Sender<Result<(), String>>,
 ) {
     // Puerto 0: este cliente no escucha. Un telefono no es alcanzable desde
     // afuera y no tiene por que serlo -- solo necesita salir.
-    let mut node = match Node::new_with_tor_proxy_at(0, tor_proxy, identity_path).await {
+    let mut node = match Node::new_with_profile(0, tor_proxy, identity_path, NodeProfile::Wallet).await {
         Ok(node) => node,
         Err(err) => {
             let _ = listo_tx.send(Err(format!("no pude crear el nodo: {err}")));
@@ -1069,22 +1152,57 @@ async fn run_client(
         }
     };
 
-    let mut alguno = false;
+    // Los pares que ya conocemos de arranques anteriores, ordenados por cuales
+    // sirvieron.
+    //
+    // Sin esto la wallet depende de que una maquina en particular este
+    // encendida: la semilla del manifiesto. Con esto, cada par que alguna vez
+    // funciono es otra puerta de entrada, y el almacen los ordena solo -- los
+    // que respondieron primero, los que fallaron al final.
+    let mut conocidos = peer_store_para(&peer_store_path);
     for seed in &seeds {
-        if node.connect_to_peer(seed).await.is_ok() {
-            alguno = true;
+        conocidos.upsert_addr(seed, "manifest_seed");
+    }
+
+    let mut alguno = false;
+    for addr in candidatos_a_marcar(&conocidos, &seeds) {
+        match node.connect_to_peer(&addr).await {
+            Ok(_) => {
+                alguno = true;
+                conocidos.mark_connected(&addr, None, "mobile");
+            }
+            Err(_) => conocidos.mark_failed(&addr),
         }
         // Bombear entre marcados: el apreton de manos ocurre dentro del bucle
         // de eventos, no dentro de connect_to_peer.
         let _ = node.pump_for(PUMP_SLICE).await;
+        // Con uno alcanza para arrancar; el resto llega por descubrimiento sin
+        // hacer esperar al usuario mirando una pantalla vacia.
+        if alguno && node.connected_peer_count() > 0 {
+            break;
+        }
     }
 
     if !alguno {
+        let _ = guardar_pares(&mut conocidos);
         let _ = listo_tx.send(Err(
-            "ninguna semilla acepto la conexion; revisa Tor y la lista de pares".to_string(),
+            "ningun par conocido acepto la conexion; revisa Tor y la lista de pares".to_string(),
         ));
         return;
     }
+    // Con un par en mano, pedirle a la red que nos presente a los demas.
+    //
+    // Hasta ahora la wallet marcaba la semilla y se quedaba ahi: si esa
+    // maquina se caia quedaba ciega, y si mintiera nadie la contradiria. El
+    // codigo de Kademlia ya viajaba compilado adentro; solo faltaba
+    // arrancarlo. Un fallo aca no es grave -- se sigue con la semilla, que es
+    // lo que habia antes.
+    if let Err(e) = node.bootstrap_kademlia() {
+        tracing::info!("no pude arrancar el descubrimiento de pares: {e}");
+    }
+
+    aprender_pares(&node, &mut conocidos);
+    let mut ultimo_aprendizaje = tokio::time::Instant::now();
     anotar_pares(node.connected_peer_count());
     let _ = listo_tx.send(Ok(()));
     let mut cache = CacheCuerpos::default();
@@ -1099,6 +1217,15 @@ async fn run_client(
         // corre. Eso hacia que el estado dijera "cero pares" mientras el
         // cliente estaba bajando bloques de un par.
         anotar_pares(node.connected_peer_count());
+
+        // Anotar lo que la red fue presentando, cada tanto y no en cada vuelta:
+        // el bucle gira cuatro veces por segundo y escribir un archivo a ese
+        // ritmo seria castigar la memoria del telefono para nada. Los pares no
+        // cambian tan rapido.
+        if ultimo_aprendizaje.elapsed() >= INTERVALO_APRENDER_PARES {
+            aprender_pares(&node, &mut conocidos);
+            ultimo_aprendizaje = tokio::time::Instant::now();
+        }
 
         tokio::select! {
             biased;
