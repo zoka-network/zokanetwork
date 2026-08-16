@@ -1125,6 +1125,24 @@ const CANDIDATOS_AL_ARRANCAR: usize = 6;
 /// mas de lo necesario.
 const INTERVALO_APRENDER_PARES: Duration = Duration::from_secs(120);
 
+/// Cuantos pares se intenta sostener.
+///
+/// El cliente se conformaba con uno: marcaba las semillas, la primera
+/// respondia y cortaba ahi. Con un solo par la wallet anda pero queda a
+/// merced de esa maquina -- cada vez que tarda, la app entera espera los
+/// noventa segundos de PEER_WAIT -- y si mintiera nadie la contradiria.
+///
+/// Tres es lo que sostiene ZSilent en la PC. No es un maximo: si el
+/// descubrimiento trae mas, se quedan.
+const PARES_DESEADOS: usize = 3;
+
+/// Cada cuanto se intenta completar el cupo si faltan pares.
+///
+/// Espaciado a proposito: cada marcado sobre Tor abre un circuito, que es caro
+/// en bateria y en tiempo. Reponer no es urgente mientras haya con quien
+/// hablar.
+const INTERVALO_REPONER_PARES: Duration = Duration::from_secs(45);
+
 /// Abre el almacen de pares, o uno vacio si no se puede leer.
 ///
 /// Que no se pueda leer no es motivo para no arrancar: se pierde la memoria de
@@ -1221,9 +1239,13 @@ async fn run_client(
         // Bombear entre marcados: el apreton de manos ocurre dentro del bucle
         // de eventos, no dentro de connect_to_peer.
         let _ = node.pump_for(PUMP_SLICE).await;
-        // Con uno alcanza para arrancar; el resto llega por descubrimiento sin
-        // hacer esperar al usuario mirando una pantalla vacia.
-        if alguno && node.connected_peer_count() > 0 {
+        // Se sigue marcando hasta juntar el cupo, no hasta el primero.
+        //
+        // Cortar en el primero era lo que dejaba la wallet con un solo par para
+        // siempre: despues nadie volvia a intentar. Igual no se hace esperar al
+        // usuario con la pantalla vacia -- la lista es corta y el resto se
+        // completa despues, en el bucle.
+        if node.connected_peer_count() >= PARES_DESEADOS {
             break;
         }
     }
@@ -1248,6 +1270,7 @@ async fn run_client(
 
     aprender_pares(&node, &mut conocidos);
     let mut ultimo_aprendizaje = tokio::time::Instant::now();
+    let mut ultima_reposicion = tokio::time::Instant::now();
     anotar_pares(node.connected_peer_count());
     let _ = listo_tx.send(Ok(()));
     let mut cache = CacheCuerpos::default();
@@ -1270,6 +1293,42 @@ async fn run_client(
         if ultimo_aprendizaje.elapsed() >= INTERVALO_APRENDER_PARES {
             aprender_pares(&node, &mut conocidos);
             ultimo_aprendizaje = tokio::time::Instant::now();
+        }
+
+        // Completar el cupo si faltan pares.
+        //
+        // Esto no existia: una vez conectado, el cliente no volvia a marcar a
+        // nadie. Si arrancaba con uno se quedaba con uno para siempre, y si se
+        // caia el unico, solo lo reintentaba la proxima llamada que necesitara
+        // red -- despues de hacer esperar al usuario.
+        //
+        // Se marca de a uno por vuelta: sobre Tor cada intento abre un
+        // circuito, y disparar varios a la vez es justo lo que hace que ninguno
+        // termine.
+        if node.connected_peer_count() < PARES_DESEADOS
+            && ultima_reposicion.elapsed() >= INTERVALO_REPONER_PARES
+        {
+            ultima_reposicion = tokio::time::Instant::now();
+            let ya_conectados = node.connected_peer_count();
+            // Las semillas primero -- son las que sabemos alcanzables por Tor --
+            // y despues lo aprendido, que puede incluir direcciones que este
+            // telefono no puede usar.
+            let candidatos: Vec<String> = seeds
+                .iter()
+                .cloned()
+                .chain(conocidos.dial_addrs(CANDIDATOS_AL_ARRANCAR))
+                .collect();
+            for addr in candidatos {
+                if node.connected_peer_count() > ya_conectados {
+                    break;
+                }
+                match node.connect_to_peer(&addr).await {
+                    Ok(_) => conocidos.mark_connected(&addr, None, "mobile"),
+                    Err(_) => conocidos.mark_failed(&addr),
+                }
+                let _ = node.pump_for(PUMP_SLICE).await;
+            }
+            anotar_pares(node.connected_peer_count());
         }
 
         tokio::select! {
