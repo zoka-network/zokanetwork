@@ -536,6 +536,82 @@ si falla la estimación, PIN + biometría, respaldo de semilla en la instalació
 
 ---
 
+## 6ter. Actualización Claude — 2026-08-16
+
+Todo lo de acá está medido en el teléfono del usuario (SM-A135M, armeabi-v7a),
+no razonado. Donde digo un número, salió del registro.
+
+### Hecho
+
+- ~~**Enviar nunca se habilitaba.**~~ La guarda pedía `missingTxCount == 0` y 12
+  de los 266 cuerpos de esta cadena ya no existen: el par que tiene la cadena
+  entera responde `private tx body not found`, no un tiempo agotado.
+  **Protegía contra el riesgo equivocado.** Los gastos se detectan por
+  nulificador y los nulificadores vienen commiteados en el bloque — llegan en
+  los resúmenes, sin pedir un solo cuerpo. Un cuerpo perdido solo puede ocultar
+  dinero **entrante**: deja el saldo por debajo del real, nunca por encima, y
+  gastar de menos es seguro. Ahora avisa en ámbar y deja enviar. Lo que sí
+  bloquea es un saldo sin anclar a la cadena. Dos pruebas fijan las dos mitades.
+
+- ~~**Cerrar la app costaba todo el escaneo.**~~ La instantánea se escribía
+  **antes** de la fase de cuerpos: guardaba qué bloques se recorrieron pero no
+  qué se encontró en ellos. Cada arranque rebajaba los 266 cuerpos para
+  redescubrir lo mismo. Ahora el esquema es v2 y guarda el resultado
+  (`ownedOutputs`, `processedTxHashes`, `ourOutputsByTx`, `txInputNullifiers`).
+  Un cuerpo que falló por red **no** se marca procesado, y nada se guarda sin
+  ancla de cadena.
+
+- ~~**Cada arranque redescubría que 12 cuerpos no existen.**~~ La lista de
+  irrecuperables vivía en memoria. Medido: el recorrido de bloques tardaba 2 s y
+  esos reintentos 60 s — el 97% del tiempo. Ahora persiste, con el reintento
+  periódico cada 10 escaneos intacto.
+
+- ~~**El panel iba a ciegas.**~~ Franja discreta con las **dos** fases: medir
+  solo los bloques la dejaba clavada en 99% durante todo el tramo lento, que es
+  justo donde se va el tiempo. Un indicador que se congela en el tramo lento es
+  peor que no tener ninguno.
+
+- ~~**Estado de la red.**~~ Con el criterio de ZSilent: un conteo de pares sin
+  fecha miente, porque el número se actualiza cuando el nodo bombea eventos y
+  envejece si está ocupado. Tres estados — en vivo / último conocido / nunca
+  leído — con línea de tendencia. Un solo par se marca en ámbar (`no fallback`).
+
+- ~~**Esperas heredadas de HTTP.**~~ 350 ms por tanda + 150 ms entre tandas + 2 s
+  de entrada venían del explorador web contra el nodo REST. La app habla P2P
+  directo: **no hay limitador en ese camino**. Más de 20 s de espera contra un
+  guardia que no está. El reintento por 429 queda por si algún par sí limita.
+
+### La trampa más cara del día
+
+**Recompilé Kotlin y di por hecho el resto.** Los `.so` eran de 08-15 16:08 y la
+precarga de cuerpos se escribió el 08-16 10:14. Todos los APK que instalé ese día
+llevaban la app nueva con **el motor de red viejo**, así que la precarga que
+convierte 266 pedidos en 3 nunca corrió en el teléfono — y yo interpretaba los
+tiempos como si sí.
+
+**Regla: tras tocar `src/mobile_net.rs` o `zkapriv/native/`, correr
+`native/build-android.ps1` ANTES de `assembleDebug`.** Comparar fechas de
+`native/jniLibs/*/libzoka_mobile.so` contra el último commit del motor.
+
+### La trampa conceptual
+
+`SerializedNativeCommandGate` es un **mutex**: todos los pedidos al nodo se
+serializan. La "concurrencia de 6" de `PRIVATE_TX_FETCH_BATCH_SIZE` no existía —
+los seis esperaban en fila. **Subir la tanda no acelera nada**; solo amortiza las
+pausas. Quien vea que va lento y suba ese número va a perder el tiempo.
+
+### Lo que sigue abierto
+
+- **Un solo par en la red.** Es el techo de todo lo demás: cada `Timeout while
+  waiting for a response` del registro es eso. Un segundo seed onion sigue siendo
+  lo más barato con más impacto, y no es código.
+- **Enviar desde Android nunca se probó.** Es el objetivo original.
+- `disconnect()` existe y nadie lo llama cuando la app pasa a segundo plano.
+- Sin `ForegroundService`/`WorkManager`: no hay sincronización en segundo plano
+  ni aviso de fondos entrantes.
+- APK de 98,8 MB (4 ABIs + 17 MB de ML Kit). App Bundle o splits.
+- Toda la interfaz está en inglés y el usuario trabaja en español.
+
 ## 7. COLATERALES Y ALTERNATIVAS A EVALUAR
 
 Buscá activamente en estas direcciones. No las descarté por malas — no las
