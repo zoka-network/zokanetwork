@@ -57,8 +57,8 @@
       "i2p": null,
       "iroh": null,
       "role": "seed",
-      "status": "active",
-      "note": "Observed live on the mesh 2026-08-16 from a connected node's /peers. Onion-only: no clearnet address, which is the norm for a node behind NAT."
+      "status": "unreachable",
+      "note": "Observed live on the mesh 2026-08-16, but its onion did not complete a Tor circuit on 2026-08-17 (curl --socks5-hostname to :28080 failed while seed1 and seed3 answered). Kept listed so it is used again if it returns; a node behind NAT going offline for a day is normal and not a reason to forget it."
     },
     {
       "label": "seed3",
