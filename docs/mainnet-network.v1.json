@@ -47,6 +47,30 @@
       "role": "seed",
       "status": "active",
       "note": "Primary bootstrap. Serverless: reachable over Tor v3 onion (no open port) and over iroh (QUIC + n0 hole-punching, for snapshot + tail-sync). The clearnet DNS/TCP address is a best-effort extra and may be unreachable behind NAT; onion + iroh are the real paths."
+    },
+    {
+      "label": "seed2",
+      "operator": "community",
+      "region": "community",
+      "multiaddr": null,
+      "onion": "/onion3/wtrwvlzli37utagttkwmqipm25uqtr4oiib4k6jpgjpyddqk2352btad:28080",
+      "i2p": null,
+      "iroh": null,
+      "role": "seed",
+      "status": "active",
+      "note": "Observed live on the mesh 2026-08-16 from a connected node's /peers. Onion-only: no clearnet address, which is the norm for a node behind NAT."
+    },
+    {
+      "label": "seed3",
+      "operator": "community",
+      "region": "community",
+      "multiaddr": null,
+      "onion": "/onion3/uzn6e2cxyihxuue2j2wsp4dhtloltqq4ai6gkspjoruu54ikhmtfgayd:28080",
+      "i2p": null,
+      "iroh": null,
+      "role": "seed",
+      "status": "active",
+      "note": "Observed live on the mesh 2026-08-16 from a connected node's /peers. Onion-only: no clearnet address, which is the norm for a node behind NAT."
     }
   ],
   "public_rpc": [],
@@ -109,6 +133,7 @@
     "Serverless: no central RPC. The old DigitalOcean bootstrap (rpc.zoka.network) was decommissioned 2026-07-09; nodes read all state from their own local node over the p2p mesh.",
     "Reachability without open ports: every node has a Tor v3 onion, and iroh (QUIC + n0 hole-punching) handles snapshot bootstrap and incremental tail-sync across NAT.",
     "Wallet secrets and private keys must remain local.",
-    "Open mining network: anyone can run a node or miner and earn block rewards directly (no pool)."
+    "Open mining network: anyone can run a node or miner and earn block rewards directly (no pool).",
+    "seed1's onion is a node that many operators also run themselves; a manifest listing only that one leaves such a node dialing itself and the unresolved clearnet name, ending with zero peers. seed2/seed3 were observed live on the mesh on 2026-08-16 and are onion-only."
   ]
 }
