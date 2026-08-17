@@ -1712,6 +1712,11 @@ mod tests {
         assert!(err.contains("repeats private nullifier"));
     }
 
+    // Describe la configuracion de consenso, donde el perfil v2-i1 esta dormido.
+    // El build `mobile` lo enciende desde genesis a proposito -- es la compuerta
+    // local del telefono, documentada en economics.rs -- asi que aca no puede
+    // pasar y no deberia intentarlo.
+    #[cfg(not(feature = "mobile"))]
     #[test]
     fn strict_private_bundle_rejects_dormant_v2_i1_profile() {
         let block = block_with_private_bundle(

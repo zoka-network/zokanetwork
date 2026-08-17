@@ -42,7 +42,6 @@
       "region": "community",
       "multiaddr": "/dns4/seed1.zoka.network/tcp/28080",
       "onion": "/onion3/d5pk3nhesk5wlvz4f5unbhcozxgtj7u6mhagauyprjrxndzpwbaoeiid:28080",
-      "i2p": null,
       "iroh": "ca7721e29d60af28dda8406191f6d7a98e146b95cd456392d0c2d2b996639f99",
       "role": "seed",
       "status": "active",
@@ -52,10 +51,7 @@
       "label": "seed2",
       "operator": "community",
       "region": "community",
-      "multiaddr": null,
       "onion": "/onion3/wtrwvlzli37utagttkwmqipm25uqtr4oiib4k6jpgjpyddqk2352btad:28080",
-      "i2p": null,
-      "iroh": null,
       "role": "seed",
       "status": "unreachable",
       "note": "Observed live on the mesh 2026-08-16, but its onion did not complete a Tor circuit on 2026-08-17 (curl --socks5-hostname to :28080 failed while seed1 and seed3 answered). Kept listed so it is used again if it returns; a node behind NAT going offline for a day is normal and not a reason to forget it."
@@ -64,10 +60,7 @@
       "label": "seed3",
       "operator": "community",
       "region": "community",
-      "multiaddr": null,
       "onion": "/onion3/uzn6e2cxyihxuue2j2wsp4dhtloltqq4ai6gkspjoruu54ikhmtfgayd:28080",
-      "i2p": null,
-      "iroh": null,
       "role": "seed",
       "status": "active",
       "note": "Observed live on the mesh 2026-08-16 from a connected node's /peers. Onion-only: no clearnet address, which is the norm for a node behind NAT."
@@ -134,6 +127,7 @@
     "Reachability without open ports: every node has a Tor v3 onion, and iroh (QUIC + n0 hole-punching) handles snapshot bootstrap and incremental tail-sync across NAT.",
     "Wallet secrets and private keys must remain local.",
     "Open mining network: anyone can run a node or miner and earn block rewards directly (no pool).",
-    "seed1's onion is a node that many operators also run themselves; a manifest listing only that one leaves such a node dialing itself and the unresolved clearnet name, ending with zero peers. seed2/seed3 were observed live on the mesh on 2026-08-16 and are onion-only."
+    "seed1's onion is a node that many operators also run themselves; a manifest listing only that one leaves such a node dialing itself and the unresolved clearnet name, ending with zero peers. seed2/seed3 were observed live on the mesh on 2026-08-16 and are onion-only.",
+    "Seed entries omit fields they do not have instead of setting them to null: the desktop client declares multiaddr as a non-nullable String, so an explicit null aborts the whole manifest parse and leaves it with no configuration. An absent key falls back to the default; null does not."
   ]
 }

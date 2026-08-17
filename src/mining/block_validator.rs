@@ -858,6 +858,16 @@ mod tests {
         assert!(matches!(err, DuplicatePrivateFeeClaim(_)));
     }
 
+    // Esta prueba describe la configuracion de consenso, donde estas
+    // activaciones estan dormidas. El build `mobile` las enciende desde genesis
+    // a proposito -- es la compuerta local del telefono, documentada en
+    // economics.rs -- asi que aca no puede pasar y no deberia intentarlo.
+    //
+    // Sin este marcado, `cargo test --features mobile` quedaba con cinco rojos
+    // permanentes y dejaba de servir como senal: un fallo real se perdia entre
+    // fallos esperados. Se descubrio usandolo justamente para validar un
+    // protocolo nuevo.
+    #[cfg(not(feature = "mobile"))]
     #[test]
     fn valid_private_fee_claim_is_committed_without_changing_coinbase() {
         let chain_id = "zoka-test-net";

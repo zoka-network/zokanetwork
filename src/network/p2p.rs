@@ -55,8 +55,8 @@ use crate::network::snapshot_request_response::{
     SnapshotManifestsResponse, SnapshotRequestResponseCodec,
 };
 use crate::network::private_tx_bodies_request_response::{
-    protocol_name as private_tx_bodies_protocol, PrivateTxBodiesRequest, PrivateTxBodiesRequestResponseCodec,
-    PrivateTxBodiesResponse,
+    protocol_name as private_tx_bodies_protocol, PrivateTxBodiesOutcome, PrivateTxBodiesRequest,
+    PrivateTxBodiesRequestResponseCodec, PrivateTxBodiesResponse,
 };
 use crate::network::wallet_digest_request_response::{
     protocol_name as wallet_digest_protocol, BlockDigest, GetWalletDigests,
@@ -3049,12 +3049,21 @@ impl Node {
         &mut self,
         tx_hashes: &[String],
         max_wait: Duration,
-    ) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
+    ) -> PrivateTxBodiesOutcome {
         use std::collections::HashSet;
         let mut faltan: HashSet<String> = tx_hashes.iter().cloned().collect();
+        // Solo lo que un par dijo explicitamente que no tiene.
+        //
+        // Antes se devolvia "todo lo que no llego" en una sola bolsa, y quien
+        // llamaba lo trataba como "nadie lo tiene". Con un par que no habla este
+        // protocolo -- porque corre un binario viejo -- eso marcaba las 266
+        // transacciones de la cadena como perdidas para siempre y dejaba el
+        // saldo en cero. La distincion entre "no lo tengo" y "no te pude
+        // contestar" estaba escrita en el protocolo y no se respetaba aca.
+        let mut dichos_faltantes: HashSet<String> = HashSet::new();
         let mut conseguidos: Vec<(String, Vec<u8>)> = Vec::new();
         if faltan.is_empty() {
-            return (conseguidos, Vec::new());
+            return PrivateTxBodiesOutcome::default();
         }
 
         let limite = Instant::now() + max_wait;
@@ -3088,6 +3097,13 @@ impl Node {
                                 conseguidos.push((entrada.tx_hash, entrada.body));
                             }
                         }
+                        // Un par que contesta "no lo tengo" es informacion; que
+                        // no contesta, no.
+                        for hash in respuesta.missing {
+                            if faltan.contains(&hash) {
+                                dichos_faltantes.insert(hash);
+                            }
+                        }
                         contesto = true;
                         break;
                     }
@@ -3099,7 +3115,18 @@ impl Node {
                 restante_del_par.retain(|h| !este_lote.contains(h));
             }
         }
-        (conseguidos, faltan.into_iter().collect())
+        // Lo que ningun par alcanzo a responder queda como "sin respuesta", no
+        // como perdido: se reintenta por el camino de a uno.
+        let sin_respuesta: Vec<String> = faltan
+            .iter()
+            .filter(|h| !dichos_faltantes.contains(*h))
+            .cloned()
+            .collect();
+        PrivateTxBodiesOutcome {
+            conseguidos,
+            dichos_faltantes: dichos_faltantes.into_iter().collect(),
+            sin_respuesta,
+        }
     }
 
     pub async fn request_wallet_digests(
@@ -5881,6 +5908,16 @@ mod tests {
             .is_err());
     }
 
+    // Esta prueba describe la configuracion de consenso, donde estas
+    // activaciones estan dormidas. El build `mobile` las enciende desde genesis
+    // a proposito -- es la compuerta local del telefono, documentada en
+    // economics.rs -- asi que aca no puede pasar y no deberia intentarlo.
+    //
+    // Sin este marcado, `cargo test --features mobile` quedaba con cinco rojos
+    // permanentes y dejaba de servir como senal: un fallo real se perdia entre
+    // fallos esperados. Se descubrio usandolo justamente para validar un
+    // protocolo nuevo.
+    #[cfg(not(feature = "mobile"))]
     #[test]
     fn test_protocol_freeze_compact_profile_is_dormant_but_width_bounded_when_configured() {
         let mut tx = sample_private_tx("tx-v2-i1");
@@ -6821,10 +6858,12 @@ mod tests {
         });
 
         let pedidos: Vec<String> = (0..10).map(|i| format!("tx{i}")).collect();
-        let (conseguidos, faltantes) = cliente
+        let r = cliente
             .request_private_tx_bodies_from_peers(&pedidos, Duration::from_secs(15))
             .await;
         let _ = atender.await;
+        let conseguidos = r.conseguidos;
+        let faltantes = r.dichos_faltantes;
 
         assert_eq!(
             conseguidos.len(),
@@ -6842,6 +6881,76 @@ mod tests {
             faltantes.len(),
             5,
             "los que el par no tiene se informan, no se callan: {faltantes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_par_sin_el_protocolo_deja_los_cuerpos_sin_respuesta_no_perdidos() {
+        // El caso que costo un saldo entero.
+        //
+        // Un par que corre un binario sin `/zoka/private-tx-bodies/1` no puede
+        // contestar. Si eso se devuelve junto con los "no lo tengo", quien
+        // llama marca transacciones vivas como perdidas para siempre -- y con
+        // una cadena de 266 transacciones privadas contra un par viejo, eso
+        // dejo el saldo de la wallet en cero.
+        //
+        // Para reproducirlo, el servidor se conecta y despues DEJA DE ATENDER:
+        // no bombea su bucle de eventos mientras el cliente pregunta, asi la
+        // peticion nunca se contesta. Es lo mismo que le pasa al cliente contra
+        // un par que no conoce el protocolo -- no hay respuesta que leer.
+        //
+        // No se puede simular con dos nodos de este binario "quitandole" el
+        // protocolo al servidor: los dos lo tienen compilado, y un par que TIENE
+        // el protocolo pero no sirve cuerpos si contesta "no los tengo" (eso lo
+        // cubre la otra prueba). Lo que hay que distinguir es el silencio.
+        let mut servidor = Node::new(0).await.expect("nodo servidor");
+        servidor
+            .listen("/ip4/127.0.0.1/tcp/0")
+            .await
+            .expect("escuchar");
+
+        let mut direccion = None;
+        for _ in 0..40 {
+            let _ = servidor.pump_for(Duration::from_millis(50)).await;
+            if let Some(addr) = servidor.swarm.listeners().next() {
+                direccion = Some(addr.clone());
+                break;
+            }
+        }
+        let direccion = direccion.expect("el servidor tiene que escuchar");
+        let addr_con_peer = format!("{direccion}/p2p/{}", servidor.peer_id());
+
+        let mut cliente = Node::new(0).await.expect("nodo cliente");
+        cliente
+            .connect_to_peer(&addr_con_peer)
+            .await
+            .expect("marcar al servidor");
+        for _ in 0..60 {
+            let _ = cliente.pump_for(Duration::from_millis(30)).await;
+            let _ = servidor.pump_for(Duration::from_millis(30)).await;
+            if cliente.connected_peer_count() > 0 {
+                break;
+            }
+        }
+
+        // A partir de aca el servidor no bombea: queda conectado y mudo.
+        let pedidos: Vec<String> = (0..5).map(|i| format!("tx{i}")).collect();
+        let r = cliente
+            .request_private_tx_bodies_from_peers(&pedidos, Duration::from_secs(3))
+            .await;
+        drop(servidor);
+
+        assert!(r.conseguidos.is_empty(), "no habia cuerpos que traer");
+        assert!(
+            r.dichos_faltantes.is_empty(),
+            "un par que no contesta NO dice que no los tiene: {:?}",
+            r.dichos_faltantes
+        );
+        assert_eq!(
+            r.sin_respuesta.len(),
+            5,
+            "los cinco tienen que quedar como sin respuesta, para reintentarlos: {:?}",
+            r.sin_respuesta
         );
     }
 
@@ -6888,7 +6997,7 @@ mod tests {
             servidor
         });
 
-        let (conseguidos, faltantes) = cliente
+        let r = cliente
             .request_private_tx_bodies_from_peers(
                 &["tx1".to_string(), "tx2".to_string()],
                 Duration::from_secs(10),
@@ -6896,11 +7005,17 @@ mod tests {
             .await;
         let _ = atender.await;
 
-        assert!(conseguidos.is_empty(), "no tenia ninguno");
+        assert!(r.conseguidos.is_empty(), "no tenia ninguno");
         assert_eq!(
-            faltantes.len(),
+            r.dichos_faltantes.len(),
             2,
-            "y tiene que decirlo, no quedarse callado: {faltantes:?}"
+            "un par CON el protocolo si dice que no los tiene: {:?}",
+            r.dichos_faltantes
+        );
+        assert!(
+            r.sin_respuesta.is_empty(),
+            "y como contesto, nada queda sin respuesta: {:?}",
+            r.sin_respuesta
         );
     }
 

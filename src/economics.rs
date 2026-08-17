@@ -467,6 +467,16 @@ mod tests {
                 && !hash.bytes().any(|byte| byte.is_ascii_uppercase())));
     }
 
+    // Esta prueba describe la configuracion de consenso, donde estas
+    // activaciones estan dormidas. El build `mobile` las enciende desde genesis
+    // a proposito -- es la compuerta local del telefono, documentada en
+    // economics.rs -- asi que aca no puede pasar y no deberia intentarlo.
+    //
+    // Sin este marcado, `cargo test --features mobile` quedaba con cinco rojos
+    // permanentes y dejaba de servir como senal: un fallo real se perdia entre
+    // fallos esperados. Se descubrio usandolo justamente para validar un
+    // protocolo nuevo.
+    #[cfg(not(feature = "mobile"))]
     #[test]
     fn canonical_private_bundle_stays_dormant_until_height_is_fixed() {
         assert_eq!(PRIVATE_TX_CANONICAL_BUNDLE_ACTIVATION_HEIGHT, None);
@@ -477,6 +487,16 @@ mod tests {
         assert!(private_tx_canonical_bundle_required_at(11, Some(10)));
     }
 
+    // Esta prueba describe la configuracion de consenso, donde estas
+    // activaciones estan dormidas. El build `mobile` las enciende desde genesis
+    // a proposito -- es la compuerta local del telefono, documentada en
+    // economics.rs -- asi que aca no puede pasar y no deberia intentarlo.
+    //
+    // Sin este marcado, `cargo test --features mobile` quedaba con cinco rojos
+    // permanentes y dejaba de servir como senal: un fallo real se perdia entre
+    // fallos esperados. Se descubrio usandolo justamente para validar un
+    // protocolo nuevo.
+    #[cfg(not(feature = "mobile"))]
     #[test]
     fn compact_private_tx_profile_stays_dormant_until_height_is_fixed() {
         assert_eq!(PRIVATE_TX_V2_I1_ACTIVATION_HEIGHT, None);

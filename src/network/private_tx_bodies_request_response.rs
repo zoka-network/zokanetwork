@@ -64,6 +64,22 @@ pub struct PrivateTxBodiesResponse {
     pub missing: Vec<String>,
 }
 
+/// Resultado de pedir cuerpos en lote.
+///
+/// Los tres casos van separados porque significan cosas distintas y confundirlos
+/// tiene consecuencias: tratar "no te pude contestar" como "nadie lo tiene"
+/// marca transacciones vivas como perdidas y deja un saldo en cero. Paso.
+#[derive(Clone, Debug, Default)]
+pub struct PrivateTxBodiesOutcome {
+    /// Cuerpos que llegaron y validaron.
+    pub conseguidos: Vec<(String, Vec<u8>)>,
+    /// Un par dijo explicitamente que no los tiene. Esto si es informacion.
+    pub dichos_faltantes: Vec<String>,
+    /// Nadie contesto por ellos: par sin el protocolo, plazo agotado, corte.
+    /// No se sabe nada, asi que hay que volver a preguntar.
+    pub sin_respuesta: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct PrivateTxBodiesRequestResponseCodec;
 

@@ -482,7 +482,7 @@ pub fn private_tx_body_json(tx_hash: &str) -> Result<String, String> {
 /// por Tor, serializadas, y en eso se iba todo el tiempo de arranque.
 pub fn private_tx_bodies_json(tx_hashes: &[String]) -> Result<String, String> {
     if tx_hashes.is_empty() {
-        return Ok("{\"bodies\":{},\"missing\":[]}".to_string());
+        return Ok("{\"bodies\":{},\"missing\":[],\"unanswered\":[]}".to_string());
     }
     let hashes = tx_hashes.to_vec();
     pedir(
@@ -1148,29 +1148,40 @@ async fn traer_cuerpos_privados(
         }
     }
 
+    // Lo que un par dijo que no tiene, separado de lo que nadie contesto.
     let mut faltantes: Vec<String> = Vec::new();
+    let mut sin_respuesta: Vec<String> = Vec::new();
     if !pendientes.is_empty() {
         if !esperar_par(node, seeds).await {
             return Err("ningun par completo la conexion; revisa Tor".to_string());
         }
-        let (conseguidos, sin_cuerpo) = node
+        let resultado = node
             .request_private_tx_bodies_from_peers(&pendientes, BLOCKS_WAIT)
             .await;
-        for (hash, crudo) in conseguidos {
+        for (hash, crudo) in resultado.conseguidos {
             match validar_cuerpo(&hash, &crudo) {
                 Ok(json) => {
                     cache.guardar(hash.clone(), crudo);
                     encontrados.insert(hash, Value::String(json));
                 }
-                Err(_) => faltantes.push(hash),
+                // Un cuerpo que no valida no es "no lo tienen": el par lo
+                // mando mal. Va a sin_respuesta para que se reintente, quiza
+                // con otro par.
+                Err(_) => sin_respuesta.push(hash),
             }
         }
-        faltantes.extend(sin_cuerpo);
+        faltantes.extend(resultado.dichos_faltantes);
+        sin_respuesta.extend(resultado.sin_respuesta);
     }
 
     let salida = serde_json::json!({
         "bodies": Value::Object(encontrados),
+        // `missing` son los que un par dijo que no tiene: eso se puede anotar.
         "missing": faltantes,
+        // `unanswered` son los que nadie contesto: no se sabe nada de ellos y
+        // hay que volver a preguntar. Confundir estos con los de arriba fue lo
+        // que marco las 266 transacciones de la cadena como perdidas.
+        "unanswered": sin_respuesta,
     });
     serde_json::to_string(&salida).map_err(|e| format!("no pude serializar la respuesta: {e}"))
 }

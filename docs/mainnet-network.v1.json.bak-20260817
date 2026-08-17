@@ -1,0 +1,114 @@
+{
+  "schema": "zoka-mainnet-network-v1",
+  "status": "release-candidate",
+  "chain_id": "zoka-mainnet-zenith-v1",
+  "protocol_freeze_id": "/zoka/1.9.0-mainnet-recovery",
+  "minimum_client_version": "2.0.1",
+  "recovery": {
+    "policy_version": "zoka-mainnet-recovery-v1",
+    "checkpoint": {
+      "status": "compiled-release-candidate",
+      "height": 10887,
+      "hash": "d30c20100f6405424d32e5c204799bc10a1197ff5cdc1fe0b04c2c538b11086e"
+    },
+    "release_gate": {
+      "status": "blocked",
+      "allow_publish": false,
+      "minimum_confirmations": 120,
+      "minimum_head_height": 11007,
+      "observed_head_height": null,
+      "minimum_independent_observations": 2,
+      "independent_observations": [],
+      "require_release_artifact_sha256": true,
+      "release_artifact_sha256": null
+    },
+    "mismatch_action": "quarantine",
+    "recovery_action": "validated-checkpoint-reorg",
+    "automatic_db_deletion": false,
+    "signed_snapshot_recommended": true,
+    "operator_note": "Do not publish 1.9.0 until every release gate is independently verified. A mismatched node stays online for sync, cannot mine, and may atomically promote only a fully validated branch containing the compiled checkpoint."
+  },
+  "transport_policy": {
+    "anonymous_transport_preferred": false,
+    "clearnet_requires_explicit_operator_choice": false,
+    "supported": [
+      "tcp"
+    ]
+  },
+  "seed_nodes": [
+    {
+      "label": "seed1",
+      "operator": "zoka-core",
+      "region": "community",
+      "multiaddr": "/dns4/seed1.zoka.network/tcp/28080",
+      "onion": "/onion3/d5pk3nhesk5wlvz4f5unbhcozxgtj7u6mhagauyprjrxndzpwbaoeiid:28080",
+      "i2p": null,
+      "iroh": "ca7721e29d60af28dda8406191f6d7a98e146b95cd456392d0c2d2b996639f99",
+      "role": "seed",
+      "status": "active",
+      "note": "Primary bootstrap. Serverless: reachable over Tor v3 onion (no open port) and over iroh (QUIC + n0 hole-punching, for snapshot + tail-sync). The clearnet DNS/TCP address is a best-effort extra and may be unreachable behind NAT; onion + iroh are the real paths."
+    }
+  ],
+  "public_rpc": [],
+  "desktop": {
+    "local_rpc_url": "http://127.0.0.1:3000"
+  },
+  "mining": {
+    "algorithm": "randomx",
+    "open_participation": true,
+    "reward_routing": "direct-to-miner",
+    "note": "Any node can mine. Set --address <your-zka1-wallet> to receive block rewards directly.",
+    "min_peers_to_mine": 1,
+    "example_command": "zoka fullnode --network mainnet --network-config mainnet-network.v1.json --mine-interval-secs 30 --mine-blocks 1 --min-mine-peers 1 --address <your-zka1-address> --password <your-password>"
+  },
+  "joining": {
+    "full_node": "zoka fullnode --network mainnet --network-config mainnet-network.v1.json --no-mine --allow-isolated-start --password <your-password>",
+    "miner": "zoka fullnode --network mainnet --network-config mainnet-network.v1.json --mine-interval-secs 30 --mine-blocks 1 --min-mine-peers 1 --address <your-zka1-address> --password <your-password>",
+    "note": "The node auto-discovers peers from the seed nodes. After the first successful join, the persistent peer store lets the node reconnect to the mesh even if every seed is down. Block rewards go directly to your wallet by protocol - no pool or intermediary."
+  },
+  "trusted_setup": {
+    "release": "https://github.com/ZokaNetwork/ZokaNetwork/releases/tag/trusted-setup-mainnet-v1",
+    "files": [
+      {
+        "name": "private_tx.params",
+        "url": "https://github.com/ZokaNetwork/ZokaNetwork/releases/download/trusted-setup-mainnet-v1/private_tx.params",
+        "sha256": "696d8fead7135313ce849f6712386bf2b283d11bf5565b6c1c2b1e37ce22f7a7",
+        "size_bytes": 11779072
+      },
+      {
+        "name": "balance.params",
+        "url": "https://github.com/ZokaNetwork/ZokaNetwork/releases/download/trusted-setup-mainnet-v1/balance.params",
+        "sha256": "5141f7d8cac2c856fda60a647dd59a90dff941df3ab00994913c90ed5fa1ac56",
+        "size_bytes": 3210
+      },
+      {
+        "name": "merkle.params",
+        "url": "https://github.com/ZokaNetwork/ZokaNetwork/releases/download/trusted-setup-mainnet-v1/merkle.params",
+        "sha256": "caad492d972a317ffc5efe3f8e2890340a189f5060f655771d634035784baf9f",
+        "size_bytes": 21811
+      },
+      {
+        "name": "nullifier.params",
+        "url": "https://github.com/ZokaNetwork/ZokaNetwork/releases/download/trusted-setup-mainnet-v1/nullifier.params",
+        "sha256": "11ecb6d4eef5a575b0a109999ddc411ed1225c7ef56aea9140562206dd9d7df7",
+        "size_bytes": 2752
+      },
+      {
+        "name": "DIGEST",
+        "url": "https://github.com/ZokaNetwork/ZokaNetwork/releases/download/trusted-setup-mainnet-v1/DIGEST",
+        "sha256": "120423b6e462667dd2a19bae810faffca1cf443b10245e2ba63cdfe9a85e4f53",
+        "size_bytes": 65
+      }
+    ]
+  },
+  "snapshot_signers": [
+    "2b1aa6051299d703974ad9701af8f6d40787fb17a3f5436012e015194c77987a",
+    "4c9f0ab16d1400cd69123a02738399498b0b5edf6f56ae45f3c96e01864216af"
+  ],
+  "notes": [
+    "Serverless: no central RPC. The old DigitalOcean bootstrap (rpc.zoka.network) was decommissioned 2026-07-09; nodes read all state from their own local node over the p2p mesh.",
+    "Reachability without open ports: every node has a Tor v3 onion, and iroh (QUIC + n0 hole-punching) handles snapshot bootstrap and incremental tail-sync across NAT.",
+    "Wallet secrets and private keys must remain local.",
+    "Open mining network: anyone can run a node or miner and earn block rewards directly (no pool)."
+  ]
+}
