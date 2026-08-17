@@ -129,6 +129,20 @@ fn digests_call_timeout(from: u64, to: u64) -> Duration {
         .saturating_add(MOBILE_CALL_SLACK)
 }
 
+/// Plazo para un pedido en lote.
+///
+/// Escala con la cantidad porque el que responde tiene que leer y comprimir
+/// todo antes de contestar, pero muy por debajo de lo que costaria pedirlos de
+/// a uno: ahi cada cuerpo pagaba su propia espera de par.
+fn private_bodies_call_timeout(cuantos: usize) -> Duration {
+    let lotes = cuantos.div_ceil(
+        crate::network::private_tx_bodies_request_response::MAX_BODIES_PER_REQUEST,
+    );
+    PEER_WAIT
+        .saturating_add(BLOCKS_WAIT.saturating_mul(lotes.clamp(1, 8) as u32))
+        .saturating_add(MOBILE_CALL_SLACK)
+}
+
 fn private_body_call_timeout() -> Duration {
     PEER_WAIT
         .saturating_add(BLOCKS_WAIT)
@@ -207,6 +221,8 @@ enum Cmd {
     Blocks(u64, u64, std_mpsc::Sender<Result<String, String>>),
     Digests(u64, u64, std_mpsc::Sender<Result<String, String>>),
     PrivateTxBody(String, std_mpsc::Sender<Result<String, String>>),
+    /// Muchos cuerpos de una vez. Es el camino de la wallet que arranca.
+    PrivateTxBodies(Vec<String>, std_mpsc::Sender<Result<String, String>>),
     Shutdown,
 }
 
@@ -452,6 +468,26 @@ pub fn private_tx_body_json(tx_hash: &str) -> Result<String, String> {
     pedir(
         |tx| Cmd::PrivateTxBody(tx_hash.to_string(), tx),
         private_body_call_timeout(),
+    )?
+}
+
+/// Muchos cuerpos de transaccion privada de una sola vez, en JSON.
+///
+/// Devuelve `{"bodies":{hash:cuerpo}, "missing":[hash]}`. Los faltantes van
+/// explicitos: un cuerpo que ningun par tiene no es un error de red, y quien
+/// llama necesita distinguirlos para no reintentarlos para siempre.
+///
+/// Esta es la diferencia entre una wallet que sincroniza y una que no. Medido
+/// contra la cadena real: 266 transacciones privadas eran 266 idas y vueltas
+/// por Tor, serializadas, y en eso se iba todo el tiempo de arranque.
+pub fn private_tx_bodies_json(tx_hashes: &[String]) -> Result<String, String> {
+    if tx_hashes.is_empty() {
+        return Ok("{\"bodies\":{},\"missing\":[]}".to_string());
+    }
+    let hashes = tx_hashes.to_vec();
+    pedir(
+        move |tx| Cmd::PrivateTxBodies(hashes.clone(), tx),
+        private_bodies_call_timeout(tx_hashes.len()),
     )?
 }
 
@@ -1081,6 +1117,84 @@ async fn precargar_cuerpos(node: &mut Node, cache: &mut CacheCuerpos, alturas: &
     }
 }
 
+/// Trae muchos cuerpos: primero del cache, el resto en lote a los pares.
+///
+/// El cache existe porque los bloques ya bajados pueden traer cuerpos; lo que
+/// no este ahi se pide, y se pide junto. Los cuerpos que llegan se validan uno
+/// por uno igual que en el camino de a uno -- un lote no es excusa para
+/// aflojar: un par podria mandar un cuerpo que no corresponde a su hash, y con
+/// eso la wallet se cargaria notas ajenas.
+async fn traer_cuerpos_privados(
+    node: &mut Node,
+    cache: &mut CacheCuerpos,
+    seeds: &[String],
+    hashes: &[String],
+) -> Result<String, String> {
+    use serde_json::{Map, Value};
+
+    let mut encontrados: Map<String, Value> = Map::new();
+    let mut pendientes: Vec<String> = Vec::new();
+    for hash in hashes {
+        match cache.buscar(hash) {
+            Some(crudo) => match validar_cuerpo(hash, crudo) {
+                Ok(json) => {
+                    encontrados.insert(hash.clone(), Value::String(json));
+                }
+                // Un cuerpo guardado que no valida se trata como ausente y se
+                // vuelve a pedir, en vez de envenenar la respuesta.
+                Err(_) => pendientes.push(hash.clone()),
+            },
+            None => pendientes.push(hash.clone()),
+        }
+    }
+
+    let mut faltantes: Vec<String> = Vec::new();
+    if !pendientes.is_empty() {
+        if !esperar_par(node, seeds).await {
+            return Err("ningun par completo la conexion; revisa Tor".to_string());
+        }
+        let (conseguidos, sin_cuerpo) = node
+            .request_private_tx_bodies_from_peers(&pendientes, BLOCKS_WAIT)
+            .await;
+        for (hash, crudo) in conseguidos {
+            match validar_cuerpo(&hash, &crudo) {
+                Ok(json) => {
+                    cache.guardar(hash.clone(), crudo);
+                    encontrados.insert(hash, Value::String(json));
+                }
+                Err(_) => faltantes.push(hash),
+            }
+        }
+        faltantes.extend(sin_cuerpo);
+    }
+
+    let salida = serde_json::json!({
+        "bodies": Value::Object(encontrados),
+        "missing": faltantes,
+    });
+    serde_json::to_string(&salida).map_err(|e| format!("no pude serializar la respuesta: {e}"))
+}
+
+/// Comprueba que un cuerpo sea de verdad el que se pidio.
+///
+/// Las dos comprobaciones importan y son distintas: que el par no haya mandado
+/// otra transaccion, y que el cuerpo coincida con su propio hash canonico. Sin
+/// la segunda, un par podria fabricar un cuerpo con el hash que le pedimos.
+fn validar_cuerpo(hash: &str, crudo: &[u8]) -> Result<String, String> {
+    let cuerpo: PrivateTransaction = serde_json::from_slice(crudo)
+        .map_err(|e| format!("el cuerpo de {hash} no es una transaccion privada valida: {e}"))?;
+    if cuerpo.tx_hash != hash {
+        return Err(format!(
+            "el par devolvio la transaccion {} cuando se pidio {hash}",
+            cuerpo.tx_hash
+        ));
+    }
+    if cuerpo.tx_hash != crate::private_wallet::expected_private_tx_hash(&cuerpo) {
+        return Err(format!("el cuerpo de {hash} no coincide con su hash canonico"));
+    }
+    serde_json::to_string(&cuerpo).map_err(|e| format!("no pude serializar el cuerpo de {hash}: {e}"))
+}
+
 async fn traer_cuerpo_privado(
     node: &mut Node,
     cache: &CacheCuerpos,
@@ -1381,6 +1495,10 @@ async fn run_client(
                     } else {
                         Err("ningun par completo la conexion; revisa Tor".to_string())
                     };
+                    let _ = resp.send(r);
+                }
+                Some(Cmd::PrivateTxBodies(hashes, resp)) => {
+                    let r = traer_cuerpos_privados(&mut node, &mut cache, &seeds, &hashes).await;
                     let _ = resp.send(r);
                 }
                 Some(Cmd::PrivateTxBody(hash, resp)) => {

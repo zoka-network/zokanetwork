@@ -54,6 +54,10 @@ use crate::network::snapshot_request_response::{
     protocol_name as snapshot_request_response_protocol, GetSnapshotManifests,
     SnapshotManifestsResponse, SnapshotRequestResponseCodec,
 };
+use crate::network::private_tx_bodies_request_response::{
+    protocol_name as private_tx_bodies_protocol, PrivateTxBodiesRequest, PrivateTxBodiesRequestResponseCodec,
+    PrivateTxBodiesResponse,
+};
 use crate::network::wallet_digest_request_response::{
     protocol_name as wallet_digest_protocol, BlockDigest, GetWalletDigests,
     WalletDigestRequestResponseCodec, WalletDigestsResponse,
@@ -874,6 +878,11 @@ pub struct Node {
     received_header_responses: VecDeque<ReceivedHeadersResponse>,
     /// Digest requests that are still owned by the active sequential failover.
     /// Removing an id marks late libp2p events as stale so the handler drops them.
+    pending_outbound_private_tx_bodies_requests:
+        HashMap<request_response::OutboundRequestId, PeerId>,
+    received_private_tx_bodies: VecDeque<(PeerId, PrivateTxBodiesResponse)>,
+    private_tx_bodies_responder:
+        Option<Box<dyn Fn(&PrivateTxBodiesRequest) -> PrivateTxBodiesResponse + Send>>,
     pending_outbound_wallet_digest_requests: HashMap<request_response::OutboundRequestId, PeerId>,
     /// Resumenes de bloque recibidos, esperando a que alguien los recoja.
     received_wallet_digests: VecDeque<ReceivedWalletDigestsResponse>,
@@ -914,6 +923,8 @@ pub struct NodeBehaviour {
     private_tx_request_response: request_response::Behaviour<PrivateTxRequestResponseCodec>,
     /// Header chain request/response for headers-first IBD.
     header_request_response: request_response::Behaviour<HeaderRequestResponseCodec>,
+    private_tx_bodies_request_response:
+        request_response::Behaviour<PrivateTxBodiesRequestResponseCodec>,
     wallet_digest_request_response: request_response::Behaviour<WalletDigestRequestResponseCodec>,
     /// Snapshot manifest discovery.
     snapshot_request_response: request_response::Behaviour<SnapshotRequestResponseCodec>,
@@ -2089,6 +2100,17 @@ impl Node {
                 )],
                 request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
             );
+            let private_tx_bodies_request_response = request_response::Behaviour::with_codec(
+                PrivateTxBodiesRequestResponseCodec,
+                [(
+                    private_tx_bodies_protocol(),
+                    request_response::ProtocolSupport::Full,
+                )],
+                // Mismo presupuesto que los resumenes: un lote de cuerpos es
+                // grande y viaja por Tor, asi que el plazo corto de los pedidos
+                // sueltos no alcanza.
+                data_request_response_config(),
+            );
             let wallet_digest_request_response = request_response::Behaviour::with_codec(
                 WalletDigestRequestResponseCodec,
                 [(
@@ -2116,6 +2138,7 @@ impl Node {
                 block_request_response,
                 private_tx_request_response,
                 header_request_response,
+                private_tx_bodies_request_response,
                 wallet_digest_request_response,
                 snapshot_request_response,
                 // Default: ping every 15s, 20s timeout. Well under the
@@ -2197,6 +2220,9 @@ impl Node {
             block_request_peer_stats: HashMap::new(),
             pending_header_requests: VecDeque::new(),
             received_header_responses: VecDeque::new(),
+            pending_outbound_private_tx_bodies_requests: HashMap::new(),
+            received_private_tx_bodies: VecDeque::new(),
+            private_tx_bodies_responder: None,
             pending_outbound_wallet_digest_requests: HashMap::new(),
             received_wallet_digests: VecDeque::new(),
             wallet_digest_peer_cursor: 0,
@@ -2746,6 +2772,85 @@ impl Node {
         Some(id)
     }
 
+    fn handle_private_tx_bodies_event(
+        &mut self,
+        event: request_response::Event<PrivateTxBodiesRequest, PrivateTxBodiesResponse>,
+    ) {
+        match event {
+            request_response::Event::Message { peer, message } => match message {
+                request_response::Message::Request {
+                    request, channel, ..
+                } => {
+                    // Sin responder configurado se contesta que no se tiene
+                    // ninguno, en vez de dejar el pedido colgado: quien
+                    // pregunta cae enseguida al protocolo de a uno en lugar de
+                    // esperar el plazo completo. Una wallet no tiene cuerpos
+                    // que servir y este es su caso normal.
+                    let respuesta = match self.private_tx_bodies_responder.as_ref() {
+                        Some(responder) => responder(&request),
+                        None => PrivateTxBodiesResponse {
+                            bodies: Vec::new(),
+                            missing: request.tx_hashes.clone(),
+                        },
+                    };
+                    let _ = self
+                        .swarm
+                        .behaviour_mut()
+                        .private_tx_bodies_request_response
+                        .send_response(channel, respuesta);
+                }
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                } => {
+                    self.pending_outbound_private_tx_bodies_requests
+                        .remove(&request_id);
+                    self.received_private_tx_bodies.push_back((peer, response));
+                }
+            },
+            request_response::Event::OutboundFailure { request_id, .. } => {
+                self.pending_outbound_private_tx_bodies_requests
+                    .remove(&request_id);
+            }
+            _ => {}
+        }
+    }
+
+    /// Quien sirve los cuerpos cuando alguien los pide en lote.
+    pub fn set_private_tx_bodies_responder(
+        &mut self,
+        responder: Box<dyn Fn(&PrivateTxBodiesRequest) -> PrivateTxBodiesResponse + Send>,
+    ) {
+        self.private_tx_bodies_responder = Some(responder);
+    }
+
+    /// Pide varios cuerpos de una sola vez.
+    ///
+    /// Devuelve `None` si el par no esta conectado, para que quien llama pruebe
+    /// con otro en vez de esperar un plazo que no va a llegar.
+    pub fn request_private_tx_bodies(
+        &mut self,
+        peer: &PeerId,
+        tx_hashes: Vec<String>,
+    ) -> Option<request_response::OutboundRequestId> {
+        if !self.swarm.is_connected(peer) || tx_hashes.is_empty() {
+            return None;
+        }
+        let id = self
+            .swarm
+            .behaviour_mut()
+            .private_tx_bodies_request_response
+            .send_request(peer, PrivateTxBodiesRequest { tx_hashes });
+        self.pending_outbound_private_tx_bodies_requests
+            .insert(id, *peer);
+        Some(id)
+    }
+
+    /// Saca una respuesta de cuerpos en lote ya recibida, si hay.
+    pub fn take_private_tx_bodies_response(&mut self) -> Option<(PeerId, PrivateTxBodiesResponse)> {
+        self.received_private_tx_bodies.pop_front()
+    }
+
     fn handle_wallet_digest_event(
         &mut self,
         event: request_response::Event<GetWalletDigests, WalletDigestsResponse>,
@@ -2928,6 +3033,73 @@ impl Node {
             .remove(&request_id);
         self.received_wallet_digests
             .retain(|response| response.request_id != request_id);
+    }
+
+    /// Trae muchos cuerpos, probando pares hasta juntarlos.
+    ///
+    /// Devuelve los que consiguio y los que ningun par consultado tenia. Un
+    /// cuerpo que nadie tiene no es un error de red: son transacciones cuyo
+    /// cuerpo se perdio de la malla, y quien llama necesita distinguirlas para
+    /// no reintentarlas para siempre.
+    ///
+    /// Se pregunta de a un par por vez y no a todos a la vez: sobre Tor cada
+    /// pedido paralelo abre su circuito, y varios a la vez es justo lo que hace
+    /// que ninguno termine.
+    pub async fn request_private_tx_bodies_from_peers(
+        &mut self,
+        tx_hashes: &[String],
+        max_wait: Duration,
+    ) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
+        use std::collections::HashSet;
+        let mut faltan: HashSet<String> = tx_hashes.iter().cloned().collect();
+        let mut conseguidos: Vec<(String, Vec<u8>)> = Vec::new();
+        if faltan.is_empty() {
+            return (conseguidos, Vec::new());
+        }
+
+        let limite = Instant::now() + max_wait;
+        let pares = self.connected_peer_ids();
+        for peer in pares {
+            if faltan.is_empty() || Instant::now() >= limite {
+                break;
+            }
+            let pedido: Vec<String> = faltan.iter().cloned().collect();
+            let mut restante_del_par = pedido;
+            // Un par puede tener que contestar varios lotes si faltan mas que
+            // el maximo por pedido.
+            while !restante_del_par.is_empty() && Instant::now() < limite {
+                let este_lote: Vec<String> = restante_del_par
+                    .iter()
+                    .take(crate::network::private_tx_bodies_request_response::MAX_BODIES_PER_REQUEST)
+                    .cloned()
+                    .collect();
+                if self
+                    .request_private_tx_bodies(&peer, este_lote.clone())
+                    .is_none()
+                {
+                    break;
+                }
+                let mut contesto = false;
+                while Instant::now() < limite {
+                    let _ = self.pump_for(Duration::from_millis(200)).await;
+                    if let Some((_, respuesta)) = self.take_private_tx_bodies_response() {
+                        for entrada in respuesta.bodies {
+                            if faltan.remove(&entrada.tx_hash) {
+                                conseguidos.push((entrada.tx_hash, entrada.body));
+                            }
+                        }
+                        contesto = true;
+                        break;
+                    }
+                }
+                if !contesto {
+                    break;
+                }
+                restante_del_par.retain(|h| faltan.contains(h));
+                restante_del_par.retain(|h| !este_lote.contains(h));
+            }
+        }
+        (conseguidos, faltan.into_iter().collect())
     }
 
     pub async fn request_wallet_digests(
@@ -3765,7 +3937,13 @@ impl Node {
                         SwarmEvent::Behaviour(NodeBehaviourEvent::HeaderRequestResponse(event)) => {
                             self.handle_header_request_response_event(event);
                         }
-                        SwarmEvent::Behaviour(NodeBehaviourEvent::WalletDigestRequestResponse(event)) => {
+                        SwarmEvent::Behaviour(NodeBehaviourEvent::PrivateTxBodiesRequestResponse(event)) => {
+                            self.handle_private_tx_bodies_event(event);
+                        }
+                        SwarmEvent::Behaviour(NodeBehaviourEvent::PrivateTxBodiesRequestResponse(event)) => {
+                    self.handle_private_tx_bodies_event(event);
+                }
+                SwarmEvent::Behaviour(NodeBehaviourEvent::WalletDigestRequestResponse(event)) => {
                             self.handle_wallet_digest_event(event);
                         }
                         SwarmEvent::Behaviour(NodeBehaviourEvent::SnapshotRequestResponse(event)) => {
@@ -6571,6 +6749,159 @@ mod tests {
                 "un nodo completo si tiene que estar en '{ajeno}': {temas_completo:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn dos_nodos_se_pasan_muchos_cuerpos_en_un_solo_pedido() {
+        // Dos nodos de verdad por TCP local. Que el codigo compile no dice nada
+        // sobre si los pares se entienden, y este protocolo existe para reemplazar
+        // 266 idas y vueltas por Tor: si no funciona de verdad, no sirve de nada.
+        use crate::network::private_tx_bodies_request_response::{
+            PrivateTxBodiesResponse, PrivateTxBodyEntry,
+        };
+
+        let mut servidor = Node::new(0).await.expect("nodo servidor");
+        servidor
+            .listen("/ip4/127.0.0.1/tcp/0")
+            .await
+            .expect("escuchar");
+        // El servidor tiene los pares y no tiene los impares: hay que poder
+        // distinguir "no lo tengo" de "no contesto".
+        servidor.set_private_tx_bodies_responder(Box::new(|pedido| {
+            let mut bodies = Vec::new();
+            let mut missing = Vec::new();
+            for hash in &pedido.tx_hashes {
+                let numero: u64 = hash.trim_start_matches("tx").parse().unwrap_or(0);
+                if numero % 2 == 0 {
+                    bodies.push(PrivateTxBodyEntry {
+                        tx_hash: hash.clone(),
+                        body: format!("cuerpo-de-{hash}").into_bytes(),
+                    });
+                } else {
+                    missing.push(hash.clone());
+                }
+            }
+            PrivateTxBodiesResponse { bodies, missing }
+        }));
+
+        let mut direccion = None;
+        for _ in 0..40 {
+            let _ = servidor.pump_for(Duration::from_millis(50)).await;
+            if let Some(addr) = servidor.swarm.listeners().next() {
+                direccion = Some(addr.clone());
+                break;
+            }
+        }
+        let direccion = direccion.expect("el servidor tiene que escuchar en algun lado");
+        let addr_con_peer = format!("{direccion}/p2p/{}", servidor.peer_id());
+
+        let mut cliente = Node::new(0).await.expect("nodo cliente");
+        cliente
+            .connect_to_peer(&addr_con_peer)
+            .await
+            .expect("marcar al servidor");
+
+        for _ in 0..60 {
+            let _ = cliente.pump_for(Duration::from_millis(30)).await;
+            let _ = servidor.pump_for(Duration::from_millis(30)).await;
+            if cliente.connected_peer_count() > 0 {
+                break;
+            }
+        }
+        assert!(
+            cliente.connected_peer_count() > 0,
+            "los nodos tienen que conectarse antes de pedirse nada"
+        );
+
+        let atender = tokio::spawn(async move {
+            for _ in 0..300 {
+                let _ = servidor.pump_for(Duration::from_millis(25)).await;
+            }
+            servidor
+        });
+
+        let pedidos: Vec<String> = (0..10).map(|i| format!("tx{i}")).collect();
+        let (conseguidos, faltantes) = cliente
+            .request_private_tx_bodies_from_peers(&pedidos, Duration::from_secs(15))
+            .await;
+        let _ = atender.await;
+
+        assert_eq!(
+            conseguidos.len(),
+            5,
+            "los cinco pares tenian que llegar en un solo viaje: {conseguidos:?}"
+        );
+        for (hash, cuerpo) in &conseguidos {
+            assert_eq!(
+                cuerpo,
+                &format!("cuerpo-de-{hash}").into_bytes(),
+                "cada cuerpo tiene que corresponder a su hash"
+            );
+        }
+        assert_eq!(
+            faltantes.len(),
+            5,
+            "los que el par no tiene se informan, no se callan: {faltantes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_par_que_no_sirve_cuerpos_contesta_que_no_los_tiene() {
+        // Una wallet no tiene cuerpos que servir. Sin responder configurado
+        // tiene que contestar "no los tengo" en vez de dejar el pedido colgado,
+        // asi quien pregunta cae al protocolo de a uno enseguida en lugar de
+        // esperar el plazo completo.
+        let mut servidor = Node::new(0).await.expect("nodo servidor");
+        servidor
+            .listen("/ip4/127.0.0.1/tcp/0")
+            .await
+            .expect("escuchar");
+
+        let mut direccion = None;
+        for _ in 0..40 {
+            let _ = servidor.pump_for(Duration::from_millis(50)).await;
+            if let Some(addr) = servidor.swarm.listeners().next() {
+                direccion = Some(addr.clone());
+                break;
+            }
+        }
+        let direccion = direccion.expect("el servidor tiene que escuchar");
+        let addr_con_peer = format!("{direccion}/p2p/{}", servidor.peer_id());
+
+        let mut cliente = Node::new(0).await.expect("nodo cliente");
+        cliente
+            .connect_to_peer(&addr_con_peer)
+            .await
+            .expect("marcar al servidor");
+        for _ in 0..60 {
+            let _ = cliente.pump_for(Duration::from_millis(30)).await;
+            let _ = servidor.pump_for(Duration::from_millis(30)).await;
+            if cliente.connected_peer_count() > 0 {
+                break;
+            }
+        }
+
+        let atender = tokio::spawn(async move {
+            for _ in 0..200 {
+                let _ = servidor.pump_for(Duration::from_millis(25)).await;
+            }
+            servidor
+        });
+
+        let (conseguidos, faltantes) = cliente
+            .request_private_tx_bodies_from_peers(
+                &["tx1".to_string(), "tx2".to_string()],
+                Duration::from_secs(10),
+            )
+            .await;
+        let _ = atender.await;
+
+        assert!(conseguidos.is_empty(), "no tenia ninguno");
+        assert_eq!(
+            faltantes.len(),
+            2,
+            "y tiene que decirlo, no quedarse callado: {faltantes:?}"
+        );
     }
 
     #[tokio::test]

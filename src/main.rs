@@ -6964,6 +6964,42 @@ fn serve_pending_private_tx_body_requests(
 /// solo sirve para gastar -- sobre todo la prueba de rango del coinbase, que es
 /// el 56% de cada bloque. Quien reconozca un coinbase propio pide ESE bloque
 /// entero por el protocolo de siempre.
+fn private_tx_bodies_from_storage(
+    storage: &RocksDbStorage,
+    request: &zoka::network::private_tx_bodies_request_response::PrivateTxBodiesRequest,
+) -> zoka::network::private_tx_bodies_request_response::PrivateTxBodiesResponse {
+    use zoka::network::private_tx_bodies_request_response::{
+        PrivateTxBodiesResponse, PrivateTxBodyEntry, MAX_BODIES_PER_REQUEST,
+    };
+
+    let mut bodies = Vec::new();
+    let mut missing = Vec::new();
+    // Se acota lo que un par puede hacer trabajar a otro de una sola vez. Lo
+    // que sobra del pedido se informa como faltante, no se descarta en
+    // silencio: quien pregunta tiene que saber que le quedo pendiente para
+    // volver a pedirlo.
+    for (indice, hash) in request.tx_hashes.iter().enumerate() {
+        let hash = hash.trim();
+        if hash.is_empty() {
+            continue;
+        }
+        if indice >= MAX_BODIES_PER_REQUEST {
+            missing.push(hash.to_string());
+            continue;
+        }
+        // Misma fuente que el protocolo de a uno, para que las dos vias no
+        // puedan discrepar sobre que cuerpos existen.
+        match storage.get_private_transaction_bytes(hash) {
+            Ok(Some(body)) if !body.is_empty() => bodies.push(PrivateTxBodyEntry {
+                tx_hash: hash.to_string(),
+                body,
+            }),
+            _ => missing.push(hash.to_string()),
+        }
+    }
+    PrivateTxBodiesResponse { bodies, missing }
+}
+
 fn wallet_digests_from_storage(
     storage: &RocksDbStorage,
     request: &zoka::network::wallet_digest_request_response::GetWalletDigests,
@@ -11076,6 +11112,10 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         let digest_storage = storage.clone();
         node.set_wallet_digest_responder(Box::new(move |request| {
             wallet_digests_from_storage(&digest_storage, request)
+        }));
+        let bodies_storage = storage.clone();
+        node.set_private_tx_bodies_responder(Box::new(move |request| {
+            private_tx_bodies_from_storage(&bodies_storage, request)
         }));
     }
     // Optionally also serve this node's chain as an iroh snapshot so fresh
