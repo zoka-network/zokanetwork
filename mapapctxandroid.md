@@ -612,6 +612,79 @@ pausas. Quien vea que va lento y suba ese número va a perder el tiempo.
 - APK de 98,8 MB (4 ABIs + 17 MB de ML Kit). App Bundle o splits.
 - Toda la interfaz está en inglés y el usuario trabaja en español.
 
+## 6quater. Actualización Claude — 2026-08-17
+
+Este día fue casi todo errores propios. Van con nombre porque son reproducibles.
+
+### Lo construido
+
+- **`/zoka/private-tx-bodies/1`**: muchos cuerpos privados en un pedido, con
+  deflate. Existe porque los cuerpos **no se pueden sacar de los bloques**:
+  verificado contra los bloques 423, 16211 y 17771 de la cadena real — hashes
+  privados sí, cuerpos cero. El campo del bloque está dormido hasta que se fije
+  su altura de activación en consenso. Dos nodos reales se pasan diez cuerpos en
+  un viaje y distinguen los que el par no tiene.
+- ~~**La wallet dejaba de buscar pares al encontrar uno.**~~ Cortaba en el
+  primero y nadie volvía a intentar. Ahora junta `PARES_DESEADOS` y repone cada
+  45 s. Medido: pasó de 1 par a 2.
+- ~~**Tres semillas onion en vez de una.**~~ Había tres vivas en la red y la app
+  conocía una.
+- ~~**El avance se publicaba por tanda.**~~ Subir la tanda a 24 fue un error
+  propio: los pedidos se serializan por un mutex, así que no aceleró nada y
+  agrandó el bloque de espera. La pantalla decía "0 of 266" y parecía trabada.
+- ~~**El punto de control de bloques borraba el resultado de la fase de
+  cuerpos.**~~ Se escribía sin esos campos y los vacíos pisaban lo guardado.
+
+### Los cuatro errores del día
+
+**1. El script de compilación mentía.** `build-android.ps1` no chequeaba
+`$LASTEXITCODE`: cuando `cargo` fallaba, seguía, empaquetaba libc++ y salía con
+éxito, dejando los `.so` de la corrida anterior. **Eso puso en el teléfono la app
+nueva sobre el motor viejo durante todo el 16/08**, y los tiempos se leyeron como
+si el cambio estuviera adentro. Ya lanza excepción.
+
+**2. Un `null` en el manifiesto rompió ZSilent.** Los seeds nuevos se agregaron
+con `"multiaddr": null`. El cliente de escritorio declara ese campo como
+`String` **no nullable**, así que un null explícito aborta el parseo del
+manifiesto entero y lo deja sin configuración — se quedó sin métricas. **Regla:
+en ese manifiesto, campo que no se tiene se OMITE, nunca se pone en null.** Una
+clave ausente usa el default; null no.
+
+**3. Confundir "no te pude contestar" con "no lo tengo" dejó el saldo en cero.**
+Contra un par sin el protocolo nuevo, el pedido en lote no se negociaba. El
+código devolvía todo lo no llegado en una bolsa y quien llamaba lo trataba como
+"nadie lo tiene": marcó las 266 transacciones privadas de la cadena como
+irrecuperables, **las persistió**, y el saldo pasó a cero. La distinción estaba
+escrita en los comentarios del protocolo y no se respetaba treinta líneas más
+arriba. Ahora hay tres campos —`conseguidos`, `dichos_faltantes`,
+`sin_respuesta`— más una salvaguarda: si un lote dice que faltan más de la mitad,
+no se anota nada (es un par que no responde bien, no una cadena con cuerpos
+perdidos). La clave del almacén se versionó a `_v2` para descartar la lista mala
+sin obligar a reinstalar.
+
+**4. `cargo test --features mobile` estaba permanentemente rojo.** Once pruebas
+escritas para la configuración de consenso, corriendo en la del teléfono, que
+enciende esas activaciones **a propósito** (documentado en `economics.rs`). Once
+rojos esperados tapan uno real sin esfuerzo — y se estaba usando ese conjunto
+para validar el protocolo nuevo. La del doble gasto **se arregló, no se
+excluyó**: el bloque sí se rechazaba, solo lo atrapaba otra guarda antes; ahora
+acepta las dos y la cobertura queda viva en la configuración del dispositivo.
+
+### La regla que sale de todo esto
+
+**Verificar por hash, no por fecha ni por "el script dijo que sí".** Dos veces en
+dos días se instaló algo distinto de lo compilado, y las dos veces lo cazó el
+hash. Antes de medir cualquier cosa:
+
+    sha256 del .so compilado == sha256 del .so dentro del APK == el del teléfono
+    grep -ac "<string del protocolo nuevo>" en el binario
+
+### Pendiente que no es código
+
+`seed2` no completó circuito Tor el 17/08 (seed1 y seed3 sí). Queda listada: un
+nodo detrás de NAT que se apaga un día es normal, y el almacén de pares ya hunde
+solo lo que no responde.
+
 ## 7. COLATERALES Y ALTERNATIVAS A EVALUAR
 
 Buscá activamente en estas direcciones. No las descarté por malas — no las
