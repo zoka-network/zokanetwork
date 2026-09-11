@@ -28,21 +28,45 @@ The helper script downloads the bundle, checksum-verifies it against a pinned
 SHA256, optionally verifies the `.asc` signature with GPG, and extracts it into
 `third_party/tor/windows-x86_64`.
 
-Pinned bundle (Tor Expert Bundle 15.0.18, tor 0.4.9.11):
+Pinned bundle (Tor Expert Bundle 15.0.22, tor 0.4.9.12 — security release of
+2026-09-08, "a series of high-severity security issues"):
 
-- URL: `https://archive.torproject.org/tor-package-archive/torbrowser/15.0.18/tor-expert-bundle-windows-x86_64-15.0.18.tar.gz`
-- SHA256: `6ac067402c7b4a3dc37887ed3754b3914b67fdc220c966190683e9ccf91abf0f`
-- Signature: `https://archive.torproject.org/tor-package-archive/torbrowser/15.0.18/tor-expert-bundle-windows-x86_64-15.0.18.tar.gz.asc`
+- URL: `https://archive.torproject.org/tor-package-archive/torbrowser/15.0.22/tor-expert-bundle-windows-x86_64-15.0.22.tar.gz`
+- SHA256: `231dad6b9cb401a54c260db7046965ef04e4f72ff071b140d423fb5da281ab1e`
+- Signature: `https://archive.torproject.org/tor-package-archive/torbrowser/15.0.22/tor-expert-bundle-windows-x86_64-15.0.22.tar.gz.asc`
+- Signed by the Tor Browser Developers key, primary fingerprint
+  `EF6E 286D DA85 EA2A 4BA7 DE68 4E2C 6E87 9329 8290` (fetch it with
+  `gpg --auto-key-locate nodefault,wkd --locate-keys torbrowser@torproject.org`
+  and check the fingerprint before trusting the "Good signature").
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File zsilent-core/scripts/prepare-tor-expert-bundle-windows.ps1 `
-  -Url "https://archive.torproject.org/tor-package-archive/torbrowser/15.0.18/tor-expert-bundle-windows-x86_64-15.0.18.tar.gz" `
-  -Sha256 "6ac067402c7b4a3dc37887ed3754b3914b67fdc220c966190683e9ccf91abf0f" `
-  -AscUrl "https://archive.torproject.org/tor-package-archive/torbrowser/15.0.18/tor-expert-bundle-windows-x86_64-15.0.18.tar.gz.asc" `
+  -Url "https://archive.torproject.org/tor-package-archive/torbrowser/15.0.22/tor-expert-bundle-windows-x86_64-15.0.22.tar.gz" `
+  -Sha256 "231dad6b9cb401a54c260db7046965ef04e4f72ff071b140d423fb5da281ab1e" `
+  -AscUrl "https://archive.torproject.org/tor-package-archive/torbrowser/15.0.22/tor-expert-bundle-windows-x86_64-15.0.22.tar.gz.asc" `
+  -ExpectedTorVersion "0.4.9.12" `
   -VerifySignature
 ```
 
-When bumping the bundle, update all three values together (URL, SHA256, `.asc`). Compute the SHA256 with `Get-FileHash -Algorithm SHA256`.
+When bumping the bundle, update **four** places together, or the next release
+ships the old Tor:
+
+1. this document;
+2. `zsilent-core/scripts/prepare-release.ps1` (`$expectedTorBundleVersion`,
+   `$expectedTorVersion`, `$expectedTorUrl`, `$expectedTorArchiveSha256`);
+3. `zsilent-core/.github/workflows/release.yml` (URL, SHA256,
+   `-ExpectedTorVersion`) — CI downloads Tor itself, so updating only the
+   local install leaves the next build on the old version;
+4. the installed copies (ZSilent `resources/tor/windows-x86_64`, Zveil
+   `tor/`), which need the node stopped because Windows locks a running
+   `tor.exe`.
+
+The SHA256 is what the script *expects*, not proof of origin: take it from an
+archive whose GPG signature you already verified. Compute it with
+`Get-FileHash -Algorithm SHA256`.
+
+Tor moved to a two-week security-release cadence in September 2026 (0.4.9.13
+announced for 2026-09-22), so expect to repeat this.
 
 ### Step 2 — Build the Windows installer with Tor required
 
