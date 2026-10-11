@@ -10,78 +10,9 @@ wallet live on your machine.
 Windows, `.deb` and `.rpm` for Linux, or the standalone node binary if you
 prefer the command line.
 
-Version 2.0 adds three sections to ZSilent. This document covers those three.
-
----
-
-## P2P Exchange — sell ZKA for USDT, person to person
-
-You publish an offer, someone pays you USDT on Tron, and your own node verifies
-the payment and releases the ZKA. Nobody sits in the middle.
-
-### How a sale works
-
-**1. You publish.** You state how much ZKA you are selling, how much USDT you
-want, and the TRC-20 address where you will be paid. Your node reserves the ZKA
-in your wallet and announces the offer over the peer mesh.
-
-**2. A buyer takes it.** The offer stops being claimable and a 45-minute payment
-window starts.
-
-**3. The buyer pays** the exact USDT amount to the address in the offer.
-
-**4. Your node verifies and releases.** It queries Tron every few seconds
-through Tor. When it sees a transfer of the right amount, to the right address,
-inside the window, it spends the reserved notes to the buyer. This is automatic
-— nobody approves it, including you.
-
-The release is a private transaction, so it confirms when a block is mined. If
-the chain is idle it stays pending until someone mines.
-
-### Before you trade
-
-**The lock is not an escrow.** Your ZKA is marked reserved inside your own
-wallet. That is bookkeeping, not a blockchain escrow, and a modified client
-could spend it anyway. Trade with people you have some reason to trust.
-
-**There is no arbiter.** No dispute process, no support desk, no way to reverse
-anything. Every outcome is reachable without a human deciding: either the
-payment is seen and the ZKA is released, or the window lapses and your lock is
-dropped.
-
-**Payment checks need Tor on mainnet.** The query tells a public API which
-address you are watching, so it goes through Tor and never falls back to a
-direct connection. If Tor is down the payment is not verified, the offer
-expires, and your ZKA comes back.
-
-**Selling locks whole notes.** A private note cannot be split. Backing a 20 ZKA
-sale may immobilise a 27.99 note; the difference returns as change when the
-trade closes. The offer row shows what is actually locked, not only what you
-are selling, so the drop in your spendable balance is never a surprise.
-
-**Only the seller can see the reservation.** It lives in the seller's wallet. If
-a reservation breaks, that node stops advertising the offer so nobody new can
-take it, and the seller is told to cancel and republish.
-
-### Rehearsing without risking money
-
-Settings → Tron network → **Nile testnet**. The node restarts by itself and
-verifies against Nile instead of Tron mainnet, so you can walk through the whole
-flow with faucet USDT.
-
-The **ZKA side is always real**. An offer published while Tron is set to Nile
-gives away real ZKA for testnet USDT. Use it to rehearse with someone you trust,
-not to trade.
-
-### When a sale does not close
-
-`GET /p2p-exchange/diagnostics` on your local node reports, for each of your
-live offers, whether its reservation is intact and what is wrong if it is not.
-
-Add `?tron=1` and it also queries Tron and tells you, for every transfer it
-found, why that transfer did or did not settle the offer — including which
-network and contract the node believes it is looking at. That last detail is
-what turns "it isn't working" into an answer.
+Version 2.0 adds two sections to ZSilent, Explorer and Mining Pool. This
+document covers both. (The P2P Exchange that shipped alongside them was
+removed in October 2026.)
 
 ---
 
@@ -140,8 +71,7 @@ everyone can check that the rotation matches what they are putting in.
 
 ## Running the node without ZSilent
 
-Everything above except the exchange works from the command line. The exchange
-is deliberately GUI-only.
+Everything above also works from the command line.
 
 ```sh
 zoka fullnode --network mainnet --address <your-zka-address>

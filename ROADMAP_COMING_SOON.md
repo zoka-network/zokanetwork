@@ -1,5 +1,10 @@
 # ZSilent Core — Roadmap: Explorer, P2P Exchange, Mining Pool
 
+> **2026-10-11: el P2P Exchange se retiró entero** (nodo, ZSilent y documentación),
+> por decisión del usuario. Todo lo que este documento dice de la Etapa 2 queda como
+> registro histórico: ese código ya no existe. El plan vigente está en
+> `docs/HOJA-DE-RUTA-mainnet-postcuantica.md`.
+
 Última actualización: 2026-07-26
 Complementa a `ROADMAP.md` (Fases A–D, wallet/core). Cubre las tres secciones que aparecieron en
 el sidebar de ZSilent en v1.9.1 como "Coming Soon" (`ui/screens/Screens.kt`) y que hoy no tienen
