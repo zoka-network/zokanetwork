@@ -202,8 +202,13 @@ compromiso y la clave de un solo uso de **las notas reales** (`selected_notes`, 
 salida publica esos mismos dos valores, cualquiera puede unir cada gasto con la salida
 que consume: el anillo CLSAG lista señuelos, pero la nota real va al lado en claro.
 Los montos (Pedersen) y los destinatarios (direcciones ocultas) siguen ocultos; el
-**grafo de transacciones**, no. Confirmarlo mirando una transacción real en la cadena
-antes de comunicarlo.
+**grafo de transacciones**, no.
+
+**Confirmado el 2026-10-11 sobre la cadena real** (copia de la base, 25.204 bloques):
+las 254 tx privadas publican sus 834 notas gastadas (clave y compromiso); solo 254 de
+esas claves están dentro del anillo, una por tx, y las demás ni siquiera tienen
+señuelos; 559 se unen directo con la salida donde nacieron (ejemplo: la tx del bloque
+297 gasta una nota nacida en el coinbase del bloque 18).
 
 Consecuencia para el diseño de Zoka Quantic: la pertenencia de la nota gastada al
 árbol de compromisos se prueba **dentro** del circuito, y la transacción publica solo
