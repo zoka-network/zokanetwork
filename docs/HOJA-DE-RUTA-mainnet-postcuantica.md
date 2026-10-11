@@ -121,7 +121,22 @@ Lo que sigue es el plan original, como registro.
 0b.3 ZSilent: pantallas, navegación y llamadas a la API.
 0b.4 Documentación y sitio: todo lo que mencione el exchange o Tron.
 
-### Etapa 0c — Whitepaper 2.0 (Zoka Quantic) — borrador hecho, sin publicar
+### Etapa 0d — Cuenta nueva de GitHub y web con Zoka Quantic (2026-10-11)
+
+Pedido del usuario: pasar todo a `github.com/zoka-network` (cuenta de usuario, creada el
+11/09), subir todos los repos y que la web presente a Quantic como red principal.
+
+- Hecho local: referencias a la cuenta suspendida cambiadas en los 6 repos (nombres de
+  repo iguales a GitLab); `publish-explorer-data.yml` borrado de `main`; web con Quantic
+  como principal (en desarrollo) y Zenith como testnet; litepaper 2.0; PDF de whitepaper y
+  litepaper con `zokaweb/scripts/build-papers.py`; descargas apuntan a GitLab.
+- **Bloqueado por permisos, lo hace el usuario:** login de `gh` como zoka-network, crear
+  los repos con Actions apagado, push a GitHub y GitLab, deploy de zoka.network.
+- Pendiente: las URLs del trusted setup en `docs/*-network.v1.json` siguen apuntando a
+  releases de la cuenta vieja (se compilan en el nodo; cambiarlas exige rehospedar los
+  archivos y sacar binario nuevo). Los releases con binarios no existen en GitHub nuevo.
+
+### Etapa 0c — Whitepaper 2.0 (Zoka Quantic) — borrador hecho; publicación pedida el 11/10
 
 Borrador en `zokaweb/docs/whitepaper-v2.md` (rama `whitepaper-zoka-quantic`), en inglés
 como el 1.0. Falta: revisión del usuario, generar el PDF, decidir cuándo publicar (dice
