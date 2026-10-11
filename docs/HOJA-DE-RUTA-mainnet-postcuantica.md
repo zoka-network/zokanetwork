@@ -121,7 +121,13 @@ Lo que sigue es el plan original, como registro.
 0b.3 ZSilent: pantallas, navegación y llamadas a la API.
 0b.4 Documentación y sitio: todo lo que mencione el exchange o Tron.
 
-### Etapa 0c — Whitepaper 2.0 (Zoka Quantic)
+### Etapa 0c — Whitepaper 2.0 (Zoka Quantic) — borrador hecho, sin publicar
+
+Borrador en `zokaweb/docs/whitepaper-v2.md` (rama `whitepaper-zoka-quantic`), en inglés
+como el 1.0. Falta: revisión del usuario, generar el PDF, decidir cuándo publicar (dice
+en público que Zenith expone el grafo de gastos), el litepaper (repite la promesa
+cuántica y "sin premine") y el sitio: `SectionOverlay.tsx` presenta "CLSAG ring
+signatures" como protección del emisor y "No premine, no foundation cut".
 
 Reescribirlo con el enfoque nuevo, marcando cada cosa como hecha, en testnet o en
 diseño, igual que la 1.0. Corrige la promesa falsa sobre la privacidad pasada y
