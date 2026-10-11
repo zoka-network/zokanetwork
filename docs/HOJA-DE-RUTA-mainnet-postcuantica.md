@@ -93,9 +93,23 @@ reemplazo maduro (pruebas basadas en hashes, tipo STARK).
 - [ ] Push de las ramas `seguridad-octubre-2026` (ZOKA, zkapriv, zokaweb, zokaexplorer,
       zoka-guard-vault) y `tor-0.4.9.13` (zsilent-core).
 
-### Etapa 0b — Sacar el P2P Exchange entero
+### Etapa 0b — Sacar el P2P Exchange entero ✅ (2026-10-11)
 
-Pedido del usuario el 2026-10-11: "sacalo todo".
+Pedido del usuario el 2026-10-11: "sacalo todo". **Hecho** en las ramas
+`sacar-exchange` de ZOKA (nodo + docs), zsilent-core y zokaweb. Nodo: 879 + 76
+pruebas en verde; ZSilent: 59. Lo que quedó resuelto de cada punto:
+
+- Nada del exchange estaba en bloques (las ofertas iban por gossip). Los mensajes
+  de red son JSON por nombre de variante: un nodo viejo que mande ofertas da un
+  error de decodificación limpio.
+- Las notas reservadas por ofertas abiertas se liberan al arrancar
+  (`release_retired_exchange_reservations`): se reconocen por no tener una tx
+  detrás en el historial de la wallet. **No** por el largo: el hash de una tx
+  privada y el id de una oferta tienen los dos 32 hex.
+- Los setups viejos de ZSilent siguen cargando (el lector ignora claves
+  desconocidas; hay prueba).
+
+Lo que sigue es el plan original, como registro.
 
 0b.1 Relevar antes de borrar: qué toca `src/p2p_exchange/` (~2.900 líneas) en el resto
      del nodo (API, CLI, gossip, notas reservadas de la wallet) y si algo del exchange
@@ -178,6 +192,22 @@ cuentas; el resto lo armo yo.
 
 Objetivo: que una computadora cuántica futura no pueda reconstruir qué salida gastó
 cada transacción. Es la etapa más grande y **arranca investigando**.
+
+**Hallazgo del 2026-10-11, más grave que lo cuántico:** hoy **no hace falta una
+computadora cuántica** para saber qué nota gasta cada transacción. `PrivateTransaction`
+publica `input_commitments` ("Commitments of consumed notes") e `input_public_keys`
+("One-time public keys of consumed notes"), y al armar un envío se llenan con el
+compromiso y la clave de un solo uso de **las notas reales** (`selected_notes`, en
+`src/private_wallet/mod.rs`). No hay ninguna serialización que los borre. Como cada
+salida publica esos mismos dos valores, cualquiera puede unir cada gasto con la salida
+que consume: el anillo CLSAG lista señuelos, pero la nota real va al lado en claro.
+Los montos (Pedersen) y los destinatarios (direcciones ocultas) siguen ocultos; el
+**grafo de transacciones**, no. Confirmarlo mirando una transacción real en la cadena
+antes de comunicarlo.
+
+Consecuencia para el diseño de Zoka Quantic: la pertenencia de la nota gastada al
+árbol de compromisos se prueba **dentro** del circuito, y la transacción publica solo
+el nullifier y la raíz del árbol, nunca el compromiso ni la clave de la nota gastada.
 
 5.1 Verificar si el circuito Groth16 actual ya prueba, por sí solo, la propiedad de la
     nota y que el nullifier está bien calculado, sin depender de la firma en anillo.
