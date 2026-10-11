@@ -1,6 +1,8 @@
 # Hoja de ruta: la red actual pasa a testnet, y mainnet nueva post-cuántica
 
-Creada: 2026-10-11. Estado: plan acordado en lo general; decisiones abiertas al final.
+Creada: 2026-10-11. Actualizada: 2026-10-11. Web y documentos publicados;
+base criptográfica experimental probada en Windows y Android ARMv7, sin integrar
+al nodo. La red todavía no es post-cuántica.
 
 ---
 
@@ -44,7 +46,7 @@ puede guardar hoy.
 | Monto cifrado para el destinatario | `encrypt_private_note_payload_v2` (clave derivada del intercambio de claves) | Quien conozca la dirección puede leer los montos | **Sí** |
 | Comisión cifrada para el minero | `PrivateFeeClaim` (`ephemeral_pubkey` + `ciphertext`) | Igual que el monto | **Sí** |
 | Key images + firma en anillo CLSAG | `RingSignatureBackend::ClsagV1`, `verify_ring_signature_with_backend` | Recalcula la key image de cada salida y ve cuál gastó cada transacción | **Sí** |
-| Nullifiers | `blake3(commitment ‖ spending_key)`, `src/transaction/nullifier.rs` | Es un hash: resiste. **A verificar:** si la clave pública de gasto de la dirección es `spending_key·G`, quien rompa esa clave también calcula los nullifiers | Depende |
+| Nullifiers de las notas privadas | `derive_note_nullifier`, `src/private_wallet/mod.rs`: SHA-256 de dominio, `spending_key`, identificador de nota y compromiso | Resolver el logaritmo discreto de la clave pública revela `reduce(SHA256(spending_key))`, no directamente la preimagen `spending_key`. No se ha demostrado recuperación del nullifier por esa vía | No demostrado por esa vía; el grafo ya se filtra por los campos de entrada |
 | Compromisos Pedersen + Bulletproofs | `src/zk/range_proofs.rs` | El monto queda oculto igual (ocultamiento perfecto), pero se podrían crear monedas sin que se note | No, solo hacia adelante |
 | Groth16 sobre BLS12-381 | `src/zk/groth16_backend.rs` | La prueba no revela nada (conocimiento cero perfecto), pero se podrían falsificar pruebas | No, solo hacia adelante |
 | Ed25519 | Firma de snapshots (`src/snapshot.rs`), identidades de red | **No protege fondos.** Se podría falsificar un snapshot de arranque | No |
@@ -55,6 +57,16 @@ Los bloques no llevan firma: el `seal` del encabezado es el hash de la prueba de
 (`src/mining/block_validator.rs`). Las transacciones son todas privadas; el tipo
 `Transaction` público queda prácticamente para el coinbase.
 
+**Aclaración sobre los nullifiers (revisión del 2026-10-11):**
+`Nullifier::from_commitment` en `src/transaction/nullifier.rs` ofrece una función
+BLAKE3, pero no es la derivación usada por los envíos del wallet privado. Estos usan
+`derive_note_nullifier`, con SHA-256 y la clave de gasto original. Además,
+`proof_nullifier` es otro campo: un escalar de 64 bits construido para la relación
+`secret * index + blind` del circuito Groth16 actual. Esa relación no demuestra que
+los `input_nullifiers` públicos provengan de las notas consumidas y de su dueño.
+La Etapa 5 exige ligar esas propiedades dentro de un circuito nuevo antes de retirar
+CLSAG. Ver [revisión técnica de la Etapa 1](REVISION-postcuantica-etapa1.md).
+
 ### El principio que ordena todo
 
 **Lo que protege la privacidad tiene que ser post-cuántico desde el génesis**, porque se
@@ -63,11 +75,13 @@ rompe hacia atrás: alguien puede guardar la cadena hoy y leerla en quince años
 hacia adelante, así que se puede migrar con un fork el día que haga falta, siempre que
 los formatos indiquen qué esquema usan.
 
-### Corrección pendiente en textos públicos
+### Corrección de textos públicos (publicada el 11/10)
 
-`zokaweb/docs/whitepaper.md` (líneas 75-77 y 436-437) y `zokaweb/docs/litepaper.md`
-(152-153) dicen que la privacidad pasada sobreviviría a una computadora cuántica. **Hoy
-no es así**, por las key images y por el intercambio de claves de las direcciones.
+Whitepaper/litepaper v2 y la web ya explican que la privacidad post-cuántica es
+un objetivo en desarrollo. Los documentos v1 conservan su texto histórico con
+un aviso inicial fechado que corrige sus promesas sobre el grafo y la privacidad
+cuántica. Los cuatro PDF se regeneraron y publicaron. Las direcciones, key images
+y campos públicos de Zenith no se volvieron privados por esta corrección editorial.
 
 ### Qué se puede prometer al terminar
 
@@ -130,32 +144,57 @@ Pedido del usuario: pasar todo a `github.com/zoka-network` (cuenta de usuario, c
   repo iguales a GitLab); `publish-explorer-data.yml` borrado de `main`; web con Quantic
   como principal (en desarrollo) y Zenith como testnet; litepaper 2.0; PDF de whitepaper y
   litepaper con `zokaweb/scripts/build-papers.py`; descargas apuntan a GitLab.
-- **Bloqueado por permisos, lo hace el usuario:** login de `gh` como zoka-network, crear
-  los repos con Actions apagado, push a GitHub y GitLab, deploy de zoka.network.
+- **Acceso resuelto:** `gh` autenticado como zoka-network; repos nodo y web existentes,
+  Actions desactivado en ambos. El token ofrecido en el portapapeles no fue necesario.
+- **Web publicada:** rama `cerrar-web-quantic`, commits `d4e0af6` (papers), `3c03184`
+  (home, accesibilidad y enlaces) y `46e9afa` (ZOKA QUANTIC en una línea,
+  privacidad más destacada y esfera reducida, según la corrección del usuario).
+  Push de la web a `main` y rama en GitHub y GitLab.
+  Cloudflare Pages: `https://b9b102ec.zokaweb.pages.dev`,
+  producción `https://zoka.network`. Verificados menú, cinco secciones y PDFs en
+  Chromium con anchos 1680, 390 y 320. Build/TypeScript/4 tests correctos; lint sin
+  errores, 7 avisos heredados de Fast Refresh.
+- La sincronización de las ramas de los demás repos sigue siendo una tarea separada;
+  no confundir la publicación de la web con la publicación de clientes nuevos.
 - Pendiente: las URLs del trusted setup en `docs/*-network.v1.json` siguen apuntando a
   releases de la cuenta vieja (se compilan en el nodo; cambiarlas exige rehospedar los
   archivos y sacar binario nuevo). Los releases con binarios no existen en GitHub nuevo.
 
-### Etapa 0c — Whitepaper 2.0 (Zoka Quantic) — borrador hecho; publicación pedida el 11/10
+### Etapa 0c — Whitepaper 2.0 (Zoka Quantic) — publicado como diseño, 11/10
 
-Borrador en `zokaweb/docs/whitepaper-v2.md` (rama `whitepaper-zoka-quantic`), en inglés
-como el 1.0. Falta: revisión del usuario, generar el PDF, decidir cuándo publicar (dice
-en público que Zenith expone el grafo de gastos), el litepaper (repite la promesa
-cuántica y "sin premine") y el sitio: `SectionOverlay.tsx` presenta "CLSAG ring
-signatures" como protección del emisor y "No premine, no foundation cut".
-
-Reescribirlo con el enfoque nuevo, marcando cada cosa como hecha, en testnet o en
-diseño, igual que la 1.0. Corrige la promesa falsa sobre la privacidad pasada y
-declara el premine. El PDF del sitio se genera con xhtml2pdf; publicarlo en
-`zoka.network` es una decisión aparte del usuario.
+Revisados whitepaper (12 páginas) y litepaper (4), publicados como diseño de una
+red todavía no lanzada. Declaran premine de 5M dentro de 23M, emisión minera de
+18M, continuidad de minería por comisiones, falta de migración de saldos y los
+problemas del grafo de Zenith. Distinguen implementación, investigación y planes.
+Corregidos X-Wing/X25519, view tags, alcance de Groth16 y costos pendientes.
+Los v1 (11 y 5 páginas) incluyen aviso histórico; extracción, símbolos, títulos,
+aritmética y páginas comprobados. Generador: `zokaweb/scripts/build-papers.py`;
+procedimiento: `zokaweb/docs/papers.md`. La revisión final contra el protocolo
+implementado sigue en la etapa 7.8.
 
 ### Etapa 1 — Base post-cuántica
 
-1.1 Librerías candidatas: `ml-kem` 0.3.x y `ml-dsa` 0.1.x de RustCrypto. Son jóvenes y
-    no tienen auditoría conocida: anotarlo como riesgo, no ocultarlo. Para combinar
-    X25519 con ML-KEM usar una construcción especificada (X-Wing); el crate `x-wing`
-    sigue un borrador viejo, así que evaluar si conviene implementar el combinador
-    nosotros siguiendo la especificación, que es corto.
+Implementación experimental en `crates/zoka-pq`, separada del nodo: ML-KEM-768,
+X-Wing y ML-DSA-65, parsers estrictos, zeroization y Debug redactado, 13 pruebas
+con vectores independientes NIST/X-Wing y casos negativos. CLI `pq-bench` mide
+expansión, encapsulado, desencapsulado, firma y verificación por separado.
+Revisión: `docs/REVISION-postcuantica-etapa1.md`; resultados por plataforma en
+`docs/RESULTADOS-postcuantica-etapa1.md`: check y biblioteca release en cinco
+targets; 13/13 tests ejecutados en Windows y Android ARMv7; benchmarks en ambos.
+Linux no se ejecutó; Android ARM64 se enlazó pero no se ejecutó. En el teléfono,
+ML-KEM desencapsula en ~1,11 ms y X-Wing en ~3,41–3,52 ms (medianas). Falta el
+escáner completo para cerrar D1/D2. Clippy y formato correctos.
+
+La dependencia directa desde el nodo se ensayó y se retiró: el lock actual de
+iroh-base 1.0.0 exige curve25519-dalek 5.0.0-rc.0, incompatible en Cargo con la
+versión estable que exige X-Wing. La futura integración necesita actualizar y
+probar las dependencias de red. El crate aislado no cambia el consenso ni el
+formato de direcciones/bloques de Zenith. No hubo cambio de wallet ni activación.
+
+1.1 Base experimental fijada: `ml-kem` 0.3.2, `ml-dsa` 0.1.1 y `x-wing` 0.1.1 de
+    RustCrypto, con lockfile independiente y vectores de procedencia registrada.
+    No tienen auditoría conocida. Se usa el combinador de la implementación
+    especificada; no se introdujo uno propio. La integración al nodo sigue pendiente.
 1.2 Que compile en los cinco destinos: Windows x86_64, Linux x86_64, **Linux aarch64**
     (para el VPS de Oracle), Android arm64-v8a y **armeabi-v7a** (el teléfono del usuario).
 1.3 **Medir en el teléfono de 32 bits** el desencapsulado ML-KEM: el escaneo prueba

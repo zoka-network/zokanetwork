@@ -4,7 +4,7 @@ version = "2.0.2"
 edition = "2021"
 autobins = false
 
-description = "100% private blockchain with Zero-Knowledge proofs (zk) in Rust."
+description = "Proof-of-work blockchain with zero-knowledge proof infrastructure in Rust."
 
 [[bin]]
 name = "zoka"

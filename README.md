@@ -1,5 +1,13 @@
 # ZOKA 2.0
 
+**Network status (11 October 2026):** Zenith is designated for testnet use;
+existing clients still select it with `--network mainnet`. Zoka Quantic is a
+new network under development, with no balance migration from Zenith. Its
+post-quantum privacy design is not active on this node. Experimental primitives
+and device benchmarks live in [crates/zoka-pq](crates/zoka-pq/README.md);
+the [implementation roadmap](docs/HOJA-DE-RUTA-mainnet-postcuantica.md) records
+the remaining integration, circuit, activation and review requirements.
+
 ZOKA is a privacy blockchain written in Rust: private wallets, RandomX proof of
 work, zero-knowledge proof infrastructure, and a full node you run yourself.
 There is no custodian and no server holding your funds — your node and your

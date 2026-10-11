@@ -1,4 +1,4 @@
-// ZOKA Library: 100% private blockchain with Zero-Knowledge proofs
+// ZOKA Library: proof-of-work blockchain with zero-knowledge proof infrastructure
 pub mod admin;
 pub mod api;
 pub mod block;
