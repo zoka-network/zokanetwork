@@ -43,7 +43,7 @@ Do not run a binary if the checksum fails.
 ## Verify Source Tag
 
 ```sh
-git clone https://github.com/ZokaNetwork/ZokaNetwork.git
+git clone https://github.com/zoka-network/zokanetwork.git
 cd zoka-network
 git fetch --tags
 git checkout testnet-v0.1.0

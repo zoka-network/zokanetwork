@@ -12,7 +12,7 @@ v3 onion service, and chain transfers use iroh (QUIC with NAT hole-punching).
 No CLI binaries are published; build from source.
 
 ```sh
-git clone https://github.com/ZokaNetwork/ZokaNetwork.git
+git clone https://github.com/zoka-network/zokanetwork.git
 cd ZokaNetwork
 cargo build --release --features randomx --bins
 ```

@@ -16,7 +16,7 @@ This guide is for running `zokahd` on a Linux VPS for the public testnet.
 Download the Linux package from GitHub Releases:
 
 ```sh
-wget https://github.com/ZokaNetwork/ZokaNetwork/releases/download/testnet-v0.1.0/zoka-testnet-v0.1.0-linux-x64.tar.gz
+wget https://github.com/zoka-network/zokanetwork/releases/download/testnet-v0.1.0/zoka-testnet-v0.1.0-linux-x64.tar.gz
 tar -xzf zoka-testnet-v0.1.0-linux-x64.tar.gz
 sudo install -m 0755 zoka /usr/local/bin/zoka
 sudo install -m 0755 zokahd /usr/local/bin/zokahd

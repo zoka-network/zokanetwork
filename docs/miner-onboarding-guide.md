@@ -8,7 +8,7 @@ ZSilent es la wallet de escritorio oficial. Incluye el nodo completo y el minero
 
 ### 1. Descargar e instalar
 
-- Descarga el instalador desde: **https://github.com/ZokaNetwork/zsilent-core/releases/latest**
+- Descarga el instalador desde: **https://github.com/zoka-network/zsilent-core/releases/latest**
 - Elegí el `.msi` (recomendado) o el `.exe`.
 - Ejecutá el instalador y abrí ZSilent.
 
@@ -43,7 +43,7 @@ ZSilent es la wallet de escritorio oficial. Incluye el nodo completo y el minero
 Antes de minar en serio, confirmá que tenés el software correcto:
 
 - Los parámetros de la ceremonia (trusted-setup) usados por la red están publicados con su hash SHA-256 en:
-  **https://github.com/ZokaNetwork/ZokaNetwork/releases/tag/trusted-setup-mainnet-v1**
+  **https://github.com/zoka-network/zokanetwork/releases/tag/trusted-setup-mainnet-v1**
 - ZSilent ya incluye estos archivos empaquetados — no necesitás descargarlos por separado.
 
 ---
@@ -54,7 +54,7 @@ Para minería headless en un servidor/VPS Linux, en vez de la wallet de escritor
 
 1. Compilá el binario desde el código fuente (no hay un binario Linux público pre-compilado todavía):
    ```sh
-   git clone https://github.com/ZokaNetwork/ZokaNetwork.git
+   git clone https://github.com/zoka-network/zokanetwork.git
    cd ZokaNetwork
    cargo build --release --features randomx --bin zoka
    ```
@@ -80,4 +80,4 @@ Para minería headless en un servidor/VPS Linux, en vez de la wallet de escritor
 
 **¿Cuánto tarda en madurar una recompensa?** 60 bloques, aproximadamente 2 horas.
 
-**¿Dónde reporto un problema?** Abrí un issue en `https://github.com/ZokaNetwork/ZokaNetwork/issues` o `https://github.com/ZokaNetwork/zsilent-core/issues` según corresponda.
+**¿Dónde reporto un problema?** Abrí un issue en `https://github.com/zoka-network/zokanetwork/issues` o `https://github.com/zoka-network/zsilent-core/issues` según corresponda.

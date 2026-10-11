@@ -5,8 +5,8 @@ Patch release after 1.6.1. Fully protocol-compatible (same freeze id
 
 Repos:
 
-- Node: `ZokaNetwork/ZokaNetwork` (tag `v1.6.2`)
-- App: `ZokaNetwork/zsilent-core` (tag `v1.6.2`, embeds the node `v1.6.2` binaries)
+- Node: `zoka-network/zokanetwork` (tag `v1.6.2`)
+- App: `zoka-network/zsilent-core` (tag `v1.6.2`, embeds the node `v1.6.2` binaries)
 
 ## Fixes included so far
 

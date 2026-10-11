@@ -29,10 +29,10 @@ entry points, and API surfaces.
 |---|---|
 | Website | [zoka.network](https://zoka.network) |
 | Explorer | [zokascan.cc](https://www.zokascan.cc) |
-| Core repository | [ZokaNetwork/ZokaNetwork](https://github.com/ZokaNetwork/ZokaNetwork) |
-| Android wallet | [ZokaNetwork/zkapriv](https://github.com/ZokaNetwork/zkapriv) |
-| Desktop wallet | [ZokaNetwork/zsilent-core](https://github.com/ZokaNetwork/zsilent-core) |
-| Explorer repository | [ZokaNetwork/zokaexplorer](https://github.com/ZokaNetwork/zokaexplorer) |
+| Core repository | [zoka-network/zokanetwork](https://github.com/zoka-network/zokanetwork) |
+| Android wallet | [zoka-network/zkapriv](https://github.com/zoka-network/zkapriv) |
+| Desktop wallet | [zoka-network/zsilent-core](https://github.com/zoka-network/zsilent-core) |
+| Explorer repository | [zoka-network/zokaexplorer](https://github.com/zoka-network/zokaexplorer) |
 
 ## Documentation Principle
 

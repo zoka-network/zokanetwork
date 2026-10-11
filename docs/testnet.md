@@ -34,7 +34,7 @@ The first public VPS seed node is added by updating
 ## Build From Source
 
 ```sh
-git clone https://github.com/ZokaNetwork/ZokaNetwork.git
+git clone https://github.com/zoka-network/zokanetwork.git
 cd zoka-network
 git checkout testnet-v0.1.0
 cargo build --release --features randomx --bin zoka --bin zokahd

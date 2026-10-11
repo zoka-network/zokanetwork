@@ -26,7 +26,7 @@ Genesis timestamp: `1782745200` → 2026-06-29 15:00:00 UTC (= 2026-06-30 00:00:
 - Cerrar ZSilent o pausar minería desde la UI antes de iniciar el reset
 
 ### 2. Reset BOOT (nodo primario)
-- Ir a: `https://github.com/ZokaNetwork/ZokaNetwork/actions/workflows/reset-genesis.yml`
+- Ir a: `https://github.com/zoka-network/zokanetwork/actions/workflows/reset-genesis.yml`
 - Parámetros: `target = bootstrap`, `confirm = RESET`
 - Esperar que el workflow complete (~60s)
 - Verificar: `curl http://159.223.119.216:3000/chain/height` → debe devolver `{"height":0}` o `{"height":1}`
@@ -114,8 +114,8 @@ curl -s http://159.223.119.216:3000/blocks/$HEIGHT | jq '{height: .block_height,
 
 ## Contactos / recursos
 
-- Repo: `https://github.com/ZokaNetwork/ZokaNetwork`
-- Trusted setup: `https://github.com/ZokaNetwork/ZokaNetwork/releases/tag/trusted-setup-mainnet-v1`
+- Repo: `https://github.com/zoka-network/zokanetwork`
+- Trusted setup: `https://github.com/zoka-network/zokanetwork/releases/tag/trusted-setup-mainnet-v1`
 - Explorador: `https://www.zokascan.cc`
-- Reset workflow: `https://github.com/ZokaNetwork/ZokaNetwork/actions/workflows/reset-genesis.yml`
-- Deploy workflow: `https://github.com/ZokaNetwork/ZokaNetwork/actions/workflows/deploy-mainnet.yml`
+- Reset workflow: `https://github.com/zoka-network/zokanetwork/actions/workflows/reset-genesis.yml`
+- Deploy workflow: `https://github.com/zoka-network/zokanetwork/actions/workflows/deploy-mainnet.yml`

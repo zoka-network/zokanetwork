@@ -6,7 +6,7 @@ There is no custodian and no server holding your funds — your node and your
 wallet live on your machine.
 
 **ZSilent Core** is the desktop application. Download it from
-[Releases](https://github.com/ZokaNetwork/ZokaNetwork/releases): `.msi` for
+[Releases](https://github.com/zoka-network/zokanetwork/releases): `.msi` for
 Windows, `.deb` and `.rpm` for Linux, or the standalone node binary if you
 prefer the command line.
 
@@ -120,7 +120,7 @@ cargo build --release --features randomx --bins
 ```
 
 The desktop application lives in its own repository,
-[ZokaNetwork/zsilent-core](https://github.com/ZokaNetwork/zsilent-core), and
+[zoka-network/zsilent-core](https://github.com/zoka-network/zsilent-core), and
 expects the node binaries to be built first.
 
 ## Security notice

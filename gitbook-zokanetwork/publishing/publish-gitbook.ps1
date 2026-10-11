@@ -9,7 +9,7 @@ param(
     [string] $SiteId,
 
     [Parameter(Mandatory=$false)]
-    [string] $RepoUrl = "https://github.com/ZokaNetwork/ZokaNetwork.git",
+    [string] $RepoUrl = "https://github.com/zoka-network/zokanetwork.git",
 
     [Parameter(Mandatory=$false)]
     [string] $Ref = "refs/heads/main",

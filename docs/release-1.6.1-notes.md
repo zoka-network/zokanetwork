@@ -4,8 +4,8 @@ Running notes for the next patch release. Nothing here is built or published
 yet — commits accumulate on the working branches until we cut 1.6.1.
 
 Repos:
-- Node: `ZokaNetwork/ZokaNetwork` (branch `codex/mainnet-hotfix-economics-private-tx`, ahead of `main`@v1.6.0)
-- App: `ZokaNetwork/zsilent-core` (branch `main`)
+- Node: `zoka-network/zokanetwork` (branch `codex/mainnet-hotfix-economics-private-tx`, ahead of `main`@v1.6.0)
+- App: `zoka-network/zsilent-core` (branch `main`)
 
 ## Fixes included so far
 

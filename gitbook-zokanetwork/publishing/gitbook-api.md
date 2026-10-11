@@ -9,7 +9,7 @@ GitBook can import this documentation source from Git through the API.
 - Git repository URL, normally:
 
 ```text
-https://github.com/ZokaNetwork/ZokaNetwork.git
+https://github.com/zoka-network/zokanetwork.git
 ```
 
 - Git ref:
@@ -38,7 +38,7 @@ Body:
 
 ```json
 {
-  "url": "https://github.com/ZokaNetwork/ZokaNetwork.git",
+  "url": "https://github.com/zoka-network/zokanetwork.git",
   "ref": "refs/heads/main",
   "repoProjectDirectory": "gitbook-zokanetwork",
   "force": true
