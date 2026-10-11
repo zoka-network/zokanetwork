@@ -15,7 +15,6 @@ pub mod mining;
 pub mod mobile;
 pub mod mobile_net;
 pub mod network;
-pub mod p2p_exchange;
 pub mod private_wallet;
 pub mod snapshot;
 pub mod state;

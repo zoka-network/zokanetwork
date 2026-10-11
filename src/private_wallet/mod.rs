@@ -2970,61 +2970,6 @@ impl PrivateWallet {
         )
     }
 
-    pub fn create_private_transaction_from_reservation(
-        &mut self,
-        amount: u64,
-        recipient_commitment: String,
-        reservation_id: &str,
-        reserved_note_ids: &[String],
-        nullifier_set: Arc<Mutex<NullifierSet>>,
-        ring_members: Vec<String>,
-        ring_backend: RingSignatureBackend,
-    ) -> Result<PrivateTransaction, BlockError> {
-        let wanted: HashSet<&str> = reserved_note_ids.iter().map(String::as_str).collect();
-        if wanted.is_empty() || wanted.len() != reserved_note_ids.len() {
-            return Err(BlockError::TransactionValidationFailed(
-                "offer reservation has invalid note ids".to_string(),
-            ));
-        }
-        let selected_note_indices = self
-            .private_notes
-            .iter()
-            .enumerate()
-            .filter(|(_, note)| wanted.contains(note.note_id.as_str()))
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        if selected_note_indices.len() != wanted.len() {
-            return Err(BlockError::TransactionValidationFailed(
-                "offer reservation references a missing note".to_string(),
-            ));
-        }
-        let selected_notes = selected_note_indices
-            .iter()
-            .map(|index| self.private_notes[*index].clone())
-            .collect::<Vec<_>>();
-        if selected_notes
-            .iter()
-            .any(|note| note.spent || note.reserved_by_tx.as_deref() != Some(reservation_id))
-        {
-            return Err(BlockError::TransactionValidationFailed(
-                "offer reservation no longer owns all selected notes".to_string(),
-            ));
-        }
-        self.build_private_transaction_from_selected_notes(
-            amount,
-            0,
-            recipient_commitment,
-            nullifier_set,
-            ring_members,
-            String::new(),
-            Vec::new(),
-            ring_backend,
-            PRIVATE_PROOF_SPEC_V1,
-            selected_note_indices,
-            selected_notes,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn build_private_transaction_from_selected_notes(
         &mut self,
@@ -3198,49 +3143,6 @@ impl PrivateWallet {
             }
         }
         self.sync_balance_cache();
-    }
-
-    /// Reserve an exact set of notes for an operation identified by `reservation_id`.
-    ///
-    /// Validation happens before mutation so a stale selection cannot leave a
-    /// partially-reserved wallet.
-    pub fn reserve_notes(
-        &mut self,
-        note_ids: &[String],
-        reservation_id: &str,
-    ) -> Result<(), BlockError> {
-        let selected: HashSet<&str> = note_ids.iter().map(String::as_str).collect();
-        if selected.len() != note_ids.len() || selected.is_empty() {
-            return Err(BlockError::TransactionValidationFailed(
-                "note reservation must contain unique note ids".to_string(),
-            ));
-        }
-
-        for note_id in &selected {
-            let note = self
-                .private_notes
-                .iter()
-                .find(|note| note.note_id == *note_id)
-                .ok_or_else(|| {
-                    BlockError::TransactionValidationFailed(format!(
-                        "private note {note_id} not found"
-                    ))
-                })?;
-            if note.spent || note.reserved {
-                return Err(BlockError::TransactionValidationFailed(format!(
-                    "private note {note_id} is no longer available"
-                )));
-            }
-        }
-
-        for note in self.private_notes.iter_mut() {
-            if selected.contains(note.note_id.as_str()) {
-                note.reserved = true;
-                note.reserved_by_tx = Some(reservation_id.to_string());
-            }
-        }
-        self.sync_balance_cache();
-        Ok(())
     }
 
     /// Confirm reserved notes as spent when the TX lands in a block.
@@ -3504,17 +3406,6 @@ pub fn scan_private_transaction_with_view_key(
 }
 
 /// Privacy-enabled wallet manager
-#[derive(Clone, Debug)]
-pub enum ExchangeReleaseState {
-    /// Every selected note is still owned by the offer reservation.
-    ReservedForOffer,
-    /// The exact release transaction was already built and is durable in the
-    /// encrypted wallet history. It must be rebroadcast, never rebuilt.
-    Pending(PrivateTransaction),
-    /// The selected inputs are already confirmed spent on-chain.
-    Confirmed,
-}
-
 pub struct PrivateWalletManager {
     private_wallets: HashMap<String, PrivateWallet>,
     private_pool: PrivateTransactionPool,
@@ -3754,114 +3645,6 @@ impl PrivateWalletManager {
         )
     }
 
-    pub fn send_reserved_exchange_transaction(
-        &mut self,
-        from_wallet: &str,
-        to_commitment: String,
-        amount: u64,
-        reservation_id: &str,
-        reserved_note_ids: &[String],
-    ) -> Result<PrivateTransaction, BlockError> {
-        let ring_members = self.build_sender_ring_members(from_wallet, &to_commitment, amount);
-        let wallet = self.private_wallets.get_mut(from_wallet).ok_or_else(|| {
-            BlockError::TransactionValidationFailed("Wallet not found".to_string())
-        })?;
-        // Transaction construction imports sender change, appends history and
-        // moves the input reservation to the tx hash. Keep a full snapshot so
-        // a validation/pool failure rolls all of those mutations back, not
-        // just the reservation flag.
-        let wallet_before = wallet.clone();
-        let nullifier_set = self.private_pool.nullifier_set();
-        let tx = wallet.create_private_transaction_from_reservation(
-            amount,
-            to_commitment,
-            reservation_id,
-            reserved_note_ids,
-            nullifier_set,
-            ring_members,
-            self.ring_backend,
-        )?;
-        if let Err(error) = self.private_pool.submit_private_transaction(tx.clone()) {
-            *wallet = wallet_before;
-            return Err(error);
-        }
-        Ok(tx)
-    }
-
-    /// Recover the release state from the encrypted wallet itself.
-    ///
-    /// A built transaction is appended to `private_transactions` before the
-    /// wallet is persisted. That history is the durable journal: after a
-    /// restart the node rebroadcasts the same tx hash instead of constructing
-    /// a second spend with the same inputs.
-    pub fn exchange_release_state(
-        &self,
-        wallet_name: &str,
-        offer_id: &str,
-        reserved_note_ids: &[String],
-    ) -> Result<ExchangeReleaseState, BlockError> {
-        let wallet = self.private_wallets.get(wallet_name).ok_or_else(|| {
-            BlockError::TransactionValidationFailed("Wallet not found".to_string())
-        })?;
-        let wanted: HashSet<&str> = reserved_note_ids.iter().map(String::as_str).collect();
-        if wanted.is_empty() || wanted.len() != reserved_note_ids.len() {
-            return Err(BlockError::TransactionValidationFailed(
-                "offer reservation has invalid note ids".to_string(),
-            ));
-        }
-        let notes = wallet
-            .private_notes
-            .iter()
-            .filter(|note| wanted.contains(note.note_id.as_str()))
-            .collect::<Vec<_>>();
-        if notes.len() != wanted.len() {
-            return Err(BlockError::TransactionValidationFailed(
-                "offer reservation references a missing note".to_string(),
-            ));
-        }
-        if notes.iter().all(|note| note.spent) {
-            return Ok(ExchangeReleaseState::Confirmed);
-        }
-        if notes.iter().any(|note| note.spent || !note.reserved) {
-            return Err(BlockError::TransactionValidationFailed(
-                "offer release notes have inconsistent spent/reserved state".to_string(),
-            ));
-        }
-        let owners = notes
-            .iter()
-            .filter_map(|note| note.reserved_by_tx.as_deref())
-            .collect::<HashSet<_>>();
-        if owners.len() != 1 {
-            return Err(BlockError::TransactionValidationFailed(
-                "offer release notes do not share one reservation owner".to_string(),
-            ));
-        }
-        let owner = *owners.iter().next().unwrap();
-        if owner == offer_id {
-            return Ok(ExchangeReleaseState::ReservedForOffer);
-        }
-        let tx = wallet
-            .private_transactions
-            .iter()
-            .rev()
-            .find(|tx| tx.tx_hash == owner)
-            .cloned()
-            .ok_or_else(|| {
-                BlockError::TransactionValidationFailed(
-                    "offer notes point to a release tx missing from wallet history".to_string(),
-                )
-            })?;
-        if notes
-            .iter()
-            .any(|note| !tx.input_commitments.contains(&note.commitment))
-        {
-            return Err(BlockError::TransactionValidationFailed(
-                "wallet release tx does not spend every reserved offer note".to_string(),
-            ));
-        }
-        Ok(ExchangeReleaseState::Pending(tx))
-    }
-
     pub fn send_private_transaction_with_fee(
         &mut self,
         from_wallet: &str,
@@ -4084,50 +3867,54 @@ impl PrivateWalletManager {
         self.private_wallets.get_mut(name)
     }
 
-    pub fn reserve_wallet_notes(
-        &mut self,
-        wallet_name: &str,
-        note_ids: &[String],
-        reservation_id: &str,
-    ) -> Result<(), BlockError> {
-        self.private_wallets
-            .get_mut(wallet_name)
-            .ok_or_else(|| BlockError::TransactionValidationFailed("Wallet not found".to_string()))?
-            .reserve_notes(note_ids, reservation_id)
-    }
-
-    pub fn release_wallet_reservation(&mut self, wallet_name: &str, reservation_id: &str) {
-        if let Some(wallet) = self.private_wallets.get_mut(wallet_name) {
-            wallet.release_reserved_notes(reservation_id);
-        }
-    }
-
-    pub fn release_reservation_from_all_wallets(&mut self, reservation_id: &str) {
+    /// Libera las reservas que dejaron las ofertas del P2P Exchange.
+    ///
+    /// El exchange se retiro en octubre de 2026. Una oferta abierta reservaba
+    /// sus notas con el id de la oferta, y sin el exchange no queda nada que
+    /// las libere: quedarian trabadas para siempre y el saldo gastable se
+    /// veria menor de lo que es.
+    ///
+    /// Se reconocen por no tener una transaccion detras. Un envio reserva sus
+    /// notas con el hash de la transaccion y la guarda en el historial de la
+    /// wallet en el mismo paso, y ese historial nunca se recorta. El largo no
+    /// sirve para distinguirlas: el hash de una tx privada y el id de una
+    /// oferta tienen los dos 32 caracteres hexadecimales.
+    ///
+    /// Devuelve cuantas notas libero.
+    pub fn release_retired_exchange_reservations(&mut self) -> usize {
+        let mut released = 0;
         for wallet in self.private_wallets.values_mut() {
-            wallet.release_reserved_notes(reservation_id);
-        }
-    }
-
-    pub fn release_note_ids(&mut self, note_ids: &[String]) {
-        let ids: HashSet<&str> = note_ids.iter().map(String::as_str).collect();
-        for wallet in self.private_wallets.values_mut() {
-            for note in wallet.private_notes.iter_mut() {
-                if ids.contains(note.note_id.as_str()) {
-                    note.reserved = false;
-                    note.reserved_by_tx = None;
-                }
+            let tx_hashes: HashSet<&str> = wallet
+                .private_transactions
+                .iter()
+                .map(|tx| tx.tx_hash.as_str())
+                .collect();
+            let orphaned: Vec<usize> = wallet
+                .private_notes
+                .iter()
+                .enumerate()
+                .filter(|(_, note)| {
+                    note.reserved
+                        && !note.spent
+                        && note
+                            .reserved_by_tx
+                            .as_deref()
+                            .is_some_and(|owner| !tx_hashes.contains(owner))
+                })
+                .map(|(idx, _)| idx)
+                .collect();
+            if orphaned.is_empty() {
+                continue;
             }
+            for idx in &orphaned {
+                let note = &mut wallet.private_notes[*idx];
+                note.reserved = false;
+                note.reserved_by_tx = None;
+            }
+            released += orphaned.len();
             wallet.sync_balance_cache();
         }
-    }
-
-    pub fn reserved_note_ids(&self) -> Vec<String> {
-        self.private_wallets
-            .values()
-            .flat_map(|wallet| wallet.private_notes.iter())
-            .filter(|note| note.reserved && !note.spent)
-            .map(|note| note.note_id.clone())
-            .collect()
+        released
     }
 
     /// Deposit to private wallet
@@ -6983,71 +6770,47 @@ mod tests {
     }
 
     #[test]
-    fn exchange_release_spends_the_reserved_notes_not_other_wallet_funds() {
+    fn retired_exchange_reservations_are_released_but_pending_sends_are_not() {
         let mut manager = PrivateWalletManager::new();
         manager.create_private_wallet("seller").unwrap();
         let buyer = manager.create_private_wallet("buyer").unwrap();
         manager.deposit_to_private_wallet("seller", 150).unwrap();
-        manager.deposit_to_private_wallet("seller", 500).unwrap();
-        let (reserved_id, reserved_commitment, unreserved_commitment) = {
-            let wallet = manager.get_private_wallet("seller").unwrap();
-            (
-                wallet.private_notes[0].note_id.clone(),
-                wallet.private_notes[0].commitment.clone(),
-                wallet.private_notes[1].commitment.clone(),
-            )
-        };
-        manager
-            .reserve_wallet_notes("seller", std::slice::from_ref(&reserved_id), "offer-1")
-            .unwrap();
+        manager.deposit_to_private_wallet("seller", 60).unwrap();
+        manager.deposit_to_private_wallet("seller", 40).unwrap();
 
-        let tx = manager
-            .send_reserved_exchange_transaction(
-                "seller",
-                buyer,
-                100,
-                "offer-1",
-                std::slice::from_ref(&reserved_id),
-            )
+        // Un envio pendiente: reserva sus notas con el hash de la tx.
+        let pending_hash = manager
+            .send_private_transaction("seller", buyer, 100)
             .unwrap();
+        let wallet = manager.get_private_wallet_mut("seller").unwrap();
+        let pending_note = wallet
+            .private_notes
+            .iter()
+            .position(|note| note.reserved_by_tx.as_deref() == Some(pending_hash.as_str()))
+            .expect("the send must reserve at least one note");
 
-        assert!(tx.input_commitments.contains(&reserved_commitment));
-        assert!(!tx.input_commitments.contains(&unreserved_commitment));
-        assert!(matches!(
-            manager
-                .exchange_release_state(
-                    "seller",
-                    "offer-1",
-                    std::slice::from_ref(&reserved_id)
-                )
-                .unwrap(),
-            ExchangeReleaseState::Pending(recovered) if recovered.tx_hash == tx.tx_hash
-        ));
-        let encoded = serde_json::to_string(manager.get_private_wallet("seller").unwrap()).unwrap();
-        let restored: PrivateWallet = serde_json::from_str(&encoded).unwrap();
-        let mut restarted = PrivateWalletManager::new();
-        restarted
-            .private_wallets
-            .insert("seller".to_string(), restored);
-        assert!(matches!(
-            restarted
-                .exchange_release_state(
-                    "seller",
-                    "offer-1",
-                    std::slice::from_ref(&reserved_id)
-                )
-                .unwrap(),
-            ExchangeReleaseState::Pending(recovered) if recovered.tx_hash == tx.tx_hash
-        ));
-        manager
-            .get_private_wallet_mut("seller")
-            .unwrap()
-            .confirm_reserved_notes(&tx.tx_hash);
-        assert!(matches!(
-            manager
-                .exchange_release_state("seller", "offer-1", &[reserved_id])
-                .unwrap(),
-            ExchangeReleaseState::Confirmed
-        ));
+        // Una oferta vieja: reservaba con su id, del mismo largo que un hash.
+        let offer_id = "ab".repeat(16);
+        assert_eq!(offer_id.len(), pending_hash.len());
+        let offer_note = wallet
+            .private_notes
+            .iter()
+            .position(|note| !note.reserved && !note.spent)
+            .expect("one note must still be free");
+        wallet.private_notes[offer_note].reserved = true;
+        wallet.private_notes[offer_note].reserved_by_tx = Some(offer_id);
+
+        assert_eq!(manager.release_retired_exchange_reservations(), 1);
+
+        let wallet = manager.get_private_wallet("seller").unwrap();
+        assert!(!wallet.private_notes[offer_note].reserved);
+        assert_eq!(wallet.private_notes[offer_note].reserved_by_tx, None);
+        assert!(wallet.private_notes[pending_note].reserved);
+        assert_eq!(
+            wallet.private_notes[pending_note].reserved_by_tx.as_deref(),
+            Some(pending_hash.as_str())
+        );
+        // Una segunda pasada no encuentra nada.
+        assert_eq!(manager.release_retired_exchange_reservations(), 0);
     }
 }

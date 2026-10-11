@@ -68,14 +68,6 @@ pub const GENERAL_TOPIC_NAME: &str = "zoka/messages/v1";
 pub const PBFT_TOPIC_NAME: &str = "zoka/pbft/v1";
 pub const STEM_TOPIC_NAME: &str = "zoka/stem/v1";
 pub const MIXER_TOPIC_NAME: &str = "zoka/mixer/v1";
-/// Topic carrying ZKA → USDT offers.
-///
-/// Deliberately separate from the general topic. Nodes on older builds do not
-/// know the offer variants and would discard each one with a warning, so
-/// publishing offers on `general` would spray a log line across the whole
-/// network for every offer. Peers that predate this topic never subscribe, so
-/// they see nothing at all.
-pub const OFFERS_TOPIC_NAME: &str = "zoka/offers/v1";
 /// Team-mining coordination stays isolated from ordinary transaction gossip.
 /// Older nodes never subscribe, so high-frequency shares do not become
 /// decode warnings or bandwidth on nodes that did not opt into the protocol.
@@ -792,8 +784,6 @@ pub struct Node {
     stem_topic: gossipsub::IdentTopic,
     /// Mixer topic for batched private transaction payloads.
     mixer_topic: gossipsub::IdentTopic,
-    /// P2P exchange offers topic.
-    offers_topic: gossipsub::IdentTopic,
     /// Non-custodial mining team coordination topic.
     team_mining_topic: gossipsub::IdentTopic,
     /// Network privacy policy knobs.
@@ -960,7 +950,7 @@ fn dns_del_sistema_disponible() -> bool {
 /// mirar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NodeProfile {
-    /// Todo: consenso, ofertas, mineria en equipo.
+    /// Todo: consenso y mineria en equipo.
     #[default]
     Full,
     /// Lo justo para una wallet: bloques, transacciones privadas y su
@@ -969,7 +959,7 @@ pub enum NodeProfile {
 }
 
 impl NodeProfile {
-    fn subscribes_to_consensus_and_market(&self) -> bool {
+    fn subscribes_to_consensus_and_team_mining(&self) -> bool {
         matches!(self, NodeProfile::Full)
     }
 }
@@ -1508,44 +1498,6 @@ impl Node {
                     return Err("public tx hash does not match canonical encoding");
                 }
             }
-            ZokaMessage::OfferAnnounce(announce) => {
-                // Runs before the offer is relayed, so a malformed or
-                // self-inconsistent one never propagates past this node.
-                announce
-                    .offer
-                    .validate()
-                    .map_err(|rejection| rejection.as_str())?;
-                if announce.offer.status != crate::p2p_exchange::OfferStatus::Open {
-                    // Announcements introduce offers. A claim or a
-                    // cancellation is a status update against an offer the
-                    // peer already has, and accepting one here would let a
-                    // peer inject an already-claimed offer nobody can take.
-                    return Err("offer announce must carry an open offer");
-                }
-            }
-            ZokaMessage::OfferStatusUpdate(update) => {
-                if update.offer_id.trim().is_empty() || update.seller_address.trim().is_empty() {
-                    return Err("offer status update missing offer id or seller");
-                }
-                match update.status {
-                    crate::p2p_exchange::OfferStatus::Claimed
-                    | crate::p2p_exchange::OfferStatus::PaymentDetected => {
-                        if update.claimed_by.is_none() || update.claim_expires_at.is_none() {
-                            return Err("claimed offer update needs a buyer and a deadline");
-                        }
-                    }
-                    crate::p2p_exchange::OfferStatus::Open => {
-                        // Offers only ever move away from Open. Allowing a
-                        // reopen would let a peer resurrect an offer whose
-                        // ZKA has already been spent.
-                        return Err("offer cannot be reopened by a status update");
-                    }
-                    _ => {}
-                }
-            }
-            ZokaMessage::OfferPaymentFailure(report) => {
-                report.validate()?;
-            }
             ZokaMessage::TeamAdvertise(advertisement) => {
                 advertisement
                     .validate()
@@ -1990,13 +1942,11 @@ impl Node {
         let pbft_topic = gossipsub::IdentTopic::new(PBFT_TOPIC_NAME);
         let stem_topic = gossipsub::IdentTopic::new(STEM_TOPIC_NAME);
         let mixer_topic = gossipsub::IdentTopic::new(MIXER_TOPIC_NAME);
-        let offers_topic = gossipsub::IdentTopic::new(OFFERS_TOPIC_NAME);
         let team_mining_topic = gossipsub::IdentTopic::new(TEAM_MINING_TOPIC_NAME);
         let general_topic_for_behaviour = general_topic.clone();
         let pbft_topic_for_behaviour = pbft_topic.clone();
         let stem_topic_for_behaviour = stem_topic.clone();
         let mixer_topic_for_behaviour = mixer_topic.clone();
-        let offers_topic_for_behaviour = offers_topic.clone();
         let team_mining_topic_for_behaviour = team_mining_topic.clone();
         let tor_proxy_for_transport = tor_proxy.clone();
 
@@ -2063,12 +2013,10 @@ impl Node {
             gossipsub.subscribe(&general_topic_for_behaviour)?;
             gossipsub.subscribe(&stem_topic_for_behaviour)?;
             gossipsub.subscribe(&mixer_topic_for_behaviour)?;
-            // Consenso, ofertas del intercambio y mineria en equipo: una wallet
-            // no participa de nada de eso, y estar suscrita la obligaria a
-            // reenviarlo.
-            if profile.subscribes_to_consensus_and_market() {
+            // Consenso y mineria en equipo: una wallet no participa de nada de
+            // eso, y estar suscrita la obligaria a reenviarlo.
+            if profile.subscribes_to_consensus_and_team_mining() {
                 gossipsub.subscribe(&pbft_topic_for_behaviour)?;
-                gossipsub.subscribe(&offers_topic_for_behaviour)?;
                 gossipsub.subscribe(&team_mining_topic_for_behaviour)?;
             }
             // In libp2p-request-response 0.26.3 this timeout bounds the
@@ -2185,7 +2133,6 @@ impl Node {
             pbft_topic,
             stem_topic,
             mixer_topic,
-            offers_topic,
             team_mining_topic,
             privacy_config,
             inbound_queue: VecDeque::new(),
@@ -4020,9 +3967,6 @@ impl Node {
             ZokaMessage::Pbft(_) => self.pbft_topic.clone(),
             ZokaMessage::StemPrivateTransaction(_) => self.stem_topic.clone(),
             ZokaMessage::PrivateMixerBatch(_) => self.mixer_topic.clone(),
-            ZokaMessage::OfferAnnounce(_)
-            | ZokaMessage::OfferStatusUpdate(_)
-            | ZokaMessage::OfferPaymentFailure(_) => self.offers_topic.clone(),
             ZokaMessage::TeamAdvertise(_)
             | ZokaMessage::TeamJoin(_)
             | ZokaMessage::ShareSubmit(_)
@@ -5108,9 +5052,6 @@ impl Node {
             ZokaMessage::Pbft(_) => PBFT_TOPIC_NAME,
             ZokaMessage::StemPrivateTransaction(_) => STEM_TOPIC_NAME,
             ZokaMessage::PrivateMixerBatch(_) => MIXER_TOPIC_NAME,
-            ZokaMessage::OfferAnnounce(_)
-            | ZokaMessage::OfferStatusUpdate(_)
-            | ZokaMessage::OfferPaymentFailure(_) => OFFERS_TOPIC_NAME,
             ZokaMessage::TeamAdvertise(_)
             | ZokaMessage::TeamJoin(_)
             | ZokaMessage::ShareSubmit(_)
@@ -5366,12 +5307,12 @@ impl Node {
     /// se publique sale por flood y lo que publiquen otros puede no llegar
     /// nunca.
     ///
-    /// Sin esto, "no me aparece la oferta que publicó otro" es indistinguible
-    /// de "no hay ofertas". Existía el equivalente solo para PBFT, y los
-    /// tópicos nuevos —ofertas, minería en equipo— quedaban a ciegas: un
-    /// cliente viejo se conecta y sincroniza bloques con normalidad, pero
-    /// nunca se suscribe a un tópico que no conoce, así que tener pares no
-    /// implica tener con quién intercambiar ofertas.
+    /// Sin esto, "no me aparece el equipo que creó otro" es indistinguible de
+    /// "no hay equipos". Existía el equivalente solo para PBFT, y los tópicos
+    /// nuevos —como la minería en equipo— quedaban a ciegas: un cliente viejo
+    /// se conecta y sincroniza bloques con normalidad, pero nunca se suscribe
+    /// a un tópico que no conoce, así que tener pares no implica tener con
+    /// quién coordinar.
     pub fn topic_peer_counts(&self) -> Vec<(String, usize, usize)> {
         let gossipsub = &self.swarm.behaviour().gossipsub;
         [
@@ -5379,7 +5320,6 @@ impl Node {
             (PBFT_TOPIC_NAME, &self.pbft_topic),
             (STEM_TOPIC_NAME, &self.stem_topic),
             (MIXER_TOPIC_NAME, &self.mixer_topic),
-            (OFFERS_TOPIC_NAME, &self.offers_topic),
             (TEAM_MINING_TOPIC_NAME, &self.team_mining_topic),
         ]
         .into_iter()
@@ -6035,16 +5975,6 @@ mod tests {
             timestamp: 55,
         });
         assert_eq!(Node::topic_name_for_message(&mixer), MIXER_TOPIC_NAME);
-
-        let offer = ZokaMessage::OfferPaymentFailure(crate::p2p_exchange::PaymentFailureReport {
-            offer_id: "offer-1".to_string(),
-            seller_address: "seller".to_string(),
-            buyer_address: "buyer".to_string(),
-            tron_tx_hash: "a".repeat(64),
-            timestamp: 55,
-            signature: Vec::new(),
-        });
-        assert_eq!(Node::topic_name_for_message(&offer), OFFERS_TOPIC_NAME);
 
         let share = ZokaMessage::ShareSubmit(crate::team_mining::SubmittedShare {
             team_id: "team".to_string(),
@@ -6776,7 +6706,7 @@ mod tests {
                 "sin '{imprescindible}' la wallet no puede ver bloques ni publicar en privado: {temas_wallet:?}"
             );
         }
-        for ajeno in ["offer", "pbft", "team"] {
+        for ajeno in ["pbft", "team"] {
             assert!(
                 !temas_wallet.iter().any(|t| t.contains(ajeno)),
                 "la wallet no participa de '{ajeno}' y no deberia reenviarlo: {temas_wallet:?}"

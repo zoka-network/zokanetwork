@@ -2863,24 +2863,6 @@ fn mining_log(message: &str) {
     }
 }
 
-/// Bitácora del exchange, en su propio archivo.
-///
-/// Separada de la de minería porque se lee en otro momento y por otra razón:
-/// cuando una venta salió mal hay que poder reconstruir qué vio el nodo sin
-/// tener que filtrar miles de líneas de hashes. Rota con el mismo techo.
-fn log_exchange_event(message: &str) {
-    eprintln!("{}", paint(&format!("exchange: {message}"), ANSI_DIM));
-    let path = PathBuf::from(NetworkProfile::Mainnet.local_dir()).join("exchange_diagnostic.log");
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    rotate_mining_log_if_oversized(&path);
-    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
-        use std::io::Write as _;
-        let _ = writeln!(f, "{} exchange: {}", now_secs(), message);
-    }
-}
-
 /// Rota el diagnóstico a una única copia `.1` cuando pasa el techo.
 ///
 /// Una sola copia a propósito: esto sirve para mirar qué pasó recién, no para
@@ -7474,7 +7456,6 @@ async fn handle_fullnode_network_message(
     node: &mut Node,
     message: &zoka::network::message::ZokaMessage,
     source: Option<libp2p::PeerId>,
-    exchange_runtime: &Arc<zoka::api::ExchangeRuntime>,
     team_mining_runtime: &Arc<zoka::team_mining::TeamMiningRuntime>,
     chain_id: &str,
     chain_db_path: Option<&str>,
@@ -7483,56 +7464,6 @@ async fn handle_fullnode_network_message(
     unsafe_rehearsal_difficulty_bits: Option<u32>,
 ) -> Option<String> {
     match message {
-        zoka::network::message::ZokaMessage::OfferAnnounce(announce) => {
-            let Some(source) = source else {
-                return Some(
-                    "Ignored offer announcement without a signed source peer.".to_string(),
-                );
-            };
-            match exchange_runtime
-                .ingest_offer_announce(announce.offer.clone(), source.to_string(), now_secs())
-                .await
-            {
-                Ok(()) => Some(format!("Offer {} is online.", announce.offer.id)),
-                Err(error) => Some(format!("Ignored offer {}: {error:?}", announce.offer.id)),
-            }
-        }
-        zoka::network::message::ZokaMessage::OfferStatusUpdate(update) => {
-            let Some(source) = source else {
-                return Some("Ignored offer update without a signed source peer.".to_string());
-            };
-            match exchange_runtime
-                .ingest_offer_update(update, &source.to_string())
-                .await
-            {
-                Ok(()) => Some(format!(
-                    "Offer {} changed to {:?}.",
-                    update.offer_id, update.status
-                )),
-                Err(error) => Some(format!(
-                    "Ignored update for offer {}: {error:?}",
-                    update.offer_id
-                )),
-            }
-        }
-        zoka::network::message::ZokaMessage::OfferPaymentFailure(report) => {
-            let Some(_) = source else {
-                return Some("Ignored payment failure without a signed source peer.".to_string());
-            };
-            match exchange_runtime
-                .ingest_payment_failure(report.clone(), now_secs())
-                .await
-            {
-                Ok(()) => Some(format!(
-                    "Recorded payment failure for offer {}.",
-                    report.offer_id
-                )),
-                Err(error) => Some(format!(
-                    "Ignored payment failure for offer {}: {error:?}",
-                    report.offer_id
-                )),
-            }
-        }
         zoka::network::message::ZokaMessage::TeamAdvertise(advertisement) => {
             let Some(source) = source else {
                 return Some(
@@ -7996,105 +7927,6 @@ async fn handle_fullnode_network_message(
         }
         _ => None,
     }
-}
-
-async fn announce_local_exchange_offers(
-    node: &mut Node,
-    exchange_runtime: &Arc<zoka::api::ExchangeRuntime>,
-) -> Result<usize, String> {
-    let outbound = exchange_runtime.drain_outbound_messages().await;
-    let mut published = 0usize;
-    let mut outbound = outbound.into_iter();
-    while let Some(message) = outbound.next() {
-        if let Err(error) = node.publish_message(&message) {
-            exchange_runtime.queue_message(message).await;
-            for pending in outbound {
-                exchange_runtime.queue_message(pending).await;
-            }
-            return Err(format!("offer update failed: {error}"));
-        }
-        published += 1;
-    }
-    let offers = {
-        let store = exchange_runtime.offer_store.lock().await;
-        store
-            .all_offers()
-            .into_iter()
-            .filter(|offer| offer.seller_address == exchange_runtime.seller_address)
-            .cloned()
-            .collect::<Vec<_>>()
-    };
-    let now = now_secs();
-    for offer in offers {
-        // Antes de ofrecerle la venta a la red, comprobar que el ZKA que la
-        // respalda sigue reservado. Si la reserva se rompio, la liberacion va a
-        // fallar despues de que el comprador ya haya mandado su USDT -- y ese
-        // dinero no vuelve. Callar la oferta es lo unico que protege a alguien
-        // que no puede ver nuestra wallet para comprobarlo por su cuenta.
-        //
-        // Solo se filtran las Open. Una oferta ya tomada se sigue anunciando
-        // aunque este rota: el comprador necesita ver que existe y en que
-        // estado quedo; borrarla de su vista seria peor.
-        if offer.status == zoka::p2p_exchange::OfferStatus::Open {
-            let problems = exchange_runtime.offer_reservation_problems(&offer).await;
-            if !problems.is_empty() {
-                log_exchange_event(&format!(
-                    "offer {} not announced: reservation is broken ({})",
-                    &offer.id[..8.min(offer.id.len())],
-                    problems.join("; ")
-                ));
-                continue;
-            }
-        }
-        let message = match offer.status {
-            zoka::p2p_exchange::OfferStatus::Open => {
-                zoka::network::message::ZokaMessage::OfferAnnounce(
-                    zoka::network::message::OfferAnnounceMessage {
-                        offer,
-                        signature: Vec::new(),
-                        timestamp: now,
-                    },
-                )
-            }
-            zoka::p2p_exchange::OfferStatus::Claimed
-            | zoka::p2p_exchange::OfferStatus::PaymentDetected => {
-                zoka::network::message::ZokaMessage::OfferStatusUpdate(
-                    zoka::network::message::OfferStatusUpdateMessage {
-                        offer_id: offer.id,
-                        seller_address: offer.seller_address,
-                        status: offer.status,
-                        claimed_by: offer.claimed_by,
-                        claim_expires_at: offer.claim_expires_at,
-                        signature: Vec::new(),
-                        timestamp: now,
-                    },
-                )
-            }
-            zoka::p2p_exchange::OfferStatus::Released
-            | zoka::p2p_exchange::OfferStatus::Expired
-                if offer
-                    .claim_expires_at
-                    .is_some_and(|deadline| now <= deadline.saturating_add(24 * 60 * 60)) =>
-            {
-                zoka::network::message::ZokaMessage::OfferStatusUpdate(
-                    zoka::network::message::OfferStatusUpdateMessage {
-                        offer_id: offer.id,
-                        seller_address: offer.seller_address,
-                        status: offer.status,
-                        claimed_by: offer.claimed_by,
-                        claim_expires_at: offer.claim_expires_at,
-                        signature: Vec::new(),
-                        timestamp: now,
-                    },
-                )
-            }
-            _ => continue,
-        };
-        node.publish_message(&message)
-            .map_err(|error| format!("offer announce failed: {error}"))?;
-        published += 1;
-    }
-    Ok(published)
 }
 
 async fn publish_team_mining_messages(
@@ -10535,7 +10367,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     // minutos se pierden.
     //
     // El nodo normal abre (o crea) una wallet privada al arrancar para la
-    // direccion de recompensas, el exchange y el escaneo de tx privadas, y sin
+    // direccion de recompensas y el escaneo de tx privadas, y sin
     // contrasena eso falla. En este modo no se toca ninguna wallet: no se
     // desbloquea, no se crea y no se escribe nada. Solo se descargan y validan
     // bloques, que es trabajo que no depende de tener claves.
@@ -10724,7 +10556,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             println!("Spend private key (hex): {}", export.spend_private_key_hex);
         }
     } else {
-        println!("Sync-only mode: no wallet opened. Blocks download and validate; mining, exchange and private scanning stay off until the wallet session starts.");
+        println!("Sync-only mode: no wallet opened. Blocks download and validate; mining and private scanning stay off until the wallet session starts.");
     }
     let mut startup_notes = vec![
         format!("Network profile: {} ({}).", network.label(), chain_id),
@@ -10746,59 +10578,36 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         ));
     }
 
-    // Receiver half of the API → fullnode-main-loop channel; populated
-    // only when the HTTP API is spun up (i.e. `--db` path present).
-    let offer_store_path = PathBuf::from(network.local_dir())
-        .join("p2p_exchange")
-        .join("offers.json");
-    let mut offer_store = zoka::p2p_exchange::OfferStore::open(&offer_store_path)
-        .map_err(|error| format!("failed to open P2P exchange store: {error:?}"))?;
-    // Con `--sync-only` el gestor de wallets esta vacio a proposito, asi que
-    // `reserved_note_ids` viene vacio y la reconciliacion no encuentra nada
-    // que liberar: las notas huerfanas se derivan de lo que la WALLET tiene
-    // reservado, no de lo que las ofertas reclaman. El camino se recorre igual
-    // y no toca nada.
-    let reserved_note_ids = private_wallet_manager.reserved_note_ids();
-    let reconciliation = offer_store
-        .reconcile(&reserved_note_ids, now_secs())
-        .map_err(|error| format!("failed to reconcile P2P exchange store: {error:?}"))?;
-    if !reconciliation.orphaned_note_ids.is_empty() {
-        // Este camino LIBERA notas, asi que es el que mas cuidado necesita: si
-        // corre sobre una vista vieja de la wallet puede soltar una reserva que
-        // otro proceso acaba de crear. El lock cubre leer-decidir-escribir como
-        // una sola operacion.
+    // El P2P Exchange se retiro en octubre de 2026. Las ofertas que quedaron
+    // abiertas dejaron notas reservadas que ya nadie va a liberar, y sin esto
+    // el saldo gastable se veria menor de lo que es. Se sueltan al arrancar.
+    //
+    // Este camino LIBERA notas, asi que es el que mas cuidado necesita: si
+    // corre sobre una vista vieja de la wallet puede soltar una reserva que
+    // otro proceso acaba de crear. El lock cubre leer-decidir-escribir como
+    // una sola operacion. Con `--sync-only` el gestor de wallets esta vacio a
+    // proposito y no hay nada que liberar.
+    {
         let _wallet_lock = storage
             .lock_private_wallets()
             .map_err(|error| format!("failed to lock wallet directory: {error}"))?;
-        private_wallet_manager.release_note_ids(&reconciliation.orphaned_note_ids);
-        for name in private_wallet_manager.get_private_wallet_names() {
-            if let Some(wallet) = private_wallet_manager.get_private_wallet(&name) {
-                storage
-                    .save_private_wallet(wallet, password.as_deref())
-                    .map_err(|error| {
-                        format!("failed to persist reconciled wallet {name}: {error}")
-                    })?;
+        let released = private_wallet_manager.release_retired_exchange_reservations();
+        if released > 0 {
+            for name in private_wallet_manager.get_private_wallet_names() {
+                if let Some(wallet) = private_wallet_manager.get_private_wallet(&name) {
+                    storage
+                        .save_private_wallet(wallet, password.as_deref())
+                        .map_err(|error| {
+                            format!("failed to persist released wallet {name}: {error}")
+                        })?;
+                }
             }
+            startup_notes.push(format!(
+                "Released {released} note reservation(s) left by retired P2P exchange offers."
+            ));
         }
-        startup_notes.push(format!(
-            "Released {} orphaned P2P note reservation(s) during startup reconciliation.",
-            reconciliation.orphaned_note_ids.len()
-        ));
     }
     let private_wallet_manager = Arc::new(tokio::sync::RwLock::new(private_wallet_manager));
-    let exchange_runtime = Arc::new(zoka::api::ExchangeRuntime::new(
-        offer_store,
-        Arc::clone(&private_wallet_manager),
-        wallet_name.clone(),
-        wallet_address.clone(),
-        Some(Arc::new(storage.clone())),
-        password.clone(),
-    ));
-    exchange_runtime
-        .configure_tron(zoka::p2p_exchange::tron::TronClient::new(
-            zoka::p2p_exchange::tron::TronConfig::from_env(tor_proxy.clone()),
-        ))
-        .await;
     let team_store_path = PathBuf::from(network.local_dir())
         .join("team_mining")
         .join("team.json");
@@ -10809,6 +10618,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             .map_err(|error| format!("failed to initialize team-mining runtime: {error}"))?,
     );
 
+    // Receiver half of the API → fullnode-main-loop channel; populated
+    // only when the HTTP API is spun up (i.e. `--db` path present).
     let mut private_tx_recv_outer: Option<
         tokio::sync::mpsc::UnboundedReceiver<zoka::private_wallet::PrivateTransaction>,
     > = None;
@@ -11005,9 +10816,6 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         let (private_tx_send, mut private_tx_recv) =
             tokio::sync::mpsc::unbounded_channel::<zoka::private_wallet::PrivateTransaction>();
         let api_broadcaster = Some(private_tx_send);
-        exchange_runtime
-            .set_private_tx_broadcaster(api_broadcaster.clone().unwrap())
-            .await;
         // Keep `private_tx_recv` alive across the main loop below by
         // shadowing the binding name when we move it into the select.
         let _ = &mut private_tx_recv;
@@ -11015,7 +10823,6 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             let api_broadcaster = api_broadcaster.clone();
             let manager = Arc::clone(&manager);
             let private_wallet_manager = Arc::clone(&private_wallet_manager);
-            let exchange_runtime = Arc::clone(&exchange_runtime);
             let team_mining_runtime = Arc::clone(&team_mining_runtime);
             async move {
                 if let Err(e) = zoka::api::start_api_on_bind_with_runtime(
@@ -11024,7 +10831,6 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     api_bind_addr,
                     api_broadcaster,
                     private_wallet_manager,
-                    exchange_runtime,
                     team_mining_runtime,
                 )
                 .await
@@ -11523,8 +11329,6 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let warmup_deadline = tokio::time::Instant::now() + Duration::from_secs(sync_warmup_secs);
     let mut next_warmup_ibd_at = tokio::time::Instant::now();
     let mut next_warmup_seed_reconnect_at = tokio::time::Instant::now();
-    let mut next_warmup_offer_announce_at = tokio::time::Instant::now();
-    let mut next_warmup_exchange_process_at = tokio::time::Instant::now();
     let mut next_warmup_team_tick_at = tokio::time::Instant::now();
     let mut warmup_seed_reconnect_failures = 0u32;
     // --mining-console throttle, shared by the warmup loop and the main loop:
@@ -11538,29 +11342,6 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut last_console_session_rewards = 0u64;
     while tokio::time::Instant::now() < warmup_deadline {
         let mut now = tokio::time::Instant::now();
-        if now >= next_warmup_exchange_process_at {
-            match exchange_runtime.process_local_exchange(now_secs()).await {
-                Ok(events) if !events.is_empty() => last_event = events.join("; "),
-                Ok(_) => {}
-                Err(error) => last_event = format!("P2P exchange: {error}"),
-            }
-            next_warmup_exchange_process_at = tokio::time::Instant::now() + Duration::from_secs(10);
-            now = tokio::time::Instant::now();
-        }
-        if now >= next_warmup_offer_announce_at {
-            // Sin wallet abierta no hay notas que respalden una oferta, asi
-            // que anunciarla seria ofrecer algo que este proceso no puede
-            // liberar. En modo solo-sincronizar el mercado no se toca.
-            if !sync_only {
-                if let Err(error) =
-                    announce_local_exchange_offers(&mut node, &exchange_runtime).await
-                {
-                    last_event = error;
-                }
-            }
-            next_warmup_offer_announce_at = tokio::time::Instant::now() + Duration::from_secs(30);
-            now = tokio::time::Instant::now();
-        }
         if now >= next_warmup_team_tick_at {
             if let Err(error) = publish_team_mining_messages(&mut node, &team_mining_runtime).await
             {
@@ -11660,7 +11441,6 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     &mut node,
                     &message,
                     sourced.source,
-                    &exchange_runtime,
                     &team_mining_runtime,
                     &chain_id,
                     db_path.as_deref(),
@@ -11865,8 +11645,6 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     };
     let mut next_mine_at = tokio::time::Instant::now();
     let mut next_sync_state_at = tokio::time::Instant::now();
-    let mut next_offer_announce_at = tokio::time::Instant::now();
-    let mut next_exchange_process_at = tokio::time::Instant::now();
     let mut next_team_tick_at = tokio::time::Instant::now();
     let mut next_team_work_at = tokio::time::Instant::now();
     // publish_recent_chain_blocks re-gossips up to `sync_rebroadcast_recent_blocks`
@@ -11953,25 +11731,6 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut team_share_task: Option<TeamShareTask> = None;
     let mut pending_team_solution: Option<zoka::team_mining::NetworkSolution> = None;
     loop {
-        if tokio::time::Instant::now() >= next_exchange_process_at {
-            match exchange_runtime.process_local_exchange(now_secs()).await {
-                Ok(events) if !events.is_empty() => last_event = events.join("; "),
-                Ok(_) => {}
-                Err(error) => last_event = format!("P2P exchange: {error}"),
-            }
-            next_exchange_process_at = tokio::time::Instant::now() + Duration::from_secs(10);
-        }
-        if tokio::time::Instant::now() >= next_offer_announce_at {
-            // Mismo motivo que en el calentamiento: sin wallet no hay respaldo.
-            if !sync_only {
-                if let Err(error) =
-                    announce_local_exchange_offers(&mut node, &exchange_runtime).await
-                {
-                    last_event = error;
-                }
-            }
-            next_offer_announce_at = tokio::time::Instant::now() + Duration::from_secs(30);
-        }
         if tokio::time::Instant::now() >= next_team_tick_at {
             if let Err(error) = publish_team_mining_messages(&mut node, &team_mining_runtime).await
             {
@@ -13267,7 +13026,6 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     &mut node,
                     &message,
                     sourced.source,
-                    &exchange_runtime,
                     &team_mining_runtime,
                     &chain_id,
                     db_path.as_deref(),
