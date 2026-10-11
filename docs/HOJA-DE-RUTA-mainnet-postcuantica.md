@@ -10,11 +10,18 @@ Lo que decidió el usuario el 2026-10-11:
 
 1. **La red actual (Zenith) pasa a ser la testnet.** Nadie pagó dinero por ZKA, así
    que la mainnet nueva arranca de cero: **no hay reclamo ni migración de saldos**.
-2. **El P2P Exchange sale de ZSilent.**
+2. **El P2P Exchange sale entero**: de ZSilent, del nodo y de la documentación, ya
+   (no espera a la mainnet).
 3. **VPS gratis** (con tarjeta solo para verificar la cuenta) para el explorador y para
-   ZKAPriv, **además** de Tor, no en su lugar.
+   ZKAPriv, **además** de Tor, no en su lugar. **En espera: el usuario avisa cuándo.**
 4. **Lo post-cuántico se implementa ahora** y se prueba en la testnet antes de lanzar
    la mainnet.
+5. **La mainnet nueva se llama Zoka Quantic.**
+6. **Premine de 5.000.000 ZKA para el equipo, gastable desde el bloque 0**, dentro del
+   tope de 23.000.000. La minería emite los 18.000.000 restantes: 12 ZKA por bloque
+   durante 1.051.200 bloques (12.614.400 ZKA) y 6 ZKA durante 897.600 bloques más.
+   Con bloques de 120 s, la emisión termina a los ~7,4 años.
+7. **El whitepaper se reescribe ya** con el enfoque nuevo (versión 2.0, Zoka Quantic).
 
 Reglas de trabajo para este plan:
 
@@ -86,6 +93,27 @@ reemplazo maduro (pruebas basadas en hashes, tipo STARK).
 - [ ] Push de las ramas `seguridad-octubre-2026` (ZOKA, zkapriv, zokaweb, zokaexplorer,
       zoka-guard-vault) y `tor-0.4.9.13` (zsilent-core).
 
+### Etapa 0b — Sacar el P2P Exchange entero
+
+Pedido del usuario el 2026-10-11: "sacalo todo".
+
+0b.1 Relevar antes de borrar: qué toca `src/p2p_exchange/` (~2.900 líneas) en el resto
+     del nodo (API, CLI, gossip, notas reservadas de la wallet) y si algo del exchange
+     quedó en bloques de la cadena actual. Si hay datos en bloques, la validación de
+     esos bloques viejos tiene que seguir funcionando en la testnet.
+0b.2 Nodo: módulo, rutas de la API, comandos del CLI, mensajes de red y pruebas.
+     Las notas marcadas `reserved` por ofertas viejas tienen que volver a quedar
+     gastables.
+0b.3 ZSilent: pantallas, navegación y llamadas a la API.
+0b.4 Documentación y sitio: todo lo que mencione el exchange o Tron.
+
+### Etapa 0c — Whitepaper 2.0 (Zoka Quantic)
+
+Reescribirlo con el enfoque nuevo, marcando cada cosa como hecha, en testnet o en
+diseño, igual que la 1.0. Corrige la promesa falsa sobre la privacidad pasada y
+declara el premine. El PDF del sitio se genera con xhtml2pdf; publicarlo en
+`zoka.network` es una decisión aparte del usuario.
+
 ### Etapa 1 — Base post-cuántica
 
 1.1 Librerías candidatas: `ml-kem` 0.3.x y `ml-dsa` 0.1.x de RustCrypto. Son jóvenes y
@@ -127,9 +155,10 @@ reemplazo maduro (pruebas basadas en hashes, tipo STARK).
 3.5 Activación por altura en la testnet y prueba de punta a punta: envío ZSilent →
     ZKAPriv y ZKAPriv → ZSilent, en el teléfono real.
 
-### Etapa 4 — VPS para la testnet (en paralelo con la 3)
+### Etapa 4 — VPS para la testnet (en paralelo con la 3) — EN ESPERA
 
-El usuario crea las cuentas; el resto lo armo yo.
+**No arrancar hasta que el usuario avise** (pedido del 2026-10-11). Él crea las
+cuentas; el resto lo armo yo.
 
 4.1 **Oracle Cloud Always Free** (ARM, hasta 4 núcleos y 24 GB entre todas sus
     máquinas): nodo que **no mina**, seed, y generador de los datos del explorador.
@@ -171,18 +200,20 @@ Después del génesis cualquier cambio de estos exige un fork.
     lru 0.12, core2, instant).
 7.2 Emisión: los bloques salen demasiado rápido (dificultad trabada en el piso,
     ~2 bloques por minuto). Fijar tiempo de bloque y dificultad inicial.
-7.3 Alinear versiones: crate, `NETWORK_MIN_CLIENT_VERSION` y manifiesto no coinciden.
-7.4 Bug de ZSilent que ofrece notas ya gastadas (saldo inflado).
-7.5 Sacar el P2P Exchange de ZSilent y apagarlo en el nodo de mainnet.
+7.3 Premine en el génesis: 5.000.000 ZKA a una dirección del equipo, contado dentro
+    del suministro emitido para que `block_reward_for_height` corte la minería en
+    18.000.000. Monto y dirección públicos en el génesis, para que cualquiera lo
+    verifique.
+7.4 Alinear versiones: crate, `NETWORK_MIN_CLIENT_VERSION` y manifiesto no coinciden.
+7.5 Bug de ZSilent que ofrece notas ya gastadas (saldo inflado).
 7.6 **Ceremonia multiparte del trusted setup** con los circuitos finales. Si los
     parámetros los genera una sola persona, esa persona puede crear monedas.
 7.7 Revisión externa, al menos de las etapas 3 y 5.
-7.8 Corregir whitepaper y litepaper, y ajustar todo texto público a "Qué se puede
-    prometer".
+7.8 Revisar el whitepaper 2.0 contra lo que de verdad quedó implementado.
 
 ### Etapa 8 — Génesis y lanzamiento
 
-8.1 Chain id nuevo y génesis nuevo.
+8.1 Zoka Quantic: chain id nuevo (propuesta: `zoka-quantic-v1`) y génesis nuevo.
 8.2 Todo lo post-cuántico activo desde el bloque 0, sin alturas de activación.
 8.3 Seeds: VPS + onion + la PC del usuario.
 8.4 Anuncio que explique por qué este relanzamiento es distinto del de Zenith (junio
@@ -196,14 +227,18 @@ Después del génesis cualquier cambio de estos exige un fork.
 |---|---|---|
 | D1 | ML-KEM-768 o ML-KEM-512 | 768: es la elección estándar (la usa TLS); 512 ahorra unos 400 bytes por dirección y 300 por salida |
 | D2 | Largo de las direcciones: con 768 rondan los 1.700 caracteres (1.200 con 512) | Aceptarlo y apoyarse en QR y copiar/pegar; las alternativas exigen un directorio de claves, que filtra privacidad |
-| D3 | Nombre y chain id de la mainnet nueva | — |
-| D4 | Premine | Ninguno, y decirlo |
-| D5 | Tiempo de bloque, recompensa y curva de emisión | Revisar con números en la Etapa 7 |
-| D6 | El exchange: ¿se apaga ya en la testnet o solo en la mainnet? | — |
+| D5 | Tiempo de bloque y dificultad inicial (la curva ya está decidida, ver LEEME) | Revisar con números en la Etapa 7 |
+
+Decididas el 2026-10-11: nombre **Zoka Quantic**; premine de **5M para el equipo,
+gastable de inmediato, dentro de los 23M**; el exchange **sale entero ya**; los VPS
+**esperan** a que el usuario avise.
 
 ## Riesgos
 
 - Es el **segundo relanzamiento** en el año: si no se explica bien, espanta a los que quedan.
+- **Premine del 21,7 % sin bloqueo:** el whitepaper 1.0 prometía "sin premine". Hay que
+  declararlo de frente (monto, dirección y que es gastable de inmediato); escondido o
+  minimizado es lo que más rápido destruye la confianza en una moneda nueva.
 - Librerías post-cuánticas **jóvenes y sin auditoría** conocida.
 - **Tamaño:** cada salida suma más de 1 KB; pesa en la cadena y en los datos del teléfono.
 - **Escaneo más lento** en el teléfono de 32 bits (se mide en la Etapa 1).
