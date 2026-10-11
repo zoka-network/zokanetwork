@@ -28,12 +28,12 @@ The helper script downloads the bundle, checksum-verifies it against a pinned
 SHA256, optionally verifies the `.asc` signature with GPG, and extracts it into
 `third_party/tor/windows-x86_64`.
 
-Pinned bundle (Tor Expert Bundle 15.0.22, tor 0.4.9.12 — security release of
-2026-09-08, "a series of high-severity security issues"):
+Pinned bundle (Tor Expert Bundle 15.0.24, tor 0.4.9.13 — security release of
+2026-09-22; bundle signed 2026-09-29):
 
-- URL: `https://archive.torproject.org/tor-package-archive/torbrowser/15.0.22/tor-expert-bundle-windows-x86_64-15.0.22.tar.gz`
-- SHA256: `231dad6b9cb401a54c260db7046965ef04e4f72ff071b140d423fb5da281ab1e`
-- Signature: `https://archive.torproject.org/tor-package-archive/torbrowser/15.0.22/tor-expert-bundle-windows-x86_64-15.0.22.tar.gz.asc`
+- URL: `https://archive.torproject.org/tor-package-archive/torbrowser/15.0.24/tor-expert-bundle-windows-x86_64-15.0.24.tar.gz`
+- SHA256: `e9dc6ccc93cd6afa507193f4de284d6424233ff5102155cd2c94b259e8a22b65`
+- Signature: `https://archive.torproject.org/tor-package-archive/torbrowser/15.0.24/tor-expert-bundle-windows-x86_64-15.0.24.tar.gz.asc`
 - Signed by the Tor Browser Developers key, primary fingerprint
   `EF6E 286D DA85 EA2A 4BA7 DE68 4E2C 6E87 9329 8290` (fetch it with
   `gpg --auto-key-locate nodefault,wkd --locate-keys torbrowser@torproject.org`
@@ -41,10 +41,10 @@ Pinned bundle (Tor Expert Bundle 15.0.22, tor 0.4.9.12 — security release of
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File zsilent-core/scripts/prepare-tor-expert-bundle-windows.ps1 `
-  -Url "https://archive.torproject.org/tor-package-archive/torbrowser/15.0.22/tor-expert-bundle-windows-x86_64-15.0.22.tar.gz" `
-  -Sha256 "231dad6b9cb401a54c260db7046965ef04e4f72ff071b140d423fb5da281ab1e" `
-  -AscUrl "https://archive.torproject.org/tor-package-archive/torbrowser/15.0.22/tor-expert-bundle-windows-x86_64-15.0.22.tar.gz.asc" `
-  -ExpectedTorVersion "0.4.9.12" `
+  -Url "https://archive.torproject.org/tor-package-archive/torbrowser/15.0.24/tor-expert-bundle-windows-x86_64-15.0.24.tar.gz" `
+  -Sha256 "e9dc6ccc93cd6afa507193f4de284d6424233ff5102155cd2c94b259e8a22b65" `
+  -AscUrl "https://archive.torproject.org/tor-package-archive/torbrowser/15.0.24/tor-expert-bundle-windows-x86_64-15.0.24.tar.gz.asc" `
+  -ExpectedTorVersion "0.4.9.13" `
   -VerifySignature
 ```
 
@@ -65,8 +65,15 @@ The SHA256 is what the script *expects*, not proof of origin: take it from an
 archive whose GPG signature you already verified. Compute it with
 `Get-FileHash -Algorithm SHA256`.
 
-Tor moved to a two-week security-release cadence in September 2026 (0.4.9.13
-announced for 2026-09-22), so expect to repeat this.
+Tor moved to a two-week security-release cadence in September 2026, so expect
+to repeat this. The Expert Bundle trails the tor release: 0.4.9.14 came out on
+2026-10-07, but on 2026-10-11 the newest bundle (15.0.24) still carried
+0.4.9.13. Check the version inside the archive (the script does, via
+`-ExpectedTorVersion`) instead of assuming the newest bundle has the newest tor.
+
+`-VerifySignature` needs `gpg` on the PATH. On a Windows box where it only
+comes with Git, prepend `C:\Program Files\Git\usr\bin` to `$env:PATH` for that
+run.
 
 ### Step 2 — Build the Windows installer with Tor required
 
