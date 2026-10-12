@@ -181,11 +181,21 @@ uno con ella.
     exactamente 1.120 bytes; `ephemeral_pubkey` vacío; `stealth_address` con
     prefijo `stlth2_`.
   - Cualquier otra versión se rechaza.
-- **Dónde se aplica la altura.** Al validar un bloque (y al armar un bloque
-  candidato) se usa la altura exacta del bloque. En el mempool, la API y el
-  P2P no hay altura: una salida v2 pasa solo si la activación ya está fijada
-  (en el binario o por la variable de entorno), y el bloque la vuelve a
-  validar con su altura. Hoy la altura es `None`: toda salida v2 se rechaza.
+- **Los cuerpos tienen que ser datos de consenso.** En Zenith los bloques
+  comprometen hashes y nulificadores de las transacciones privadas, pero los
+  cuerpos viajan como adjuntos y solo se validan desde la altura de los
+  bundles canónicos (`ZOKA_PRIVATE_TX_CANONICAL_BUNDLE_ACTIVATION_HEIGHT`, hoy
+  `None`). Una regla sobre salidas es una regla sobre cuerpos: sin bundles
+  canónicos, un nodo sin la activación v2 acepta igual el bloque (medido en la
+  red local, corrida 1). Por eso la salida v2 exige **las dos alturas** y vale
+  desde la mayor (`economics::pq_hybrid_outputs_activation_height`), igual que
+  el perfil `v2_i1`.
+- **Dónde se aplica la altura.** Al validar los cuerpos de un bloque (y al
+  armar un bloque candidato) se usa la altura exacta del bloque. En el
+  mempool, la API y el P2P no hay altura: una salida v2 pasa solo si las dos
+  activaciones ya están fijadas (en el binario o por las variables de
+  entorno), y el bloque la vuelve a validar con su altura. Hoy las dos son
+  `None`: toda salida v2 se rechaza.
 - **Hash.** En una salida v2 el hash de la transacción agrega
   `"zoka-output-v2" ‖ versión ‖ ciphertext ‖ 0x1f` después de la clave
   efímera. En v1 recorre exactamente los mismos bytes que antes: la prueba
@@ -196,12 +206,68 @@ uno con ella.
   como antes; lo mismo las notas de las wallets guardadas. No hay formatos
   binarios (todo es JSON), así que no hay cambios de diseño de registro.
 - **Hard fork.** Un nodo viejo ignora los campos desconocidos, calcula otro
-  hash para una transacción con salidas v2 y la rechaza: activarla exige una
-  altura anunciada y que la red actualice antes.
+  hash para una transacción con salidas v2 y la rechaza; con bundles
+  canónicos activos también rechaza el bloque que la trae. Activarla exige
+  una altura anunciada y que la red actualice antes.
+- **P2P.** El mensaje de salida del P2P (`PrivateOutputMessage`) lleva los dos
+  campos nuevos con la misma serialización: una v1 viaja byte por byte igual
+  y una v2 no pierde nada.
 - **Coinbase:** sigue siendo v1 (decisión del usuario del 12/10/2026). Su
   estructura no tiene los campos v2 y el minero sigue cobrando en `zka1`.
 - En Zenith (testnet) conviven v1 y v2 después de la altura. En Quantic,
   solo v2 desde el bloque 0.
+
+## Prueba en red local (12/10/2026)
+
+Tres nodos en la PC del usuario, aislados: cada uno con su `ZOKA_HOME`, su
+API (3311-3313) y su puerto P2P, un manifiesto sin semillas ni RPC públicas y
+`--no-iroh-bootstrap`. Nada llegó a la testnet pública ni al nodo del usuario
+(puerto 3000). Binario release con `pq-experimental` y dificultad de ensayo
+(`--unsafe-rehearsal-difficulty-bits 1`). Las activaciones se fijaron por
+variables de entorno; los binarios siguen con `None`.
+
+| Nodo | Rol | Salida v2 desde | Bundles canónicos (corrida 2) |
+|---|---|---|---|
+| A | minero, wallet alice | 80 | 70 |
+| B | wallet bob, no mina | 80 | 70 |
+| C | `--sync-only` | (sin activar) | 70 |
+
+**Corrida 1, sin bundles canónicos:**
+
+- En la altura 67 alice le pagó 5 ZKA a la `zkq1` de bob (`ce85666a`): pago y
+  vuelto v2, 26 KB de JSON. Esperó en el mempool de 68 a 79 y entró en el 80.
+- El nodo de bob vio 5 ZKA; bob los gastó hacia la `zka1` de alice
+  (`97abef87`, salidas v1, bloque 86). Saldos finales exactos: bob 3; alice
+  1.065 = 89 × 12 − 5 + 2 (su vuelto v2 reconocido).
+- **C aceptó el bloque 80:** sin bundles canónicos nadie valida los cuerpos.
+  De ahí la corrección: la salida v2 exige las dos alturas.
+
+**Corrida 2, bundles canónicos desde el 70 y binario corregido:**
+
+- alice2 le pagó a la `zkq1` de bob2 5 ZKA (`a5d85da1`) y 1 ZKA (`906b9f14`)
+  entre las alturas 63 y 67. El minero las salteó en cada bloque hasta el 79
+  ("hybrid private outputs are not active at this height") y las incluyó en
+  el 80 con sus cuerpos (bloque de 139 KB).
+- B2 siguió la cadena. **C2 rechazó el bloque 80** ("invalid canonical
+  private transaction bundle: … hybrid private outputs are not active at this
+  height") y quedó en el 79.
+- bob2 vio 6 ZKA y gastó 4 hacia la `zka1` de alice2 (`ad440c12`, bloque 87).
+  Saldos finales exactos: bob2 2; alice2 1.138 = 95 × 12 − 5 − 1 + 4.
+
+**Hallazgos que no son de la v2, anotados para después:**
+
+- La wallet del CLI volvió a ofrecer una nota que ya gastaba una transacción
+  pendiente (`fca318a9` contra `906b9f14`): la API respondió 409 y el minero
+  eligió una sola. Es el problema conocido de las notas ya gastadas.
+- En los primeros envíos desde el nodo minero el CLI informó "Archived private
+  tx bodies: 0", aunque la transacción entró igual por la cola lateral; por un
+  proxy de diagnóstico y desde el nodo B la publicación anduvo. La causa no
+  quedó reproducida.
+- El chisme del mensaje `PrivateTransaction` (y del mezclador) se descarta
+  para toda transacción moderna: la validación de forma exige
+  `recipient_commitment`, que el armador deja vacío a propósito, y al mensaje
+  le falta `status`. Las transacciones viajan por anuncio + cuerpo crudo, que
+  conserva los campos v2.
 
 ## Abiertos
 
@@ -259,3 +325,8 @@ frase da lo mismo por los dos caminos.
 CLI (`cargo test --bin zoka -- recipient_accepts_zka1`): `--to` sigue
 aceptando `zka1` igual que antes y rechaza `zkq1` con un mensaje claro
 mientras la activación no esté fijada.
+
+Activación y P2P (`cargo test --lib -- hybrid_outputs_need_canonical
+el_mensaje_p2p_conserva`): la salida v2 exige también los bundles canónicos y
+vale desde la mayor de las dos alturas; una salida v1 viaja por el mensaje
+P2P igual que antes y una v2 no pierde versión ni ciphertext.

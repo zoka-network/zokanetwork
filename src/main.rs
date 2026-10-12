@@ -2097,7 +2097,7 @@ fn require_private_recipient_address(raw: &str, flag: &str) -> Result<String, St
     if !zoka::private_wallet::is_hybrid_payment_address(raw) {
         return require_private_network_address(raw, flag);
     }
-    if economics::pq_feature_activation_height(economics::PqFeature::HybridAddresses).is_none() {
+    if economics::pq_hybrid_outputs_activation_height().is_none() {
         return Err(format!(
             "{flag}: zkq1 hybrid addresses are not active on this network yet; use the recipient's zka1 address"
         ));
@@ -13782,8 +13782,7 @@ fn cmd_receive_address(args: &[String]) -> Result<(), String> {
     } else {
         None
     };
-    let hybrid_activation =
-        economics::pq_feature_activation_height(economics::PqFeature::HybridAddresses);
+    let hybrid_activation = economics::pq_hybrid_outputs_activation_height();
     if as_json {
         let mut out = serde_json::json!({
             "wallet": wallet_name,
@@ -19928,8 +19927,7 @@ mod tests {
             require_private_recipient_address(&addr, "--to").unwrap(),
             require_private_network_address(&addr, "--to").unwrap()
         );
-        if economics::pq_feature_activation_height(economics::PqFeature::HybridAddresses).is_none()
-        {
+        if economics::pq_hybrid_outputs_activation_height().is_none() {
             let err = require_private_recipient_address("zkq1abc", "--to").unwrap_err();
             assert!(
                 err.contains("not active") && err.contains("zka1"),

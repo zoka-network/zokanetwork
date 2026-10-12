@@ -332,6 +332,37 @@ pub fn pq_feature_active_at(height: u64, activation_height: Option<u64>) -> bool
     activation_height.is_some_and(|activation| height >= activation)
 }
 
+/// Altura desde la que valen las salidas v2 (`PqFeature::HybridAddresses`).
+///
+/// Las reglas de la salida v2 son reglas sobre los cuerpos de las
+/// transacciones, y los cuerpos solo son datos de consenso con los bundles
+/// canónicos: antes de esa altura los bloques comprometen hashes y
+/// nulificadores y ningún nodo valida los cuerpos (medido el 12/10 en una red
+/// local: un nodo sin la activación aceptó el bloque con la salida v2). Por
+/// eso, como `private_tx_v2_i1_active_at`, hacen falta las dos alturas.
+pub fn pq_hybrid_outputs_activation_height_from(
+    hybrid_activation: Option<u64>,
+    canonical_bundle_activation: Option<u64>,
+) -> Option<u64> {
+    Some(hybrid_activation?.max(canonical_bundle_activation?))
+}
+
+pub fn pq_hybrid_outputs_activation_height() -> Option<u64> {
+    pq_hybrid_outputs_activation_height_from(
+        pq_feature_activation_height(PqFeature::HybridAddresses),
+        private_tx_canonical_bundle_activation_height(),
+    )
+}
+
+pub fn pq_hybrid_outputs_active_at(
+    height: u64,
+    hybrid_activation: Option<u64>,
+    canonical_bundle_activation: Option<u64>,
+) -> bool {
+    pq_hybrid_outputs_activation_height_from(hybrid_activation, canonical_bundle_activation)
+        .is_some_and(|activation| height >= activation)
+}
+
 /// Minimum difficulty the per-block retarget can fall to. Keeps the chain
 /// viable even with a single low-end miner.
 pub const POW_MIN_DIFFICULTY_BITS: u32 = 12;
@@ -647,6 +678,35 @@ mod tests {
         assert_eq!(ids.len(), PqFeature::ALL.len());
         assert_eq!(vars.len(), PqFeature::ALL.len());
         assert!(vars.iter().all(|v| v.starts_with("ZOKA_PQ_")));
+    }
+
+    // Una salida v2 es una regla sobre cuerpos: sin bundles canónicos ningún
+    // bloque la valida, así que hacen falta las dos alturas y manda la mayor.
+    #[test]
+    fn hybrid_outputs_need_canonical_bundles_too() {
+        assert_eq!(pq_hybrid_outputs_activation_height_from(None, None), None);
+        assert_eq!(
+            pq_hybrid_outputs_activation_height_from(Some(80), None),
+            None
+        );
+        assert_eq!(
+            pq_hybrid_outputs_activation_height_from(None, Some(70)),
+            None
+        );
+        assert_eq!(
+            pq_hybrid_outputs_activation_height_from(Some(80), Some(70)),
+            Some(80)
+        );
+        assert_eq!(
+            pq_hybrid_outputs_activation_height_from(Some(60), Some(70)),
+            Some(70)
+        );
+        assert!(!pq_hybrid_outputs_active_at(79, Some(80), Some(70)));
+        assert!(pq_hybrid_outputs_active_at(80, Some(80), Some(70)));
+        assert!(!pq_hybrid_outputs_active_at(u64::MAX, Some(80), None));
+        if std::env::var_os(PqFeature::HybridAddresses.activation_env_var()).is_none() {
+            assert_eq!(pq_hybrid_outputs_activation_height(), None);
+        }
     }
 
     #[test]

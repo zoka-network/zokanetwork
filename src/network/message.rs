@@ -103,6 +103,16 @@ pub struct PrivateOutputMessage {
     pub stealth_address: String,
     #[serde(default)]
     pub ephemeral_pubkey: Vec<u8>,
+    /// Ver `PrivateOutput::output_version`. Sin estos dos campos una salida v2
+    /// perdería su versión y su ciphertext al pasar por este mensaje y su hash
+    /// dejaría de cerrar. Las v1 no los serializan: su JSON no cambia.
+    #[serde(
+        default = "crate::private_wallet::default_private_output_version",
+        skip_serializing_if = "crate::private_wallet::is_classic_private_output_version"
+    )]
+    pub output_version: u8,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kem_ciphertext: Vec<u8>,
     #[serde(default)]
     pub commitment: String,
     #[serde(default)]
@@ -488,6 +498,8 @@ mod tests {
                 recipient_commitment: "recipient".to_string(),
                 stealth_address: "stlth_abc".to_string(),
                 ephemeral_pubkey: vec![1, 2, 3],
+                output_version: 1,
+                kem_ciphertext: Vec::new(),
                 commitment: "commitment".to_string(),
                 amount_commitment: "amount-commitment".to_string(),
                 range_proof: vec![8u8; 32],
@@ -574,6 +586,8 @@ mod tests {
                     recipient_commitment: "recipient".to_string(),
                     stealth_address: "stlth_abc".to_string(),
                     ephemeral_pubkey: vec![1, 2, 3],
+                    output_version: 1,
+                    kem_ciphertext: Vec::new(),
                     commitment: "commitment".to_string(),
                     amount_commitment: "amount-commitment".to_string(),
                     range_proof: vec![8u8; 32],
@@ -675,6 +689,8 @@ mod tests {
                     recipient_commitment: "recipient".to_string(),
                     stealth_address: "stlth_abc".to_string(),
                     ephemeral_pubkey: vec![1, 2, 3],
+                    output_version: 1,
+                    kem_ciphertext: Vec::new(),
                     commitment: "commitment".to_string(),
                     amount_commitment: "amount-commitment".to_string(),
                     range_proof: vec![8u8; 32],

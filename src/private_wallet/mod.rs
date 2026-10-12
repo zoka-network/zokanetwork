@@ -1145,11 +1145,11 @@ pub const PRIVATE_OUTPUT_VERSION_HYBRID: u8 = 2;
 /// tenga o no soporte post-cuántico: validar no exige descifrar.
 pub const HYBRID_OUTPUT_KEM_CIPHERTEXT_BYTES: usize = 1120;
 
-fn default_private_output_version() -> u8 {
+pub(crate) fn default_private_output_version() -> u8 {
     PRIVATE_OUTPUT_VERSION_CLASSIC
 }
 
-fn is_classic_private_output_version(version: &u8) -> bool {
+pub(crate) fn is_classic_private_output_version(version: &u8) -> bool {
     *version <= PRIVATE_OUTPUT_VERSION_CLASSIC
 }
 
@@ -4963,12 +4963,11 @@ impl PrivateWalletManager {
         tx: &PrivateTransaction,
     ) -> Result<(), BlockError> {
         let proof_profile = private_proof_profile_spec_for_tx(tx)?;
-        // Sin altura (mempool, API): una salida v2 pasa si la activación ya
-        // está programada. El bloque la vuelve a validar con su altura exacta.
-        let hybrid_outputs_allowed = crate::economics::pq_feature_activation_height(
-            crate::economics::PqFeature::HybridAddresses,
-        )
-        .is_some();
+        // Sin altura (mempool, API, P2P): una salida v2 pasa si su activación
+        // ya está fijada (incluye la de los bundles canónicos). El bloque la
+        // vuelve a validar con su altura exacta.
+        let hybrid_outputs_allowed =
+            crate::economics::pq_hybrid_outputs_activation_height().is_some();
         self.validate_inbound_private_transaction_with_profile(
             tx,
             proof_profile,
@@ -4990,9 +4989,14 @@ impl PrivateWalletManager {
             v2_i1_activation_height,
             canonical_bundle_activation_height,
         )?;
-        let hybrid_outputs_allowed = crate::economics::pq_feature_active(
-            crate::economics::PqFeature::HybridAddresses,
+        // Como v2_i1: la salida v2 exige también los bundles canónicos, que son
+        // los que hacen de los cuerpos datos de consenso.
+        let hybrid_outputs_allowed = crate::economics::pq_hybrid_outputs_active_at(
             height,
+            crate::economics::pq_feature_activation_height(
+                crate::economics::PqFeature::HybridAddresses,
+            ),
+            canonical_bundle_activation_height,
         );
         self.validate_inbound_private_transaction_with_profile(
             tx,
@@ -7193,6 +7197,55 @@ mod tests {
         assert_eq!(leida, v2);
     }
 
+    // Las salidas viajan por P2P dentro de `PrivateTransactionMessage`: una
+    // salida v2 no puede perder nada en ese viaje (antes perdía versión y
+    // ciphertext, y el hash dejaba de cerrar) y una v1 tiene que viajar igual
+    // que antes. Hoy las transacciones se propagan por anuncio + cuerpo
+    // crudo; el chisme de este mensaje no llega a convertirse (le falta
+    // `status` y la validación de forma exige `recipient_commitment`), pero
+    // si se arregla, la v2 ya no se rompe.
+    #[test]
+    fn el_mensaje_p2p_conserva_la_salida_v2() {
+        use crate::network::message::{PrivateOutputMessage, PrivateTransactionMessage};
+
+        for version in [
+            PRIVATE_OUTPUT_VERSION_CLASSIC,
+            PRIVATE_OUTPUT_VERSION_HYBRID,
+        ] {
+            let salida = salida_de_prueba(version);
+            let json_salida = serde_json::to_value(&salida).unwrap();
+            let mensaje: PrivateOutputMessage =
+                serde_json::from_value(json_salida.clone()).unwrap();
+            let json_mensaje = serde_json::to_value(&mensaje).unwrap();
+            assert_eq!(json_mensaje, json_salida);
+            let vuelta: PrivateOutput = serde_json::from_value(json_mensaje).unwrap();
+            assert_eq!(vuelta, salida);
+        }
+
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        let bob_commitment = manager.create_private_wallet("bob").unwrap();
+        manager.deposit_to_private_wallet("alice", 100).unwrap();
+        let tx_hash = manager
+            .send_private_transaction("alice", bob_commitment, 20)
+            .unwrap();
+        let mut tx = manager.get_private_transaction(&tx_hash).unwrap();
+        let salida = &mut tx.outputs[0];
+        salida.output_version = PRIVATE_OUTPUT_VERSION_HYBRID;
+        salida.ephemeral_pubkey.clear();
+        salida.kem_ciphertext = vec![5u8; HYBRID_OUTPUT_KEM_CIPHERTEXT_BYTES];
+        salida.stealth_address = format!("stlth2_{}", "ab".repeat(20));
+        tx.tx_hash = expected_private_tx_hash(&tx);
+
+        let json_tx = serde_json::to_value(&tx).unwrap();
+        let mensaje: PrivateTransactionMessage = serde_json::from_value(json_tx.clone()).unwrap();
+        let json_mensaje = serde_json::to_value(&mensaje).unwrap();
+        assert_eq!(json_mensaje["outputs"], json_tx["outputs"]);
+        let salidas: Vec<PrivateOutput> =
+            serde_json::from_value(json_mensaje["outputs"].clone()).unwrap();
+        assert_eq!(salidas, tx.outputs);
+    }
+
     #[test]
     fn formato_de_las_salidas_segun_su_version() {
         let v1 = salida_de_prueba(PRIVATE_OUTPUT_VERSION_CLASSIC);
@@ -7251,7 +7304,8 @@ mod tests {
         assert!(err.to_string().contains("not active"), "{err}");
 
         // Con la activación sin fijar, como en los binarios de hoy, las dos
-        // entradas públicas la rechazan por la misma razón.
+        // entradas públicas la rechazan por la misma razón; también un bloque
+        // con bundles canónicos activos (sus cuerpos sí se validan).
         if crate::economics::pq_feature_activation_height(
             crate::economics::PqFeature::HybridAddresses,
         )
@@ -7261,10 +7315,12 @@ mod tests {
                 .validate_inbound_private_transaction(&tx)
                 .unwrap_err();
             assert!(err.to_string().contains("not active"), "{err}");
-            let err = PrivateWalletManager::new()
-                .validate_inbound_private_transaction_at(&tx, 1_000_000, None, None)
-                .unwrap_err();
-            assert!(err.to_string().contains("not active"), "{err}");
+            for canonical in [None, Some(0)] {
+                let err = PrivateWalletManager::new()
+                    .validate_inbound_private_transaction_at(&tx, 1_000_000, None, canonical)
+                    .unwrap_err();
+                assert!(err.to_string().contains("not active"), "{err}");
+            }
         }
     }
 
