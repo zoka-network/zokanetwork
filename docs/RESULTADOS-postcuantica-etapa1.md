@@ -157,7 +157,15 @@ la base real de Zenith (altura 25.204); no se tocó `%APPDATA%\Zoka`.
 |---|---|
 | Servidor nuevo (`--serve-iroh-snapshot`) → cliente viejo (`snapshot-fetch-iroh`) | OK: 349.675.478 bytes por iroh, 25.204 bloques aplicados, misma altura (696 s en total) |
 | Servidor viejo → cliente nuevo | OK: 349.675.478 bytes, 25.204 bloques, misma altura (715 s) |
-| Nodo nuevo contra la red real por Tor | No se pudo completar: las tres semillas del manifiesto no respondían. El nodo las marcó todas (onion y DNS) y terminó con `all configured seed nodes failed`; `curl` por el mismo Tor también falla con las tres (SOCKS, código 97) mientras una onion de control (torproject.org) responde 200 en 13 s. seed1 es la PC del usuario, apagada durante la prueba |
+| Nodo nuevo contra la red real por Tor, 12/10 13:00 (argumentos como los pasa ZSilent: `--allow-isolated-start`, `--sync-warmup-secs 30`, `--tor-proxy`) | OK: se conectó a seed3 por su onion, entró al gossip de todos los tópicos y sincronizó 25.204 → 25.244, la punta de la red durante la prueba |
+| Binario 2.0.2 instalado, misma prueba y en paralelo | Igual: seed3 por Tor, 25.204 → 25.244. Los dos aceptaron los mismos bloques (25.206 `f42925f1…`, 25.244 `8f276db6…`) |
+
+Un intento anterior (11/10, de noche) no pudo conectarse: ninguna semilla
+respondía por Tor (`curl` SOCKS, código 97) mientras una onion de control
+respondía. El 12/10 seed3 volvió (seed1, la PC del usuario, y seed2 siguieron
+sin responder). Con un Tor recién iniciado, el plazo inicial de 20 s por
+semilla puede no alcanzar; ZSilent usa `--allow-isolated-start` y el nodo
+reintenta en segundo plano, que es como se corrió la prueba buena.
 
 Hallazgo aparte: `fullnode --sync-only` no arranca ni en el binario instalado
 ni en el nuevo (`failed to initialize team-mining runtime: invalid team member

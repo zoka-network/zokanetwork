@@ -14,7 +14,7 @@ postcuántica.**
 
 **Siguiente paso natural:** etapa 3 (direcciones y cifrado híbridos). Antes,
 conviene corregir en una rama aparte la falla previa de `fullnode --sync-only`
-(etapa 1, abajo) y repetir la prueba contra la red real con seed1 encendida.
+(etapa 1, abajo). La prueba contra la red real ya se hizo (12/10, vía seed3).
 
 Segunda sesión, 11 y 12/10 (Claude): se cerró la integración de la etapa 1 y se
 hizo la etapa 2 (Zenith como testnet) en ramas de los tres repos. El detalle de
@@ -87,8 +87,9 @@ Referencias Git verificadas al preparar este archivo:
 - [x] Pruebas de compatibilidad: vector RFC 8032 para la identidad iroh y prueba
   cruzada con el binario 2.0.2 instalado: snapshot por iroh en las dos
   direcciones (349.675.478 bytes, 25.204 bloques) y wallets de un binario
-  visibles en el otro. Contra la red real por Tor no se pudo: ninguna de las tres
-  semillas respondía (seed1 es la PC del usuario, apagada). Repetir con seed1 en línea.
+  visibles en el otro. Contra la red real por Tor (12/10): el nodo nuevo y el
+  2.0.2, en paralelo, se conectaron a seed3 y sincronizaron los mismos bloques
+  (25.204 → 25.244). seed1 (PC del usuario) y seed2 no respondían.
 - [ ] **Falla previa encontrada:** `fullnode --sync-only` no arranca ni en el 2.0.2
   instalado (`invalid team member address`: sin wallet, la dirección queda
   vacía y `TeamMiningRuntime::new` la rechaza, `src/main.rs`, armado del
