@@ -35,6 +35,8 @@ use zoka_pq::{
 pub const HYBRID_ADDRESS_PREFIX: &str = "zkq1";
 pub const HYBRID_ADDRESS_VERSION: u8 = 2;
 pub const HYBRID_KEM_CIPHERTEXT_BYTES: usize = X_WING_CIPHERTEXT_BYTES;
+// El consenso valida el largo sin depender de X-Wing; tienen que coincidir.
+const _: () = assert!(HYBRID_KEM_CIPHERTEXT_BYTES == super::HYBRID_OUTPUT_KEM_CIPHERTEXT_BYTES);
 /// Ninguna dirección válida llega a este largo. Se corta antes de decodificar
 /// Base58 para no gastar CPU en entradas gigantes.
 pub const HYBRID_ADDRESS_MAX_CHARS: usize = 1800;

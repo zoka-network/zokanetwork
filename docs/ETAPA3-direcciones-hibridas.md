@@ -2,8 +2,9 @@
 
 Estado: **experimental, sin activar.** Rama `etapa3-direcciones-hibridas`.
 Implementación de referencia: `src/private_wallet/hybrid.rs`, detrás de la
-feature `pq-experimental`. Nada de esto está conectado a transacciones,
-validación de bloques, wallets guardadas, ZSilent ni ZKAPriv todavía.
+feature `pq-experimental`. Las reglas de consenso de la salida v2 ya están en
+el nodo (todas las builds) y rechazan toda salida v2 mientras la activación
+siga en `None`. ZSilent y ZKAPriv todavía no saben nada de esto.
 
 Decisiones tomadas por el usuario el 12/10/2026: **D1 = ML-KEM-768** (a través
 de X-Wing) y **D2 = direcciones largas** (unos 1.715 caracteres, con QR y
@@ -122,14 +123,38 @@ permitiría a una computadora cuántica descartar o confirmar pertenencia sin
 romper ML-KEM. Si el escaneo resulta demasiado lento, una etiqueta tiene que
 derivarse del secreto híbrido y revisarse antes de incorporarla.
 
-## Activación y consenso (pendiente de implementar)
+## Activación y consenso
 
-- Antes de la altura de `PqFeature::HybridAddresses` (hoy `None`), los nodos
-  **rechazan** cualquier salida con `output_version = 2` o `kem_ciphertext` no
-  vacío. Un nodo viejo no conoce esos campos y calcularía otro hash de
-  transacción, así que activarla es un hard fork con altura anunciada.
-- El hash de la transacción incluye `output_version` y `kem_ciphertext` solo en
-  salidas v2: los hashes de las transacciones v1 históricas no cambian.
+Implementado en `src/private_wallet/mod.rs` (`validate_private_output_format`)
+y presente en **todas** las builds: validar una salida v2 no requiere X-Wing,
+solo revisar forma y largos. Un nodo sin `pq-experimental` valida igual que
+uno con ella.
+
+- Reglas de formato de cada salida:
+  - v1 (o sin `output_version`, que vale 1): `kem_ciphertext` vacío.
+  - v2: solo si `PqFeature::HybridAddresses` está activa; ciphertext de
+    exactamente 1.120 bytes; `ephemeral_pubkey` vacío; `stealth_address` con
+    prefijo `stlth2_`.
+  - Cualquier otra versión se rechaza.
+- **Dónde se aplica la altura.** Al validar un bloque (y al armar un bloque
+  candidato) se usa la altura exacta del bloque. En el mempool, la API y el
+  P2P no hay altura: una salida v2 pasa solo si la activación ya está fijada
+  (en el binario o por la variable de entorno), y el bloque la vuelve a
+  validar con su altura. Hoy la altura es `None`: toda salida v2 se rechaza.
+- **Hash.** En una salida v2 el hash de la transacción agrega
+  `"zoka-output-v2" ‖ versión ‖ ciphertext ‖ 0x1f` después de la clave
+  efímera. En v1 recorre exactamente los mismos bytes que antes: la prueba
+  `una_salida_v1_conserva_su_json_y_su_hash` fija el valor
+  `f12314d4d35a13a1bc62371840bbae93`, calculado con el código anterior a la
+  etapa 3 (commit `2b245d1e`).
+- **JSON.** Una salida v1 se serializa sin los campos nuevos, byte por byte
+  como antes; lo mismo las notas de las wallets guardadas. No hay formatos
+  binarios (todo es JSON), así que no hay cambios de diseño de registro.
+- **Hard fork.** Un nodo viejo ignora los campos desconocidos, calcula otro
+  hash para una transacción con salidas v2 y la rechaza: activarla exige una
+  altura anunciada y que la red actualice antes.
+- **Coinbase:** sigue siendo v1 (decisión del usuario del 12/10/2026). Su
+  estructura no tiene los campos v2 y el minero sigue cobrando en `zka1`.
 - En Zenith (testnet) conviven v1 y v2 después de la altura. En Quantic,
   solo v2 desde el bloque 0.
 
@@ -159,3 +184,10 @@ uso ajena no se reconocen; cada salida usa un encapsulado nuevo; errores
 precisos para prefijo, Base58, largo, checksum, versión, clave de gasto
 identidad y entradas demasiado largas; etiquetas de dominio distintas; `Debug`
 sin secretos.
+
+Consenso, en todas las builds (`cargo test --lib -- salida_v1_conserva
+hash_de_una_salida_v2 formato_de_las_salidas la_red_rechaza_salidas_v2`): el
+JSON y el hash de una salida v1 quedan fijos; el hash de una v2 cubre versión
+y ciphertext (bajarle la versión cambia el hash); reglas de formato por
+versión; y una transacción real con una salida v2 bien formada se rechaza
+antes de la activación, en el mempool y dentro de un bloque.

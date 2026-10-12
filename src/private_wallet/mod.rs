@@ -734,6 +734,8 @@ fn derive_key_image_hex(public_key: &RistrettoPoint, secret_scalar: Scalar) -> S
 struct OutputStealthMaterial {
     stealth_address: String,
     ephemeral_pubkey: Vec<u8>,
+    output_version: u8,
+    kem_ciphertext: Vec<u8>,
     one_time_public_key: String,
     amount_blind: Scalar,
 }
@@ -808,6 +810,8 @@ fn derive_stealth_payload(
     Ok(OutputStealthMaterial {
         stealth_address,
         ephemeral_pubkey,
+        output_version: PRIVATE_OUTPUT_VERSION_CLASSIC,
+        kem_ciphertext: Vec::new(),
         one_time_public_key,
         amount_blind,
     })
@@ -883,6 +887,14 @@ fn private_tx_hash(
         hasher.update([0x1f]);
         hasher.update(&output.ephemeral_pubkey);
         hasher.update([0x1f]);
+        if output.output_version >= PRIVATE_OUTPUT_VERSION_HYBRID {
+            // Solo las salidas v2: los hashes de las transacciones v1
+            // históricas no cambian.
+            hasher.update(b"zoka-output-v2");
+            hasher.update([output.output_version]);
+            hasher.update(&output.kem_ciphertext);
+            hasher.update([0x1f]);
+        }
         hasher.update(output.one_time_public_key.as_bytes());
         hasher.update([0x1f]);
         hasher.update(&output.encrypted_amount);
@@ -938,6 +950,17 @@ pub struct PrivateOutput {
     pub stealth_address: String,
     #[serde(default)]
     pub ephemeral_pubkey: Vec<u8>,
+    /// 1 = salida clásica (ECDH Ristretto con `ephemeral_pubkey`); 2 = híbrida
+    /// X-Wing con `kem_ciphertext` (etapa 3). Las v1 no serializan el campo:
+    /// su JSON y su hash quedan exactamente como antes.
+    #[serde(
+        default = "default_private_output_version",
+        skip_serializing_if = "is_classic_private_output_version"
+    )]
+    pub output_version: u8,
+    /// Ciphertext X-Wing de una salida v2; vacío en v1.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kem_ciphertext: Vec<u8>,
     #[serde(default)]
     pub commitment: String,
     #[serde(default)]
@@ -952,6 +975,66 @@ pub struct PrivateOutput {
     pub commitment_blind: Vec<u8>,
     #[serde(default)]
     pub is_change: bool,
+}
+
+pub const PRIVATE_OUTPUT_VERSION_CLASSIC: u8 = 1;
+pub const PRIVATE_OUTPUT_VERSION_HYBRID: u8 = 2;
+/// Largo del ciphertext X-Wing de una salida v2. Cualquier nodo lo valida,
+/// tenga o no soporte post-cuántico: validar no exige descifrar.
+pub const HYBRID_OUTPUT_KEM_CIPHERTEXT_BYTES: usize = 1120;
+
+fn default_private_output_version() -> u8 {
+    PRIVATE_OUTPUT_VERSION_CLASSIC
+}
+
+fn is_classic_private_output_version(version: &u8) -> bool {
+    *version <= PRIVATE_OUTPUT_VERSION_CLASSIC
+}
+
+/// Reglas de formato de cada salida. Una salida v2 solo vale si la activación
+/// de `PqFeature::HybridAddresses` lo permite; una v1 no puede traer
+/// ciphertext. No hace falta X-Wing para validar: solo forma y largos.
+fn validate_private_output_format(
+    output: &PrivateOutput,
+    hybrid_outputs_allowed: bool,
+) -> Result<(), BlockError> {
+    match output.output_version {
+        0 | PRIVATE_OUTPUT_VERSION_CLASSIC => {
+            if !output.kem_ciphertext.is_empty() {
+                return Err(BlockError::TransactionValidationFailed(
+                    "classic private output carries a KEM ciphertext".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        PRIVATE_OUTPUT_VERSION_HYBRID => {
+            if !hybrid_outputs_allowed {
+                return Err(BlockError::TransactionValidationFailed(
+                    "hybrid private outputs are not active at this height".to_string(),
+                ));
+            }
+            if output.kem_ciphertext.len() != HYBRID_OUTPUT_KEM_CIPHERTEXT_BYTES {
+                return Err(BlockError::TransactionValidationFailed(format!(
+                    "hybrid private output ciphertext must be {HYBRID_OUTPUT_KEM_CIPHERTEXT_BYTES} bytes, got {}",
+                    output.kem_ciphertext.len()
+                )));
+            }
+            if !output.ephemeral_pubkey.is_empty() {
+                return Err(BlockError::TransactionValidationFailed(
+                    "hybrid private output must not carry a classic ephemeral key".to_string(),
+                ));
+            }
+            if !output.stealth_address.starts_with("stlth2_") {
+                return Err(BlockError::TransactionValidationFailed(
+                    "hybrid private output has a malformed stealth tag".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        other => Err(BlockError::TransactionValidationFailed(format!(
+            "unsupported private output version {other}"
+        ))),
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -971,6 +1054,15 @@ pub struct PrivateNote {
     pub recipient_commitment: String,
     pub stealth_address: String,
     pub ephemeral_pubkey: Vec<u8>,
+    /// Ver `PrivateOutput::output_version`. Las notas v1 no lo serializan,
+    /// así los archivos de wallet existentes no cambian.
+    #[serde(
+        default = "default_private_output_version",
+        skip_serializing_if = "is_classic_private_output_version"
+    )]
+    pub output_version: u8,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kem_ciphertext: Vec<u8>,
     pub commitment: String,
     #[serde(default)]
     pub amount_commitment: String,
@@ -1080,6 +1172,8 @@ fn legacy_output_from_tx(tx: &PrivateTransaction) -> Option<PrivateOutput> {
         recipient_commitment: tx.recipient_commitment.clone(),
         stealth_address: tx.stealth_address.clone(),
         ephemeral_pubkey: tx.ephemeral_pubkey.clone(),
+        output_version: PRIVATE_OUTPUT_VERSION_CLASSIC,
+        kem_ciphertext: Vec::new(),
         commitment: tx.commitment.clone(),
         amount_commitment: String::new(),
         range_proof: Vec::new(),
@@ -2204,6 +2298,8 @@ impl PrivateTransactionBuilder {
                 recipient_commitment: String::new(),
                 stealth_address: stealth_material.stealth_address,
                 ephemeral_pubkey: stealth_material.ephemeral_pubkey,
+                output_version: stealth_material.output_version,
+                kem_ciphertext: stealth_material.kem_ciphertext,
                 commitment: commitment_hex,
                 amount_commitment: amount_commitment_hex(planned_output.amount, amount_blind),
                 range_proof: prove_output_range(planned_output.amount, amount_blind)?,
@@ -2738,6 +2834,8 @@ impl PrivateWallet {
             recipient_commitment: self.commitment_key.clone(),
             stealth_address: stealth_material.stealth_address,
             ephemeral_pubkey: stealth_material.ephemeral_pubkey,
+            output_version: stealth_material.output_version,
+            kem_ciphertext: stealth_material.kem_ciphertext,
             commitment: commitment_hex,
             amount_commitment: amount_commitment_hex(amount, stealth_material.amount_blind),
             range_proof: prove_output_range(amount, stealth_material.amount_blind)
@@ -2810,6 +2908,8 @@ impl PrivateWallet {
             recipient_commitment: output.recipient_commitment.clone(),
             stealth_address: output.stealth_address.clone(),
             ephemeral_pubkey: output.ephemeral_pubkey.clone(),
+            output_version: output.output_version,
+            kem_ciphertext: output.kem_ciphertext.clone(),
             commitment: output.commitment.clone(),
             amount_commitment: output.amount_commitment.clone(),
             range_proof: output.range_proof.clone(),
@@ -3040,6 +3140,8 @@ impl PrivateWallet {
                         recipient_commitment: note.recipient_commitment.clone(),
                         stealth_address: note.stealth_address.clone(),
                         ephemeral_pubkey: note.ephemeral_pubkey.clone(),
+                        output_version: note.output_version,
+                        kem_ciphertext: note.kem_ciphertext.clone(),
                         commitment: note.commitment.clone(),
                         amount_commitment: note.amount_commitment.clone(),
                         range_proof: note.range_proof.clone(),
@@ -3067,6 +3169,8 @@ impl PrivateWallet {
                         recipient_commitment: note.recipient_commitment.clone(),
                         stealth_address: note.stealth_address.clone(),
                         ephemeral_pubkey: note.ephemeral_pubkey.clone(),
+                        output_version: note.output_version,
+                        kem_ciphertext: note.kem_ciphertext.clone(),
                         commitment: note.commitment.clone(),
                         amount_commitment: note.amount_commitment.clone(),
                         range_proof: note.range_proof.clone(),
@@ -3985,6 +4089,9 @@ impl PrivateWalletManager {
             recipient_commitment: output.recipient_commitment.clone(),
             stealth_address: output.stealth_address.clone(),
             ephemeral_pubkey: output.ephemeral_pubkey.clone(),
+            // El coinbase sigue siendo clásico (decisión del 12/10).
+            output_version: PRIVATE_OUTPUT_VERSION_CLASSIC,
+            kem_ciphertext: Vec::new(),
             commitment: output.commitment.clone(),
             amount_commitment: output.amount_commitment.clone(),
             range_proof: output.range_proof.clone(),
@@ -4638,7 +4745,17 @@ impl PrivateWalletManager {
         tx: &PrivateTransaction,
     ) -> Result<(), BlockError> {
         let proof_profile = private_proof_profile_spec_for_tx(tx)?;
-        self.validate_inbound_private_transaction_with_profile(tx, proof_profile)
+        // Sin altura (mempool, API): una salida v2 pasa si la activación ya
+        // está programada. El bloque la vuelve a validar con su altura exacta.
+        let hybrid_outputs_allowed = crate::economics::pq_feature_activation_height(
+            crate::economics::PqFeature::HybridAddresses,
+        )
+        .is_some();
+        self.validate_inbound_private_transaction_with_profile(
+            tx,
+            proof_profile,
+            hybrid_outputs_allowed,
+        )
     }
 
     pub fn validate_inbound_private_transaction_at(
@@ -4655,13 +4772,22 @@ impl PrivateWalletManager {
             v2_i1_activation_height,
             canonical_bundle_activation_height,
         )?;
-        self.validate_inbound_private_transaction_with_profile(tx, proof_profile)
+        let hybrid_outputs_allowed = crate::economics::pq_feature_active(
+            crate::economics::PqFeature::HybridAddresses,
+            height,
+        );
+        self.validate_inbound_private_transaction_with_profile(
+            tx,
+            proof_profile,
+            hybrid_outputs_allowed,
+        )
     }
 
     fn validate_inbound_private_transaction_with_profile(
         &mut self,
         tx: &PrivateTransaction,
         proof_profile: PrivateProofProfileSpec,
+        hybrid_outputs_allowed: bool,
     ) -> Result<(), BlockError> {
         let proof_circuit = proof_profile.circuit;
         let expected_tx_hash = expected_private_tx_hash(tx);
@@ -4705,9 +4831,13 @@ impl PrivateWalletManager {
                 "Missing Bulletproof range proof in private transaction output".to_string(),
             ));
         }
+        for output in &outputs {
+            validate_private_output_format(output, hybrid_outputs_allowed)?;
+        }
         if tx.zk_proof.is_some()
             && outputs.iter().any(|output| {
-                output.stealth_address.is_empty() || output.ephemeral_pubkey.is_empty()
+                output.stealth_address.is_empty()
+                    || (output.ephemeral_pubkey.is_empty() && output.kem_ciphertext.is_empty())
             })
         {
             return Err(BlockError::TransactionValidationFailed(
@@ -6707,6 +6837,8 @@ mod tests {
             recipient_commitment: "recipient".to_string(),
             stealth_address: "stealth".to_string(),
             ephemeral_pubkey: vec![1u8; 32],
+            output_version: PRIVATE_OUTPUT_VERSION_CLASSIC,
+            kem_ciphertext: Vec::new(),
             commitment: "commitment".to_string(),
             amount_commitment: "amount-commitment".to_string(),
             range_proof: vec![2u8; 32],
@@ -6754,6 +6886,168 @@ mod tests {
         );
 
         assert_ne!(hash_a, hash_b);
+    }
+
+    fn salida_de_prueba(version: u8) -> PrivateOutput {
+        let hibrida = version >= PRIVATE_OUTPUT_VERSION_HYBRID;
+        PrivateOutput {
+            output_id: "out-1".to_string(),
+            asset_tag: "ZOKA".to_string(),
+            asset_tag_commitment: asset_tag_commitment_hex("ZOKA"),
+            recipient_commitment: "recipient".to_string(),
+            stealth_address: if hibrida {
+                format!("stlth2_{}", "ab".repeat(20))
+            } else {
+                "stealth".to_string()
+            },
+            ephemeral_pubkey: if hibrida { Vec::new() } else { vec![1u8; 32] },
+            output_version: version,
+            kem_ciphertext: if hibrida {
+                vec![5u8; HYBRID_OUTPUT_KEM_CIPHERTEXT_BYTES]
+            } else {
+                Vec::new()
+            },
+            commitment: "commitment".to_string(),
+            amount_commitment: "amount-commitment".to_string(),
+            range_proof: vec![2u8; 32],
+            one_time_public_key: "one-time-key".to_string(),
+            encrypted_amount: vec![3u8; 8],
+            commitment_blind: vec![4u8; 32],
+            is_change: false,
+        }
+    }
+
+    fn hash_de_prueba(outputs: &[PrivateOutput]) -> String {
+        private_tx_hash(
+            &[String::from("nullifier-1")],
+            &[String::from("commitment-1")],
+            &[String::from("ZOKA")],
+            "root-1",
+            &[String::from("pubkey-1")],
+            &[String::from("key-image-1")],
+            &[String::from("amount-commitment-1")],
+            "balance-commitment-1",
+            "ZOKA",
+            &[AssetBalanceCommitment {
+                asset_tag: "ZOKA".to_string(),
+                balance_commitment: "balance-commitment-1".to_string(),
+            }],
+            "fee-commitment-1",
+            outputs,
+        )
+    }
+
+    // Las salidas v1 no pueden cambiar ni un byte: su JSON y su hash son los
+    // de las transacciones que ya están en la cadena. El valor fijo es el que
+    // da el código anterior a la etapa 3 con estas mismas entradas.
+    #[test]
+    fn una_salida_v1_conserva_su_json_y_su_hash() {
+        let salida = salida_de_prueba(PRIVATE_OUTPUT_VERSION_CLASSIC);
+        let json = serde_json::to_value(&salida).unwrap();
+        assert!(json.get("output_version").is_none());
+        assert!(json.get("kem_ciphertext").is_none());
+        let leida: PrivateOutput = serde_json::from_value(json).unwrap();
+        assert_eq!(leida, salida);
+
+        assert_eq!(
+            hash_de_prueba(&[salida]),
+            "f12314d4d35a13a1bc62371840bbae93"
+        );
+    }
+
+    #[test]
+    fn el_hash_de_una_salida_v2_cubre_version_y_ciphertext() {
+        let v2 = salida_de_prueba(PRIVATE_OUTPUT_VERSION_HYBRID);
+        let base = hash_de_prueba(&[v2.clone()]);
+
+        let mut otro_ciphertext = v2.clone();
+        otro_ciphertext.kem_ciphertext[0] ^= 1;
+        assert_ne!(base, hash_de_prueba(&[otro_ciphertext]));
+
+        // Bajarle la versión a una v2 tampoco puede dar el mismo hash.
+        let mut como_v1 = v2.clone();
+        como_v1.output_version = PRIVATE_OUTPUT_VERSION_CLASSIC;
+        assert_ne!(base, hash_de_prueba(&[como_v1]));
+
+        let json = serde_json::to_value(&v2).unwrap();
+        assert_eq!(json["output_version"], PRIVATE_OUTPUT_VERSION_HYBRID);
+        let leida: PrivateOutput = serde_json::from_value(json).unwrap();
+        assert_eq!(leida, v2);
+    }
+
+    #[test]
+    fn formato_de_las_salidas_segun_su_version() {
+        let v1 = salida_de_prueba(PRIVATE_OUTPUT_VERSION_CLASSIC);
+        assert!(validate_private_output_format(&v1, false).is_ok());
+        assert!(validate_private_output_format(&v1, true).is_ok());
+
+        let mut v1_con_ciphertext = v1.clone();
+        v1_con_ciphertext.kem_ciphertext = vec![5u8; HYBRID_OUTPUT_KEM_CIPHERTEXT_BYTES];
+        assert!(validate_private_output_format(&v1_con_ciphertext, true).is_err());
+
+        let v2 = salida_de_prueba(PRIVATE_OUTPUT_VERSION_HYBRID);
+        let err = validate_private_output_format(&v2, false).unwrap_err();
+        assert!(err.to_string().contains("not active"), "{err}");
+        assert!(validate_private_output_format(&v2, true).is_ok());
+
+        let mut corta = v2.clone();
+        corta.kem_ciphertext.pop();
+        assert!(validate_private_output_format(&corta, true).is_err());
+
+        let mut con_efimera = v2.clone();
+        con_efimera.ephemeral_pubkey = vec![1u8; 32];
+        assert!(validate_private_output_format(&con_efimera, true).is_err());
+
+        let mut etiqueta_clasica = v2.clone();
+        etiqueta_clasica.stealth_address = "stlth_00".to_string();
+        assert!(validate_private_output_format(&etiqueta_clasica, true).is_err());
+
+        let mut desconocida = v2;
+        desconocida.output_version = 3;
+        assert!(validate_private_output_format(&desconocida, true).is_err());
+    }
+
+    // Una transacción real con una salida v2 bien formada: la red la rechaza
+    // mientras la activación no llegue, en el mempool y dentro de un bloque.
+    #[test]
+    fn la_red_rechaza_salidas_v2_antes_de_la_activacion() {
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        let bob_commitment = manager.create_private_wallet("bob").unwrap();
+        manager.deposit_to_private_wallet("alice", 100).unwrap();
+        let tx_hash = manager
+            .send_private_transaction("alice", bob_commitment, 20)
+            .unwrap();
+        let mut tx = manager.get_private_transaction(&tx_hash).unwrap();
+        let salida = &mut tx.outputs[0];
+        salida.output_version = PRIVATE_OUTPUT_VERSION_HYBRID;
+        salida.ephemeral_pubkey.clear();
+        salida.kem_ciphertext = vec![5u8; HYBRID_OUTPUT_KEM_CIPHERTEXT_BYTES];
+        salida.stealth_address = format!("stlth2_{}", "ab".repeat(20));
+        tx.tx_hash = expected_private_tx_hash(&tx);
+
+        let perfil = private_proof_profile_spec_for_tx(&tx).unwrap();
+        let err = PrivateWalletManager::new()
+            .validate_inbound_private_transaction_with_profile(&tx, perfil, false)
+            .unwrap_err();
+        assert!(err.to_string().contains("not active"), "{err}");
+
+        // Con la activación sin fijar, como en los binarios de hoy, las dos
+        // entradas públicas la rechazan por la misma razón.
+        if crate::economics::pq_feature_activation_height(
+            crate::economics::PqFeature::HybridAddresses,
+        )
+        .is_none()
+        {
+            let err = PrivateWalletManager::new()
+                .validate_inbound_private_transaction(&tx)
+                .unwrap_err();
+            assert!(err.to_string().contains("not active"), "{err}");
+            let err = PrivateWalletManager::new()
+                .validate_inbound_private_transaction_at(&tx, 1_000_000, None, None)
+                .unwrap_err();
+            assert!(err.to_string().contains("not active"), "{err}");
+        }
     }
 
     #[test]
