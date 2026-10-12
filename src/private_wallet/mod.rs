@@ -27,6 +27,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use zeroize::Zeroize;
 mod clsag;
+/// Direcciones y salidas híbridas X-Wing (etapa 3). Experimental: no está
+/// conectado a transacciones ni a consenso.
+#[cfg(feature = "pq-experimental")]
+pub mod hybrid;
 
 /// Helper function to convert bytes to hex string
 fn bytes_to_hex(bytes: &[u8]) -> String {
