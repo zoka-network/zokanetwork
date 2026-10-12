@@ -28,6 +28,24 @@ Las ramas del nodo están apiladas, cada una sobre la anterior:
 `quantic-interfaz` → `etapa3-direcciones-hibridas`. La última contiene todo.
 En ZSilent y ZKAPriv: `zenith-testnet` → `quantic-interfaz`.
 
+### Instalado en los equipos del usuario (12/10, con su autorización)
+
+- **PC:** ZSilent desde `quantic-interfaz` (`21dac3e`) con `zoka.exe`/`zokahd.exe`
+  release de `etapa3-direcciones-hibridas` (`38534d0c`, features por defecto, sin
+  `pq-experimental`; `zoka.exe` SHA-256 `109B94FB…`), en
+  `%LOCALAPPDATA%\ZSilent Core`. Copia completa de lo anterior en
+  `%LOCALAPPDATA%\ZSilent Core.respaldo-20261012`; el `zoka.exe` previo también en
+  `app\resources\bin\zoka.exe.bak-20261012`. Nota con los detalles:
+  `INSTALADO-20261012.txt` en la carpeta de instalación. No se tocó `%APPDATA%\Zoka`;
+  el binario nuevo abre la base real (altura 25.204 al instalar).
+- **Teléfono (SM-A135M):** ZKAPriv 1.0.1 release (`com.zoka.zkapriv`, certificado
+  `061376f8…`) desde `quantic-interfaz` (`8b60551`), con los motores recompilados
+  contra `38534d0c`. Era la primera instalación (no había ninguna). Abre y muestra
+  "Zoka Quantic · Testnet". La app usa `FLAG_SECURE`: no admite capturas de
+  pantalla, a propósito.
+- La versión declarada sigue siendo 2.0.2 (ZSilent y nodo) y 1.0.1 (ZKAPriv): no se
+  cambió el número; alinear versiones es la etapa 7.4.
+
 Segunda sesión, 11 y 12/10 (Claude): se cerró la integración de la etapa 1 y se
 hizo la etapa 2 (Zenith como testnet) en ramas de los tres repos. El detalle de
 lo hecho, lo probado y lo que falta está en cada etapa de abajo.
@@ -49,7 +67,8 @@ de pruebas y las decisiones más recientes del usuario.
 - El P2P Exchange se retira del nodo, ZSilent y la documentación. Preservar ese trabajo.
 - Los cambios postcuánticos se implementan y prueban primero en la testnet.
 - **VPS en espera:** el usuario avisará cuándo continuar con cuentas e infraestructura.
-- Instalar un APK en el teléfono sigue pendiente de indicación del usuario.
+- Instalar en sus equipos solo con su indicación. **12/10: lo autorizó e instalé**
+  (ver "Instalado en los equipos del usuario").
 - Home: **ZOKA QUANTIC en una sola línea**, **Private by design. más destacado debajo**,
   esfera pequeña, fondo negro y acentos rosas. Esta fue la corrección final del usuario.
 - **12/10:** ZSilent "ya no es más Zenith, pasa a ser Quantic": las dos apps muestran
