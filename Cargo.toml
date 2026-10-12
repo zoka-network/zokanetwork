@@ -39,6 +39,11 @@ randomx = ["dep:randomx-rs", "dep:sysinfo"]
 # minutes on a phone. Node/server builds never enable this, so they keep the
 # full check. See src/zk/setup_io.rs::read_circuit_params.
 mobile = []
+# Primitivas postcuanticas experimentales de Zoka Quantic (crates/zoka-pq).
+# Apagada por defecto: compilarla no cambia consenso, direcciones ni wallets,
+# y el .so de la wallet movil (que usa `mobile` sin default features) no la
+# arrastra. Solo expone `zoka::pq` para pruebas y trabajo de integracion.
+pq-experimental = ["dep:zoka-pq"]
 
 [dependencies]
 randomx-rs = { version = "1.3", optional = true }
@@ -101,6 +106,9 @@ bs58 = "0.5"
 # prefiere fs4 sobre una implementacion propia porque el sistema operativo
 # libera el lock si un proceso muere; un lockfile casero se queda trabado.
 fs4 = "0.8"
+# Ver la feature `pq-experimental`. Tiene su propio Cargo.lock para compilarse
+# suelta en el telefono; dentro del nodo manda el Cargo.lock de la raiz.
+zoka-pq = { path = "crates/zoka-pq", optional = true }
 
 [dev-dependencies]
 proptest = "1.0"

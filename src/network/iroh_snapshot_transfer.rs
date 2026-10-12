@@ -463,6 +463,36 @@ mod tests {
         );
     }
 
+    // Seeds advertise EndpointIds derived from key files written by older
+    // binaries. Bumping the curve25519/ed25519 crates under iroh must not
+    // change that derivation nor the signatures peers check, so pin both to
+    // RFC 8032 section 7.1, TEST 1 (empty message).
+    #[test]
+    fn key_file_identity_matches_rfc8032_vector() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("iroh_key");
+        let secret =
+            hex::decode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+                .expect("hex");
+        std::fs::write(&path, secret).expect("write key file");
+
+        let key = load_or_generate_secret_key(&path).expect("load");
+        assert_eq!(
+            hex::encode(key.public().as_bytes()),
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+        );
+        let signature = key.sign(b"");
+        assert_eq!(
+            hex::encode(signature.to_bytes()),
+            "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155\
+             5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
+        );
+        key.public()
+            .verify(b"", &signature)
+            .expect("valid signature");
+        assert!(key.public().verify(b"x", &signature).is_err());
+    }
+
     // A server bound to a fixed key exposes that key's stable EndpointId, and a
     // client can still pull the snapshot from it (direct/local via Minimal).
     #[tokio::test]

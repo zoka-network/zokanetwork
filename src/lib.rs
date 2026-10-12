@@ -24,3 +24,7 @@ pub mod transaction;
 pub mod types;
 pub mod wallet;
 pub mod zk;
+
+// Experimental: no lo usa ningun camino de consenso ni de wallet.
+#[cfg(feature = "pq-experimental")]
+pub use zoka_pq as pq;
