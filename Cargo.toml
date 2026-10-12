@@ -18,6 +18,12 @@ path = "src/bin/zokahd.rs"
 name = "zoka"
 path = "src/lib.rs"
 
+# Mide el escaneo de salidas v1 y v2 (etapa 3). Solo existe con la feature
+# experimental; sin ella Cargo lo saltea en vez de fallar.
+[[example]]
+name = "hybrid_scan_bench"
+required-features = ["pq-experimental"]
+
 [features]
 # `randomx` is on by default so a stock `cargo build --release` produces a
 # binary that can actually mine mainnet. Disable explicitly with

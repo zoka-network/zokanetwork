@@ -40,7 +40,7 @@ la categoría 3 de ML-KEM-768. **Para Quantic se recomiendan 24 palabras**
 
 ## Dirección v2
 
-```
+```text
 "zkq1" ‖ Base58( versión(1) ‖ gasto(32) ‖ x-wing(1216) ‖ checksum(4) )
 checksum = primeros 4 bytes de SHA-256("zoka-hybrid-address-v2" ‖ 0x1f ‖ versión ‖ gasto ‖ x-wing)
 ```
@@ -70,7 +70,7 @@ Una salida v2 pesa unos 1.090 bytes más que una v1.
 
 Derivación, con `ss` = secreto compartido X-Wing (32 bytes):
 
-```
+```text
 ctx          = SHA-256("zoka-hybrid-output-ctx-v2" ‖ 0x1f ‖ ciphertext ‖ 0x1f ‖ compromiso)
 desplazamiento = H_escalar("zoka-hybrid-output-key-v2", ss, ctx)
 P (un solo uso) = B (gasto) + desplazamiento · G
@@ -91,10 +91,31 @@ salida es propia y se derivan el ciego del monto y el secreto de gasto. Como
 ML-KEM usa rechazo implícito, una salida ajena da un secreto distinto y la
 comparación falla; no hay oráculo de error.
 
-**Costo:** un desencapsulado X-Wing por salida. En el teléfono ARMv7 del
-usuario, ~3,4–3,5 ms (incluye reexpandir la clave en cada llamada: X-Wing
-0.1.1 no expone una clave expandida). Medición del escaneo completo en el
-teléfono: ver resultados abajo.
+**Costo medido (12/10/2026)** con `examples/hybrid_scan_bench.rs`, release,
+mediana de 100 iteraciones. En el teléfono, rango de tres pasadas:
+
+| Operación | Windows (i5-6400) | Teléfono ARMv7 (SM-A135M) |
+|---|---:|---:|
+| Escanear una salida v1 (lo que hace hoy la wallet) | 89 µs | 1,52 ms |
+| Escanear una salida v2 propia | 262 µs | 3,78–3,80 ms |
+| Escanear una salida v2 ajena | 263 µs | 3,80–3,82 ms |
+| Armar una salida v2 (quien envía) | 199 µs | 2,66–2,69 ms |
+| Codificar la dirección v2 | 2,22 ms | 7,14–7,15 ms |
+| Decodificar y validar la dirección v2 | 0,80 ms | 4,04 ms |
+
+Escanear una salida v2 cuesta unas **2,5 veces** lo de una v1 en el teléfono
+(+2,3 ms por salida). Como referencia aritmética: 10.000 salidas tardan
+~15 s en v1 y ~38 s en v2; 100.000 salidas, ~2,5 min y ~6,3 min. Propias y
+ajenas cuestan lo mismo, así que el tiempo no revela cuáles son de la wallet.
+El escaneo incremental (bloques nuevos) no se nota; una resincronización
+completa en el teléfono sí. Incluye reexpandir la clave X-Wing en cada salida
+(la versión 0.1.1 no expone una clave expandida): si una versión futura lo
+permite, se ahorra parte. No se midieron memoria ni batería. Evidencia:
+[benchmarks/2026-10-12-hybrid-scan.json](benchmarks/2026-10-12-hybrid-scan.json).
+
+Con estos números **D1/D2 quedan cerrados como decidió el usuario**: el costo
+de ML-KEM-768 vía X-Wing es manejable en el teléfono de 32 bits sin etiquetas
+de vista.
 
 **Sin view tags.** Una etiqueta de vista derivada solo de ECDH clásico le
 permitiría a una computadora cuántica descartar o confirmar pertenencia sin
@@ -126,6 +147,8 @@ derivarse del secreto híbrido y revisarse antes de incorporarla.
 5. Revisión externa de esta construcción antes de activarla en cualquier red.
 
 ## Pruebas actuales
+
+Medición: `cargo run --release --no-default-features --features pq-experimental --example hybrid_scan_bench -- --iterations 100`.
 
 `cargo test --features pq-experimental --lib private_wallet::hybrid`:
 ida y vuelta de la dirección; determinismo desde la raíz; misma clave de gasto

@@ -12,9 +12,21 @@ rama `zenith-testnet` de nodo, ZSilent y ZKAPriv, sin mover datos. Nada de eso
 está publicado como release. La red actual no tiene activada privacidad
 postcuántica.**
 
-**Siguiente paso natural:** etapa 3 (direcciones y cifrado híbridos). Antes,
-conviene corregir en una rama aparte la falla previa de `fullnode --sync-only`
-(etapa 1, abajo). La prueba contra la red real ya se hizo (12/10, vía seed3).
+**12/10, a pedido del usuario:** `fullnode --sync-only` arreglado (rama
+`arreglo-sync-only`); ZSilent, ZKAPriv y el nodo se presentan como **"Zoka
+Quantic · Testnet"** y ZSilent tomó el estilo de zoka.network (ramas
+`quantic-interfaz`); **etapa 3 iniciada** (rama `etapa3-direcciones-hibridas`):
+direcciones y salidas híbridas X-Wing con pruebas y especificación, sin conectar
+a transacciones ni a consenso.
+
+**Siguiente paso natural:** seguir la etapa 3 (ver su sección): conectar las
+salidas v2 al armado y la validación de transacciones detrás de la activación,
+y llevarlas a wallets, ZSilent y ZKAPriv.
+
+Las ramas del nodo están apiladas, cada una sobre la anterior:
+`postcuantica-integracion-nodo` → `zenith-testnet` → `arreglo-sync-only` →
+`quantic-interfaz` → `etapa3-direcciones-hibridas`. La última contiene todo.
+En ZSilent y ZKAPriv: `zenith-testnet` → `quantic-interfaz`.
 
 Segunda sesión, 11 y 12/10 (Claude): se cerró la integración de la etapa 1 y se
 hizo la etapa 2 (Zenith como testnet) en ramas de los tres repos. El detalle de
@@ -40,6 +52,11 @@ de pruebas y las decisiones más recientes del usuario.
 - Instalar un APK en el teléfono sigue pendiente de indicación del usuario.
 - Home: **ZOKA QUANTIC en una sola línea**, **Private by design. más destacado debajo**,
   esfera pequeña, fondo negro y acentos rosas. Esta fue la corrección final del usuario.
+- **12/10:** ZSilent "ya no es más Zenith, pasa a ser Quantic": las dos apps muestran
+  **"Zoka Quantic · Testnet"** (la mainnet Quantic todavía no existe) y ZSilent copia
+  el estilo de la web (acento rosa `#F2ABD0`, ZOKA **QUANTIC**, "Private by design.").
+- **12/10, etapa 3:** **D1 = ML-KEM-768 vía X-Wing** y **D2 = direcciones largas**
+  (unos 1.715 caracteres, con QR y copiar/pegar).
 
 ## Lo terminado y dónde está
 
@@ -51,6 +68,9 @@ de pruebas y las decisiones más recientes del usuario.
 | Primitivas experimentales | [crates/zoka-pq](crates/zoka-pq/README.md): ML-KEM-768, X-Wing y ML-DSA-65 |
 | Integración al nodo | Feature `pq-experimental` (apagada por defecto), `zoka::pq`; iroh-base 1.0.3 y curve25519-dalek 5.0.0 |
 | Zenith como testnet | Rama `zenith-testnet` en los tres repos; ver [etapa 2](docs/ETAPA2-zenith-testnet.md) |
+| Interfaz Zoka Quantic | Ramas `quantic-interfaz`; capturas en `zsilent-core/docs/capturas-quantic` |
+| Arreglo de `--sync-only` | Rama `arreglo-sync-only` (nodo) |
+| Etapa 3 iniciada | `src/private_wallet/hybrid.rs` y [especificación](docs/ETAPA3-direcciones-hibridas.md) |
 | Pruebas criptográficas | 13/13 en Windows, Linux x64, Linux ARM64 (qemu) y el teléfono ARMv7, con el lock alineado al nodo |
 | Pruebas del nodo | Ver [resultados](docs/RESULTADOS-postcuantica-etapa1.md#integración-al-nodo) por plataforma |
 | Ejecución pendiente | Android ARM64 (no hay dispositivo de 64 bits) y hardware ARM64 real |
@@ -90,11 +110,14 @@ Referencias Git verificadas al preparar este archivo:
   visibles en el otro. Contra la red real por Tor (12/10): el nodo nuevo y el
   2.0.2, en paralelo, se conectaron a seed3 y sincronizaron los mismos bloques
   (25.204 → 25.244). seed1 (PC del usuario) y seed2 no respondían.
-- [ ] **Falla previa encontrada:** `fullnode --sync-only` no arranca ni en el 2.0.2
-  instalado (`invalid team member address`: sin wallet, la dirección queda
-  vacía y `TeamMiningRuntime::new` la rechaza, `src/main.rs`, armado del
-  runtime de team-mining). ZSilent usa ese modo para bajar bloques antes del
-  login. No se corrigió: queda para una rama aparte.
+- [x] **Falla previa encontrada y corregida (12/10, rama `arreglo-sync-only`,
+  `1acd4c68`):** `fullnode --sync-only` no arrancaba ni en el 2.0.2 instalado
+  (`invalid team member address`: sin wallet la dirección quedaba vacía y
+  `TeamMiningRuntime::new` la rechazaba). Ahora ese modo usa un runtime de
+  team-mining observador (`without_local_member`) con almacén en memoria: no
+  actúa como miembro ni toca el `team.json`. ZSilent usa ese modo para bajar
+  bloques antes del login. Suite: 884 + 79 + 3; probado con el binario en una
+  carpeta temporal (llega a ready y no crea wallets). Falta un release.
 - [x] Integrar `crates/zoka-pq` detrás de `pq-experimental`, apagada por defecto.
 - [x] Pruebas del nodo en Windows y Linux x64 (880 + 76 + 3 en ambos); `check` para
   Android ARM64/ARMv7; build release cruzada a Linux ARM64 y subconjunto de
@@ -143,19 +166,30 @@ Ramas y commits de la etapa 2:
 - **ZSilent (`zsilent-core`):** `zenith-testnet` sobre `sacar-exchange` (`8c09b71`),
   commit `b86b1c5`. En la copia de trabajo de `zsilent-core` (rama `sacar-exchange`)
   había un cambio **sin commitear** en `ZSilentAppState.kt` de las 14:20 del 11/10 que
-  borra 1.195 líneas (Tor, explorador, pares manuales). No se tocó ni se incluyó:
-  revisar con el usuario antes de descartarlo o comitearlo.
+  borraba 1.195 líneas. **Resuelto el 12/10:** era la versión del primer release
+  (0.1.0, `06c895d`, 19/05) regrabada con BOM, sin nada nuevo. Quedó guardada en
+  `stash@{0}` de `zsilent-core` y el archivo volvió al último commit.
 - **ZKAPriv (`zkapriv`):** `zenith-testnet` sobre `seguridad-octubre-2026` (`5e5752f`),
   commit `dc7f448`.
 
 ### 3. Direcciones, cifrado y escaneo de wallets
 
-- [ ] Especificar versiones, prefijos, checksum, tamaños máximos y recuperación de claves.
-- [ ] Fijar el perfil híbrido y la derivación contextual para salidas, importes,
-  comisiones del minero y coinbase. Respetar la construcción X-Wing especificada.
-- [ ] Adaptar nodo, ZSilent y motor móvil al formato nuevo.
-- [ ] Medir escaneo representativo, memoria y tamaño de datos en el teléfono de 32 bits.
-- [ ] Cerrar D1/D2 (parámetros y longitud de direcciones) con evidencia.
+Iniciada el 12/10 en la rama `etapa3-direcciones-hibridas` (`986e98b5`).
+Especificación de trabajo: [docs/ETAPA3-direcciones-hibridas.md](docs/ETAPA3-direcciones-hibridas.md).
+
+- [x] Especificar versiones, prefijos, checksum, tamaños máximos y recuperación de
+  claves: dirección `zkq1`, versión 2, ~1.715 caracteres; misma clave de gasto que
+  `zka1` y clave X-Wing derivada de la misma raíz (la frase recupera las dos).
+- [x] Perfil híbrido y derivación contextual para salidas e importes
+  (`src/private_wallet/hybrid.rs`, 8 pruebas). **Faltan** comisión del minero y
+  coinbase (abiertos en la especificación: hoy el coinbase publica la dirección).
+- [ ] Conectar las salidas v2 al armado y la validación de transacciones, con el
+  rechazo antes de la altura y el hash extendido solo para v2.
+- [ ] Adaptar wallets guardadas, CLI, ZSilent y motor móvil al formato nuevo.
+- [x] Medir escaneo en el teléfono de 32 bits: v2 3,8 ms por salida contra 1,5 ms de v1
+  (`examples/hybrid_scan_bench.rs`, tres pasadas; ver la especificación). Faltan
+  memoria, batería y tamaño real de los datos de la cadena.
+- [x] D1/D2 decididos por el usuario: ML-KEM-768 vía X-Wing y direcciones largas.
 - [ ] Diseñar y revisar cualquier etiqueta de vista antes de incorporarla: una etiqueta
   basada solamente en ECDH clásico puede filtrar pertenencia frente a un adversario cuántico.
 - [ ] Probar envíos ZSilent → ZKAPriv y ZKAPriv → ZSilent, recuperación y resincronización.

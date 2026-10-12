@@ -1,0 +1,276 @@
+{
+    "schema_version":  1,
+    "captured_at_utc":  "2026-10-12T15:40:00Z",
+    "tool":  "examples/hybrid_scan_bench.rs (rama etapa3-direcciones-hibridas)",
+    "build":  "release, --no-default-features --features pq-experimental",
+    "android_binary_sha256":  "C6DF5D7F6D674B5693B041E6EA2B2FD0ED49AE1AAE576B65F6C8BEDEDC248014",
+    "android_device":  "Samsung SM-A135M, API 34, armeabi-v7a (32 bits), NDK 27.3, minSdk 26",
+    "windows_cpu":  "Intel Core i5-6400 @ 2.70GHz, 4 nucleos",
+    "notes":  [
+                  "Datos sinteticos: 100 iteraciones por operacion, sin calentamiento aparte; no lee wallets, cadena ni red.",
+                  "v1_scan_output_equivalent reproduce lo que hace la wallet hoy por salida: s*R, derivar el desplazamiento, B + k*G y comparar.",
+                  "En el telefono se corrio tres veces con archivos temporales en /data/local/tmp, borrados al terminar; no se instalo APK."
+              ],
+    "windows":  {
+                    "schema_version":  1,
+                    "tool":  "hybrid_scan_bench",
+                    "os":  "windows",
+                    "architecture":  "x86_64",
+                    "iterations":  100,
+                    "address_chars":  1715,
+                    "kem_ciphertext_bytes":  1120,
+                    "operations":  [
+                                       {
+                                           "operation":  "v2_address_encode",
+                                           "iterations":  100,
+                                           "mean_us":  2271.43,
+                                           "median_us":  2222.05,
+                                           "p95_us":  2601.80,
+                                           "min_us":  2142.80,
+                                           "max_us":  2750.90
+                                       },
+                                       {
+                                           "operation":  "v2_address_decode_and_validate",
+                                           "iterations":  100,
+                                           "mean_us":  844.86,
+                                           "median_us":  802.10,
+                                           "p95_us":  1127.30,
+                                           "min_us":  773.10,
+                                           "max_us":  1290.30
+                                       },
+                                       {
+                                           "operation":  "v2_output_build",
+                                           "iterations":  100,
+                                           "mean_us":  221.34,
+                                           "median_us":  198.55,
+                                           "p95_us":  356.00,
+                                           "min_us":  196.40,
+                                           "max_us":  428.70
+                                       },
+                                       {
+                                           "operation":  "v2_scan_own_output",
+                                           "iterations":  100,
+                                           "mean_us":  277.00,
+                                           "median_us":  262.00,
+                                           "p95_us":  327.30,
+                                           "min_us":  261.00,
+                                           "max_us":  443.00
+                                       },
+                                       {
+                                           "operation":  "v2_scan_foreign_output",
+                                           "iterations":  100,
+                                           "mean_us":  276.31,
+                                           "median_us":  262.80,
+                                           "p95_us":  334.70,
+                                           "min_us":  261.50,
+                                           "max_us":  450.30
+                                       },
+                                       {
+                                           "operation":  "v1_scan_output_equivalent",
+                                           "iterations":  100,
+                                           "mean_us":  93.53,
+                                           "median_us":  88.60,
+                                           "p95_us":  120.90,
+                                           "min_us":  88.40,
+                                           "max_us":  171.80
+                                       }
+                                   ]
+                },
+    "android_runs":  [
+                         {
+                             "schema_version":  1,
+                             "tool":  "hybrid_scan_bench",
+                             "os":  "android",
+                             "architecture":  "arm",
+                             "iterations":  100,
+                             "address_chars":  1715,
+                             "kem_ciphertext_bytes":  1120,
+                             "operations":  [
+                                                {
+                                                    "operation":  "v2_address_encode",
+                                                    "iterations":  100,
+                                                    "mean_us":  7160.62,
+                                                    "median_us":  7148.33,
+                                                    "p95_us":  7236.04,
+                                                    "min_us":  7083.54,
+                                                    "max_us":  7733.81
+                                                },
+                                                {
+                                                    "operation":  "v2_address_decode_and_validate",
+                                                    "iterations":  100,
+                                                    "mean_us":  4064.46,
+                                                    "median_us":  4044.58,
+                                                    "p95_us":  4122.23,
+                                                    "min_us":  3999.12,
+                                                    "max_us":  5414.77
+                                                },
+                                                {
+                                                    "operation":  "v2_output_build",
+                                                    "iterations":  100,
+                                                    "mean_us":  2690.15,
+                                                    "median_us":  2686.29,
+                                                    "p95_us":  2784.85,
+                                                    "min_us":  2584.85,
+                                                    "max_us":  2818.85
+                                                },
+                                                {
+                                                    "operation":  "v2_scan_own_output",
+                                                    "iterations":  100,
+                                                    "mean_us":  3808.72,
+                                                    "median_us":  3780.08,
+                                                    "p95_us":  3911.46,
+                                                    "min_us":  3707.08,
+                                                    "max_us":  3929.46
+                                                },
+                                                {
+                                                    "operation":  "v2_scan_foreign_output",
+                                                    "iterations":  100,
+                                                    "mean_us":  3821.03,
+                                                    "median_us":  3795.71,
+                                                    "p95_us":  3925.08,
+                                                    "min_us":  3736.96,
+                                                    "max_us":  3955.08
+                                                },
+                                                {
+                                                    "operation":  "v1_scan_output_equivalent",
+                                                    "iterations":  100,
+                                                    "mean_us":  1528.74,
+                                                    "median_us":  1523.38,
+                                                    "p95_us":  1587.65,
+                                                    "min_us":  1497.92,
+                                                    "max_us":  1617.58
+                                                }
+                                            ]
+                         },
+                         {
+                             "schema_version":  1,
+                             "tool":  "hybrid_scan_bench",
+                             "os":  "android",
+                             "architecture":  "arm",
+                             "iterations":  100,
+                             "address_chars":  1715,
+                             "kem_ciphertext_bytes":  1120,
+                             "operations":  [
+                                                {
+                                                    "operation":  "v2_address_encode",
+                                                    "iterations":  100,
+                                                    "mean_us":  7152.90,
+                                                    "median_us":  7143.46,
+                                                    "p95_us":  7242.38,
+                                                    "min_us":  7084.77,
+                                                    "max_us":  7330.73
+                                                },
+                                                {
+                                                    "operation":  "v2_address_decode_and_validate",
+                                                    "iterations":  100,
+                                                    "mean_us":  4047.41,
+                                                    "median_us":  4042.83,
+                                                    "p95_us":  4102.81,
+                                                    "min_us":  3994.61,
+                                                    "max_us":  4239.04
+                                                },
+                                                {
+                                                    "operation":  "v2_output_build",
+                                                    "iterations":  100,
+                                                    "mean_us":  2675.43,
+                                                    "median_us":  2656.46,
+                                                    "p95_us":  2797.23,
+                                                    "min_us":  2584.38,
+                                                    "max_us":  2822.58
+                                                },
+                                                {
+                                                    "operation":  "v2_scan_own_output",
+                                                    "iterations":  100,
+                                                    "mean_us":  3804.85,
+                                                    "median_us":  3789.77,
+                                                    "p95_us":  3916.42,
+                                                    "min_us":  3714.35,
+                                                    "max_us":  3971.58
+                                                },
+                                                {
+                                                    "operation":  "v2_scan_foreign_output",
+                                                    "iterations":  100,
+                                                    "mean_us":  3819.93,
+                                                    "median_us":  3795.58,
+                                                    "p95_us":  3933.19,
+                                                    "min_us":  3720.00,
+                                                    "max_us":  3975.92
+                                                },
+                                                {
+                                                    "operation":  "v1_scan_output_equivalent",
+                                                    "iterations":  100,
+                                                    "mean_us":  1526.98,
+                                                    "median_us":  1522.83,
+                                                    "p95_us":  1575.54,
+                                                    "min_us":  1496.81,
+                                                    "max_us":  1606.12
+                                                }
+                                            ]
+                         },
+                         {
+                             "schema_version":  1,
+                             "tool":  "hybrid_scan_bench",
+                             "os":  "android",
+                             "architecture":  "arm",
+                             "iterations":  100,
+                             "address_chars":  1715,
+                             "kem_ciphertext_bytes":  1120,
+                             "operations":  [
+                                                {
+                                                    "operation":  "v2_address_encode",
+                                                    "iterations":  100,
+                                                    "mean_us":  7157.02,
+                                                    "median_us":  7149.87,
+                                                    "p95_us":  7226.27,
+                                                    "min_us":  7082.69,
+                                                    "max_us":  7315.69
+                                                },
+                                                {
+                                                    "operation":  "v2_address_decode_and_validate",
+                                                    "iterations":  100,
+                                                    "mean_us":  4044.66,
+                                                    "median_us":  4040.21,
+                                                    "p95_us":  4112.96,
+                                                    "min_us":  3991.88,
+                                                    "max_us":  4166.46
+                                                },
+                                                {
+                                                    "operation":  "v2_output_build",
+                                                    "iterations":  100,
+                                                    "mean_us":  2683.24,
+                                                    "median_us":  2671.81,
+                                                    "p95_us":  2784.65,
+                                                    "min_us":  2588.08,
+                                                    "max_us":  2865.92
+                                                },
+                                                {
+                                                    "operation":  "v2_scan_own_output",
+                                                    "iterations":  100,
+                                                    "mean_us":  3815.86,
+                                                    "median_us":  3798.21,
+                                                    "p95_us":  3930.15,
+                                                    "min_us":  3706.62,
+                                                    "max_us":  3982.58
+                                                },
+                                                {
+                                                    "operation":  "v2_scan_foreign_output",
+                                                    "iterations":  100,
+                                                    "mean_us":  3831.38,
+                                                    "median_us":  3816.06,
+                                                    "p95_us":  3928.65,
+                                                    "min_us":  3736.62,
+                                                    "max_us":  3997.85
+                                                },
+                                                {
+                                                    "operation":  "v1_scan_output_equivalent",
+                                                    "iterations":  100,
+                                                    "mean_us":  1531.09,
+                                                    "median_us":  1523.31,
+                                                    "p95_us":  1609.50,
+                                                    "min_us":  1496.77,
+                                                    "max_us":  1709.88
+                                                }
+                                            ]
+                         }
+                     ]
+}
