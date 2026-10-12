@@ -4,7 +4,9 @@ Estado: **experimental, sin activar.** Rama `etapa3-direcciones-hibridas`.
 Implementación de referencia: `src/private_wallet/hybrid.rs`, detrás de la
 feature `pq-experimental`. Las reglas de consenso de la salida v2 ya están en
 el nodo (todas las builds) y rechazan toda salida v2 mientras la activación
-siga en `None`. ZSilent y ZKAPriv todavía no saben nada de esto.
+siga en `None`. Con `pq-experimental`, el nodo y el CLI ya arman, reconocen y
+gastan salidas v2 (ver "Envío y recepción"). ZSilent y ZKAPriv todavía no
+saben nada de esto.
 
 Decisiones tomadas por el usuario el 12/10/2026: **D1 = ML-KEM-768** (a través
 de X-Wing) y **D2 = direcciones largas** (unos 1.715 caracteres, con QR y
@@ -33,6 +35,14 @@ Todo sale de la raíz de la wallet: los 16 o 32 bytes de entropía de la frase
   Una misma wallet gasta salidas v1 y v2, y la frase de siempre recupera ambas.
 - **Clave de escaneo X-Wing:** semilla de 32 bytes =
   `SHA-256("zoka-hybrid-scan-seed-v2" ‖ 0x1f ‖ raíz)`, expandida por X-Wing.
+
+En el código, la clave de escaneo (`HybridScanKey`) está separada de la de
+gasto: sale de la "scan key" guardada de la wallet, que en una wallet creada
+desde una frase **es** la raíz. Así también tienen dirección v2 las wallets de
+claves al azar o rotadas (`HybridWalletKeys::from_wallet_keys`, con su clave
+de gasto real) y las de solo lectura, que reconocen y leen montos sin la
+clave de gasto. La dirección v2 de una wallet toma la clave de gasto pública
+de su `zka1`.
 
 Una frase de **12 palabras** tiene 128 bits de entropía: frente a una búsqueda
 con Grover eso equivale a la categoría 1 del NIST (como AES-128), por debajo de
@@ -123,6 +133,41 @@ permitiría a una computadora cuántica descartar o confirmar pertenencia sin
 romper ML-KEM. Si el escaneo resulta demasiado lento, una etiqueta tiene que
 derivarse del secreto híbrido y revisarse antes de incorporarla.
 
+## Envío y recepción (con `pq-experimental`)
+
+- **Destinatario.** `canonical_send_recipient` acepta `zka1` como siempre y
+  `zkq1`, que se decodifica y valida entera antes de armar nada. El coinbase
+  usa `canonical_payment_address`, que solo acepta `zka1`.
+- **Armado.** Hacia una `zkq1`, `derive_stealth_payload` produce una salida
+  v2 (`hybrid_output_material`): ciphertext X-Wing, clave efímera vacía,
+  etiqueta `stlth2_`. El monto viaja cifrado igual que en v1, con el ciego
+  derivado del secreto X-Wing.
+- **El vuelto sigue al pago.** Si el pago va a una `zkq1`, el vuelto va a la
+  `zkq1` propia: una salida v1 al lado de una v2 delataría cuál de las dos es
+  el vuelto. Un envío a `zka1` sigue siendo v1 entero.
+- **Recepción y gasto.** El descifrado de la wallet, el gasto de notas y el
+  escaneo con clave de vista tienen una rama v2 que desencapsula X-Wing. La
+  clave de vista se usa junto con la `zka1`: la clave de gasto pública es la
+  misma, así que ve también los pagos a la `zkq1`.
+- **Notas guardadas.** Una nota v2 guarda `output_version` y `kem_ciphertext`
+  para poder gastarse; las v1 no cambian.
+- **Builds sin `pq-experimental`** (por ejemplo, el motor de ZKAPriv hoy): no
+  pueden enviar a `zkq1` (error claro), no reconocen salidas v2 (las saltean)
+  y validan el consenso igual que las demás.
+
+### CLI
+
+- `zoka wallet-receive --address <zka1> --hybrid [--json]` muestra también la
+  dirección v2 (JSON: `hybrid_address`, `hybrid_activation_height`). Si la
+  activación no está fijada lo avisa: nadie puede pagarle todavía y la que se
+  comparte es la `zka1`.
+- `zoka tx-send --to <zkq1…>` (y la consola guiada) aceptan una `zkq1` solo si
+  la activación está fijada (en el binario o por
+  `ZOKA_PQ_HYBRID_ADDRESSES_ACTIVATION_HEIGHT`) y la build tiene la feature;
+  si no, lo rechazan antes de reservar notas.
+- Si la `zkq1` es de una wallet local, el CLI la reconoce como destinataria
+  (para el control de montos y el de aislamiento entre wallets).
+
 ## Activación y consenso
 
 Implementado en `src/private_wallet/mod.rs` (`validate_private_output_format`)
@@ -165,11 +210,19 @@ uno con ella.
    minero sigue siendo pública (el team mining la usa) y, si no, usar salidas v2.
 2. **Comisión del minero** (`PrivateFeeClaim`): misma construcción con su
    propia etiqueta de dominio (`zoka-hybrid-fee-claim-v2`).
-3. Formato en wallets guardadas (archivos `.private.json`), comando del CLI
-   para mostrar la dirección v2, QR en ZSilent y ZKAPriv.
+3. ~~Formato en wallets guardadas y comando del CLI~~ (hecho: ver "Envío y
+   recepción"). Falta mostrar la dirección v2 y su QR en ZSilent y ZKAPriv,
+   solo cuando la red la active (decisión del usuario del 12/10/2026).
 4. Motor móvil: compilar con `pq-experimental` para los dos ABIs y medir el
-   tamaño del `.so`.
+   tamaño del `.so`. Hasta entonces la app no reconoce pagos a su `zkq1`.
 5. Revisión externa de esta construcción antes de activarla en cualquier red.
+6. **Tamaño en JSON.** `kem_ciphertext` se serializa como arreglo de números
+   (igual que `ephemeral_pubkey` y `range_proof`): unos 4 KB por salida v2 en
+   el cuerpo JSON, frente a 1.120 bytes en binario. El hash usa los bytes, así
+   que pasarlo a hex o base64 no cambiaría hashes, pero sí el formato de red:
+   decidirlo antes de activar.
+7. El envío por la API con semilla (el camino viejo de ZKAPriv) sigue
+   aceptando solo `zka1`.
 
 ## Pruebas actuales
 
@@ -191,3 +244,18 @@ JSON y el hash de una salida v1 quedan fijos; el hash de una v2 cubre versión
 y ciphertext (bajarle la versión cambia el hash); reglas de formato por
 versión; y una transacción real con una salida v2 bien formada se rechaza
 antes de la activación, en el mempool y dentro de un bloque.
+
+Envío y recepción (`cargo test --features pq-experimental --lib -- zkq1
+private_wallet::hybrid`): de punta a punta sin red, alice le paga a la `zkq1`
+de bob; pago y vuelto salen v2; la transacción es válida con la activación
+fijada; bob reconoce y descifra 30, alice su vuelto de 70, carol nada; bob la
+recibe, la nota guarda versión y ciphertext, y después la gasta hacia una
+`zka1` en una transacción v1 válida. La clave de vista sola reconoce el pago
+v2 y el vuelto v2. Una `zkq1` mal escrita se rechaza sin reservar notas, el
+coinbase no acepta `zkq1`, y sin la feature el error lo dice. Una wallet de
+claves sueltas tiene su propia dirección v2 y gasta sus salidas; la de una
+frase da lo mismo por los dos caminos.
+
+CLI (`cargo test --bin zoka -- recipient_accepts_zka1`): `--to` sigue
+aceptando `zka1` igual que antes y rechaza `zkq1` con un mensaje claro
+mientras la activación no esté fijada.

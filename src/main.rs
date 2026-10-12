@@ -1405,7 +1405,7 @@ fn interactive_transfer_menu() -> Result<bool, String> {
                         continue;
                     }
                 };
-                let to_commitment = match require_private_network_address(&to, "--to") {
+                let to_commitment = match require_private_recipient_address(&to, "--to") {
                     Ok(value) => value,
                     Err(err) => {
                         eprintln!("{}", err);
@@ -2089,14 +2089,37 @@ fn require_private_network_address(raw: &str, flag: &str) -> Result<String, Stri
     validate_user_private_address(raw).map_err(|reason| format!("{flag}: {reason}"))
 }
 
+/// Destinatario de un envío: una dirección `zka1` como siempre, o una v2
+/// `zkq1` (Zoka Quantic) si la red ya fijó su activación y la build la
+/// soporta. Antes de la activación la red rechazaría la transacción: mejor
+/// decirlo acá que dejar notas reservadas por un envío que no va a entrar.
+fn require_private_recipient_address(raw: &str, flag: &str) -> Result<String, String> {
+    if !zoka::private_wallet::is_hybrid_payment_address(raw) {
+        return require_private_network_address(raw, flag);
+    }
+    if economics::pq_feature_activation_height(economics::PqFeature::HybridAddresses).is_none() {
+        return Err(format!(
+            "{flag}: zkq1 hybrid addresses are not active on this network yet; use the recipient's zka1 address"
+        ));
+    }
+    zoka::private_wallet::canonical_send_recipient(raw).map_err(|e| format!("{flag}: {e}"))
+}
+
 fn find_private_wallet_name_by_commitment(
     manager: &PrivateWalletManager,
     commitment: &str,
 ) -> Option<String> {
+    // Una zkq1 no es el commitment de ninguna wallet: se compara con la
+    // dirección v2 que cada wallet deriva de sus claves.
+    let hybrid = zoka::private_wallet::is_hybrid_payment_address(commitment);
     manager.get_private_wallet_names().into_iter().find(|name| {
         manager
             .get_private_wallet(name)
-            .map(|wallet| wallet.commitment_key == commitment)
+            .map(|wallet| {
+                wallet.commitment_key == commitment
+                    || (hybrid
+                        && wallet.hybrid_payment_address().ok().as_deref() == Some(commitment))
+            })
             .unwrap_or(false)
     })
 }
@@ -13748,21 +13771,50 @@ fn cmd_receive_address(args: &[String]) -> Result<(), String> {
         .get_private_wallet(&wallet_name)
         .ok_or_else(|| format!("private wallet not found: {wallet_name}"))?;
     let address = user_private_address_display(&wallet.commitment_key);
+    // La dirección v2 (zkq1) solo se muestra si se pide: hasta que la red fije
+    // su activación nadie puede pagarle, y la que hay que compartir es la zka1.
+    let hybrid_address = if has_flag(args, "--hybrid") {
+        Some(
+            wallet
+                .hybrid_payment_address()
+                .map_err(|e| format!("hybrid address unavailable: {e}"))?,
+        )
+    } else {
+        None
+    };
+    let hybrid_activation =
+        economics::pq_feature_activation_height(economics::PqFeature::HybridAddresses);
     if as_json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "wallet": wallet_name,
-                "address": address,
-                "view_only": wallet.view_only,
-            })
-        );
+        let mut out = serde_json::json!({
+            "wallet": wallet_name,
+            "address": address,
+            "view_only": wallet.view_only,
+        });
+        if let Some(hybrid) = hybrid_address.as_deref() {
+            out["hybrid_address"] = serde_json::json!(hybrid);
+            out["hybrid_activation_height"] = serde_json::json!(hybrid_activation);
+        }
+        println!("{out}");
         return Ok(());
     }
     println!("Receive ZKA");
     println!("Wallet: {}", wallet_name);
     println!("Address: {}", address);
     println!("Share this address to receive private ZKA.");
+    if let Some(hybrid) = hybrid_address.as_deref() {
+        println!();
+        println!(
+            "Hybrid address (zkq1, post-quantum, {} chars):",
+            hybrid.len()
+        );
+        println!("{hybrid}");
+        match hybrid_activation {
+            Some(height) => println!("Senders can pay it from block {height} on."),
+            None => println!(
+                "Not active on this network yet: nobody can pay it. Keep sharing the zka1 address."
+            ),
+        }
+    }
     Ok(())
 }
 
@@ -14507,7 +14559,7 @@ fn cmd_private_send(args: &[String]) -> Result<(), String> {
         ));
     }
 
-    let to_commitment = require_private_network_address(&to_raw, "--to")?;
+    let to_commitment = require_private_recipient_address(&to_raw, "--to")?;
     let recipient_wallet_name = find_private_wallet_name_by_commitment(&manager, &to_commitment);
 
     let mut remaining_amount = amount;
@@ -15255,7 +15307,7 @@ fn cmd_tx_send_unified(args: &[String]) -> Result<(), String> {
     let from = required_option_value(args, "--from")?;
     let to = required_option_value(args, "--to")?;
     let from_commitment = require_private_network_address(&from, "--from")?;
-    let to_commitment = require_private_network_address(&to, "--to")?;
+    let to_commitment = require_private_recipient_address(&to, "--to")?;
     let amount = required_option_value(args, "--amount")?;
     let password = option_value(args, "--password");
     let password_env = option_value(args, "--password-env")
@@ -19865,6 +19917,25 @@ mod tests {
         let canonical =
             require_private_network_address(&addr, "--address").expect("valid network address");
         assert!(canonical.starts_with("zpriv:"));
+    }
+
+    // `--to` sigue aceptando zka1 como siempre; una zkq1 se rechaza con un
+    // mensaje claro mientras la red no fije su activación (hoy, nunca).
+    #[test]
+    fn recipient_accepts_zka1_and_gates_zkq1_on_activation() {
+        let addr = make_valid_zka1();
+        assert_eq!(
+            require_private_recipient_address(&addr, "--to").unwrap(),
+            require_private_network_address(&addr, "--to").unwrap()
+        );
+        if economics::pq_feature_activation_height(economics::PqFeature::HybridAddresses).is_none()
+        {
+            let err = require_private_recipient_address("zkq1abc", "--to").unwrap_err();
+            assert!(
+                err.contains("not active") && err.contains("zka1"),
+                "got: {err}"
+            );
+        }
     }
 
     #[test]
