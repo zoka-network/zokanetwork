@@ -13,12 +13,14 @@
 //!   ML-KEM-768. La autorización de gasto sigue siendo clásica (Ristretto):
 //!   eso es la etapa 5.
 //!
-//! Nada de esto está conectado a transacciones ni a consenso. La activación en
-//! Zenith depende de `economics::PqFeature::HybridAddresses`, sin altura.
+//! Las reglas de consenso de la salida v2 (formato y activación) viven en el
+//! módulo padre y están en todas las builds; acá están el armado y el
+//! escaneo, que necesitan X-Wing. La activación en Zenith depende de
+//! `economics::PqFeature::HybridAddresses`, hoy sin altura.
 
 use super::{
     constant_time_eq_bytes, derive_spending_key_from_recovery_seed, hash_to_scalar,
-    scalar_from_secret_bytes,
+    scalar_from_secret_bytes, HYBRID_PAYMENT_ADDRESS_PREFIX,
 };
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
@@ -32,7 +34,7 @@ use zoka_pq::{
     X_WING_PUBLIC_KEY_BYTES,
 };
 
-pub const HYBRID_ADDRESS_PREFIX: &str = "zkq1";
+pub const HYBRID_ADDRESS_PREFIX: &str = HYBRID_PAYMENT_ADDRESS_PREFIX;
 pub const HYBRID_ADDRESS_VERSION: u8 = 2;
 pub const HYBRID_KEM_CIPHERTEXT_BYTES: usize = X_WING_CIPHERTEXT_BYTES;
 // El consenso valida el largo sin depender de X-Wing; tienen que coincidir.
@@ -180,56 +182,48 @@ fn address_checksum(payload: &[u8]) -> [u8; CHECKSUM_BYTES] {
     checksum
 }
 
-/// Claves de una wallet para direcciones v2.
+/// Clave de escaneo v2: reconoce salidas propias y lee sus montos, pero no
+/// autoriza gastos.
 ///
-/// Salen de la misma raíz que la dirección `zka1` (los 16 o 32 bytes de
-/// entropía de la frase): la clave de gasto es exactamente la de siempre, así
-/// que una misma wallet gasta salidas v1 y v2, y la clave X-Wing sale de esa
-/// raíz con una etiqueta de dominio propia. Una frase de 12 palabras da 128
-/// bits de entropía; para Quantic se recomiendan 24 (ver la especificación).
-pub struct HybridWalletKeys {
-    spend_secret: Scalar,
-    spend_public: RistrettoPoint,
+/// Sale de la "scan key" de la wallet, la misma de la dirección `zka1`, con
+/// una etiqueta de dominio propia. En una wallet creada desde una frase esa
+/// clave es la raíz (los 16 o 32 bytes de entropía); en una de claves al azar
+/// o rotadas, son sus 32 bytes.
+pub struct HybridScanKey {
     kem_secret: XWingSecretKey,
 }
 
-impl HybridWalletKeys {
-    pub fn from_root_seed(root: &[u8]) -> Result<Self, HybridError> {
-        if root.len() != 16 && root.len() != 32 {
+impl HybridScanKey {
+    pub fn from_scan_key(scan_key: &[u8]) -> Result<Self, HybridError> {
+        if scan_key.len() != 16 && scan_key.len() != 32 {
             return Err(HybridError::RootSeed);
         }
-        let mut spending_key = derive_spending_key_from_recovery_seed(root);
-        let spend_secret = scalar_from_secret_bytes(&spending_key);
-        spending_key.zeroize();
-
         let mut hasher = Sha256::new();
         hasher.update(SCAN_SEED_DOMAIN);
         hasher.update([0x1f]);
-        hasher.update(root);
+        hasher.update(scan_key);
         let mut scan_seed: [u8; 32] = hasher.finalize().into();
         let kem_secret = XWingSecretKey::from_seed(&scan_seed);
         scan_seed.zeroize();
-        let kem_secret = kem_secret.map_err(|_| HybridError::KemKey)?;
-
         Ok(Self {
-            spend_secret,
-            spend_public: spend_secret * RISTRETTO_BASEPOINT_POINT,
-            kem_secret,
+            kem_secret: kem_secret.map_err(|_| HybridError::KemKey)?,
         })
     }
 
-    pub fn address(&self) -> HybridAddress {
+    /// Dirección v2 de la wallet cuya clave de gasto pública es `spend_public`.
+    pub fn address(&self, spend_public: RistrettoPoint) -> HybridAddress {
         HybridAddress {
-            spend_public: self.spend_public,
+            spend_public,
             kem_public: self.kem_secret.public_key(),
         }
     }
 
-    /// Intenta reconocer una salida v2. `None` si no es de esta wallet o si
-    /// el ciphertext está mal formado o es no contributivo: los tres casos se
-    /// tratan igual, sin distinguir por qué.
+    /// Intenta reconocer una salida v2 dirigida a `spend_public`. `None` si no
+    /// es de esta wallet o si el ciphertext está mal formado o es no
+    /// contributivo: los tres casos se tratan igual, sin distinguir por qué.
     pub fn scan(
         &self,
+        spend_public: &RistrettoPoint,
         kem_ciphertext: &[u8],
         commitment: &str,
         one_time_public_key_hex: &str,
@@ -238,7 +232,7 @@ impl HybridWalletKeys {
         let shared = self.kem_secret.decapsulate(&ciphertext).ok()?;
         let context = output_context(kem_ciphertext, commitment);
         let key_offset = hash_to_scalar(&[OUTPUT_KEY_DOMAIN, shared.expose_secret(), &context]);
-        let expected = (self.spend_public + key_offset * RISTRETTO_BASEPOINT_POINT).compress();
+        let expected = (spend_public + key_offset * RISTRETTO_BASEPOINT_POINT).compress();
         let claimed = hex::decode(one_time_public_key_hex).ok()?;
         if !constant_time_eq_bytes(expected.as_bytes(), &claimed) {
             return None;
@@ -248,6 +242,84 @@ impl HybridWalletKeys {
             key_offset,
             amount_blind,
         })
+    }
+
+    /// Ciego del monto de una salida que ya se sabe propia. No comprueba
+    /// pertenencia: por el rechazo implícito, un ciphertext ajeno también da
+    /// un valor, que no abre nada. Para reconocer salidas, [`Self::scan`].
+    pub fn amount_blind(&self, kem_ciphertext: &[u8], commitment: &str) -> Option<Scalar> {
+        let ciphertext = XWingCiphertext::from_bytes(kem_ciphertext).ok()?;
+        let shared = self.kem_secret.decapsulate(&ciphertext).ok()?;
+        let context = output_context(kem_ciphertext, commitment);
+        Some(hash_to_scalar(&[
+            AMOUNT_BLIND_DOMAIN,
+            shared.expose_secret(),
+            &context,
+        ]))
+    }
+}
+
+impl fmt::Debug for HybridScanKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("HybridScanKey([redacted])")
+    }
+}
+
+/// Claves de una wallet para direcciones v2: la de gasto de siempre y la de
+/// escaneo X-Wing.
+///
+/// La clave de gasto es exactamente la de la dirección `zka1`, así que una
+/// misma wallet gasta salidas v1 y v2 y la frase de siempre recupera ambas.
+/// Una frase de 12 palabras da 128 bits de entropía; para Quantic se
+/// recomiendan 24 (ver la especificación).
+pub struct HybridWalletKeys {
+    spend_secret: Scalar,
+    spend_public: RistrettoPoint,
+    scan_key: HybridScanKey,
+}
+
+impl HybridWalletKeys {
+    /// Desde la raíz de una frase (16 o 32 bytes de entropía).
+    pub fn from_root_seed(root: &[u8]) -> Result<Self, HybridError> {
+        if root.len() != 16 && root.len() != 32 {
+            return Err(HybridError::RootSeed);
+        }
+        let mut spending_key = derive_spending_key_from_recovery_seed(root);
+        let keys = Self::from_wallet_keys(&spending_key, root);
+        spending_key.zeroize();
+        keys
+    }
+
+    /// Desde las claves guardadas de una wallet. Con una wallet creada desde
+    /// una frase da lo mismo que [`Self::from_root_seed`]; también sirve para
+    /// las de claves al azar o rotadas, cuya clave de gasto no sale de la raíz.
+    pub fn from_wallet_keys(spending_key: &[u8], scan_key: &[u8]) -> Result<Self, HybridError> {
+        let scan_key = HybridScanKey::from_scan_key(scan_key)?;
+        let spend_secret = scalar_from_secret_bytes(spending_key);
+        Ok(Self {
+            spend_secret,
+            spend_public: spend_secret * RISTRETTO_BASEPOINT_POINT,
+            scan_key,
+        })
+    }
+
+    pub fn address(&self) -> HybridAddress {
+        self.scan_key.address(self.spend_public)
+    }
+
+    /// Ver [`HybridScanKey::scan`].
+    pub fn scan(
+        &self,
+        kem_ciphertext: &[u8],
+        commitment: &str,
+        one_time_public_key_hex: &str,
+    ) -> Option<HybridOwnedOutput> {
+        self.scan_key.scan(
+            &self.spend_public,
+            kem_ciphertext,
+            commitment,
+            one_time_public_key_hex,
+        )
     }
 
     /// Secreto de un solo uso de una salida propia: el mismo esquema que v1
@@ -539,6 +611,68 @@ mod tests {
         ];
         let unique: std::collections::BTreeSet<_> = labels.iter().collect();
         assert_eq!(unique.len(), labels.len());
+    }
+
+    // Una wallet creada desde una frase da la misma dirección por los dos
+    // caminos; una de claves sueltas (al azar o rotadas) tiene la suya y
+    // también reconoce y gasta sus salidas.
+    #[test]
+    fn wallet_keys_match_the_root_for_phrase_wallets() {
+        let seed = root(9);
+        let spending_key = derive_spending_key_from_recovery_seed(&seed);
+        let from_root = HybridWalletKeys::from_root_seed(&seed).unwrap();
+        let from_keys = HybridWalletKeys::from_wallet_keys(&spending_key, &seed).unwrap();
+        assert_eq!(from_root.address().encode(), from_keys.address().encode());
+
+        let loose = HybridWalletKeys::from_wallet_keys(&[3u8; 32], &[4u8; 32]).unwrap();
+        assert_ne!(loose.address().encode(), from_root.address().encode());
+        let material = hybrid_output_material(&loose.address(), "commitment-a");
+        let owned = loose
+            .scan(
+                &material.kem_ciphertext,
+                "commitment-a",
+                &material.one_time_public_key,
+            )
+            .expect("own output");
+        let one_time = loose.one_time_secret(&owned) * RISTRETTO_BASEPOINT_POINT;
+        assert_eq!(
+            hex::encode(one_time.compress().as_bytes()),
+            material.one_time_public_key
+        );
+    }
+
+    // La clave de escaneo sola (una wallet de solo lectura) reconoce la
+    // salida y lee el ciego del monto, pero solo para la clave de gasto
+    // pública que corresponde.
+    #[test]
+    fn scan_key_alone_recognizes_outputs_and_reads_the_amount() {
+        let keys = HybridWalletKeys::from_root_seed(&root(7)).unwrap();
+        let scan = HybridScanKey::from_scan_key(&root(7)).unwrap();
+        let spend_public = keys.address().spend_public();
+        let material = hybrid_output_material(&keys.address(), "commitment-a");
+        let ct = &material.kem_ciphertext;
+        let otk = &material.one_time_public_key;
+
+        let owned = scan
+            .scan(&spend_public, ct, "commitment-a", otk)
+            .expect("own output");
+        assert_eq!(owned.amount_blind, material.amount_blind);
+        assert_eq!(
+            scan.amount_blind(ct, "commitment-a"),
+            Some(material.amount_blind)
+        );
+
+        let other_spend = HybridWalletKeys::from_root_seed(&root(8))
+            .unwrap()
+            .address()
+            .spend_public();
+        assert!(scan.scan(&other_spend, ct, "commitment-a", otk).is_none());
+        assert!(scan.amount_blind(&ct[..10], "commitment-a").is_none());
+        assert_eq!(
+            HybridScanKey::from_scan_key(&[1u8; 20]).err(),
+            Some(HybridError::RootSeed)
+        );
+        assert_eq!(format!("{scan:?}"), "HybridScanKey([redacted])");
     }
 
     #[test]

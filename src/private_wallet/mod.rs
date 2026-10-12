@@ -302,6 +302,68 @@ pub fn canonical_payment_address(address: &str) -> Result<String, BlockError> {
     ))
 }
 
+/// Prefijo de las direcciones v2 (`zkq1…`, Zoka Quantic). Todas las builds lo
+/// reconocen para dar un error claro; usarlas requiere `pq-experimental`.
+pub const HYBRID_PAYMENT_ADDRESS_PREFIX: &str = "zkq1";
+
+pub fn is_hybrid_payment_address(address: &str) -> bool {
+    address.trim().starts_with(HYBRID_PAYMENT_ADDRESS_PREFIX)
+}
+
+#[cfg(not(feature = "pq-experimental"))]
+fn hybrid_unsupported_error() -> BlockError {
+    BlockError::TransactionValidationFailed(
+        "zkq1 hybrid addresses need a build with the pq-experimental feature".to_string(),
+    )
+}
+
+/// Destinatario de un envío: una dirección `zka1` (o `zpriv:`) como siempre,
+/// o una v2 `zkq1`, que se valida entera y se devuelve en forma canónica.
+///
+/// El coinbase no pasa por acá: usa [`canonical_payment_address`], que solo
+/// acepta `zka1` (el coinbase sigue siendo v1).
+pub fn canonical_send_recipient(address: &str) -> Result<String, BlockError> {
+    let trimmed = address.trim();
+    if is_hybrid_payment_address(trimmed) {
+        return canonical_hybrid_address(trimmed);
+    }
+    canonical_payment_address(trimmed)
+}
+
+#[cfg(feature = "pq-experimental")]
+fn canonical_hybrid_address(address: &str) -> Result<String, BlockError> {
+    decode_hybrid_recipient(address).map(|decoded| decoded.encode())
+}
+
+#[cfg(not(feature = "pq-experimental"))]
+fn canonical_hybrid_address(_address: &str) -> Result<String, BlockError> {
+    Err(hybrid_unsupported_error())
+}
+
+#[cfg(feature = "pq-experimental")]
+fn decode_hybrid_recipient(address: &str) -> Result<hybrid::HybridAddress, BlockError> {
+    hybrid::HybridAddress::decode(address)
+        .map_err(|err| BlockError::TransactionValidationFailed(format!("recipient {err}")))
+}
+
+#[cfg(feature = "pq-experimental")]
+fn hybrid_address_for_keys(
+    spend_public: RistrettoPoint,
+    scan_key: &[u8],
+) -> Result<String, BlockError> {
+    hybrid::HybridScanKey::from_scan_key(scan_key)
+        .map(|scan| scan.address(spend_public).encode())
+        .map_err(|err| BlockError::TransactionValidationFailed(err.to_string()))
+}
+
+#[cfg(not(feature = "pq-experimental"))]
+fn hybrid_address_for_keys(
+    _spend_public: RistrettoPoint,
+    _scan_key: &[u8],
+) -> Result<String, BlockError> {
+    Err(hybrid_unsupported_error())
+}
+
 fn parse_payment_address(payment_address: &str) -> Option<(RistrettoPoint, RistrettoPoint)> {
     let parts = payment_address.split(':').collect::<Vec<_>>();
     if parts.len() != 3 || parts[0] != "zpriv" {
@@ -700,6 +762,9 @@ fn derive_output_secret_scalar(
     scan_key: &[u8],
     output: &PrivateOutput,
 ) -> Result<Scalar, BlockError> {
+    if output.output_version == PRIVATE_OUTPUT_VERSION_HYBRID {
+        return hybrid_output_secret_scalar(spending_key, scan_key, output);
+    }
     let spend_secret = scalar_from_secret_bytes(spending_key);
     let ephemeral_bytes: [u8; 32] =
         output.ephemeral_pubkey.as_slice().try_into().map_err(|_| {
@@ -726,6 +791,55 @@ fn derive_output_secret_scalar(
     Ok(spend_secret + derived_scalar)
 }
 
+/// Clave con la que escanea una wallet: las viejas sin scan key usan la de
+/// gasto, igual que el descifrado de salidas v1.
+fn effective_scan_key<'a>(spending_key: &'a [u8], scan_key: &'a [u8]) -> &'a [u8] {
+    if scan_key.is_empty() {
+        spending_key
+    } else {
+        scan_key
+    }
+}
+
+/// Secreto de un solo uso de una salida v2 propia. Escanea con X-Wing: si la
+/// salida no es de esta wallet, falla igual que una v1 ajena.
+#[cfg(feature = "pq-experimental")]
+fn hybrid_output_secret_scalar(
+    spending_key: &[u8],
+    scan_key: &[u8],
+    output: &PrivateOutput,
+) -> Result<Scalar, BlockError> {
+    let keys = hybrid::HybridWalletKeys::from_wallet_keys(
+        spending_key,
+        effective_scan_key(spending_key, scan_key),
+    )
+    .map_err(|err| {
+        BlockError::TransactionValidationFailed(format!("output {}: {err}", output.output_id))
+    })?;
+    let owned = keys
+        .scan(
+            &output.kem_ciphertext,
+            &output.commitment,
+            &output.one_time_public_key,
+        )
+        .ok_or_else(|| {
+            BlockError::TransactionValidationFailed(format!(
+                "output {}: hybrid output does not belong to this wallet",
+                output.output_id
+            ))
+        })?;
+    Ok(keys.one_time_secret(&owned))
+}
+
+#[cfg(not(feature = "pq-experimental"))]
+fn hybrid_output_secret_scalar(
+    _spending_key: &[u8],
+    _scan_key: &[u8],
+    _output: &PrivateOutput,
+) -> Result<Scalar, BlockError> {
+    Err(hybrid_unsupported_error())
+}
+
 fn derive_key_image_hex(public_key: &RistrettoPoint, secret_scalar: Scalar) -> String {
     let hash_point = hash_to_point(&[b"zoka-key-image", public_key.compress().as_bytes()]);
     point_to_hex(&(secret_scalar * hash_point))
@@ -745,6 +859,9 @@ fn amount_blind_from_shared(shared_bytes: &[u8], commitment: &str) -> Scalar {
 }
 
 fn derive_output_amount_blind_from_note(scan_key: &[u8], output: &PrivateOutput) -> Option<Scalar> {
+    if output.output_version == PRIVATE_OUTPUT_VERSION_HYBRID {
+        return hybrid_output_amount_blind(scan_key, output);
+    }
     let ephemeral_public = output
         .ephemeral_pubkey
         .as_slice()
@@ -756,6 +873,20 @@ fn derive_output_amount_blind_from_note(scan_key: &[u8], output: &PrivateOutput)
         shared_point.compress().as_bytes(),
         &output.commitment,
     ))
+}
+
+/// Ciego del monto de una salida v2 que ya se sabe propia (como la versión
+/// v1 de arriba, no comprueba pertenencia).
+#[cfg(feature = "pq-experimental")]
+fn hybrid_output_amount_blind(scan_key: &[u8], output: &PrivateOutput) -> Option<Scalar> {
+    hybrid::HybridScanKey::from_scan_key(scan_key)
+        .ok()?
+        .amount_blind(&output.kem_ciphertext, &output.commitment)
+}
+
+#[cfg(not(feature = "pq-experimental"))]
+fn hybrid_output_amount_blind(_scan_key: &[u8], _output: &PrivateOutput) -> Option<Scalar> {
+    None
 }
 
 /// Produce the ephemeral keypair, one-time address and amount-blind for a
@@ -771,6 +902,10 @@ fn derive_stealth_payload(
 ) -> Result<OutputStealthMaterial, BlockError> {
     use rand::RngCore;
     use sha2::{Digest, Sha256};
+
+    if is_hybrid_payment_address(recipient_commitment) {
+        return derive_hybrid_stealth_payload(recipient_commitment, commitment);
+    }
 
     let (scan_public, spend_public) =
         parse_payment_address(recipient_commitment).ok_or_else(|| {
@@ -815,6 +950,33 @@ fn derive_stealth_payload(
         one_time_public_key,
         amount_blind,
     })
+}
+
+/// Salida v2 hacia una dirección `zkq1`: el ciphertext X-Wing ocupa el lugar
+/// de la clave efímera (ver `hybrid::hybrid_output_material`).
+#[cfg(feature = "pq-experimental")]
+fn derive_hybrid_stealth_payload(
+    recipient: &str,
+    commitment: &str,
+) -> Result<OutputStealthMaterial, BlockError> {
+    let address = decode_hybrid_recipient(recipient)?;
+    let material = hybrid::hybrid_output_material(&address, commitment);
+    Ok(OutputStealthMaterial {
+        stealth_address: material.stealth_address,
+        ephemeral_pubkey: Vec::new(),
+        output_version: PRIVATE_OUTPUT_VERSION_HYBRID,
+        kem_ciphertext: material.kem_ciphertext,
+        one_time_public_key: material.one_time_public_key,
+        amount_blind: material.amount_blind,
+    })
+}
+
+#[cfg(not(feature = "pq-experimental"))]
+fn derive_hybrid_stealth_payload(
+    _recipient: &str,
+    _commitment: &str,
+) -> Result<OutputStealthMaterial, BlockError> {
+    Err(hybrid_unsupported_error())
 }
 
 fn private_tx_hash(
@@ -3196,6 +3358,13 @@ impl PrivateWallet {
             })
             .collect::<Vec<_>>();
 
+        // Si el pago va a una dirección v2, el vuelto también: una salida v1 al
+        // lado de una v2 delataría cuál de las dos es el vuelto.
+        let change_recipient = if is_hybrid_payment_address(&recipient_commitment) {
+            self.hybrid_payment_address()?
+        } else {
+            self.commitment_key.clone()
+        };
         let mut builder =
             PrivateTransactionBuilder::new(amount, self.spending_key.clone(), nullifier_set)
                 .with_recipient_commitment(recipient_commitment)
@@ -3215,7 +3384,7 @@ impl PrivateWallet {
                 .with_private_proof_profile(proof_profile)
                 .with_fee(fee);
         if change_amount > 0 {
-            builder = builder.with_change_output(self.commitment_key.clone(), change_amount);
+            builder = builder.with_change_output(change_recipient, change_amount);
         }
 
         let tx = builder.build()?;
@@ -3275,6 +3444,21 @@ impl PrivateWallet {
     /// Get transaction count
     pub fn private_transaction_count(&self) -> usize {
         self.private_transactions.len()
+    }
+
+    /// Dirección v2 (`zkq1…`) de esta wallet: la clave de gasto pública de su
+    /// dirección `zka1` y la clave X-Wing derivada de su scan key. No usa la
+    /// clave de gasto privada, así que también vale para una de solo lectura.
+    pub fn hybrid_payment_address(&self) -> Result<String, BlockError> {
+        let (_, spend_public) = parse_payment_address(&self.commitment_key).ok_or_else(|| {
+            BlockError::TransactionValidationFailed(
+                "wallet address is not a valid zpriv address".to_string(),
+            )
+        })?;
+        hybrid_address_for_keys(
+            spend_public,
+            effective_scan_key(&self.spending_key, &self.scan_key),
+        )
     }
 
     /// Rotate spending key and commitment key while preserving legacy keys for recovery.
@@ -3412,6 +3596,55 @@ pub fn validate_view_scan_key_for_address(
     Ok((scan_public, spend_public))
 }
 
+/// Ciego del monto de una salida v1 dirigida a `spend_public`, o `None` si la
+/// salida no es de esa dirección.
+fn classic_view_scan_amount_blind(
+    scan_key: &[u8],
+    spend_public: &RistrettoPoint,
+    output: &PrivateOutput,
+) -> Option<Scalar> {
+    let amount_blind = derive_output_amount_blind_from_note(scan_key, output)?;
+    let ephemeral_public = output
+        .ephemeral_pubkey
+        .as_slice()
+        .try_into()
+        .ok()
+        .and_then(|bytes: [u8; 32]| CompressedRistretto(bytes).decompress())?;
+    let shared_point = scalar_from_secret_bytes(scan_key) * ephemeral_public;
+    let derived_scalar = hash_to_scalar(&[
+        b"zoka-output-key",
+        shared_point.compress().as_bytes(),
+        output.commitment.as_bytes(),
+    ]);
+    let derived_public = point_to_hex(&(spend_public + derived_scalar * RISTRETTO_BASEPOINT_POINT));
+    constant_time_eq_str(&derived_public, &output.one_time_public_key).then_some(amount_blind)
+}
+
+/// Lo mismo para una salida v2: reconocerla exige desencapsular el X-Wing.
+#[cfg(feature = "pq-experimental")]
+fn hybrid_view_scan_amount_blind(
+    scan_key: &[u8],
+    spend_public: &RistrettoPoint,
+    output: &PrivateOutput,
+) -> Option<Scalar> {
+    let owned = hybrid::HybridScanKey::from_scan_key(scan_key).ok()?.scan(
+        spend_public,
+        &output.kem_ciphertext,
+        &output.commitment,
+        &output.one_time_public_key,
+    )?;
+    Some(owned.amount_blind)
+}
+
+#[cfg(not(feature = "pq-experimental"))]
+fn hybrid_view_scan_amount_blind(
+    _scan_key: &[u8],
+    _spend_public: &RistrettoPoint,
+    _output: &PrivateOutput,
+) -> Option<Scalar> {
+    None
+}
+
 pub fn scan_private_transaction_with_view_key(
     scan_key: &[u8],
     payment_address: &str,
@@ -3420,29 +3653,14 @@ pub fn scan_private_transaction_with_view_key(
     let (_, spend_public) = validate_view_scan_key_for_address(scan_key, payment_address)?;
     let mut matches = Vec::new();
     for (output_index, output) in tx_outputs(tx).into_iter().enumerate() {
-        let Some(amount_blind) = derive_output_amount_blind_from_note(scan_key, &output) else {
+        let owned_amount_blind = if output.output_version == PRIVATE_OUTPUT_VERSION_HYBRID {
+            hybrid_view_scan_amount_blind(scan_key, &spend_public, &output)
+        } else {
+            classic_view_scan_amount_blind(scan_key, &spend_public, &output)
+        };
+        let Some(amount_blind) = owned_amount_blind else {
             continue;
         };
-        let Some(ephemeral_public) = output
-            .ephemeral_pubkey
-            .as_slice()
-            .try_into()
-            .ok()
-            .and_then(|bytes: [u8; 32]| CompressedRistretto(bytes).decompress())
-        else {
-            continue;
-        };
-        let shared_point = scalar_from_secret_bytes(scan_key) * ephemeral_public;
-        let derived_scalar = hash_to_scalar(&[
-            b"zoka-output-key",
-            shared_point.compress().as_bytes(),
-            output.commitment.as_bytes(),
-        ]);
-        let derived_public =
-            point_to_hex(&(spend_public + derived_scalar * RISTRETTO_BASEPOINT_POINT));
-        if !constant_time_eq_str(&derived_public, &output.one_time_public_key) {
-            continue;
-        }
 
         let (amount, commitment_blind) =
             if output.encrypted_amount.len() == PRIVATE_NOTE_PAYLOAD_V2_LEN {
@@ -7047,6 +7265,175 @@ mod tests {
                 .validate_inbound_private_transaction_at(&tx, 1_000_000, None, None)
                 .unwrap_err();
             assert!(err.to_string().contains("not active"), "{err}");
+        }
+    }
+
+    // Envío de punta a punta hacia una dirección zkq1, sin red: todas las
+    // salidas son v2 (también el vuelto), la red las acepta con la activación
+    // fijada, bob reconoce la suya y lee el monto, una wallet ajena no, y bob
+    // después gasta esa salida en una transacción v1 válida.
+    #[cfg(feature = "pq-experimental")]
+    #[test]
+    fn un_envio_a_zkq1_se_reconoce_y_se_gasta() {
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        manager.create_private_wallet("bob").unwrap();
+        let carol = manager.create_private_wallet("carol").unwrap();
+        manager.deposit_to_private_wallet("alice", 100).unwrap();
+
+        let bob_zkq1 = manager
+            .get_private_wallet("bob")
+            .unwrap()
+            .hybrid_payment_address()
+            .unwrap();
+        assert!(bob_zkq1.starts_with(HYBRID_PAYMENT_ADDRESS_PREFIX));
+        let destino = canonical_send_recipient(&format!("  {bob_zkq1}\n")).unwrap();
+        assert_eq!(destino, bob_zkq1);
+
+        let tx_hash = manager
+            .send_private_transaction("alice", destino, 30)
+            .unwrap();
+        let tx = manager.get_private_transaction(&tx_hash).unwrap();
+        assert_eq!(tx.outputs.len(), 2);
+        for salida in &tx.outputs {
+            assert_eq!(salida.output_version, PRIVATE_OUTPUT_VERSION_HYBRID);
+            assert!(salida.ephemeral_pubkey.is_empty());
+            assert_eq!(
+                salida.kem_ciphertext.len(),
+                HYBRID_OUTPUT_KEM_CIPHERTEXT_BYTES
+            );
+            assert!(salida.stealth_address.starts_with("stlth2_"));
+        }
+        let perfil = private_proof_profile_spec_for_tx(&tx).unwrap();
+        PrivateWalletManager::new()
+            .validate_inbound_private_transaction_with_profile(&tx, perfil, true)
+            .expect("una transacción v2 es válida con la activación fijada");
+
+        assert_eq!(
+            manager
+                .decrypt_private_amount_for_wallet("bob", &tx)
+                .unwrap(),
+            30
+        );
+        assert_eq!(
+            manager
+                .decrypt_private_amount_for_wallet("alice", &tx)
+                .unwrap(),
+            70
+        );
+        assert!(!manager.can_wallet_decrypt_private_tx("carol", &tx).unwrap());
+
+        assert_eq!(
+            manager
+                .receive_private_transaction_for_wallet("bob", &tx)
+                .unwrap(),
+            30
+        );
+        assert_eq!(manager.get_private_balance("bob"), Some(30));
+        let nota = manager
+            .get_private_wallet("bob")
+            .unwrap()
+            .private_notes
+            .iter()
+            .find(|note| !note.spent)
+            .cloned()
+            .unwrap();
+        assert_eq!(nota.output_version, PRIVATE_OUTPUT_VERSION_HYBRID);
+        assert_eq!(
+            nota.kem_ciphertext.len(),
+            HYBRID_OUTPUT_KEM_CIPHERTEXT_BYTES
+        );
+
+        // Gastar la nota v2 hacia una dirección clásica: pago y vuelto, v1.
+        let tx2_hash = manager.send_private_transaction("bob", carol, 10).unwrap();
+        let tx2 = manager.get_private_transaction(&tx2_hash).unwrap();
+        assert!(tx2
+            .outputs
+            .iter()
+            .all(|salida| salida.output_version == PRIVATE_OUTPUT_VERSION_CLASSIC));
+        let perfil = private_proof_profile_spec_for_tx(&tx2).unwrap();
+        PrivateWalletManager::new()
+            .validate_inbound_private_transaction_with_profile(&tx2, perfil, false)
+            .expect("gastar una nota v2 da una transacción v1 válida");
+        assert_eq!(
+            manager
+                .decrypt_private_amount_for_wallet("carol", &tx2)
+                .unwrap(),
+            10
+        );
+        assert_eq!(manager.get_private_balance("bob"), Some(20));
+    }
+
+    // La clave de vista sola, sin la de gasto, reconoce un pago a la zkq1 de
+    // la wallet y lee el monto; otra clave de vista no lo ve.
+    #[cfg(feature = "pq-experimental")]
+    #[test]
+    fn la_clave_de_vista_reconoce_un_pago_a_zkq1() {
+        let mut manager = PrivateWalletManager::new();
+        let alice_address = manager.create_private_wallet("alice").unwrap();
+        let bob_address = manager.create_private_wallet("bob").unwrap();
+        let bob_scan_key = manager.get_private_wallet("bob").unwrap().scan_key.clone();
+        let bob_zkq1 = manager
+            .get_private_wallet("bob")
+            .unwrap()
+            .hybrid_payment_address()
+            .unwrap();
+        let alice_scan_key = manager
+            .get_private_wallet("alice")
+            .unwrap()
+            .scan_key
+            .clone();
+        manager.deposit_to_private_wallet("alice", 100).unwrap();
+
+        let tx_hash = manager
+            .send_private_transaction("alice", bob_zkq1, 40)
+            .unwrap();
+        let tx = manager.get_private_transaction(&tx_hash).unwrap();
+
+        let matches =
+            scan_private_transaction_with_view_key(&bob_scan_key, &bob_address, &tx).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].amount, 40);
+        assert!(!matches[0].is_change);
+
+        // El vuelto v2 de alice lo ve su propia clave de vista.
+        let vuelto =
+            scan_private_transaction_with_view_key(&alice_scan_key, &alice_address, &tx).unwrap();
+        assert_eq!(vuelto.len(), 1);
+        assert_eq!(vuelto[0].amount, 60);
+    }
+
+    // Una zkq1 mal escrita se rechaza antes de reservar nada; el coinbase no
+    // acepta zkq1 (sigue siendo v1); y una build sin pq-experimental lo dice.
+    #[test]
+    fn destinatarios_zkq1_invalidos_o_sin_soporte() {
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        manager.deposit_to_private_wallet("alice", 100).unwrap();
+        let mal_escrita = format!("{HYBRID_PAYMENT_ADDRESS_PREFIX}{}", "1".repeat(40));
+
+        assert!(is_hybrid_payment_address(&mal_escrita));
+        assert!(canonical_send_recipient(&mal_escrita).is_err());
+        assert!(manager
+            .send_private_transaction("alice", mal_escrita.clone(), 10)
+            .is_err());
+        assert_eq!(manager.get_private_balance("alice"), Some(100));
+        assert!(create_private_coinbase_output_for_recipient(12, 5, &mal_escrita, 65).is_err());
+
+        let propia = manager
+            .get_private_wallet("alice")
+            .unwrap()
+            .hybrid_payment_address();
+        #[cfg(feature = "pq-experimental")]
+        {
+            let propia = propia.unwrap();
+            assert!(create_private_coinbase_output_for_recipient(12, 5, &propia, 65).is_err());
+        }
+        #[cfg(not(feature = "pq-experimental"))]
+        {
+            assert!(propia.is_err());
+            let err = canonical_send_recipient(&mal_escrita).unwrap_err();
+            assert!(err.to_string().contains("pq-experimental"), "{err}");
         }
     }
 
