@@ -261,6 +261,77 @@ pub fn private_tx_v2_i1_active_at(
         && private_tx_canonical_bundle_required_at(height, canonical_bundle_activation_height)
 }
 
+/// Funciones post-cuanticas de Zoka Quantic que se prueban primero en Zenith.
+///
+/// Ninguna cambia el consenso de Zenith sin una altura de activacion fijada en
+/// los binarios. Hoy todas estan en `None` (tambien en la build `mobile`): la
+/// cadena valida exactamente como antes. La variable de entorno de cada una
+/// existe, como en las activaciones de arriba, para ensayar en redes locales;
+/// un nodo de la red publica que la use se separa de los demas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PqFeature {
+    /// Direcciones y salidas con encapsulado hibrido X-Wing (etapa 3).
+    HybridAddresses,
+    /// Gastos probados en un circuito, sin key images ni CLSAG (etapa 5).
+    SpendCircuitWithoutKeyImages,
+    /// Snapshots con firma Ed25519 + ML-DSA-65, las dos obligatorias (etapa 6).
+    HybridSnapshotSignatures,
+}
+
+pub const PQ_HYBRID_ADDRESSES_ACTIVATION_HEIGHT: Option<u64> = None;
+pub const PQ_SPEND_CIRCUIT_ACTIVATION_HEIGHT: Option<u64> = None;
+pub const PQ_HYBRID_SNAPSHOT_SIGNATURES_ACTIVATION_HEIGHT: Option<u64> = None;
+
+impl PqFeature {
+    pub const ALL: [PqFeature; 3] = [
+        PqFeature::HybridAddresses,
+        PqFeature::SpendCircuitWithoutKeyImages,
+        PqFeature::HybridSnapshotSignatures,
+    ];
+
+    /// Identificador estable para logs, diagnosticos y documentacion.
+    pub fn id(self) -> &'static str {
+        match self {
+            PqFeature::HybridAddresses => "pq-hybrid-addresses",
+            PqFeature::SpendCircuitWithoutKeyImages => "pq-spend-circuit",
+            PqFeature::HybridSnapshotSignatures => "pq-hybrid-snapshot-signatures",
+        }
+    }
+
+    pub fn activation_env_var(self) -> &'static str {
+        match self {
+            PqFeature::HybridAddresses => "ZOKA_PQ_HYBRID_ADDRESSES_ACTIVATION_HEIGHT",
+            PqFeature::SpendCircuitWithoutKeyImages => "ZOKA_PQ_SPEND_CIRCUIT_ACTIVATION_HEIGHT",
+            PqFeature::HybridSnapshotSignatures => {
+                "ZOKA_PQ_HYBRID_SNAPSHOT_SIGNATURES_ACTIVATION_HEIGHT"
+            }
+        }
+    }
+
+    pub fn compiled_activation_height(self) -> Option<u64> {
+        match self {
+            PqFeature::HybridAddresses => PQ_HYBRID_ADDRESSES_ACTIVATION_HEIGHT,
+            PqFeature::SpendCircuitWithoutKeyImages => PQ_SPEND_CIRCUIT_ACTIVATION_HEIGHT,
+            PqFeature::HybridSnapshotSignatures => PQ_HYBRID_SNAPSHOT_SIGNATURES_ACTIVATION_HEIGHT,
+        }
+    }
+}
+
+pub fn pq_feature_activation_height(feature: PqFeature) -> Option<u64> {
+    activation_height_from_env(
+        feature.activation_env_var(),
+        feature.compiled_activation_height(),
+    )
+}
+
+pub fn pq_feature_active(feature: PqFeature, height: u64) -> bool {
+    pq_feature_active_at(height, pq_feature_activation_height(feature))
+}
+
+pub fn pq_feature_active_at(height: u64, activation_height: Option<u64>) -> bool {
+    activation_height.is_some_and(|activation| height >= activation)
+}
+
 /// Minimum difficulty the per-block retarget can fall to. Keeps the chain
 /// viable even with a single low-end miner.
 pub const POW_MIN_DIFFICULTY_BITS: u32 = 12;
@@ -541,6 +612,41 @@ mod tests {
         assert_eq!(activation_height_from_env(VAR, Some(42)), None);
 
         std::env::remove_var(VAR);
+    }
+
+    // Incluir las primitivas post-cuanticas no puede cambiar Zenith: ninguna
+    // funcion tiene altura hasta que se acuerde y se fije en los binarios.
+    // Vale tambien para la build `mobile`, a diferencia de v2-i1.
+    #[test]
+    fn pq_features_stay_dormant_until_a_height_is_fixed() {
+        for feature in PqFeature::ALL {
+            assert_eq!(
+                feature.compiled_activation_height(),
+                None,
+                "{}",
+                feature.id()
+            );
+            if std::env::var_os(feature.activation_env_var()).is_none() {
+                assert!(!pq_feature_active(feature, 0), "{}", feature.id());
+                assert!(!pq_feature_active(feature, u64::MAX), "{}", feature.id());
+            }
+        }
+        assert!(!pq_feature_active_at(u64::MAX, None));
+        assert!(!pq_feature_active_at(9, Some(10)));
+        assert!(pq_feature_active_at(10, Some(10)));
+        assert!(pq_feature_active_at(11, Some(10)));
+    }
+
+    #[test]
+    fn pq_feature_ids_and_env_vars_are_unique() {
+        let ids: std::collections::BTreeSet<_> = PqFeature::ALL.iter().map(|f| f.id()).collect();
+        let vars: std::collections::BTreeSet<_> = PqFeature::ALL
+            .iter()
+            .map(|f| f.activation_env_var())
+            .collect();
+        assert_eq!(ids.len(), PqFeature::ALL.len());
+        assert_eq!(vars.len(), PqFeature::ALL.len());
+        assert!(vars.iter().all(|v| v.starts_with("ZOKA_PQ_")));
     }
 
     #[test]
