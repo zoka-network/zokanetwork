@@ -2,19 +2,26 @@
 
 This crate is research infrastructure for the next ZOKA protocol. It does not
 activate post-quantum privacy on Zenith, define addresses, migrate wallets or
-change consensus. It builds with its own manifest and is not yet a dependency
-of the root node.
+change consensus.
 
-Integration gate: the node lockfile pins iroh-base 1.0.0, which requires
-curve25519-dalek 5.0.0-rc.0; X-Wing requires 5.0.0 through x25519-dalek 3.
-Cargo cannot currently resolve both in that dependency graph. Upgrading the
-network dependencies and validating compatibility is separate required work;
-the isolated crate does not replace the node's working dependency graph.
+Node integration (2026-10-11): the root node depends on this crate as an
+optional dependency behind the `pq-experimental` feature, off by default, and
+re-exports it as `zoka::pq`. No consensus, wallet or address path uses it, and
+the mobile engine (`default-features = false`) does not compile it. The former
+gate was resolved by moving the node from iroh-base 1.0.2 to 1.0.3, which only
+widens its version range so curve25519-dalek resolves to the stable 5.0.0 that
+X-Wing needs through x25519-dalek 3. Between 5.0.0-rc.0 and 5.0.0 the only
+changes are trait implementations behind the `group`/`lizard` features and the
+AVX-512 cfg flag, none of them enabled in the node. The zeroize requirement is
+`^1.8.2`; the node resolves 1.9.0 because iroh-base requires it.
 
 Pinned RustCrypto implementations: ML-KEM 0.3.2 (ML-KEM-768), ML-DSA 0.1.1
 (ML-DSA-65), and X-Wing 0.1.1. They have not been independently audited for this
 project. The crate requires Rust 1.85 or later. Its own Cargo.lock is committed
-for standalone device builds; root builds use the root lockfile.
+for standalone device builds; root builds use the root lockfile. Both lockfiles
+resolve every package of this crate's dependency tree to the same version, so
+the standalone tests exercise exactly what the node links. Keep them aligned
+when either lockfile changes (compare `cargo tree -e normal` of both).
 
 ## API boundaries
 
@@ -45,6 +52,8 @@ cargo test --manifest-path crates/zoka-pq/Cargo.toml --locked
 cargo clippy --manifest-path crates/zoka-pq/Cargo.toml --locked --all-targets -- -D warnings
 cargo run --manifest-path crates/zoka-pq/Cargo.toml --locked --release --bin pq-bench -- --iterations 100
 ./scripts/check-pq-platforms.ps1 -RunAndroidBench -Iterations 100 -AndroidRuns 3
+# Inside the node build (root of the repository):
+cargo test --features pq-experimental --test pq_experimental
 ```
 
 Fixtures in `tests/vectors` are selected NIST ACVP and official X-Wing vectors.

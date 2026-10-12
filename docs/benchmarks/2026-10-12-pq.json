@@ -1,0 +1,516 @@
+{
+    "captured_at_utc":  "2026-10-12T03:06:55.2070582Z",
+    "completed_at_utc":  "2026-10-12T03:10:55.3454104Z",
+    "lock_sha256":  "1D7F3E8882943ED4107096F2CA4CCC056790D5DF622040824A4E494FCBE1985B",
+    "rustc":  "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-pc-windows-msvc\nrelease: 1.95.0\nLLVM version: 22.1.2",
+    "cargo_ndk":  "cargo-ndk 4.1.2",
+    "android_model":  "SM-A135M",
+    "android_api":  "34",
+    "android_abis":  "armeabi-v7a,armeabi",
+    "android_kernel":  "Linux localhost 4.19.198-28701120-abA135MUBSDDZB3 #1 SMP PREEMPT Sat Feb 14 01:34:56 KST 2026 armv8l Toybox",
+    "benchmark_android_sha256":  "215E7A93686A581458ACF8297D0E81574161DE471F825AC924E32386163201CD",
+    "android_tests":  "test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s",
+    "windows_cpu":  "Intel Core i5-6400 @ 2.70GHz, 4 cores",
+    "notes":  [
+                  "Repeticion del 12/10 con el Cargo.lock del crate alineado al del nodo (zeroize 1.9.0, curve25519-dalek 5.0.0, hybrid-array 0.4.13 y otros parches).",
+                  "Mismo script y parametros que la corrida del 11/10: 100 iteraciones, 5 de calentamiento, tres pasadas en el telefono."
+              ],
+    "results":  [
+                    {
+                        "source":  "benchmark-windows.json",
+                        "sha256":  "65F49CF441CFDA09D694159BC048CE0E92DB91231D1AEA6CFE9A1A71D425DEAE",
+                        "result":  {
+                                       "architecture":  "x86_64",
+                                       "iterations":  100,
+                                       "notes":  "Synthetic repeated inputs. Timings include returned-value drop/zeroization. ML-KEM decapsulation reuses an expanded key; X-Wing re-expands internally. Not a full wallet scan or memory benchmark.",
+                                       "operations":  [
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  59.5,
+                                                              "mean_us":  56.49,
+                                                              "median_us":  56.4,
+                                                              "min_us":  54.6,
+                                                              "operation":  "mlkem768_keygen_os_rng",
+                                                              "p95_us":  58.400000000000006
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  111.89999999999999,
+                                                              "mean_us":  52.482,
+                                                              "median_us":  51.0,
+                                                              "min_us":  50.800000000000004,
+                                                              "operation":  "mlkem768_expand_seed",
+                                                              "p95_us":  53.5
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  51.199999999999996,
+                                                              "mean_us":  50.58899999999995,
+                                                              "median_us":  50.599999999999994,
+                                                              "min_us":  50.4,
+                                                              "operation":  "mlkem768_encapsulate",
+                                                              "p95_us":  50.800000000000004
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  63.3,
+                                                              "mean_us":  62.751999999999946,
+                                                              "median_us":  62.7,
+                                                              "min_us":  62.5,
+                                                              "operation":  "mlkem768_decapsulate_expanded_key",
+                                                              "p95_us":  63.0
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  232.79999999999998,
+                                                              "mean_us":  91.30199999999999,
+                                                              "median_us":  89.4,
+                                                              "min_us":  89.1,
+                                                              "operation":  "xwing_import_seed_and_expand_public_key",
+                                                              "p95_us":  90.60000000000001
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  0.39999999999999997,
+                                                              "mean_us":  0.26900000000000046,
+                                                              "median_us":  0.3,
+                                                              "min_us":  0.19999999999999998,
+                                                              "operation":  "xwing_copy_cached_public_key",
+                                                              "p95_us":  0.3
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  242.0,
+                                                              "mean_us":  160.31200000000004,
+                                                              "median_us":  158.1,
+                                                              "min_us":  153.1,
+                                                              "operation":  "xwing_encapsulate",
+                                                              "p95_us":  159.70000000000002
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  388.40000000000003,
+                                                              "mean_us":  231.82100000000005,
+                                                              "median_us":  227.8,
+                                                              "min_us":  227.0,
+                                                              "operation":  "xwing_decapsulate_including_expansion",
+                                                              "p95_us":  243.0
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  575.2,
+                                                              "mean_us":  425.74799999999993,
+                                                              "median_us":  419.29999999999995,
+                                                              "min_us":  409.0,
+                                                              "operation":  "mldsa65_keygen_os_rng",
+                                                              "p95_us":  459.2
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  515.1,
+                                                              "mean_us":  423.211,
+                                                              "median_us":  419.2,
+                                                              "min_us":  410.09999999999997,
+                                                              "operation":  "mldsa65_expand_seed",
+                                                              "p95_us":  446.7
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  42165.3,
+                                                              "mean_us":  1172.013,
+                                                              "median_us":  706.1,
+                                                              "min_us":  702.9,
+                                                              "operation":  "mldsa65_sign_64_bytes",
+                                                              "p95_us":  812.8000000000001
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  99.9,
+                                                              "mean_us":  73.95400000000002,
+                                                              "median_us":  73.5,
+                                                              "min_us":  73.2,
+                                                              "operation":  "mldsa65_verify_64_bytes",
+                                                              "p95_us":  75.9
+                                                          }
+                                                      ],
+                                       "os":  "windows",
+                                       "profile":  "release",
+                                       "schema_version":  1,
+                                       "warmup_iterations":  5,
+                                       "xwing_profile":  "x-wing-draft06-rustcrypto-0.1.1-reject-noncontributory"
+                                   }
+                    },
+                    {
+                        "source":  "benchmark-android-armv7-1.json",
+                        "sha256":  "174A236DFF741CCE6BBD1D902F1457BD6F30841EC9A8D052C203177CCD1B7CFB",
+                        "result":  {
+                                       "architecture":  "arm",
+                                       "iterations":  100,
+                                       "notes":  "Synthetic repeated inputs. Timings include returned-value drop/zeroization. ML-KEM decapsulation reuses an expanded key; X-Wing re-expands internally. Not a full wallet scan or memory benchmark.",
+                                       "operations":  [
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  1124.692,
+                                                              "mean_us":  971.90613,
+                                                              "median_us":  963.9615,
+                                                              "min_us":  926.423,
+                                                              "operation":  "mlkem768_keygen_os_rng",
+                                                              "p95_us":  1032.384
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  1017.9620000000001,
+                                                              "mean_us":  950.6269499999995,
+                                                              "median_us":  937.7505,
+                                                              "min_us":  932.731,
+                                                              "operation":  "mlkem768_expand_seed",
+                                                              "p95_us":  1000.077
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  973.461,
+                                                              "mean_us":  909.73309,
+                                                              "median_us":  897.1155,
+                                                              "min_us":  894.116,
+                                                              "operation":  "mlkem768_encapsulate",
+                                                              "p95_us":  959.538
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  1232.269,
+                                                              "mean_us":  1117.1672899999994,
+                                                              "median_us":  1103.981,
+                                                              "min_us":  1097.731,
+                                                              "operation":  "mlkem768_decapsulate_expanded_key",
+                                                              "p95_us":  1171.116
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  1771.269,
+                                                              "mean_us":  1671.27541,
+                                                              "median_us":  1666.519,
+                                                              "min_us":  1639.5,
+                                                              "operation":  "xwing_import_seed_and_expand_public_key",
+                                                              "p95_us":  1739.384
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  3.1540000000000004,
+                                                              "mean_us":  2.5230799999999998,
+                                                              "median_us":  2.5,
+                                                              "min_us":  2.5,
+                                                              "operation":  "xwing_copy_cached_public_key",
+                                                              "p95_us":  2.539
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  2361.153,
+                                                              "mean_us":  2259.17267,
+                                                              "median_us":  2250.7690000000002,
+                                                              "min_us":  2214.577,
+                                                              "operation":  "xwing_encapsulate",
+                                                              "p95_us":  2320.423
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  3570.8469999999998,
+                                                              "mean_us":  3458.15036,
+                                                              "median_us":  3432.884,
+                                                              "min_us":  3384.5,
+                                                              "operation":  "xwing_decapsulate_including_expansion",
+                                                              "p95_us":  3541.654
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  4538.731,
+                                                              "mean_us":  4406.275420000002,
+                                                              "median_us":  4391.808,
+                                                              "min_us":  4334.615,
+                                                              "operation":  "mldsa65_keygen_os_rng",
+                                                              "p95_us":  4503.846
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  4551.231,
+                                                              "mean_us":  4398.86226,
+                                                              "median_us":  4377.635,
+                                                              "min_us":  4324.5,
+                                                              "operation":  "mldsa65_expand_seed",
+                                                              "p95_us":  4500.692
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  4231.538,
+                                                              "mean_us":  4118.3169,
+                                                              "median_us":  4095.2495,
+                                                              "min_us":  4050.576,
+                                                              "operation":  "mldsa65_sign_64_bytes",
+                                                              "p95_us":  4216.269
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  698.462,
+                                                              "mean_us":  622.4895699999998,
+                                                              "median_us":  612.0195,
+                                                              "min_us":  609.653,
+                                                              "operation":  "mldsa65_verify_64_bytes",
+                                                              "p95_us":  665.3470000000001
+                                                          }
+                                                      ],
+                                       "os":  "android",
+                                       "profile":  "release",
+                                       "schema_version":  1,
+                                       "warmup_iterations":  5,
+                                       "xwing_profile":  "x-wing-draft06-rustcrypto-0.1.1-reject-noncontributory"
+                                   }
+                    },
+                    {
+                        "source":  "benchmark-android-armv7-2.json",
+                        "sha256":  "02852DF0CBB5E78790FFEABBCD6D24697CA98EF25675C6A58E4456456A30FF03",
+                        "result":  {
+                                       "architecture":  "arm",
+                                       "iterations":  100,
+                                       "notes":  "Synthetic repeated inputs. Timings include returned-value drop/zeroization. ML-KEM decapsulation reuses an expanded key; X-Wing re-expands internally. Not a full wallet scan or memory benchmark.",
+                                       "operations":  [
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  1074.653,
+                                                              "mean_us":  975.1346299999998,
+                                                              "median_us":  967.942,
+                                                              "min_us":  926.0,
+                                                              "operation":  "mlkem768_keygen_os_rng",
+                                                              "p95_us":  1038.693
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  1132.615,
+                                                              "mean_us":  1011.0823600000002,
+                                                              "median_us":  988.5575,
+                                                              "min_us":  984.1540000000001,
+                                                              "operation":  "mlkem768_expand_seed",
+                                                              "p95_us":  1082.847
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  1062.423,
+                                                              "mean_us":  968.6745399999999,
+                                                              "median_us":  952.192,
+                                                              "min_us":  947.192,
+                                                              "operation":  "mlkem768_encapsulate",
+                                                              "p95_us":  1032.077
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  1484.346,
+                                                              "mean_us":  1182.0476200000003,
+                                                              "median_us":  1156.0575,
+                                                              "min_us":  1148.539,
+                                                              "operation":  "mlkem768_decapsulate_expanded_key",
+                                                              "p95_us":  1282.461
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  1835.269,
+                                                              "mean_us":  1665.9845899999998,
+                                                              "median_us":  1656.5385,
+                                                              "min_us":  1624.577,
+                                                              "operation":  "xwing_import_seed_and_expand_public_key",
+                                                              "p95_us":  1738.731
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  3.577,
+                                                              "mean_us":  2.5319100000000003,
+                                                              "median_us":  2.5,
+                                                              "min_us":  2.5,
+                                                              "operation":  "xwing_copy_cached_public_key",
+                                                              "p95_us":  2.539
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  2367.846,
+                                                              "mean_us":  2253.9195300000015,
+                                                              "median_us":  2240.1155,
+                                                              "min_us":  2202.0389999999998,
+                                                              "operation":  "xwing_encapsulate",
+                                                              "p95_us":  2330.462
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  3639.9610000000002,
+                                                              "mean_us":  3448.0346799999998,
+                                                              "median_us":  3448.1155,
+                                                              "min_us":  3360.0,
+                                                              "operation":  "xwing_decapsulate_including_expansion",
+                                                              "p95_us":  3541.846
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  4588.808,
+                                                              "mean_us":  4435.1465100000005,
+                                                              "median_us":  4437.5575,
+                                                              "min_us":  4325.5,
+                                                              "operation":  "mldsa65_keygen_os_rng",
+                                                              "p95_us":  4549.077
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  4614.846,
+                                                              "mean_us":  4426.50191,
+                                                              "median_us":  4412.365,
+                                                              "min_us":  4317.192,
+                                                              "operation":  "mldsa65_expand_seed",
+                                                              "p95_us":  4556.692
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  4293.039000000001,
+                                                              "mean_us":  4153.5585200000005,
+                                                              "median_us":  4153.6535,
+                                                              "min_us":  4063.8460000000005,
+                                                              "operation":  "mldsa65_sign_64_bytes",
+                                                              "p95_us":  4263.3460000000005
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  704.385,
+                                                              "mean_us":  625.00499,
+                                                              "median_us":  611.3075,
+                                                              "min_us":  609.808,
+                                                              "operation":  "mldsa65_verify_64_bytes",
+                                                              "p95_us":  682.346
+                                                          }
+                                                      ],
+                                       "os":  "android",
+                                       "profile":  "release",
+                                       "schema_version":  1,
+                                       "warmup_iterations":  5,
+                                       "xwing_profile":  "x-wing-draft06-rustcrypto-0.1.1-reject-noncontributory"
+                                   }
+                    },
+                    {
+                        "source":  "benchmark-android-armv7-3.json",
+                        "sha256":  "A75A43725CCFB2C7C68B810AF3BD4DB9F047A4D882DA0B53B13AD8191CCD2EFD",
+                        "result":  {
+                                       "architecture":  "arm",
+                                       "iterations":  100,
+                                       "notes":  "Synthetic repeated inputs. Timings include returned-value drop/zeroization. ML-KEM decapsulation reuses an expanded key; X-Wing re-expands internally. Not a full wallet scan or memory benchmark.",
+                                       "operations":  [
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  1150.346,
+                                                              "mean_us":  980.8484300000002,
+                                                              "median_us":  966.3655,
+                                                              "min_us":  925.884,
+                                                              "operation":  "mlkem768_keygen_os_rng",
+                                                              "p95_us":  1044.616
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  1119.192,
+                                                              "mean_us":  982.8046200000003,
+                                                              "median_us":  964.3655,
+                                                              "min_us":  959.231,
+                                                              "operation":  "mlkem768_expand_seed",
+                                                              "p95_us":  1047.423
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  1021.0,
+                                                              "mean_us":  938.44343,
+                                                              "median_us":  921.846,
+                                                              "min_us":  918.385,
+                                                              "operation":  "mlkem768_encapsulate",
+                                                              "p95_us":  998.769
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  1303.846,
+                                                              "mean_us":  1158.9372900000003,
+                                                              "median_us":  1139.442,
+                                                              "min_us":  1124.0759999999998,
+                                                              "operation":  "mlkem768_decapsulate_expanded_key",
+                                                              "p95_us":  1236.7700000000002
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  1830.731,
+                                                              "mean_us":  1706.51266,
+                                                              "median_us":  1697.6535,
+                                                              "min_us":  1662.5,
+                                                              "operation":  "xwing_import_seed_and_expand_public_key",
+                                                              "p95_us":  1779.808
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  3.693,
+                                                              "mean_us":  2.5296000000000007,
+                                                              "median_us":  2.5,
+                                                              "min_us":  2.5,
+                                                              "operation":  "xwing_copy_cached_public_key",
+                                                              "p95_us":  2.539
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  2434.3849999999998,
+                                                              "mean_us":  2296.63465,
+                                                              "median_us":  2285.4615,
+                                                              "min_us":  2239.192,
+                                                              "operation":  "xwing_encapsulate",
+                                                              "p95_us":  2386.5
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  3800.0769999999998,
+                                                              "mean_us":  3534.779629999999,
+                                                              "median_us":  3527.0,
+                                                              "min_us":  3435.0,
+                                                              "operation":  "xwing_decapsulate_including_expansion",
+                                                              "p95_us":  3659.2690000000002
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  5288.308,
+                                                              "mean_us":  4494.518480000001,
+                                                              "median_us":  4446.8265,
+                                                              "min_us":  4323.539000000001,
+                                                              "operation":  "mldsa65_keygen_os_rng",
+                                                              "p95_us":  5009.616
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  4584.308,
+                                                              "mean_us":  4423.463429999998,
+                                                              "median_us":  4411.269,
+                                                              "min_us":  4319.231,
+                                                              "operation":  "mldsa65_expand_seed",
+                                                              "p95_us":  4558.9619999999995
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  1784.846,
+                                                              "mean_us":  1656.8400700000004,
+                                                              "median_us":  1648.0005,
+                                                              "min_us":  1603.231,
+                                                              "operation":  "mldsa65_sign_64_bytes",
+                                                              "p95_us":  1736.808
+                                                          },
+                                                          {
+                                                              "iterations":  100,
+                                                              "max_us":  714.269,
+                                                              "mean_us":  625.7276699999998,
+                                                              "median_us":  611.423,
+                                                              "min_us":  609.654,
+                                                              "operation":  "mldsa65_verify_64_bytes",
+                                                              "p95_us":  682.615
+                                                          }
+                                                      ],
+                                       "os":  "android",
+                                       "profile":  "release",
+                                       "schema_version":  1,
+                                       "warmup_iterations":  5,
+                                       "xwing_profile":  "x-wing-draft06-rustcrypto-0.1.1-reject-noncontributory"
+                                   }
+                    }
+                ]
+}

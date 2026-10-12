@@ -185,16 +185,20 @@ Linux no se ejecutó; Android ARM64 se enlazó pero no se ejecutó. En el teléf
 ML-KEM desencapsula en ~1,11 ms y X-Wing en ~3,41–3,52 ms (medianas). Falta el
 escáner completo para cerrar D1/D2. Clippy y formato correctos.
 
-La dependencia directa desde el nodo se ensayó y se retiró: el lock actual de
-iroh-base 1.0.0 exige curve25519-dalek 5.0.0-rc.0, incompatible en Cargo con la
-versión estable que exige X-Wing. La futura integración necesita actualizar y
-probar las dependencias de red. El crate aislado no cambia el consenso ni el
-formato de direcciones/bloques de Zenith. No hubo cambio de wallet ni activación.
+**Integrada al nodo (11/10, rama `postcuantica-integracion-nodo`):** el choque
+de versiones se resolvió subiendo `iroh-base` de 1.0.2 a 1.0.3, que solo acepta
+las versiones estables de la curva; `curve25519-dalek` pasa de 5.0.0-rc.0 a
+5.0.0 sin cambios activos en el nodo (diff de fuentes revisado). El crate entra
+como dependencia opcional detrás de `pq-experimental`, apagada por defecto, y no
+cambia el consenso ni el formato de direcciones/bloques de Zenith. No hubo cambio
+de wallet ni activación. Resultados por plataforma en
+`docs/RESULTADOS-postcuantica-etapa1.md#integración-al-nodo`.
 
 1.1 Base experimental fijada: `ml-kem` 0.3.2, `ml-dsa` 0.1.1 y `x-wing` 0.1.1 de
     RustCrypto, con lockfile independiente y vectores de procedencia registrada.
     No tienen auditoría conocida. Se usa el combinador de la implementación
-    especificada; no se introdujo uno propio. La integración al nodo sigue pendiente.
+    especificada; no se introdujo uno propio. Integrada al nodo el 11/10 detrás
+    de `pq-experimental` (ver arriba).
 1.2 Que compile en los cinco destinos: Windows x86_64, Linux x86_64, **Linux aarch64**
     (para el VPS de Oracle), Android arm64-v8a y **armeabi-v7a** (el teléfono del usuario).
 1.3 **Medir en el teléfono de 32 bits** el desencapsulado ML-KEM: el escaneo prueba
