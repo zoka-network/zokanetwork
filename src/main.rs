@@ -10647,15 +10647,24 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         }
     }
     let private_wallet_manager = Arc::new(tokio::sync::RwLock::new(private_wallet_manager));
-    let team_store_path = PathBuf::from(network.local_dir())
-        .join("team_mining")
-        .join("team.json");
-    let team_store = zoka::team_mining::TeamStore::load(&team_store_path)
-        .map_err(|error| format!("failed to open team-mining store: {error}"))?;
-    let team_mining_runtime = Arc::new(
-        zoka::team_mining::TeamMiningRuntime::new(team_store, wallet_address.clone())
-            .map_err(|error| format!("failed to initialize team-mining runtime: {error}"))?,
-    );
+    // Sin wallet (--sync-only) el runtime solo observa y trabaja con un almacen
+    // en memoria: el team.json pertenece a la sesion de la wallet y este modo
+    // no la abre. Con la direccion vacia `new` fallaba y el nodo no arrancaba.
+    let team_mining_runtime = if sync_only {
+        Arc::new(zoka::team_mining::TeamMiningRuntime::without_local_member(
+            zoka::team_mining::TeamStore::memory(),
+        ))
+    } else {
+        let team_store_path = PathBuf::from(network.local_dir())
+            .join("team_mining")
+            .join("team.json");
+        let team_store = zoka::team_mining::TeamStore::load(&team_store_path)
+            .map_err(|error| format!("failed to open team-mining store: {error}"))?;
+        Arc::new(
+            zoka::team_mining::TeamMiningRuntime::new(team_store, wallet_address.clone())
+                .map_err(|error| format!("failed to initialize team-mining runtime: {error}"))?,
+        )
+    };
 
     // Receiver half of the API → fullnode-main-loop channel; populated
     // only when the HTTP API is spun up (i.e. `--db` path present).

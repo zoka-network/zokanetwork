@@ -723,6 +723,8 @@ pub enum TeamError {
     InvalidTemplate,
     #[error("invalid team member address")]
     InvalidAddress,
+    #[error("team mining needs an open wallet")]
+    NoLocalWallet,
     #[error("message belongs to another team")]
     WrongTeam,
     #[error("team invite has not been observed from an online coordinator")]
@@ -825,7 +827,30 @@ impl TeamMiningRuntime {
                 return Err(TeamError::UnknownMember);
             }
         }
-        Ok(Self {
+        Ok(Self::build(store, local_address))
+    }
+
+    /// Runtime para un nodo sin wallet abierta (`fullnode --sync-only`): sigue
+    /// los mensajes de la red pero no puede actuar como miembro. Crear, unirse,
+    /// salir, disolver o enviar shares responde `NoLocalWallet`.
+    ///
+    /// Antes ese modo armaba el runtime con la direccion vacia, `new` la
+    /// rechazaba y el nodo no arrancaba: ZSilent no bajaba bloques antes del
+    /// login.
+    pub fn without_local_member(store: TeamStore) -> Self {
+        Self::build(store, String::new())
+    }
+
+    fn require_local_member(&self) -> Result<(), TeamError> {
+        if self.local_address.is_empty() {
+            Err(TeamError::NoLocalWallet)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn build(store: TeamStore, local_address: String) -> Self {
+        Self {
             store: Arc::new(Mutex::new(store)),
             local_address,
             observed: Mutex::new(HashMap::new()),
@@ -838,7 +863,7 @@ impl TeamMiningRuntime {
             pending_join_team: Mutex::new(None),
             join_status: Mutex::new("not_joined".to_string()),
             last_broadcast_at: Mutex::new(0),
-        })
+        }
     }
 
     pub async fn queue_message(&self, message: crate::network::message::ZokaMessage) {
@@ -850,6 +875,7 @@ impl TeamMiningRuntime {
     }
 
     pub async fn create_team(&self, now: u64) -> Result<TeamState, TeamError> {
+        self.require_local_member()?;
         let state = TeamState::create(self.local_address.clone(), now)?;
         self.store.lock().await.replace(state.clone())?;
         *self.pending_join_team.lock().await = None;
@@ -904,6 +930,7 @@ impl TeamMiningRuntime {
     }
 
     pub async fn request_join(&self, invite_code: &str, now: u64) -> Result<(), TeamError> {
+        self.require_local_member()?;
         let normalized = invite_code.trim().to_ascii_uppercase();
         let team_id = parse_invite_code(&normalized).ok_or(TeamError::InvalidTeam)?;
         let observed = self
@@ -936,6 +963,7 @@ impl TeamMiningRuntime {
     }
 
     pub async fn request_leave(&self, now: u64) -> Result<(), TeamError> {
+        self.require_local_member()?;
         let state = self
             .store
             .lock()
@@ -984,6 +1012,7 @@ impl TeamMiningRuntime {
     /// promueven al backup o quedan sin plantilla, que es el mismo camino que
     /// si el coordinador se apagara.
     pub async fn disband(&self) -> Result<(), TeamError> {
+        self.require_local_member()?;
         let state = self
             .store
             .lock()
@@ -1143,6 +1172,7 @@ impl TeamMiningRuntime {
         share: SubmittedShare,
         now: u64,
     ) -> Result<ValidatedShare, TeamError> {
+        self.require_local_member()?;
         let is_coordinator = self
             .store
             .lock()
@@ -1946,6 +1976,40 @@ mod tests {
             state.last_hijacked_recipient.as_deref(),
             Some(carol.as_str())
         );
+    }
+
+    // `fullnode --sync-only` no abre wallet. Su runtime tiene que poder crearse
+    // sin direccion (antes el nodo no arrancaba) y no puede actuar en nombre de
+    // nadie: ni crear equipos, ni unirse, ni salir, ni disolver, ni mandar shares.
+    #[tokio::test]
+    async fn runtime_without_wallet_starts_but_cannot_act_as_a_member() {
+        assert_eq!(
+            TeamMiningRuntime::new(TeamStore::memory(), String::new()).err(),
+            Some(TeamError::InvalidAddress)
+        );
+        let observer = TeamMiningRuntime::without_local_member(TeamStore::memory());
+
+        assert_eq!(
+            observer.create_team(100).await.err(),
+            Some(TeamError::NoLocalWallet)
+        );
+        assert_eq!(
+            observer.request_join("ZOKA-TEAM-ANY", 100).await.err(),
+            Some(TeamError::NoLocalWallet)
+        );
+        assert_eq!(
+            observer.request_leave(100).await.err(),
+            Some(TeamError::NoLocalWallet)
+        );
+        assert_eq!(
+            observer.disband().await.err(),
+            Some(TeamError::NoLocalWallet)
+        );
+        assert!(observer.drain_outbound_messages().await.is_empty());
+        assert!(observer.store.lock().await.state().is_none());
+        let status = observer.status().await;
+        assert!(status.team.is_none());
+        assert!(status.local_address.is_empty());
     }
 
     #[tokio::test]
