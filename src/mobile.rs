@@ -7,7 +7,8 @@
 //! cross the network.
 
 use crate::private_wallet::{
-    PrivateTransaction, PrivateWalletManager, PRIVATE_PROOF_PROFILE_V1, PRIVATE_PROOF_VERSION_V1,
+    canonical_send_recipient, is_hybrid_payment_address, PrivateTransaction, PrivateWalletManager,
+    PRIVATE_PROOF_PROFILE_V1, PRIVATE_PROOF_VERSION_V1,
 };
 use crate::types::PrivateCoinbaseOutput;
 use crate::zk::groth16_backend::{
@@ -16,7 +17,7 @@ use crate::zk::groth16_backend::{
 };
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const MOBILE_WALLET_NAME: &str = "mobile-self-custody";
 
@@ -146,6 +147,144 @@ fn zpriv_from_zka1(address: &str) -> Result<String, String> {
     ))
 }
 
+/// Destinatario de un envío desde el teléfono: una `zka1` como siempre, o una
+/// v2 `zkq1` solo si la red ya fijó la activación de las salidas v2 (antes la
+/// red rechazaría la transacción).
+fn mobile_recipient(address: &str) -> Result<String, String> {
+    let address = address.trim();
+    if !is_hybrid_payment_address(address) {
+        return zpriv_from_zka1(address);
+    }
+    if crate::economics::pq_hybrid_outputs_activation_height().is_none() {
+        return Err(
+            "zkq1 hybrid addresses are not active on this network yet; use the recipient's zka1 address"
+                .to_string(),
+        );
+    }
+    canonical_send_recipient(address).map_err(|e| e.to_string())
+}
+
+fn decode_seed_hex(seed_hex: &str) -> Result<Zeroizing<Vec<u8>>, String> {
+    hex::decode(seed_hex.trim().trim_start_matches("0x"))
+        .map(Zeroizing::new)
+        .map_err(|_| "seed_hex must be hexadecimal".to_string())
+}
+
+/// Lo que la app necesita para la dirección v2 de su wallet.
+#[derive(Debug, Clone, Serialize)]
+pub struct MobileHybridWalletInfo {
+    /// La build trae X-Wing (`pq-experimental`).
+    pub supported: bool,
+    /// Altura desde la que la red acepta salidas v2; `None` = no activada.
+    /// La app muestra la `zkq1` solo cuando hay altura.
+    pub activation_height: Option<u64>,
+    /// Dirección `zkq1` de la wallet (solo si la build la soporta).
+    pub hybrid_address: Option<String>,
+}
+
+pub fn hybrid_wallet_info_json(seed_hex: &str) -> Result<String, String> {
+    let seed = decode_seed_hex(seed_hex)?;
+    let info = MobileHybridWalletInfo {
+        supported: cfg!(feature = "pq-experimental"),
+        activation_height: crate::economics::pq_hybrid_outputs_activation_height(),
+        hybrid_address: hybrid_address_for_seed(&seed)?,
+    };
+    serde_json::to_string(&info).map_err(|e| format!("failed to encode hybrid wallet info: {e}"))
+}
+
+#[cfg(feature = "pq-experimental")]
+fn hybrid_address_for_seed(seed: &[u8]) -> Result<Option<String>, String> {
+    crate::private_wallet::hybrid::HybridWalletKeys::from_root_seed(seed)
+        .map(|keys| Some(keys.address().encode()))
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "pq-experimental"))]
+fn hybrid_address_for_seed(_seed: &[u8]) -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+/// Tope de salidas por llamada: el escaneo v2 cuesta unos 4 ms por salida en
+/// el teléfono de 32 bits, así que un lote acotado no traba la app.
+pub const MOBILE_HYBRID_SCAN_MAX_OUTPUTS: usize = 512;
+
+/// Salidas v2 que la app le pasa al motor para saber cuáles son suyas.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MobileHybridScanRequest {
+    pub seed_hex: String,
+    pub outputs: Vec<MobileHybridScanOutput>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(not(feature = "pq-experimental"), allow(dead_code))]
+pub struct MobileHybridScanOutput {
+    pub kem_ciphertext: Vec<u8>,
+    pub commitment: String,
+    pub one_time_public_key: String,
+    pub encrypted_amount: Vec<u8>,
+    /// El `nullifier` de la transacción: es el dominio del cifrado del monto.
+    pub nullifier_domain: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MobileHybridScanResponse {
+    pub supported: bool,
+    /// En el mismo orden que `outputs`: el monto (en átomos) de cada salida
+    /// que es de la wallet, `None` para las ajenas.
+    pub amounts: Vec<Option<u64>>,
+}
+
+/// Reconoce y descifra salidas v2 con X-Wing. El costo es el mismo para
+/// salidas propias y ajenas: el tiempo no revela cuáles son de la wallet.
+pub fn scan_hybrid_outputs_json(request_json: &str) -> Result<String, String> {
+    let mut request: MobileHybridScanRequest = serde_json::from_str(request_json)
+        .map_err(|e| format!("invalid hybrid scan request: {e}"))?;
+    if request.outputs.len() > MOBILE_HYBRID_SCAN_MAX_OUTPUTS {
+        return Err(format!(
+            "too many outputs in one hybrid scan: {} (max {MOBILE_HYBRID_SCAN_MAX_OUTPUTS})",
+            request.outputs.len()
+        ));
+    }
+    let seed = decode_seed_hex(&request.seed_hex);
+    request.seed_hex.zeroize();
+    let seed = seed?;
+    let response = MobileHybridScanResponse {
+        supported: cfg!(feature = "pq-experimental"),
+        amounts: scan_hybrid_outputs(&seed, &request.outputs)?,
+    };
+    serde_json::to_string(&response).map_err(|e| format!("failed to encode hybrid scan: {e}"))
+}
+
+#[cfg(feature = "pq-experimental")]
+fn scan_hybrid_outputs(
+    seed: &[u8],
+    outputs: &[MobileHybridScanOutput],
+) -> Result<Vec<Option<u64>>, String> {
+    let keys = crate::private_wallet::hybrid::HybridWalletKeys::from_root_seed(seed)
+        .map_err(|e| e.to_string())?;
+    Ok(outputs
+        .iter()
+        .map(|output| {
+            crate::private_wallet::hybrid_output_amount(
+                &keys,
+                &output.kem_ciphertext,
+                &output.commitment,
+                &output.one_time_public_key,
+                &output.encrypted_amount,
+                &output.nullifier_domain,
+            )
+        })
+        .collect())
+}
+
+#[cfg(not(feature = "pq-experimental"))]
+fn scan_hybrid_outputs(
+    _seed: &[u8],
+    outputs: &[MobileHybridScanOutput],
+) -> Result<Vec<Option<u64>>, String> {
+    Ok(vec![None; outputs.len()])
+}
+
 pub fn build_private_transfer(
     mut request: MobilePrivateTxBuildRequest,
 ) -> Result<MobilePrivateTxBuildResponse, String> {
@@ -164,7 +303,7 @@ pub fn build_private_transfer(
     let seed = hex::decode(seed_hex.trim_start_matches("0x"));
     seed_hex.zeroize();
     let seed = seed.map_err(|_| "seed_hex must be hexadecimal".to_string())?;
-    let to_commitment = zpriv_from_zka1(&request.to)?;
+    let to_commitment = mobile_recipient(&request.to)?;
     std::env::set_var(TRUSTED_SETUP_ENV, request.trusted_setup_dir);
     metrics.validation_ms = elapsed_ms(validation_started);
 
@@ -416,6 +555,117 @@ mod tests {
 
         assert_eq!(request.private_proof_version, PRIVATE_PROOF_VERSION_V1);
         assert_eq!(request.private_proof_profile, PRIVATE_PROOF_PROFILE_V1);
+    }
+
+    #[test]
+    fn hybrid_wallet_info_reports_support_and_dormant_activation() {
+        let info: serde_json::Value =
+            serde_json::from_str(&hybrid_wallet_info_json(&"07".repeat(32)).unwrap()).unwrap();
+        assert_eq!(info["supported"], cfg!(feature = "pq-experimental"));
+        if crate::economics::pq_hybrid_outputs_activation_height().is_none() {
+            assert!(info["activation_height"].is_null());
+        }
+        #[cfg(feature = "pq-experimental")]
+        {
+            let expected =
+                crate::private_wallet::hybrid::HybridWalletKeys::from_root_seed(&[7u8; 32])
+                    .unwrap()
+                    .address()
+                    .encode();
+            assert_eq!(info["hybrid_address"], expected);
+        }
+        #[cfg(not(feature = "pq-experimental"))]
+        assert!(info["hybrid_address"].is_null());
+        assert!(hybrid_wallet_info_json("zz").is_err());
+    }
+
+    // La zka1 sigue igual; una zkq1 se rechaza con un mensaje claro mientras
+    // la red no fije la activación.
+    #[test]
+    fn mobile_recipient_gates_zkq1_on_activation() {
+        let zka1 = zka1_address(&[3u8; 64]);
+        assert_eq!(
+            mobile_recipient(&format!(" {zka1} ")).unwrap(),
+            zpriv_from_zka1(&zka1).unwrap()
+        );
+        if crate::economics::pq_hybrid_outputs_activation_height().is_none() {
+            let err = mobile_recipient("zkq1abc").unwrap_err();
+            assert!(err.contains("not active") && err.contains("zka1"), "{err}");
+        }
+    }
+
+    #[test]
+    fn hybrid_scan_rejects_oversized_batches() {
+        let output = serde_json::json!({
+            "kem_ciphertext": [],
+            "commitment": "",
+            "one_time_public_key": "",
+            "encrypted_amount": [],
+            "nullifier_domain": "",
+        });
+        let request = serde_json::json!({
+            "seed_hex": "07".repeat(32),
+            "outputs": vec![output; MOBILE_HYBRID_SCAN_MAX_OUTPUTS + 1],
+        })
+        .to_string();
+        assert!(scan_hybrid_outputs_json(&request).is_err());
+    }
+
+    // De punta a punta sin red: le pagan a la zkq1 del teléfono y el motor
+    // reconoce esa salida y su monto; el vuelto ajeno y otra semilla, nada.
+    #[cfg(feature = "pq-experimental")]
+    #[test]
+    fn hybrid_scan_finds_the_wallet_output_and_its_amount() {
+        let seed = [9u8; 32];
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        manager
+            .restore_private_wallet_from_recovery_seed("phone", seed.to_vec())
+            .unwrap();
+        manager.deposit_to_private_wallet("alice", 100).unwrap();
+        let zkq1 = manager
+            .get_private_wallet("phone")
+            .unwrap()
+            .hybrid_payment_address()
+            .unwrap();
+        let info: serde_json::Value =
+            serde_json::from_str(&hybrid_wallet_info_json(&hex::encode(seed)).unwrap()).unwrap();
+        assert_eq!(info["hybrid_address"], zkq1.as_str());
+
+        let hash = manager.send_private_transaction("alice", zkq1, 30).unwrap();
+        let tx = manager.get_private_transaction(&hash).unwrap();
+        let outputs = tx
+            .outputs
+            .iter()
+            .map(|output| {
+                serde_json::json!({
+                    "kem_ciphertext": output.kem_ciphertext,
+                    "commitment": output.commitment,
+                    "one_time_public_key": output.one_time_public_key,
+                    "encrypted_amount": output.encrypted_amount,
+                    "nullifier_domain": tx.nullifier,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let scan = |seed: [u8; 32]| -> Vec<serde_json::Value> {
+            let request = serde_json::json!({
+                "seed_hex": hex::encode(seed),
+                "outputs": outputs,
+            })
+            .to_string();
+            let response: serde_json::Value =
+                serde_json::from_str(&scan_hybrid_outputs_json(&request).unwrap()).unwrap();
+            assert_eq!(response["supported"], true);
+            response["amounts"].as_array().unwrap().clone()
+        };
+        let mine = scan(seed);
+        assert_eq!(
+            mine.iter().filter_map(|a| a.as_u64()).collect::<Vec<_>>(),
+            vec![30]
+        );
+        assert_eq!(mine.iter().filter(|a| a.is_null()).count(), 1);
+        assert!(scan([8u8; 32]).iter().all(|a| a.is_null()));
     }
 
     #[test]

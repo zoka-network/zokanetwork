@@ -3645,6 +3645,35 @@ fn hybrid_view_scan_amount_blind(
     None
 }
 
+/// Monto de una salida v2 si es de la wallet de `keys`; `None` si no lo es o
+/// si algo no cierra. Para clientes que escanean la cadena por su cuenta (el
+/// móvil): reconoce con X-Wing, descifra el monto con el dominio de la
+/// transacción (`tx.nullifier`) y lo comprueba contra el compromiso, igual
+/// que `decrypt_private_output_for_wallet`.
+#[cfg(feature = "pq-experimental")]
+pub fn hybrid_output_amount(
+    keys: &hybrid::HybridWalletKeys,
+    kem_ciphertext: &[u8],
+    commitment: &str,
+    one_time_public_key: &str,
+    encrypted_amount: &[u8],
+    nullifier_domain: &str,
+) -> Option<u64> {
+    let owned = keys.scan(kem_ciphertext, commitment, one_time_public_key)?;
+    if encrypted_amount.len() != PRIVATE_NOTE_PAYLOAD_V2_LEN {
+        return None;
+    }
+    let (amount, commitment_blind) = decrypt_private_note_payload_v2(
+        encrypted_amount,
+        owned.amount_blind,
+        commitment,
+        nullifier_domain,
+    )
+    .ok()?;
+    let expected = Commitment::new_blinded(&amount.to_le_bytes(), &commitment_blind);
+    constant_time_eq_str(&expected.to_hex(), commitment).then_some(amount)
+}
+
 pub fn scan_private_transaction_with_view_key(
     scan_key: &[u8],
     payment_address: &str,
