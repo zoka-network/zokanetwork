@@ -2620,6 +2620,22 @@ async fn auth_and_rate_limit(
     Ok(response)
 }
 
+// `network` conserva la etiqueta interna ("mainnet" para Zenith), que es lo
+// que leen los clientes existentes. Estos dos campos dicen lo que la red es hoy.
+fn network_role_of(startup: &StartupStatusSnapshot) -> Option<&'static str> {
+    startup
+        .chain_id
+        .as_deref()
+        .and_then(crate::economics::network_role_for_chain)
+}
+
+fn network_name_of(startup: &StartupStatusSnapshot) -> Option<&'static str> {
+    startup
+        .chain_id
+        .as_deref()
+        .and_then(crate::economics::network_display_name_for_chain)
+}
+
 /// Health check endpoint
 async fn health(State(app_state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let startup = global_startup_status().snapshot();
@@ -2632,6 +2648,8 @@ async fn health(State(app_state): State<Arc<AppState>>) -> Json<serde_json::Valu
         "phase": startup.phase,
         "detail": startup.detail,
         "network": startup.network,
+        "network_role": network_role_of(&startup),
+        "network_name": network_name_of(&startup),
         "chain_id": startup.chain_id,
         "height": height,
         "peers": runtime.connected_peers,
@@ -2658,6 +2676,8 @@ async fn ready() -> (StatusCode, Json<serde_json::Value>) {
             "phase": startup.phase,
             "detail": startup.detail,
             "network": startup.network,
+            "network_role": network_role_of(&startup),
+            "network_name": network_name_of(&startup),
             "chain_id": startup.chain_id,
             "updated_at": startup.updated_at,
             "version": startup.version,

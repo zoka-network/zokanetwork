@@ -48,34 +48,41 @@ fn print_usage() {
             ANSI_DIM
         )
     );
+    println!(
+        "  {}",
+        paint(
+            "Network: Zenith testnet (chain zoka-mainnet-zenith-v1). Zenith ZKA are test coins; `--network mainnet` is still accepted as Zenith's former name.",
+            ANSI_DIM
+        )
+    );
     println!("{}", dashboard_divider());
     println!("{}", dashboard_section("Everyday commands", ANSI_GREEN));
     println!(
-        "  zoka create <label> --network mainnet|testnet --password <pwd>|--password-env <var>|--password-stdin [--seed-words 12|24]"
+        "  zoka create <label> --network testnet --password <pwd>|--password-env <var>|--password-stdin [--seed-words 12|24]"
     );
     println!(
-        "  zoka restore \"<recovery phrase>\" --network mainnet|testnet --password <pwd>|--password-env <var>|--password-stdin [--name <label>]"
+        "  zoka restore \"<recovery phrase>\" --network testnet --password <pwd>|--password-env <var>|--password-stdin [--name <label>]"
     );
-    println!("  zoka wallets [--network mainnet|testnet] [--password <pwd>]");
-    println!("  zoka balance <wallet-address> [--network mainnet|testnet] [--password <pwd>]");
-    println!("  zoka receive <wallet-address> [--network mainnet|testnet] [--password <pwd>]");
+    println!("  zoka wallets [--network testnet] [--password <pwd>]");
+    println!("  zoka balance <wallet-address> [--network testnet] [--password <pwd>]");
+    println!("  zoka receive <wallet-address> [--network testnet] [--password <pwd>]");
     println!(
-        "  zoka send <from-zka1> <to-zka1> <amount> [--network mainnet|testnet] [--password <pwd>] --yes"
+        "  zoka send <from-zka1> <to-zka1> <amount> [--network testnet] [--password <pwd>] --yes"
     );
-    println!("  zoka pending [--network mainnet|testnet] [--db <path>]");
+    println!("  zoka pending [--network testnet] [--db <path>]");
     println!("  zoka backup <wallet-address> <path> [--password <pwd>]");
     println!(
         "  zoka restore-backup <path> [--name <label>] --password <pwd>|--password-env <var>|--password-stdin"
     );
     println!("  zoka wallet-generate-seed [--seed-words 12|24] [--json]");
     println!(
-        "  zoka mine <wallet-zka1> [--network mainnet|testnet] [--password <pwd>] [--db <path>] [--rpc <http-url>] [--network-config <file>] [--minutes <n>] [--blocks <n>] [--power low|normal|max] [--allow-unsynced-mining]"
+        "  zoka mine <wallet-zka1> [--network testnet] [--password <pwd>] [--db <path>] [--rpc <http-url>] [--network-config <file>] [--minutes <n>] [--blocks <n>] [--power low|normal|max] [--allow-unsynced-mining]"
     );
     println!(
-        "  zoka node [--network mainnet|testnet] [--password <pwd>|--password-env <var>|--password-stdin] [--seed <multiaddr> ...] [--power low|normal|max] [--tor-proxy host:port] [--tor-only] [--external-addr <multiaddr> ...]"
+        "  zoka node [--network testnet] [--password <pwd>|--password-env <var>|--password-stdin] [--seed <multiaddr> ...] [--power low|normal|max] [--tor-proxy host:port] [--tor-only] [--external-addr <multiaddr> ...]"
     );
     println!(
-        "  zoka node --sync-only [--network mainnet|testnet]  (descarga y valida bloques sin abrir ninguna wallet: no mina, no publica ofertas y no escanea tx privadas)"
+        "  zoka node --sync-only [--network testnet]  (descarga y valida bloques sin abrir ninguna wallet: no mina, no publica ofertas y no escanea tx privadas)"
     );
     println!("  zoka node-status [--db <path>] [--password <pwd>]");
     println!("  zoka status");
@@ -104,19 +111,19 @@ fn print_usage() {
   Whole blocks rotate by contributed work and are paid from the chain to each member's own address."
     );
     println!("{}", dashboard_section("Chain and operators", ANSI_YELLOW));
-    println!("  height [--network mainnet|testnet] [--db <path>] [--json]");
+    println!("  height [--network testnet] [--db <path>] [--json]");
     println!(
-        "  block-info --height <n> [--network mainnet|testnet] [--db <path>] [--json]  (miner address and reward for a specific block height)"
+        "  block-info --height <n> [--network testnet] [--db <path>] [--json]  (miner address and reward for a specific block height)"
     );
-    println!("  chain-stats [--network mainnet|testnet] [--db <path>] [--json]");
+    println!("  chain-stats [--network testnet] [--db <path>] [--json]");
     println!(
-        "  chain-economics-migrate [--network mainnet|testnet] [--db <path>] [--dry-run|--yes] [--repair-supply] [--json]"
-    );
-    println!(
-        "  private-pending-diagnostics [--network mainnet|testnet] [--db <path>] [--height <n>] [--limit <n>] [--json]"
+        "  chain-economics-migrate [--network testnet] [--db <path>] [--dry-run|--yes] [--repair-supply] [--json]"
     );
     println!(
-        "  rpc-list [--network mainnet|testnet] [--network-config <file>] [--json]  (lists configured read-only public RPC endpoints)"
+        "  private-pending-diagnostics [--network testnet] [--db <path>] [--height <n>] [--limit <n>] [--json]"
+    );
+    println!(
+        "  rpc-list [--network testnet] [--network-config <file>] [--json]  (lists configured read-only public RPC endpoints)"
     );
     println!(
         "  rpc-status [--rpc <http-url>] [--network-config <file>] [--json]  (read-only RPC health + height)"
@@ -125,7 +132,7 @@ fn print_usage() {
         "  rpc-height [--rpc <http-url>] [--network-config <file>] [--json]  (read-only RPC chain height)"
     );
     println!(
-        "  rpc-sync [--network mainnet|testnet] [--network-config <file>] [--db <path>] [--limit <n>] [--json]  (bootstrap local chain from configured RPC)"
+        "  rpc-sync [--network testnet] [--network-config <file>] [--db <path>] [--limit <n>] [--json]  (bootstrap local chain from configured RPC)"
     );
     println!(
         "  rpc-mempool [--rpc <http-url>] [--network-config <file>] [--json]  (read-only RPC mempool size)"
@@ -439,7 +446,7 @@ impl MainnetNetworkConfig {
             return Err(format!(
                 "network config schema '{}' is not supported for {}",
                 self.schema,
-                network.label()
+                network.display_name()
             ));
         }
         if self.chain_id != network.chain_id() {
@@ -788,9 +795,10 @@ fn default_mainnet_network_config_path() -> PathBuf {
 }
 
 fn network_config_path_from_env(network: NetworkProfile) -> Option<PathBuf> {
+    // ZSilent exporta ZOKA_MAINNET_NETWORK_CONFIG para Zenith. La variable de
+    // la testnet retirada no se lee: apuntaria a un manifiesto de otra cadena.
     let network_specific = match network {
-        NetworkProfile::Mainnet => "ZOKA_MAINNET_NETWORK_CONFIG",
-        NetworkProfile::Testnet => "ZOKA_TESTNET_NETWORK_CONFIG",
+        NetworkProfile::Zenith => "ZOKA_MAINNET_NETWORK_CONFIG",
     };
     env_non_empty(network_specific)
         .or_else(|| env_non_empty("ZOKA_NETWORK_CONFIG"))
@@ -836,7 +844,7 @@ fn required_local_rpc_url(network: NetworkProfile) -> Result<String, String> {
     configured_local_rpc_url(network).ok_or_else(|| {
         format!(
             "local RPC is not configured for {}. Set ZOKA_LOCAL_RPC_URL, ZOKA_NODE_ENDPOINT, or desktop.local_rpc_url in the network manifest.",
-            network.label()
+            network.display_name()
         )
     })
 }
@@ -854,7 +862,7 @@ fn configured_api_bind_addr(args: &[String], network: NetworkProfile) -> Result<
     let rpc = configured_local_rpc_url_from_path(network, Some(&path)).ok_or_else(|| {
         format!(
             "API bind address is not configured for {}. Set ZOKA_API_BIND or desktop.local_rpc_url in '{}'.",
-            network.label(),
+            network.display_name(),
             path.display()
         )
     })?;
@@ -863,7 +871,7 @@ fn configured_api_bind_addr(args: &[String], network: NetworkProfile) -> Result<
 
 #[cfg(test)]
 fn parse_mainnet_network_config(raw: &str) -> Result<MainnetNetworkConfig, String> {
-    parse_network_config_for(raw, NetworkProfile::Mainnet)
+    parse_network_config_for(raw, NetworkProfile::Zenith)
 }
 
 fn parse_network_config_for(
@@ -877,7 +885,7 @@ fn parse_network_config_for(
 }
 
 fn load_mainnet_network_config(path: &Path) -> Result<MainnetNetworkConfig, String> {
-    load_network_config_for(path, NetworkProfile::Mainnet)
+    load_network_config_for(path, NetworkProfile::Zenith)
 }
 
 /// Network manifests are baked into the binary so a fresh `zoka.exe` works in
@@ -885,12 +893,10 @@ fn load_mainnet_network_config(path: &Path) -> Result<MainnetNetworkConfig, Stri
 /// loader still prefers a real file on disk if it exists (for operators
 /// pointing at a custom config) and falls back to the embedded copy otherwise.
 const EMBEDDED_MAINNET_NETWORK_CONFIG: &str = include_str!("../docs/mainnet-network.v1.json");
-const EMBEDDED_TESTNET_NETWORK_CONFIG: &str = include_str!("../docs/testnet-network.v1.json");
 
 fn embedded_network_config_for(network: NetworkProfile) -> &'static str {
     match network {
-        NetworkProfile::Mainnet => EMBEDDED_MAINNET_NETWORK_CONFIG,
-        NetworkProfile::Testnet => EMBEDDED_TESTNET_NETWORK_CONFIG,
+        NetworkProfile::Zenith => EMBEDDED_MAINNET_NETWORK_CONFIG,
     }
 }
 
@@ -1406,7 +1412,7 @@ fn interactive_transfer_menu() -> Result<bool, String> {
                         continue;
                     }
                 };
-                let storage = match wallet_storage_for_network(NetworkProfile::Mainnet) {
+                let storage = match wallet_storage_for_network(NetworkProfile::Zenith) {
                     Ok(value) => value,
                     Err(err) => {
                         eprintln!("{}", err);
@@ -1416,7 +1422,7 @@ fn interactive_transfer_menu() -> Result<bool, String> {
                 let manager = match load_private_wallet_manager_for_network(
                     &storage,
                     password.as_deref(),
-                    NetworkProfile::Mainnet,
+                    NetworkProfile::Zenith,
                 ) {
                     Ok(value) => value,
                     Err(err) => {
@@ -2323,32 +2329,50 @@ const COINBASE_MATURITY_BLOCKS: u64 = economics::COINBASE_MATURITY_BLOCKS;
 const LOCAL_PRIVATE_TXS_PER_BLOCK_LIMIT: usize = economics::PRIVATE_TX_HASHES_PER_BLOCK_LIMIT;
 const MINING_STALE_AFTER_SECS: u64 = 30;
 const DEFAULT_CHAIN_DB_PATH: &str = ".zoka/mainnet/blockchain.db";
-const DEFAULT_TESTNET_CHAIN_DB_PATH: &str = ".zoka/testnet/blockchain.db";
 
+/// Perfil de red local. Hay uno solo: Zenith (`zoka-mainnet-zenith-v1`), que
+/// desde octubre de 2026 es la testnet de Zoka Quantic.
+///
+/// Todo lo que identifica a Zenith en disco y en el protocolo queda igual: el
+/// chain id (de el sale el hash del genesis), `.zoka/mainnet`, el manifiesto y
+/// el genesis `mainnet`, el modo de mineria y la etiqueta interna "mainnet"
+/// que las bases guardan en `chain:genesis:network`. Mover los datos haria que
+/// un cliente viejo y uno nuevo vieran wallets distintas, y Zoka Quantic va a
+/// tener su propio perfil y sus propias rutas, que ningun cliente viejo conoce.
+///
+/// `zoka-testnet-v1` nunca funciono como red publica y quedo retirada: lo que
+/// haya en `.zoka/testnet` no se abre ni se toca.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NetworkProfile {
-    Mainnet,
-    Testnet,
+    Zenith,
 }
 
 impl NetworkProfile {
     fn from_args(args: &[String]) -> Result<Self, String> {
         let raw = option_value(args, "--network")
             .or_else(|| std::env::var("ZOKA_NETWORK").ok())
-            .unwrap_or_else(|| "mainnet".to_string());
-        match raw.to_ascii_lowercase().as_str() {
-            "mainnet" => Ok(Self::Mainnet),
-            "testnet" => Ok(Self::Testnet),
+            .unwrap_or_else(|| "testnet".to_string());
+        Self::from_name(&raw)
+    }
+
+    fn from_name(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            // "mainnet" es el nombre anterior de Zenith: lo siguen pasando
+            // ZSilent, los scripts de mineria y este mismo binario cuando se
+            // relanza a si mismo.
+            "testnet" | "zenith" | "mainnet" => Ok(Self::Zenith),
             other => Err(format!(
-                "invalid --network '{other}'; expected mainnet|testnet"
+                "invalid --network '{other}'; expected testnet (Zenith). 'mainnet' is still accepted as Zenith's former name"
             )),
         }
     }
 
     fn from_chain_id(chain_id: &str) -> Result<Self, String> {
         match chain_id {
-            MAINNET_CHAIN_ID => Ok(Self::Mainnet),
-            TESTNET_CHAIN_ID => Ok(Self::Testnet),
+            MAINNET_CHAIN_ID => Ok(Self::Zenith),
+            TESTNET_CHAIN_ID => Err(format!(
+                "chain id '{TESTNET_CHAIN_ID}' was retired: it never ran as a public network. Zenith ({MAINNET_CHAIN_ID}) is the testnet now"
+            )),
             other => Err(format!(
                 "unknown chain id '{other}' for local wallet storage profile"
             )),
@@ -2357,57 +2381,64 @@ impl NetworkProfile {
 
     fn chain_id(self) -> &'static str {
         match self {
-            Self::Mainnet => MAINNET_CHAIN_ID,
-            Self::Testnet => TESTNET_CHAIN_ID,
+            Self::Zenith => MAINNET_CHAIN_ID,
         }
     }
 
     fn default_db_path(self) -> &'static str {
         match self {
-            Self::Mainnet => DEFAULT_CHAIN_DB_PATH,
-            Self::Testnet => DEFAULT_TESTNET_CHAIN_DB_PATH,
+            Self::Zenith => DEFAULT_CHAIN_DB_PATH,
         }
     }
 
     fn local_dir(self) -> &'static str {
         match self {
-            Self::Mainnet => ".zoka/mainnet",
-            Self::Testnet => ".zoka/testnet",
+            Self::Zenith => ".zoka/mainnet",
         }
     }
 
     fn default_genesis_path(self) -> &'static str {
         match self {
-            Self::Mainnet => "docs/genesis.mainnet.v1.json",
-            Self::Testnet => "docs/genesis.testnet.v1.json",
+            Self::Zenith => "docs/genesis.mainnet.v1.json",
         }
     }
 
     fn default_network_config_path(self) -> &'static str {
         match self {
-            Self::Mainnet => "docs/mainnet-network.v1.json",
-            Self::Testnet => "docs/testnet-network.v1.json",
+            Self::Zenith => "docs/mainnet-network.v1.json",
         }
     }
 
     fn network_config_schema(self) -> &'static str {
         match self {
-            Self::Mainnet => "zoka-mainnet-network-v1",
-            Self::Testnet => "zoka-testnet-network-v1",
+            Self::Zenith => "zoka-mainnet-network-v1",
         }
     }
 
     fn mining_mode(self) -> &'static str {
         match self {
-            Self::Mainnet => MAINNET_MINING_MODE,
-            Self::Testnet => TESTNET_MINING_MODE,
+            Self::Zenith => MAINNET_MINING_MODE,
         }
     }
 
+    /// Identificador interno y estable: va en el JSON (`network`), en la API,
+    /// en la marca de genesis de la base y en `--network` al relanzarse.
+    /// Para mostrar, `display_name`.
     fn label(self) -> &'static str {
         match self {
-            Self::Mainnet => "mainnet",
-            Self::Testnet => "testnet",
+            Self::Zenith => "mainnet",
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Zenith => economics::ZENITH_DISPLAY_NAME,
+        }
+    }
+
+    fn role(self) -> &'static str {
+        match self {
+            Self::Zenith => economics::ZENITH_NETWORK_ROLE,
         }
     }
 }
@@ -2852,7 +2883,7 @@ const MINING_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 fn mining_log(message: &str) {
     eprintln!("{}", paint(&format!("mining: {message}"), ANSI_DIM));
-    let path = PathBuf::from(NetworkProfile::Mainnet.local_dir()).join("mining_diagnostic.log");
+    let path = PathBuf::from(NetworkProfile::Zenith.local_dir()).join("mining_diagnostic.log");
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -3033,7 +3064,7 @@ fn mining_process_is_live(state: &UserMiningState) -> bool {
 }
 
 fn load_user_mining_state_for_display() -> Result<UserMiningState, String> {
-    load_user_mining_state_for_display_for_network(NetworkProfile::Mainnet)
+    load_user_mining_state_for_display_for_network(NetworkProfile::Zenith)
 }
 
 fn load_user_mining_state_for_display_for_network(
@@ -4746,7 +4777,7 @@ fn sync_private_coinbase_outputs_from_available_rpc(
     if errors.is_empty() {
         Err(format!(
             "no wallet sync RPC endpoint configured for {}",
-            network.label()
+            network.display_name()
         ))
     } else {
         Err(format!(
@@ -9688,7 +9719,7 @@ fn validate_genesis_network_marker(
     Err(format!(
         "DB genesis network '{}' does not match requested {} ({})",
         genesis_network,
-        network.label(),
+        network.display_name(),
         network.chain_id()
     ))
 }
@@ -10128,7 +10159,7 @@ fn cmd_node_wallet_info(args: &[String]) -> Result<(), String> {
     } else {
         println!("Node wallet loaded: {}", wallet_name);
     }
-    println!("Network: {}", network.label());
+    println!("Network: {}", network.display_name());
     println!(
         "Wallet file: {}",
         private_wallet_file_path_text(&storage, &wallet_name)
@@ -10348,7 +10379,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let chain_id = network.chain_id().to_string();
     zoka::api::global_startup_status().reset(
         "starting",
-        Some(format!("starting {} fullnode", network.label())),
+        Some(format!("starting {} fullnode", network.display_name())),
     );
     zoka::api::global_startup_status().set_chain_context(network.label(), chain_id.as_str());
     let wallet_selector = wallet_selector_value(args);
@@ -10403,6 +10434,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             "starting",
             serde_json::json!({
                 "network": network.label(),
+                "network_role": network.role(),
+                "network_name": network.display_name(),
                 "chain_id": chain_id.as_str(),
                 "db": db_path,
             }),
@@ -10522,6 +10555,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             "wallet_loaded",
             serde_json::json!({
                 "network": network.label(),
+                "network_role": network.role(),
+                "network_name": network.display_name(),
                 "chain_id": chain_id.as_str(),
                 "db": db_path,
                 "wallet": wallet_name,
@@ -10559,7 +10594,11 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         println!("Sync-only mode: no wallet opened. Blocks download and validate; mining and private scanning stay off until the wallet session starts.");
     }
     let mut startup_notes = vec![
-        format!("Network profile: {} ({}).", network.label(), chain_id),
+        format!(
+            "Network profile: {} ({}).",
+            network.display_name(),
+            chain_id
+        ),
         if created {
             format!("Node wallet created automatically for {}.", wallet_address)
         } else {
@@ -10868,6 +10907,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 "state_ready",
                 serde_json::json!({
                     "network": network.label(),
+                    "network_role": network.role(),
+                    "network_name": network.display_name(),
                     "chain_id": chain_id.as_str(),
                     "db": db_path,
                     "wallet": wallet_name,
@@ -10993,6 +11034,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             "ready",
             serde_json::json!({
                 "network": network.label(),
+                "network_role": network.role(),
+                "network_name": network.display_name(),
                 "chain_id": chain_id.as_str(),
                 "peer_id": peer_id,
                 "listen_address": announced,
@@ -11097,7 +11140,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 }
                 startup_notes.push(format!(
                     "{} network config loaded from {}: status={}, active_rpc={}, manifest_seeds_merged={} (reconnect pool now {}).",
-                    network.label(),
+                    network.display_name(),
                     config_path.display(),
                     if network_config.status.is_empty() {
                         "unknown"
@@ -11192,7 +11235,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             }
             startup_notes.push(format!(
                 "{} network config loaded from {}: status={}, active_seeds={}, active_rpc={}, snapshot_signers={}, notes={}.",
-                network.label(),
+                network.display_name(),
                 config_path.display(),
                 if network_config.status.is_empty() {
                     "unknown"
@@ -11251,13 +11294,13 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         } else if network_config_arg.is_some() {
             return Err(format!(
                 "{} network config file not found: {}",
-                network.label(),
+                network.display_name(),
                 config_path.display()
             ));
         } else {
             startup_notes.push(format!(
                 "Default {} network config not found at {}; running standalone until peers connect.",
-                network.label(),
+                network.display_name(),
                 config_path.display()
             ));
         }
@@ -13160,7 +13203,7 @@ async fn run_zokahd_guided_default() -> Result<(), String> {
             ANSI_DIM
         )
     );
-    let storage = wallet_storage_for_network(NetworkProfile::Mainnet)?;
+    let storage = wallet_storage_for_network(NetworkProfile::Zenith)?;
     let wallet_names = local_private_wallet_file_names(&storage);
     let wallet_addresses = local_private_wallet_address_choices(&storage);
     println!(
@@ -13573,6 +13616,8 @@ fn cmd_private_wallet_list(args: &[String]) -> Result<(), String> {
             "{}",
             serde_json::json!({
                 "network": network.label(),
+                "network_role": network.role(),
+                "network_name": network.display_name(),
                 "wallet_storage": wallet_storage_path_text_for(&storage),
                 "private_wallets": json_rows
             })
@@ -13583,7 +13628,7 @@ fn cmd_private_wallet_list(args: &[String]) -> Result<(), String> {
         println!("No private wallets found");
         return Ok(());
     }
-    println!("Wallets ({})", network.label());
+    println!("Wallets ({})", network.display_name());
     println!("Storage: {}", wallet_storage_path_text_for(&storage));
     let any_unlocked = rows.iter().any(|row| row.6);
     if password.is_some() && !any_unlocked {
@@ -13923,7 +13968,7 @@ fn sync_private_wallet_history_from_available_rpc(
     if errors.is_empty() {
         Err(format!(
             "no wallet sync RPC endpoint configured for {}",
-            network.label()
+            network.display_name()
         ))
     } else {
         Err(format!(
@@ -16841,7 +16886,7 @@ async fn run() -> Result<(), String> {
         if first == "--help" || first == "-h" || first == "help" {
             println!("zokahd (automatic fullnode)");
             println!(
-                "Usage: zokahd [--network mainnet|testnet] [--address <wallet-address>] [--password <pwd>|--password-env <var>|--password-stdin] [--seed <multiaddr> ...] [--network-config <file>] [--no-network-config] [--allow-clearnet-seeds] [--allow-isolated-start] [--seconds <n>] [--show-keys] [--no-mine] [--power low|normal|max] [--threads <n>] [--db <path>] [--genesis <file>] [--tor-proxy host:port] [--tor-only] [--external-addr <multiaddr> ...] [--inline]"
+                "Usage: zokahd [--network testnet] [--address <wallet-address>] [--password <pwd>|--password-env <var>|--password-stdin] [--seed <multiaddr> ...] [--network-config <file>] [--no-network-config] [--allow-clearnet-seeds] [--allow-isolated-start] [--seconds <n>] [--show-keys] [--no-mine] [--power low|normal|max] [--threads <n>] [--db <path>] [--genesis <file>] [--tor-proxy host:port] [--tor-only] [--external-addr <multiaddr> ...] [--inline]"
             );
             println!(
                 "Runs fullnode + sync warmup + auto-mining by default until interrupted. --password is required when auto-creating a wallet."
@@ -18878,7 +18923,7 @@ mod tests {
         // The checkpoint must survive a reload from disk, otherwise every
         // unlock would still rescan from genesis.
         let reloaded =
-            load_private_wallet_manager_for_network(&storage, None, NetworkProfile::Mainnet)
+            load_private_wallet_manager_for_network(&storage, None, NetworkProfile::Zenith)
                 .expect("reload manager from disk");
         assert_eq!(
             reloaded
@@ -19126,6 +19171,75 @@ mod tests {
         assert!(err.contains("no atomic economics marker"));
     }
 
+    // Zenith paso a ser la testnet. `testnet`, `zenith` y su nombre anterior
+    // `mainnet` abren la misma cadena con las rutas de siempre: un cliente
+    // viejo y uno nuevo tienen que ver las mismas wallets en la misma carpeta.
+    #[test]
+    fn every_network_name_opens_zenith_with_its_historical_paths() {
+        for name in ["testnet", "TESTNET", "zenith", "mainnet", " Mainnet "] {
+            assert_eq!(
+                NetworkProfile::from_name(name).expect(name),
+                NetworkProfile::Zenith
+            );
+        }
+        let zenith = NetworkProfile::Zenith;
+        assert_eq!(zenith.chain_id(), "zoka-mainnet-zenith-v1");
+        assert_eq!(zenith.local_dir(), ".zoka/mainnet");
+        assert_eq!(zenith.default_db_path(), ".zoka/mainnet/blockchain.db");
+        assert_eq!(
+            zenith.default_genesis_path(),
+            "docs/genesis.mainnet.v1.json"
+        );
+        assert_eq!(
+            zenith.default_network_config_path(),
+            "docs/mainnet-network.v1.json"
+        );
+        assert_eq!(zenith.network_config_schema(), "zoka-mainnet-network-v1");
+        assert_eq!(zenith.mining_mode(), "pow-mainnet");
+        assert_eq!(zenith.label(), "mainnet");
+        assert_eq!(zenith.role(), "testnet");
+        assert_eq!(zenith.display_name(), "Zenith testnet");
+        if std::env::var_os("ZOKA_NETWORK").is_none() {
+            assert_eq!(NetworkProfile::from_args(&[]).expect("default"), zenith);
+        }
+    }
+
+    #[test]
+    fn retired_testnet_chain_and_unknown_names_are_rejected() {
+        let err = NetworkProfile::from_chain_id(TESTNET_CHAIN_ID).unwrap_err();
+        assert!(err.contains("retired"), "{err}");
+        assert!(NetworkProfile::from_name("devnet").is_err());
+        assert_eq!(
+            NetworkProfile::from_chain_id(MAINNET_CHAIN_ID).expect("zenith"),
+            NetworkProfile::Zenith
+        );
+    }
+
+    // Las bases existentes guardan como marca de genesis la etiqueta "mainnet"
+    // o el chain id. Si la etiqueta interna cambiara, el nodo rechazaria su
+    // propia base al actualizarse.
+    #[test]
+    fn databases_marked_with_the_former_label_still_open_as_zenith() {
+        for marker in ["mainnet", MAINNET_CHAIN_ID] {
+            let (_tmp, db) = temp_db_arg();
+            let storage = RocksDbStorage::new(&db).expect("temp rocksdb");
+            storage
+                .put_raw("chain:genesis:network", marker.as_bytes().to_vec())
+                .expect("set genesis network");
+            validate_genesis_network_marker(&storage, NetworkProfile::Zenith)
+                .unwrap_or_else(|err| panic!("marker {marker}: {err}"));
+        }
+        let (_tmp, db) = temp_db_arg();
+        let storage = RocksDbStorage::new(&db).expect("temp rocksdb");
+        storage
+            .put_raw(
+                "chain:genesis:network",
+                TESTNET_CHAIN_ID.as_bytes().to_vec(),
+            )
+            .expect("set genesis network");
+        assert!(validate_genesis_network_marker(&storage, NetworkProfile::Zenith).is_err());
+    }
+
     #[test]
     fn atomic_economics_migration_marks_audited_atomic_chain() {
         let (_tmp, db) = temp_db_arg();
@@ -19135,7 +19249,7 @@ mod tests {
             &storage,
             1,
             reward,
-            genesis_pow_hash_for_chain(NetworkProfile::Mainnet.chain_id()),
+            genesis_pow_hash_for_chain(NetworkProfile::Zenith.chain_id()),
         );
         storage
             .set_total_supply_emitted(reward)
@@ -19143,14 +19257,14 @@ mod tests {
         storage
             .put_raw(
                 "chain:genesis:network",
-                NetworkProfile::Mainnet.chain_id().as_bytes().to_vec(),
+                NetworkProfile::Zenith.chain_id().as_bytes().to_vec(),
             )
             .expect("set genesis network");
 
         let report = migrate_atomic_economics_marker(
             &storage,
             &db,
-            NetworkProfile::Mainnet,
+            NetworkProfile::Zenith,
             false,
             true,
             false,
@@ -19173,7 +19287,7 @@ mod tests {
             &storage,
             1,
             12,
-            genesis_pow_hash_for_chain(NetworkProfile::Mainnet.chain_id()),
+            genesis_pow_hash_for_chain(NetworkProfile::Zenith.chain_id()),
         );
         storage
             .set_total_supply_emitted(12)
@@ -19182,7 +19296,7 @@ mod tests {
         let err = migrate_atomic_economics_marker(
             &storage,
             &db,
-            NetworkProfile::Mainnet,
+            NetworkProfile::Zenith,
             false,
             true,
             false,
@@ -19201,7 +19315,7 @@ mod tests {
         drop(storage);
 
         assert_eq!(
-            current_known_height_for_network(Some(&db), NetworkProfile::Mainnet),
+            current_known_height_for_network(Some(&db), NetworkProfile::Zenith),
             7
         );
     }
@@ -19452,7 +19566,7 @@ mod tests {
         )
         .expect("write sidecar fixture");
         let block = zoka::types::Block::new(
-            genesis_pow_hash_for_chain(NetworkProfile::Mainnet.chain_id()),
+            genesis_pow_hash_for_chain(NetworkProfile::Zenith.chain_id()),
             1_780_000_001,
             0,
             1,
@@ -19492,7 +19606,7 @@ mod tests {
         std::fs::create_dir_all(&sidecar).expect("create sidecar dir");
         std::fs::write(&sidecar_file, &body).expect("write sidecar fixture");
         let block = zoka::types::Block::new(
-            genesis_pow_hash_for_chain(NetworkProfile::Mainnet.chain_id()),
+            genesis_pow_hash_for_chain(NetworkProfile::Zenith.chain_id()),
             1_780_000_001,
             0,
             1,

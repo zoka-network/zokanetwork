@@ -11,7 +11,26 @@ pub const TOKEN_SYMBOL: &str = "ZKA";
 // not just rejected by protocol version, but unable to even produce a
 // matching block-1 parent hash. Defense in depth alongside PROTOCOL_FREEZE_ID.
 pub const MAINNET_CHAIN_ID: &str = "zoka-mainnet-zenith-v1";
+/// Retirada: nunca funciono como red publica. Se conserva solo porque la
+/// eleccion historica del algoritmo de PoW la nombra; el CLI ya no la abre.
 pub const TESTNET_CHAIN_ID: &str = "zoka-testnet-v1";
+
+// Zenith (`MAINNET_CHAIN_ID`) es la testnet de Zoka Quantic desde octubre de
+// 2026. El chain id no se renombra (de el sale el hash del genesis) y la
+// etiqueta "mainnet" sigue siendo el identificador que guardan las bases y que
+// pasan los clientes viejos. Lo que se le muestra a la gente sale de aca.
+pub const ZENITH_NETWORK_ROLE: &str = "testnet";
+pub const ZENITH_DISPLAY_NAME: &str = "Zenith testnet";
+
+/// Rol publico de una cadena conocida ("testnet" para Zenith).
+pub fn network_role_for_chain(chain_id: &str) -> Option<&'static str> {
+    (chain_id == MAINNET_CHAIN_ID).then_some(ZENITH_NETWORK_ROLE)
+}
+
+/// Nombre para personas de una cadena conocida ("Zenith testnet").
+pub fn network_display_name_for_chain(chain_id: &str) -> Option<&'static str> {
+    (chain_id == MAINNET_CHAIN_ID).then_some(ZENITH_DISPLAY_NAME)
+}
 
 /// Emergency mainnet checkpoint used by the 1.4.x hotfix rollout. Nodes that
 /// have this checkpoint must not reorganize onto a branch that does not contain
@@ -522,6 +541,18 @@ mod tests {
         assert_eq!(activation_height_from_env(VAR, Some(42)), None);
 
         std::env::remove_var(VAR);
+    }
+
+    #[test]
+    fn zenith_is_presented_as_testnet_without_renaming_the_chain() {
+        assert_eq!(MAINNET_CHAIN_ID, "zoka-mainnet-zenith-v1");
+        assert_eq!(network_role_for_chain(MAINNET_CHAIN_ID), Some("testnet"));
+        assert_eq!(
+            network_display_name_for_chain(MAINNET_CHAIN_ID),
+            Some("Zenith testnet")
+        );
+        assert_eq!(network_role_for_chain(TESTNET_CHAIN_ID), None);
+        assert_eq!(network_role_for_chain("zoka-quantic-v1"), None);
     }
 
     #[test]
