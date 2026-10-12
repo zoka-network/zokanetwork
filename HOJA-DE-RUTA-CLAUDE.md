@@ -198,8 +198,8 @@ Ramas y commits de la etapa 2:
 
 Rama `etapa3-direcciones-hibridas`: `986e98b5` (módulo híbrido), `38534d0c`
 (costo en el teléfono), `4c5064f3` (consenso de la salida v2), `b814468b`
-(armar, reconocer y gastar con `pq-experimental`), `4ea05c73` (CLI) y el commit
-de la prueba en red local (v2 atada a los bundles canónicos y mensaje P2P).
+(armar, reconocer y gastar con `pq-experimental`), `4ea05c73` (CLI) y `6f3a1b57`
+(prueba en red local: v2 atada a los bundles canónicos y mensaje P2P).
 Especificación de trabajo: [docs/ETAPA3-direcciones-hibridas.md](docs/ETAPA3-direcciones-hibridas.md).
 Decisiones del usuario del 12/10: probar en una red **local** de la PC (no en
 la testnet pública), el coinbase sigue público (v1) y las apps muestran la
