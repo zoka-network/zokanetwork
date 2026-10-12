@@ -15,13 +15,16 @@ postcuántica.**
 **12/10, a pedido del usuario:** `fullnode --sync-only` arreglado (rama
 `arreglo-sync-only`); ZSilent, ZKAPriv y el nodo se presentan como **"Zoka
 Quantic · Testnet"** y ZSilent tomó el estilo de zoka.network (ramas
-`quantic-interfaz`); **etapa 3 iniciada** (rama `etapa3-direcciones-hibridas`):
-direcciones y salidas híbridas X-Wing con pruebas y especificación, sin conectar
-a transacciones ni a consenso.
+`quantic-interfaz`); **etapa 3 implementada en el nodo y probada en una red
+local, sin activar** (rama `etapa3-direcciones-hibridas`): consenso de la
+salida v2 en todas las builds; envío, recepción, gasto y CLI de `zkq1` con
+`pq-experimental`; la v2 exige también los bundles canónicos. Ver la etapa 3.
 
-**Siguiente paso natural:** seguir la etapa 3 (ver su sección): conectar las
-salidas v2 al armado y la validación de transacciones detrás de la activación,
-y llevarlas a wallets, ZSilent y ZKAPriv.
+**Siguiente paso natural:** cerrar la etapa 3 en los clientes: motor móvil con
+`pq-experimental` (los dos ABIs), dirección `zkq1` y su QR en ZSilent y ZKAPriv
+solo cuando la red la active, y la comisión del minero híbrida. Fijar alturas
+en Zenith (primero los bundles canónicos, después la v2) es decisión del
+usuario y exige que la red actualice antes.
 
 Las ramas del nodo están apiladas, cada una sobre la anterior:
 `postcuantica-integracion-nodo` → `zenith-testnet` → `arreglo-sync-only` →
@@ -89,7 +92,7 @@ de pruebas y las decisiones más recientes del usuario.
 | Zenith como testnet | Rama `zenith-testnet` en los tres repos; ver [etapa 2](docs/ETAPA2-zenith-testnet.md) |
 | Interfaz Zoka Quantic | Ramas `quantic-interfaz`; capturas en `zsilent-core/docs/capturas-quantic` |
 | Arreglo de `--sync-only` | Rama `arreglo-sync-only` (nodo) |
-| Etapa 3 iniciada | `src/private_wallet/hybrid.rs` y [especificación](docs/ETAPA3-direcciones-hibridas.md) |
+| Etapa 3 (sin activar) | Consenso v2, envío/recepción/CLI y prueba en red local: [especificación](docs/ETAPA3-direcciones-hibridas.md) |
 | Pruebas criptográficas | 13/13 en Windows, Linux x64, Linux ARM64 (qemu) y el teléfono ARMv7, con el lock alineado al nodo |
 | Pruebas del nodo | Ver [resultados](docs/RESULTADOS-postcuantica-etapa1.md#integración-al-nodo) por plataforma |
 | Ejecución pendiente | Android ARM64 (no hay dispositivo de 64 bits) y hardware ARM64 real |
@@ -193,8 +196,15 @@ Ramas y commits de la etapa 2:
 
 ### 3. Direcciones, cifrado y escaneo de wallets
 
-Iniciada el 12/10 en la rama `etapa3-direcciones-hibridas` (`986e98b5`).
+Rama `etapa3-direcciones-hibridas`: `986e98b5` (módulo híbrido), `38534d0c`
+(costo en el teléfono), `4c5064f3` (consenso de la salida v2), `b814468b`
+(armar, reconocer y gastar con `pq-experimental`), `4ea05c73` (CLI) y el commit
+de la prueba en red local (v2 atada a los bundles canónicos y mensaje P2P).
 Especificación de trabajo: [docs/ETAPA3-direcciones-hibridas.md](docs/ETAPA3-direcciones-hibridas.md).
+Decisiones del usuario del 12/10: probar en una red **local** de la PC (no en
+la testnet pública), el coinbase sigue público (v1) y las apps muestran la
+`zkq1` solo cuando la red la active. Nada de esto se instaló: la PC sigue con
+el `zoka.exe` de `38534d0c`.
 
 - [x] Especificar versiones, prefijos, checksum, tamaños máximos y recuperación de
   claves: dirección `zkq1`, versión 2, ~1.715 caracteres; misma clave de gasto que
@@ -202,9 +212,19 @@ Especificación de trabajo: [docs/ETAPA3-direcciones-hibridas.md](docs/ETAPA3-di
 - [x] Perfil híbrido y derivación contextual para salidas e importes
   (`src/private_wallet/hybrid.rs`, 8 pruebas). **Faltan** comisión del minero y
   coinbase (abiertos en la especificación: hoy el coinbase publica la dirección).
-- [ ] Conectar las salidas v2 al armado y la validación de transacciones, con el
-  rechazo antes de la altura y el hash extendido solo para v2.
-- [ ] Adaptar wallets guardadas, CLI, ZSilent y motor móvil al formato nuevo.
+- [x] Conectar las salidas v2 al armado y la validación de transacciones, con el
+  rechazo antes de la altura y el hash extendido solo para v2. El hash de las
+  v1 quedó fijado con el código anterior. **La v2 exige además los bundles
+  canónicos:** sin ellos los cuerpos no son de consenso y un nodo sin la
+  activación aceptaba el bloque (medido en la red local).
+- [x] Wallets guardadas y CLI (`wallet-receive --hybrid`, `tx-send --to zkq1…`).
+  El vuelto sigue al pago (pago v2 ⇒ vuelto v2).
+- [ ] ZSilent y motor móvil (compilar el `.so` con `pq-experimental`).
+- [x] Prueba en red local de tres nodos (dos corridas): la v2 espera en el
+  mempool hasta la altura, entra con sus cuerpos, el destinatario la ve y la
+  gasta, los saldos cierran exactos y un nodo sin la activación rechaza el
+  bloque. Hallazgos ajenos a la v2 (notas ya gastadas en la wallet del CLI,
+  "Archived: 0" desde el nodo minero, chisme P2P muerto): en la especificación.
 - [x] Medir escaneo en el teléfono de 32 bits: v2 3,8 ms por salida contra 1,5 ms de v1
   (`examples/hybrid_scan_bench.rs`, tres pasadas; ver la especificación). Faltan
   memoria, batería y tamaño real de los datos de la cadena.
