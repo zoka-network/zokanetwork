@@ -7,8 +7,14 @@ Proyecto: `C:\Users\mderramus\ZOKA`.
 
 **La web y los papers están publicados. La base criptográfica experimental está
 integrada al nodo detrás de la feature `pq-experimental`, apagada por defecto
-(rama `postcuantica-integracion-nodo`). La red actual no tiene activada
-privacidad postcuántica.**
+(rama `postcuantica-integracion-nodo`), y Zenith se presenta como testnet en la
+rama `zenith-testnet` de nodo, ZSilent y ZKAPriv, sin mover datos. Nada de eso
+está publicado como release. La red actual no tiene activada privacidad
+postcuántica.**
+
+**Siguiente paso natural:** etapa 3 (direcciones y cifrado híbridos). Antes,
+conviene corregir en una rama aparte la falla previa de `fullnode --sync-only`
+(etapa 1, abajo) y repetir la prueba contra la red real con seed1 encendida.
 
 Segunda sesión, 11 y 12/10 (Claude): se cerró la integración de la etapa 1 y se
 hizo la etapa 2 (Zenith como testnet) en ramas de los tres repos. El detalle de
@@ -44,6 +50,7 @@ de pruebas y las decisiones más recientes del usuario.
 | Papers históricos v1 | Conservados con aviso inicial de correcciones; cuatro PDF publicados en total |
 | Primitivas experimentales | [crates/zoka-pq](crates/zoka-pq/README.md): ML-KEM-768, X-Wing y ML-DSA-65 |
 | Integración al nodo | Feature `pq-experimental` (apagada por defecto), `zoka::pq`; iroh-base 1.0.3 y curve25519-dalek 5.0.0 |
+| Zenith como testnet | Rama `zenith-testnet` en los tres repos; ver [etapa 2](docs/ETAPA2-zenith-testnet.md) |
 | Pruebas criptográficas | 13/13 en Windows, Linux x64, Linux ARM64 (qemu) y el teléfono ARMv7, con el lock alineado al nodo |
 | Pruebas del nodo | Ver [resultados](docs/RESULTADOS-postcuantica-etapa1.md#integración-al-nodo) por plataforma |
 | Ejecución pendiente | Android ARM64 (no hay dispositivo de 64 bits) y hardware ARM64 real |
@@ -54,7 +61,11 @@ Referencias Git verificadas al preparar este archivo:
 - **Nodo:** rama `postcuantica-base-criptografica`, commit `1be41b57`.
   Publicada en GitHub y GitLab como rama de desarrollo; no se integró a `main`.
 - **Nodo, etapa 1:** rama `postcuantica-integracion-nodo` (sobre `1be41b57`),
-  commit `9c8fca0f` (integración) más el de documentación.
+  commits `9c8fca0f` (integración) y `df74753c` (documentación).
+- **Nodo, etapa 2:** rama `zenith-testnet` (sobre la anterior); ver etapa 2 abajo.
+- La rama `postcuantica-integracion-nodo` (nodo) y las `zenith-testnet` de los
+  tres repos se publicaron en GitHub (`zoka-network`) y GitLab. Ninguna se integró
+  a `main`.
 - **Web:** repositorio independiente `zokaweb`, rama `cerrar-web-quantic`.
   Commits `d4e0af6` (papers), `3c03184` (home y navegación) y `46e9afa`
   (título en una línea, privacidad más visible y esfera reducida).
@@ -96,14 +107,43 @@ ya fallaba antes: exige la versión 1.9.0 y el crate es 2.0.2 desde agosto (etap
 
 ### 2. Preparar Zenith como testnet y definir activación
 
-- [ ] Presentar Zenith como testnet en CLI, ZSilent y ZKAPriv de forma consistente.
-- [ ] Conservar el chain ID histórico: renombrarlo alteraría la identidad de la cadena.
-- [ ] Diseñar cualquier cambio de directorios con copia y verificación de wallets.
-- [ ] Implementar el marco de activación y definir una altura explícita antes de
-  cambiar el consenso de la red existente.
+Hecha el 12/10 en la rama `zenith-testnet` de los tres repos. Detalle, decisión y
+procedimiento: [docs/ETAPA2-zenith-testnet.md](docs/ETAPA2-zenith-testnet.md).
 
-**Cierre:** compatibilidad histórica probada y procedimiento reproducible de cambio
-de cliente/datos. Todavía no hay una altura de activación acordada.
+- [x] Presentar Zenith como testnet: CLI y API dicen "Zenith testnet" (el JSON
+  suma `network_role`/`network_name`), ZSilent muestra "Zenith testnet" con color
+  de testnet y ZKAPriv también, con aviso de que sus ZKA son de prueba.
+- [x] Chain ID histórico conservado; `zoka-testnet-v1` retirada (nunca operó).
+- [x] Directorios: **decisión de no mover nada.** Zenith sigue en `.zoka/mainnet`
+  con la etiqueta interna `mainnet`, que las bases guardan en
+  `chain:genesis:network`. `--network testnet|zenith|mainnet` abren Zenith. Mover
+  los datos haría que un cliente viejo y uno nuevo vieran wallets distintas, y en
+  la PC del usuario ya hay un `.zoka/testnet` de la red retirada con wallets
+  propias, que no se toca.
+- [x] Marco de activación: `economics::PqFeature` con alturas `None` en todas las
+  builds. **Todavía no hay una altura acordada.**
+- [ ] Anuncio: borrador en [docs/ANUNCIO-zenith-testnet-BORRADOR.md](docs/ANUNCIO-zenith-testnet-BORRADOR.md);
+  publicarlo solo con aprobación del usuario y clientes nuevos publicados.
+- [ ] Releases de nodo, ZSilent y ZKAPriv con estos cambios (no se generaron).
+
+**Cierre:** compatibilidad probada con el binario 2.0.2 instalado (wallets visibles
+en los dos sentidos, snapshot por iroh en los dos sentidos). Procedimiento de
+cambio de cliente: reemplazar el binario, sin mover datos; volver atrás es
+reinstalar el anterior. Suite del nodo en Windows: 883 + 79 + 3 OK (falla solo la
+prueba heredada de la versión 1.9.0). ZSilent 62/62; ZKAPriv compila.
+
+Ramas y commits de la etapa 2:
+
+- **Nodo:** `zenith-testnet` sobre `postcuantica-integracion-nodo`: `357d2089`
+  (presentación y retiro de la testnet vieja), `dab312af` (marco de activación),
+  `b5414f5f` (ayuda de zokahd) y el de documentación.
+- **ZSilent (`zsilent-core`):** `zenith-testnet` sobre `sacar-exchange` (`8c09b71`),
+  commit `b86b1c5`. En la copia de trabajo de `zsilent-core` (rama `sacar-exchange`)
+  había un cambio **sin commitear** en `ZSilentAppState.kt` de las 14:20 del 11/10 que
+  borra 1.195 líneas (Tor, explorador, pares manuales). No se tocó ni se incluyó:
+  revisar con el usuario antes de descartarlo o comitearlo.
+- **ZKAPriv (`zkapriv`):** `zenith-testnet` sobre `seguridad-octubre-2026` (`5e5752f`),
+  commit `dc7f448`.
 
 ### 3. Direcciones, cifrado y escaneo de wallets
 

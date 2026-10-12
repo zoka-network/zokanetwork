@@ -1,8 +1,9 @@
 # Hoja de ruta: la red actual pasa a testnet, y mainnet nueva post-cuántica
 
-Creada: 2026-10-11. Actualizada: 2026-10-11. Web y documentos publicados;
-base criptográfica experimental probada en Windows y Android ARMv7, sin integrar
-al nodo. La red todavía no es post-cuántica.
+Creada: 2026-10-11. Actualizada: 2026-10-12. Web y documentos publicados;
+base criptográfica experimental integrada al nodo detrás de `pq-experimental`
+(etapa 1) y Zenith presentada como testnet en ramas de desarrollo (etapa 2), sin
+release. La red todavía no es post-cuántica.
 
 ---
 
@@ -206,7 +207,18 @@ de wallet ni activación. Resultados por plataforma en
     vista para descartar rápido.
 1.4 Con esas mediciones, cerrar D1 y D2.
 
-### Etapa 2 — La red actual pasa a ser la testnet
+### Etapa 2 — La red actual pasa a ser la testnet ✅ (2026-10-12, sin release)
+
+**Hecha en la rama `zenith-testnet` de nodo, zsilent-core y zkapriv**
+(ver [ETAPA2-zenith-testnet.md](ETAPA2-zenith-testnet.md)). Cambio respecto del
+plan de abajo: **2.2 no mueve datos.** Las bases guardan la etiqueta `mainnet` en
+`chain:genesis:network`, ZSilent y los scripts pasan `--network mainnet`, y en una
+instalación real ya existe `.zoka/testnet` de la red retirada. Se cambió lo que se
+muestra ("Zenith testnet") y `--network testnet|zenith|mainnet` abren Zenith en
+`.zoka/mainnet`. 2.3 quedó como `economics::PqFeature`, sin alturas. 2.5 es un
+borrador sin publicar.
+
+Plan original, como registro:
 
 2.1 **El chain id no se puede renombrar.** El hash sintético del génesis sale de
     `MAINNET_CHAIN_ID` (`src/economics.rs`), así que cambiarlo rompe la cadena. Los
