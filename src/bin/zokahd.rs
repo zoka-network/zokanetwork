@@ -9,7 +9,7 @@ const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 fn print_usage() {
     println!("zokahd (automatic fullnode)");
     println!(
-        "Usage: zokahd [--network mainnet|testnet] [--address <wallet-address>] [--password <pwd>|--password-env <var>|--password-stdin] [--seed <multiaddr>] [--network-config <file>] [--no-network-config] [--allow-clearnet-seeds] [--allow-isolated-start] [--seconds <n>] [--show-keys] [--no-mine] [--power low|normal|max] [--threads <n>] [--db <path>] [--genesis <file>] [--tor-proxy host:port] [--tor-only] [--external-addr <multiaddr> ...] [--inline]"
+        "Usage: zokahd [--network testnet] [--address <wallet-address>] [--password <pwd>|--password-env <var>|--password-stdin] [--seed <multiaddr>] [--network-config <file>] [--no-network-config] [--allow-clearnet-seeds] [--allow-isolated-start] [--seconds <n>] [--show-keys] [--no-mine] [--power low|normal|max] [--threads <n>] [--db <path>] [--genesis <file>] [--tor-proxy host:port] [--tor-only] [--external-addr <multiaddr> ...] [--inline]"
     );
     println!("Runs fullnode + sync warmup + auto-mining by default until interrupted.");
     println!("Without arguments, opens the autopilot launcher: wallet, sync, then mining.");
