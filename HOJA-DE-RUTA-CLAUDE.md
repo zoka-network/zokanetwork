@@ -111,9 +111,11 @@ ya fallaba antes: exige la versión 1.9.0 y el crate es 2.0.2 desde agosto (etap
 Hecha el 12/10 en la rama `zenith-testnet` de los tres repos. Detalle, decisión y
 procedimiento: [docs/ETAPA2-zenith-testnet.md](docs/ETAPA2-zenith-testnet.md).
 
-- [x] Presentar Zenith como testnet: CLI y API dicen "Zenith testnet" (el JSON
-  suma `network_role`/`network_name`), ZSilent muestra "Zenith testnet" con color
-  de testnet y ZKAPriv también, con aviso de que sus ZKA son de prueba.
+- [x] Presentar Zenith como testnet (el JSON suma `network_role`/`network_name`).
+  Desde el 12/10 (ramas `quantic-interfaz`) el nombre visible es la marca nueva:
+  "Zoka Quantic · Testnet" en ZSilent y ZKAPriv, "Zoka Quantic testnet" en CLI y
+  API; ZSilent tomó además el estilo de zoka.network. ZKAPriv avisa que sus ZKA
+  son de prueba.
 - [x] Chain ID histórico conservado; `zoka-testnet-v1` retirada (nunca operó).
 - [x] Directorios: **decisión de no mover nada.** Zenith sigue en `.zoka/mainnet`
   con la etiqueta interna `mainnet`, que las bases guardan en

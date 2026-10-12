@@ -20,14 +20,14 @@ pub const TESTNET_CHAIN_ID: &str = "zoka-testnet-v1";
 // etiqueta "mainnet" sigue siendo el identificador que guardan las bases y que
 // pasan los clientes viejos. Lo que se le muestra a la gente sale de aca.
 pub const ZENITH_NETWORK_ROLE: &str = "testnet";
-pub const ZENITH_DISPLAY_NAME: &str = "Zenith testnet";
+pub const ZENITH_DISPLAY_NAME: &str = "Zoka Quantic testnet";
 
 /// Rol publico de una cadena conocida ("testnet" para Zenith).
 pub fn network_role_for_chain(chain_id: &str) -> Option<&'static str> {
     (chain_id == MAINNET_CHAIN_ID).then_some(ZENITH_NETWORK_ROLE)
 }
 
-/// Nombre para personas de una cadena conocida ("Zenith testnet").
+/// Nombre para personas de una cadena conocida ("Zoka Quantic testnet").
 pub fn network_display_name_for_chain(chain_id: &str) -> Option<&'static str> {
     (chain_id == MAINNET_CHAIN_ID).then_some(ZENITH_DISPLAY_NAME)
 }
@@ -655,7 +655,7 @@ mod tests {
         assert_eq!(network_role_for_chain(MAINNET_CHAIN_ID), Some("testnet"));
         assert_eq!(
             network_display_name_for_chain(MAINNET_CHAIN_ID),
-            Some("Zenith testnet")
+            Some("Zoka Quantic testnet")
         );
         assert_eq!(network_role_for_chain(TESTNET_CHAIN_ID), None);
         assert_eq!(network_role_for_chain("zoka-quantic-v1"), None);

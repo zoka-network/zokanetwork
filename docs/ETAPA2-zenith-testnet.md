@@ -1,5 +1,13 @@
 # Etapa 2: Zenith pasa a ser la testnet
 
+> **Actualización 12/10/2026:** a pedido del usuario, los clientes ya no
+> muestran "Zenith testnet" sino la marca nueva: **"Zoka Quantic · Testnet"**
+> en ZSilent y ZKAPriv, y "Zoka Quantic testnet" en el CLI y en `network_name`
+> de la API (ramas `quantic-interfaz`). ZSilent además adoptó el estilo de
+> zoka.network (acento rosa, ZOKA QUANTIC, "Private by design."). Las tablas de
+> abajo describen la etapa 2 tal como se cerró el 11/10; el resto de lo que
+> dicen (datos, chain id, `--network`) sigue igual.
+
 Rama `zenith-testnet` en el nodo, ZSilent (`zsilent-core`) y ZKAPriv (`zkapriv`).
 Implementado el 11/10/2026. No hay altura de activación acordada para nada
 post-cuántico: Zenith valida exactamente igual que antes.

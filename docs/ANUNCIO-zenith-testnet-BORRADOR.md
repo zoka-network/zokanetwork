@@ -21,7 +21,7 @@ Qué cambia y qué no:
   Zoka Quantic: no habrá reclamo ni migración de saldos.
 - **La cadena es la misma.** Mismo historial, mismas wallets, mismos nodos. No
   hace falta reinstalar ni mover archivos. Los clientes viejos la siguen
-  llamando "mainnet"; los nuevos la muestran como "Zenith testnet".
+  llamando "mainnet"; los nuevos la muestran como "Zoka Quantic · Testnet".
 - **Se puede seguir minando y enviando** en Zenith, ahora con el fin de probar.
 - **El P2P Exchange se retiró** del nodo, de ZSilent y de la documentación.
 
@@ -56,7 +56,7 @@ What changes and what does not:
   Zoka Quantic: there is no claim and no balance migration.
 - **It is the same chain.** Same history, same wallets, same nodes. Nothing to
   reinstall and no files to move. Older clients still call it "mainnet"; new
-  ones show it as "Zenith testnet".
+  ones show it as "Zoka Quantic · Testnet".
 - **Mining and sending keep working** on Zenith, now for testing purposes.
 - **The P2P Exchange has been removed** from the node, ZSilent and the docs.
 

@@ -51,7 +51,7 @@ fn print_usage() {
     println!(
         "  {}",
         paint(
-            "Network: Zenith testnet (chain zoka-mainnet-zenith-v1). Zenith ZKA are test coins; `--network mainnet` is still accepted as Zenith's former name.",
+            "Network: Zoka Quantic testnet (the Zenith chain, zoka-mainnet-zenith-v1). Testnet ZKA are test coins; `--network mainnet` is still accepted as its former name.",
             ANSI_DIM
         )
     );
@@ -19207,7 +19207,7 @@ mod tests {
         assert_eq!(zenith.mining_mode(), "pow-mainnet");
         assert_eq!(zenith.label(), "mainnet");
         assert_eq!(zenith.role(), "testnet");
-        assert_eq!(zenith.display_name(), "Zenith testnet");
+        assert_eq!(zenith.display_name(), "Zoka Quantic testnet");
         if std::env::var_os("ZOKA_NETWORK").is_none() {
             assert_eq!(NetworkProfile::from_args(&[]).expect("default"), zenith);
         }
