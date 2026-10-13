@@ -44,13 +44,36 @@ VPS")** y pidió que **su PC sea el nodo autoritario** de Zenith y de Quantic.
 - VPS: paquete listo en `deploy/vps/` (`ed304d43`); no se contrata ni se arranca
   nada hasta que el usuario consiga los servidores.
 
-**Siguiente paso natural:** instalar en la PC el `zoka.exe` de
-`checkpoints-autoritativos` para que empiece a firmar (pendiente de que el usuario
-lo autorice; release compilado de `9bcb6ad9` con features por defecto: `zoka.exe`
-SHA-256 `18179F27…`, `zokahd.exe` `3F61962E…`; `checkpoint-status` confirma que
-reconoce la clave local), y armar la 2.1.0 de testnet: alturas de activación, versiones
-alineadas, release en `github.com/zoka-network` y anuncio. Después, la etapa 4
-(gastar sin key images), que es diseño.
+**13/10, tarde: el usuario dijo "sigue tú solo".** Hecho, en ramas nuevas apiladas
+sobre `checkpoints-autoritativos`:
+
+- **Notas gastadas de ZSilent** (rama `arreglo-notas-gastadas`, `88e59f4a`): causa
+  más probable hallada leyendo el código, no reproducida en vivo. Varios caminos
+  guardaban una copia de wallets leída sin el candado y borraban la reserva de un
+  envío hecho en el medio; el caso frecuente era el cierre de cada tanda de minado.
+  Ahora se lee con el candado tomado (`with_fresh_private_wallets`). Falta verlo en
+  ZSilent minando con el binario nuevo.
+- **Checkpoints** (rama `checkpoints-correccion-manual`, `f94b624f`):
+  `checkpoint-sign` para corregir una rama a mano, y el firmador no firma mientras
+  su cadena no contenga el último checkpoint (si no, devolvía la red a la rama
+  corregida).
+- **Versiones:** `NETWORK_MIN_CLIENT_VERSION` = manifiesto (2.0.1); la prueba
+  heredada de la 1.9.0 ahora comprueba coherencia y la suite pasa sin saltear nada.
+- **Tor 0.4.9.14** (bundle 15.0.25 del 12/10): firma y SHA-256 verificados, fijado
+  en zsilent-core rama `tor-0.4.9.14` (`9096d40`) y en
+  `docs/zsilent-managed-tor-onion-seed.md`.
+- **2.1.0:** procedimiento en [docs/RELEASE-2.1.0-testnet.md](docs/RELEASE-2.1.0-testnet.md)
+  (el `PROTOCOL_FREEZE_ID` no cambia; las alturas se fijan el día de publicar) y
+  sección 2.1.0 en el borrador de anuncio.
+- **Instalar en la PC:** el clasificador de permisos frenó dos veces reemplazar el
+  `zoka.exe` instalado. Queda `scripts/instalar-en-pc.ps1`, que corre el usuario
+  con ZSilent cerrado: instala el nodo de `target/release` y Tor 0.4.9.14, con
+  respaldos y verificación de hashes y firma.
+
+**Siguiente paso natural:** que el usuario corra `scripts/instalar-en-pc.ps1` y
+respalde la clave de autoridad; después la 2.1.0 según su procedimiento (publicar
+y anunciar, solo con su aprobación). Luego la etapa 4 (gastar sin key images), que
+es diseño.
 
 Las ramas del nodo están apiladas, cada una sobre la anterior:
 `postcuantica-integracion-nodo` → `zenith-testnet` → `arreglo-sync-only` →
@@ -174,8 +197,10 @@ Referencias Git verificadas al preparar este archivo:
   Linux ARM64 se ejecutó emulado con qemu-user, no en hardware real.
 
 **Cierre:** ver [resultados](docs/RESULTADOS-postcuantica-etapa1.md#integración-al-nodo).
-La única prueba del nodo que falla (`recovery_manifest_matches_the_compiled_1_9_consensus_policy`)
-ya fallaba antes: exige la versión 1.9.0 y el crate es 2.0.2 desde agosto (etapa 7.4).
+La única prueba del nodo que fallaba (`recovery_manifest_matches_the_compiled_1_9_consensus_policy`)
+exigía la versión 1.9.0 con el crate en 2.0.2 desde agosto. Desde el 13/10 se llama
+`network_manifest_matches_the_compiled_policy` y comprueba coherencia en vez de
+fijar la versión: ya no hace falta `--skip`.
 
 ### 2. Preparar Zenith como testnet y definir activación
 
@@ -298,7 +323,8 @@ de escaneo completo ni una comparación aislada del coste del combinador.
 
 - [ ] Implementar snapshots con Ed25519 + ML-DSA-65 y verificación obligatoria de ambos.
 - [ ] Completar los motores móviles `.so` para los dos ABIs y generar APK revisables.
-- [ ] Corregir y probar el problema pendiente de ZSilent que ofrece notas ya gastadas.
+- [x] Corregir el problema de ZSilent que ofrece notas ya gastadas (13/10, rama
+  `arreglo-notas-gastadas`). **Falta probarlo** en ZSilent minando con el binario nuevo.
 - [ ] Revisar y sincronizar las ramas de seguridad/Tor/retiro del exchange de los demás
   repositorios, conservando los cambios previos y resolviendo divergencias sin force push.
 - [ ] Rehospedar los archivos de trusted setup todavía referenciados en la cuenta antigua,
@@ -316,6 +342,9 @@ no significa haber publicado clientes nuevos.
 - [ ] Implementar y probar premine, suministro máximo, fronteras de emisión y comisiones.
 - [ ] Fijar la dirección pública del equipo para el génesis; todavía no está definida aquí.
 - [ ] Alinear versiones de crate, cliente mínimo, manifiestos y formatos de protocolo.
+  13/10: cliente mínimo del código = manifiesto (2.0.1) y la prueba heredada de la
+  1.9.0 comprueba coherencia; el salto a 2.1.0 va con la versión (ver
+  [docs/RELEASE-2.1.0-testnet.md](docs/RELEASE-2.1.0-testnet.md)).
 - [ ] Ejecutar pruebas integrales en la testnet y revisión externa de cifrado/circuitos.
 - [ ] Revisar los papers contra lo efectivamente implementado, después de cerrar el diseño.
 

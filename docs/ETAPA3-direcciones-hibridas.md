@@ -310,7 +310,13 @@ variables de entorno; los binarios siguen con `None`.
 
 - La wallet del CLI volvió a ofrecer una nota que ya gastaba una transacción
   pendiente (`fca318a9` contra `906b9f14`): la API respondió 409 y el minero
-  eligió una sola. Es el problema conocido de las notas ya gastadas.
+  eligió una sola. Es el problema conocido de las notas ya gastadas. **Causa
+  más probable, encontrada leyendo el código el 13/10** (arreglada en la rama
+  `arreglo-notas-gastadas`, no reproducida en vivo): el minero acreditaba las
+  recompensas maduras al cerrar cada tanda sobre la copia de wallets leída al
+  empezarla, y al guardarla borraba la reserva del envío hecho en el medio. En
+  esta corrida la tx esperó doce bloques en el mempool, con varias tandas
+  encima de la reserva.
 - En los primeros envíos desde el nodo minero el CLI informó "Archived private
   tx bodies: 0", aunque la transacción entró igual por la cola lateral; por un
   proxy de diagnóstico y desde el nodo B la publicación anduvo. La causa no

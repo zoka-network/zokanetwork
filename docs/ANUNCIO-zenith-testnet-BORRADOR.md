@@ -40,6 +40,23 @@ Zoka Quantic arranca de cero:
 Vamos a anunciar la fecha de Zoka Quantic recién cuando el diseño esté
 implementado, probado en la testnet y revisado.
 
+### Versión 2.1.0 (completar las alturas y la fecha al publicar)
+
+**Zenith 2.1.0: hay que actualizar antes del bloque {ALTURA_BUNDLES}.**
+
+- Desde el bloque {ALTURA_BUNDLES} cada bloque lleva adentro los cuerpos de sus
+  transacciones privadas, y desde el {ALTURA_V2} la red acepta las direcciones
+  postcuánticas `zkq1` (X-Wing: X25519 + ML-KEM-768) para probarlas. Es la
+  primera prueba pública de esta parte de Quantic; la red sigue siendo de prueba.
+- Un nodo que no actualice queda en otra rama desde esa altura.
+- **Checkpoints del equipo.** El nodo del equipo firma cada 30 bloques un
+  checkpoint ("en la altura H el bloque es X") y los nodos 2.1.0 no siguen
+  ninguna rama que lo contradiga: evita forks. Es una confianza explícita en el
+  equipo, que elige cuál de las cadenas válidas es la canónica, pero no puede
+  crear monedas, gastar fondos ajenos ni volver válido un bloque inválido.
+  Quantic va a usar el mismo mecanismo con otra clave.
+- ZSilent ya no muestra un saldo inflado por notas que ya se habían gastado.
+
 ---
 
 ## English
@@ -74,3 +91,20 @@ Zoka Quantic starts from zero:
 
 We will announce a Zoka Quantic date only once the design is implemented,
 tested on the testnet and reviewed.
+
+### Release 2.1.0 (fill in heights and date when publishing)
+
+**Zenith 2.1.0: update before block {HEIGHT_BUNDLES}.**
+
+- From block {HEIGHT_BUNDLES} every block carries the bodies of its private
+  transactions, and from block {HEIGHT_V2} the network accepts post-quantum
+  `zkq1` addresses (X-Wing: X25519 + ML-KEM-768) for testing. This is the first
+  public test of this part of Quantic; the network is still a testnet.
+- A node that does not update ends up on a different branch from that height.
+- **Team checkpoints.** Every 30 blocks the team's node signs a checkpoint
+  ("at height H the block is X") and 2.1.0 nodes do not follow any branch that
+  contradicts it, which prevents forks. This is explicit trust in the team: it
+  picks which valid chain is canonical, but it cannot create coins, spend
+  anyone's funds or make an invalid block valid. Quantic will use the same
+  mechanism with a different key.
+- ZSilent no longer shows a balance inflated by notes that were already spent.

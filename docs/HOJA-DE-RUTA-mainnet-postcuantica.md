@@ -104,7 +104,9 @@ reemplazo maduro (pruebas basadas en hashes, tipo STARK).
       `zoka.exe.bak-20261011`).
 - [x] npm: Zveil y bot sin alertas; sitios de 39 a 16 (las que quedan exigen versión mayor).
 - [ ] Motor móvil: `.so` de los dos ABIs, commit, APK (instalar solo cuando el usuario diga).
-- [ ] Tor 0.4.9.14 cuando exista un Expert Bundle que la traiga (15.0.24 trae 0.4.9.13).
+- [x] Tor 0.4.9.14: llegó en el Expert Bundle 15.0.25 (12/10). Firma y SHA-256
+      verificados el 13/10 y fijado en zsilent-core (rama `tor-0.4.9.14`) y en la
+      guía. **Falta instalarlo** en la PC con `scripts/instalar-en-pc.ps1`.
 - [ ] Push de las ramas `seguridad-octubre-2026` (ZOKA, zkapriv, zokaweb, zokaexplorer,
       zoka-guard-vault) y `tor-0.4.9.13` (zsilent-core).
 

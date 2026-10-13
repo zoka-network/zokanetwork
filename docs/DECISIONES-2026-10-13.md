@@ -56,10 +56,12 @@ apenas se active la v2, con la versión 2.1.0 instalada en la PC y el teléfono.
 La clave de Zenith se creó en la PC del usuario
 (`%APPDATA%\Zoka\.zoka\mainnet\checkpoint-authority.key`, pública
 `bf5c92154ee0e250f4419d47cf0a16c263c586244274ccad196234d339c47bd4`) y está
-compilada en el nodo. El `zoka.exe` nuevo va en ZSilent (compilado y verificado;
-falta que el usuario autorice reemplazar el instalado): con la clave presente
+compilada en el nodo. El `zoka.exe` nuevo va en ZSilent: con la clave presente
 firma un checkpoint cada 30 bloques, y solo con pares conectados que confirman su
-punta. Los demás nodos lo obedecen desde que corran un binario con
+punta. El usuario dijo "sigue tú solo", pero el clasificador de permisos frenó
+dos veces el reemplazo del ejecutable instalado; queda
+`scripts/instalar-en-pc.ps1` para que lo corra él con ZSilent cerrado (instala
+también Tor 0.4.9.14). Los demás nodos lo obedecen desde que corran un binario con
 la clave compilada (2.1.0). **El usuario tiene que respaldar ese archivo fuera de
 la PC:** es la única copia.
 
