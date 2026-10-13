@@ -1866,6 +1866,48 @@ fn xor_with_blake3_stream(data: &[u8], key_material: &[u8], domain: &[u8]) -> Ve
     out
 }
 
+/// Si el sobre de una comisión sale v2 (X-Wing hacia la `zkq1` del minero).
+/// Solo con la feature y con la activación de las salidas v2 fijada; hoy no.
+fn hybrid_fee_claims_enabled() -> bool {
+    cfg!(feature = "pq-experimental")
+        && crate::economics::pq_hybrid_outputs_activation_height().is_some()
+}
+
+/// Abre un sobre de comisión. El largo del campo efímero dice la versión:
+/// 32 bytes son un punto Ristretto (v1) y 1.120 un ciphertext X-Wing (v2). Los
+/// dos pasan la validación de bloques, que solo exige que no esté vacío, así
+/// que el sobre v2 no cambia el consenso: lo arma y lo lee el mismo nodo.
+fn open_fee_claim(scan_key: &[u8], envelope: &PrivateFeeClaimEnvelope) -> Option<Vec<u8>> {
+    if envelope.ephemeral_pubkey.len() == HYBRID_OUTPUT_KEM_CIPHERTEXT_BYTES {
+        return open_hybrid_fee_claim(scan_key, envelope);
+    }
+    let shared_secret =
+        fee_claim_shared_secret_from_receiver(scan_key, &envelope.ephemeral_pubkey).ok()?;
+    let mut key_material = shared_secret.to_bytes().to_vec();
+    key_material.extend_from_slice(envelope.tx_hash.as_bytes());
+    Some(xor_with_blake3_stream(
+        &envelope.ciphertext,
+        &key_material,
+        b"zoka-fee-claim-v1",
+    ))
+}
+
+#[cfg(feature = "pq-experimental")]
+fn open_hybrid_fee_claim(scan_key: &[u8], envelope: &PrivateFeeClaimEnvelope) -> Option<Vec<u8>> {
+    let keys = hybrid::HybridScanKey::from_scan_key(scan_key).ok()?;
+    let key = keys.fee_claim_key(&envelope.ephemeral_pubkey, &envelope.tx_hash)?;
+    Some(xor_with_blake3_stream(
+        &envelope.ciphertext,
+        key.as_slice(),
+        hybrid::FEE_CLAIM_DOMAIN,
+    ))
+}
+
+#[cfg(not(feature = "pq-experimental"))]
+fn open_hybrid_fee_claim(_scan_key: &[u8], _envelope: &PrivateFeeClaimEnvelope) -> Option<Vec<u8>> {
+    None
+}
+
 fn fee_claim_shared_secret_from_sender(
     miner_commitment_key: &str,
 ) -> Result<(Scalar, Vec<u8>), BlockError> {
@@ -4449,6 +4491,7 @@ impl PrivateWalletManager {
             tx_hash,
             miner_commitment_key,
             &[PrivacyStatus::Confirmed],
+            hybrid_fee_claims_enabled(),
         )
     }
 
@@ -4461,6 +4504,21 @@ impl PrivateWalletManager {
         tx_hash: &str,
         miner_commitment_key: &str,
     ) -> Result<PrivateFeeClaimEnvelope, BlockError> {
+        self.create_miner_fee_claim_envelope_for_block_with_mode(
+            from_wallet,
+            tx_hash,
+            miner_commitment_key,
+            hybrid_fee_claims_enabled(),
+        )
+    }
+
+    fn create_miner_fee_claim_envelope_for_block_with_mode(
+        &self,
+        from_wallet: &str,
+        tx_hash: &str,
+        miner_commitment_key: &str,
+        hybrid: bool,
+    ) -> Result<PrivateFeeClaimEnvelope, BlockError> {
         self.create_miner_fee_claim_envelope_with_statuses(
             from_wallet,
             tx_hash,
@@ -4470,7 +4528,19 @@ impl PrivateWalletManager {
                 PrivacyStatus::Verified,
                 PrivacyStatus::Confirmed,
             ],
+            hybrid,
         )
+    }
+
+    /// `zkq1` del minero para el sobre v2 de una comisión. Solo si su wallet es
+    /// local: el sobre lo arma y lo lee este mismo nodo. Si no, sale v1.
+    #[cfg(feature = "pq-experimental")]
+    fn hybrid_fee_claim_recipient(&self, miner_commitment_key: &str) -> Option<hybrid::HybridAddress> {
+        let wallet = self
+            .private_wallets
+            .values()
+            .find(|wallet| wallet.commitment_key == miner_commitment_key)?;
+        hybrid::HybridAddress::decode(&wallet.hybrid_payment_address().ok()?).ok()
     }
 
     fn create_miner_fee_claim_envelope_with_statuses(
@@ -4479,6 +4549,7 @@ impl PrivateWalletManager {
         tx_hash: &str,
         miner_commitment_key: &str,
         allowed_statuses: &[PrivacyStatus],
+        hybrid: bool,
     ) -> Result<PrivateFeeClaimEnvelope, BlockError> {
         let wallet = self.private_wallets.get(from_wallet).ok_or_else(|| {
             BlockError::TransactionValidationFailed("Wallet not found".to_string())
@@ -4517,13 +4588,30 @@ impl PrivateWalletManager {
             ));
         }
 
-        let (shared_secret, ephemeral_pubkey) =
-            fee_claim_shared_secret_from_sender(miner_commitment_key)?;
         let payload = serde_json::to_vec(&PrivateFeeClaimPayload {
             fee: opening.fee,
             fee_blind: opening.fee_blind,
         })
         .map_err(|e| BlockError::SerializationError(e.to_string()))?;
+
+        #[cfg(feature = "pq-experimental")]
+        if hybrid {
+            if let Some(miner) = self.hybrid_fee_claim_recipient(miner_commitment_key) {
+                let (kem_ciphertext, key) = hybrid::hybrid_fee_claim_material(&miner, tx_hash);
+                let ciphertext =
+                    xor_with_blake3_stream(&payload, key.as_slice(), hybrid::FEE_CLAIM_DOMAIN);
+                return Ok(PrivateFeeClaimEnvelope {
+                    tx_hash: tx_hash.to_string(),
+                    ephemeral_pubkey: kem_ciphertext,
+                    ciphertext,
+                });
+            }
+        }
+        #[cfg(not(feature = "pq-experimental"))]
+        let _ = hybrid;
+
+        let (shared_secret, ephemeral_pubkey) =
+            fee_claim_shared_secret_from_sender(miner_commitment_key)?;
         let mut key_material = shared_secret.to_bytes().to_vec();
         key_material.extend_from_slice(tx_hash.as_bytes());
         let ciphertext = xor_with_blake3_stream(&payload, &key_material, b"zoka-fee-claim-v1");
@@ -4544,15 +4632,29 @@ impl PrivateWalletManager {
         tx_hashes: &[String],
         miner_commitment_key: &str,
     ) -> Result<Vec<crate::types::PrivateFeeClaim>, BlockError> {
+        self.local_private_fee_claims_with_mode(
+            tx_hashes,
+            miner_commitment_key,
+            hybrid_fee_claims_enabled(),
+        )
+    }
+
+    fn local_private_fee_claims_with_mode(
+        &self,
+        tx_hashes: &[String],
+        miner_commitment_key: &str,
+        hybrid: bool,
+    ) -> Result<Vec<crate::types::PrivateFeeClaim>, BlockError> {
         let mut claims = Vec::new();
         for tx_hash in tx_hashes {
             let Some(from_wallet) = self.local_fee_opening_wallet_for_tx(tx_hash) else {
                 continue;
             };
-            let envelope = self.create_miner_fee_claim_envelope_for_block(
+            let envelope = self.create_miner_fee_claim_envelope_for_block_with_mode(
                 &from_wallet,
                 tx_hash,
                 miner_commitment_key,
+                hybrid,
             )?;
             claims.push(envelope.into());
         }
@@ -4613,20 +4715,10 @@ impl PrivateWalletManager {
                 continue;
             }
 
-            let shared_secret = match fee_claim_shared_secret_from_receiver(
-                &scan_key,
-                &envelope.ephemeral_pubkey,
-            ) {
-                Ok(secret) => secret,
-                Err(_) => {
-                    skipped.push(envelope.tx_hash.clone());
-                    continue;
-                }
+            let Some(plaintext) = open_fee_claim(&scan_key, envelope) else {
+                skipped.push(envelope.tx_hash.clone());
+                continue;
             };
-            let mut key_material = shared_secret.to_bytes().to_vec();
-            key_material.extend_from_slice(envelope.tx_hash.as_bytes());
-            let plaintext =
-                xor_with_blake3_stream(&envelope.ciphertext, &key_material, b"zoka-fee-claim-v1");
             let payload: PrivateFeeClaimPayload = match serde_json::from_slice(&plaintext) {
                 Ok(payload) => payload,
                 Err(_) => {
@@ -6699,6 +6791,59 @@ mod tests {
         assert_eq!(outcome.claimed_tx_hashes, vec![tx_hash]);
         assert!(outcome.skipped_tx_hashes.is_empty());
         assert_eq!(manager.get_private_balance("miner"), Some(3));
+    }
+
+    // Sobre v2 de la comisión: con el modo híbrido el campo efímero lleva el
+    // ciphertext X-Wing (1.120 bytes), el bloque lo acepta igual que a uno v1
+    // y el minero lo abre y cobra. Otra wallet no lo abre.
+    #[cfg(feature = "pq-experimental")]
+    #[test]
+    fn la_comision_al_minero_viaja_hibrida_y_se_cobra() {
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        let bob_commitment = manager.create_private_wallet("bob").unwrap();
+        let miner_commitment = manager.create_private_wallet("miner").unwrap();
+        manager.deposit_to_private_wallet("alice", 40).unwrap();
+        let tx_hash = manager
+            .send_private_transaction_with_fee("alice", bob_commitment, 10, 3)
+            .unwrap();
+
+        let claims = manager
+            .local_private_fee_claims_with_mode(std::slice::from_ref(&tx_hash), &miner_commitment, true)
+            .unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].ephemeral_pubkey.len(), HYBRID_OUTPUT_KEM_CIPHERTEXT_BYTES);
+        assert!(!claims[0].ciphertext.is_empty());
+
+        manager.confirm_private_transaction(&tx_hash).unwrap();
+        let ajeno = manager
+            .claim_private_fees_from_block_claims("bob", &claims)
+            .unwrap_err();
+        assert!(ajeno.to_string().contains("No valid private fee claims"), "{ajeno}");
+
+        let outcome = manager
+            .claim_private_fees_from_block_claims("miner", &claims)
+            .unwrap();
+        assert_eq!(outcome.total_fee_claimed, 3);
+        assert_eq!(outcome.claimed_tx_hashes, vec![tx_hash]);
+        assert_eq!(manager.get_private_balance("miner"), Some(3));
+    }
+
+    // Sin el modo híbrido (hoy, sin activación) el sobre sigue siendo v1.
+    #[test]
+    fn sin_activacion_la_comision_sigue_siendo_v1() {
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("alice").unwrap();
+        let bob_commitment = manager.create_private_wallet("bob").unwrap();
+        let miner_commitment = manager.create_private_wallet("miner").unwrap();
+        manager.deposit_to_private_wallet("alice", 40).unwrap();
+        let tx_hash = manager
+            .send_private_transaction_with_fee("alice", bob_commitment, 10, 3)
+            .unwrap();
+        let claims = manager
+            .local_private_fee_claims_with_mode(std::slice::from_ref(&tx_hash), &miner_commitment, false)
+            .unwrap();
+        assert_eq!(claims[0].ephemeral_pubkey.len(), 32);
     }
 
     #[test]

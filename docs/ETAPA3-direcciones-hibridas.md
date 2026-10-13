@@ -168,6 +168,58 @@ derivarse del secreto híbrido y revisarse antes de incorporarla.
 - Si la `zkq1` es de una wallet local, el CLI la reconoce como destinataria
   (para el control de montos y el de aislamiento entre wallets).
 
+### Clientes (13/10/2026)
+
+Las dos apps muestran la `zkq1` y aceptan enviarle **solo cuando la red fijó la
+altura de activación** (decisión del usuario del 12/10). Hoy es nula en todas las
+builds: no se ve nada.
+
+- **ZKAPriv** (rama `etapa3-apps-zkq1`, `3ee8956` y `f2f8953`). El motor se
+  compila con `pq-experimental` en los dos ABIs (`build-android.ps1`) y expone por
+  JNI `hybridWalletInfo` (zkq1 y altura) y `scanHybridOutputs` (lote de hasta 512
+  salidas v2; usa `zoka::mobile`, `e0a4f866`). El escaneo de saldo sigue en Kotlin
+  para las v1; las v2 se juntan y se reconocen en el motor al cerrar cada tanda,
+  antes del punto de control. Si el motor no está o no trae X-Wing, esos pagos no
+  se ven pero el escaneo v1 sigue intacto. Para gastar no hace falta nada nuevo:
+  la app ya le pasa al motor los cuerpos crudos. Recibir: tarjeta "Quantic
+  address (zkq1)", QR a 1040 px con corrección L (a 220 px una zkq1, unos 150
+  módulos por lado, es ilegible). Enviar: la zkq1 se valida entera en Kotlin
+  (prefijo, Base58, 1.253 bytes, versión 2, checksum) y se acepta solo con la
+  activación; el camino viejo por API con semilla la rechaza. Tamaño del `.so`:
+  arm64-v8a +172 KB (+1,1 %), armeabi-v7a +104 KB (+0,9 %).
+- **ZSilent** (rama `etapa3-apps-zkq1`, `a55423f`). La zkq1 sale de
+  `zoka wallet-receive --hybrid --json` con una copia de la contraseña de la
+  sesión que se borra al terminar; se guarda solo si viene altura. Con un binario
+  sin `pq-experimental` el comando falla y queda oculta. Recibir: panel con QR
+  (corrección L, 420 dp, módulos cuadrados: con la Q de siempre una zkq1 no entra
+  en ningún QR, el máximo son 1.273 bytes). Enviar: el destino acepta la zkq1
+  solo con la activación; el CLI la vuelve a validar.
+
+## Comisión del minero: sobre v2 (13/10/2026)
+
+El sobre `PrivateFeeClaim` lleva la apertura de la comisión de una transacción
+cifrada hacia el minero. En v1 el campo `ephemeral_pubkey` es un punto Ristretto
+de 32 bytes y el secreto sale de un ECDH contra la `zka1` del minero, que es
+pública (el coinbase la publica): con una computadora cuántica se leerían los
+montos de las comisiones.
+
+En v2 ese campo lleva el **ciphertext X-Wing** (1.120 bytes) hacia la clave de la
+`zkq1` del minero, y la clave del sobre es `SHA-256("zoka-hybrid-fee-claim-v2" ‖
+0x1f ‖ secreto ‖ 0x1f ‖ ciphertext ‖ 0x1f ‖ tx_hash)`, que cifra la apertura con
+el mismo flujo BLAKE3 y esa etiqueta.
+
+- **No cambia el consenso.** La regla de bloques de los sobres
+  (`validate_private_fee_claims`) solo exige que los campos no estén vacíos; no
+  mira el largo ni el contenido. Lo fija la prueba
+  `a_hybrid_fee_claim_passes_the_consensus_shape_rule`. El sobre lo arma y lo lee
+  el mismo nodo minero: es un formato local entre esas dos puntas.
+- **El largo dice la versión** al leerlo: 32 bytes v1, 1.120 v2. Un binario sin
+  `pq-experimental` (o uno viejo) no abre un sobre v2 y lo saltea, sin error.
+- **Cuándo sale v2:** con `pq-experimental`, con la altura de las salidas v2
+  fijada (hoy no) y si la wallet del minero es local (si no, no hay de dónde sacar
+  su zkq1 y el sobre sale v1). Las funciones internas reciben el modo explícito,
+  para probarlo sin variables de entorno.
+
 ## Activación y consenso
 
 Implementado en `src/private_wallet/mod.rs` (`validate_private_output_format`)
@@ -274,13 +326,13 @@ variables de entorno; los binarios siguen con `None`.
 1. **Coinbase:** hoy publica `recipient_address` y cifra el monto con una clave
    derivada de esa dirección pública. Decidir para Quantic si la dirección del
    minero sigue siendo pública (el team mining la usa) y, si no, usar salidas v2.
-2. **Comisión del minero** (`PrivateFeeClaim`): misma construcción con su
-   propia etiqueta de dominio (`zoka-hybrid-fee-claim-v2`).
-3. ~~Formato en wallets guardadas y comando del CLI~~ (hecho: ver "Envío y
-   recepción"). Falta mostrar la dirección v2 y su QR en ZSilent y ZKAPriv,
-   solo cuando la red la active (decisión del usuario del 12/10/2026).
-4. Motor móvil: compilar con `pq-experimental` para los dos ABIs y medir el
-   tamaño del `.so`. Hasta entonces la app no reconoce pagos a su `zkq1`.
+2. ~~**Comisión del minero**~~ (hecho el 13/10: ver "Comisión del minero: sobre
+   v2", sin cambio de consenso).
+3. ~~Formato en wallets guardadas, CLI y apps~~ (hecho: "Envío y recepción" y
+   "Clientes"). Falta probar envíos reales ZSilent → ZKAPriv y ZKAPriv → ZSilent
+   en una red local con la activación fijada; exige instalar el APK nuevo
+   (decisión del usuario).
+4. ~~Motor móvil con `pq-experimental`~~ (hecho el 13/10: ver "Clientes").
 5. Revisión externa de esta construcción antes de activarla en cualquier red.
 6. **Tamaño en JSON.** `kem_ciphertext` se serializa como arreglo de números
    (igual que `ephemeral_pubkey` y `range_proof`): unos 4 KB por salida v2 en
@@ -325,6 +377,14 @@ frase da lo mismo por los dos caminos.
 CLI (`cargo test --bin zoka -- recipient_accepts_zka1`): `--to` sigue
 aceptando `zka1` igual que antes y rechaza `zkq1` con un mensaje claro
 mientras la activación no esté fijada.
+
+Comisión v2 (`cargo test --lib --features pq-experimental -- comision
+a_hybrid_fee_claim`): con el modo híbrido el sobre lleva 1.120 bytes en el campo
+efímero, el minero lo abre y cobra exacto, otra wallet no lo abre; sin el modo
+sale v1 (32 bytes); y la regla de consenso de los sobres acepta uno v2.
+
+Apps: ZKAPriv compila (red, ui, app) y pasan 30 pruebas de red; ZSilent pasa 63
+más 3 nuevas (lectura del JSON de `wallet-receive --hybrid`).
 
 Activación y P2P (`cargo test --lib -- hybrid_outputs_need_canonical
 el_mensaje_p2p_conserva`): la salida v2 exige también los bundles canónicos y

@@ -753,6 +753,31 @@ mod tests {
         assert!(matches!(err, FeeClaimForMissingPrivateTx(_)));
     }
 
+    // Un sobre v2 de comision lleva el ciphertext X-Wing (1.120 bytes) en el
+    // campo efimero. La regla de consenso de los sobres solo exige que no este
+    // vacio, asi que pasa igual que uno v1: el sobre v2 no es un cambio de
+    // consenso (docs/ETAPA3-direcciones-hibridas.md).
+    #[test]
+    fn a_hybrid_fee_claim_passes_the_consensus_shape_rule() {
+        let chain_id = "zoka-test-net";
+        let parent = build_genesis_parent(chain_id);
+        let block = mine_block(
+            chain_id,
+            &parent,
+            "zka1miner",
+            initial_reward(),
+            4,
+            1_700_000_000,
+        )
+        .with_private_tx_hashes(vec!["private-tx-a".to_string()])
+        .with_private_fee_claims(vec![PrivateFeeClaim {
+            tx_hash: "private-tx-a".to_string(),
+            ephemeral_pubkey: vec![7; crate::private_wallet::HYBRID_OUTPUT_KEM_CIPHERTEXT_BYTES],
+            ciphertext: vec![9; 48],
+        }]);
+        assert!(validate_private_fee_claims(&block).is_ok());
+    }
+
     #[test]
     fn block_private_tx_hashes_are_consensus_bounded() {
         let chain_id = "zoka-test-net";

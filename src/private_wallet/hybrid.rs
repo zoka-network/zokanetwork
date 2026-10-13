@@ -28,7 +28,7 @@ use curve25519_dalek::scalar::Scalar;
 use curve25519_dalek::traits::Identity;
 use sha2::{Digest, Sha256};
 use std::fmt;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 use zoka_pq::{
     XWingCiphertext, XWingPublicKey, XWingSecretKey, X_WING_CIPHERTEXT_BYTES,
     X_WING_PUBLIC_KEY_BYTES,
@@ -55,6 +55,8 @@ const OUTPUT_CONTEXT_DOMAIN: &[u8] = b"zoka-hybrid-output-ctx-v2";
 const OUTPUT_KEY_DOMAIN: &[u8] = b"zoka-hybrid-output-key-v2";
 const AMOUNT_BLIND_DOMAIN: &[u8] = b"zoka-hybrid-amount-blind-v2";
 const STEALTH_TAG_DOMAIN: &[u8] = b"zoka-hybrid-stealth-v2";
+/// Clave del sobre v2 con la apertura de la comisión de una transacción.
+pub const FEE_CLAIM_DOMAIN: &[u8] = b"zoka-hybrid-fee-claim-v2";
 
 /// Los errores nunca incluyen claves, secretos ni el texto de la dirección.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,6 +246,18 @@ impl HybridScanKey {
         })
     }
 
+    /// Clave del sobre v2 de una comisión, del lado del minero. Un ciphertext
+    /// ajeno da otra clave por el rechazo implícito, y el sobre no se abre.
+    pub fn fee_claim_key(
+        &self,
+        kem_ciphertext: &[u8],
+        tx_hash: &str,
+    ) -> Option<Zeroizing<[u8; 32]>> {
+        let ciphertext = XWingCiphertext::from_bytes(kem_ciphertext).ok()?;
+        let shared = self.kem_secret.decapsulate(&ciphertext).ok()?;
+        Some(fee_claim_key(shared.expose_secret(), kem_ciphertext, tx_hash))
+    }
+
     /// Ciego del monto de una salida que ya se sabe propia. No comprueba
     /// pertenencia: por el rechazo implícito, un ciphertext ajeno también da
     /// un valor, que no abre nada. Para reconocer salidas, [`Self::scan`].
@@ -404,6 +418,32 @@ pub fn hybrid_output_material(recipient: &HybridAddress, commitment: &str) -> Hy
         amount_blind,
         stealth_address,
     }
+}
+
+/// Sobre v2 con la apertura de la comisión de `tx_hash`: encapsula hacia la
+/// clave X-Wing de la `zkq1` del minero. El ciphertext viaja en el lugar de la
+/// clave efímera Ristretto del sobre v1; la clave, ligada al ciphertext y a la
+/// transacción, cifra la apertura.
+pub fn hybrid_fee_claim_material(
+    miner: &HybridAddress,
+    tx_hash: &str,
+) -> (Vec<u8>, Zeroizing<[u8; 32]>) {
+    let (ciphertext, shared) = miner.kem_public.encapsulate();
+    let kem_ciphertext = ciphertext.as_bytes().to_vec();
+    let key = fee_claim_key(shared.expose_secret(), &kem_ciphertext, tx_hash);
+    (kem_ciphertext, key)
+}
+
+fn fee_claim_key(shared: &[u8], kem_ciphertext: &[u8], tx_hash: &str) -> Zeroizing<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    hasher.update(FEE_CLAIM_DOMAIN);
+    hasher.update([0x1f]);
+    hasher.update(shared);
+    hasher.update([0x1f]);
+    hasher.update(kem_ciphertext);
+    hasher.update([0x1f]);
+    hasher.update(tx_hash.as_bytes());
+    Zeroizing::new(hasher.finalize().into())
 }
 
 fn output_context(kem_ciphertext: &[u8], commitment: &str) -> [u8; 32] {

@@ -1,6 +1,6 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
-Actualizada: **12 de octubre de 2026**, Argentina (segunda sesión, Claude).
+Actualizada: **13 de octubre de 2026**, Argentina (tercera sesión, Claude).
 Proyecto: `C:\Users\mderramus\ZOKA`.
 
 ## Punto de partida
@@ -20,11 +20,19 @@ local, sin activar** (rama `etapa3-direcciones-hibridas`): consenso de la
 salida v2 en todas las builds; envío, recepción, gasto y CLI de `zkq1` con
 `pq-experimental`; la v2 exige también los bundles canónicos. Ver la etapa 3.
 
-**Siguiente paso natural:** cerrar la etapa 3 en los clientes: motor móvil con
-`pq-experimental` (los dos ABIs), dirección `zkq1` y su QR en ZSilent y ZKAPriv
-solo cuando la red la active, y la comisión del minero híbrida. Fijar alturas
-en Zenith (primero los bundles canónicos, después la v2) es decisión del
-usuario y exige que la red actualice antes.
+**13/10: la etapa 3 quedó cerrada en código, sin activar.** Motor móvil con
+`pq-experimental` en los dos ABIs (+172 KB / +104 KB), ZKAPriv y ZSilent reconocen,
+muestran y envían a la `zkq1` **solo cuando la red fija la altura** (hoy nula: no se
+ve nada), y la comisión del minero viaja en un sobre v2 que **no cambia el
+consenso**. Ramas `etapa3-apps-zkq1` (ZKAPriv `3ee8956`, `f2f8953`; ZSilent
+`a55423f`) y `etapa3-direcciones-hibridas` (nodo). Nada instalado ni publicado.
+
+**Siguiente paso natural:** decisiones del usuario antes de seguir con la etapa 3:
+(a) instalar el APK y el ZSilent nuevos para probar envíos reales entre las dos apps
+en una red local con la activación fijada; (b) formato JSON del ciphertext (abierto
+6 de la especificación) antes de activar; (c) fijar alturas en Zenith (primero los
+bundles canónicos, después la v2), que exige que la red actualice antes. Sin esas
+decisiones, lo que sigue es la etapa 4 (circuito sin key images), que es diseño.
 
 Las ramas del nodo están apiladas, cada una sobre la anterior:
 `postcuantica-integracion-nodo` → `zenith-testnet` → `arreglo-sync-only` →
@@ -219,7 +227,14 @@ el `zoka.exe` de `38534d0c`.
   activación aceptaba el bloque (medido en la red local).
 - [x] Wallets guardadas y CLI (`wallet-receive --hybrid`, `tx-send --to zkq1…`).
   El vuelto sigue al pago (pago v2 ⇒ vuelto v2).
-- [ ] ZSilent y motor móvil (compilar el `.so` con `pq-experimental`).
+- [x] ZSilent y motor móvil (13/10): `.so` de los dos ABIs con `pq-experimental`,
+  JNI `hybridWalletInfo`/`scanHybridOutputs`, escaneo v2 en lote en ZKAPriv, zkq1 y
+  QR en las dos apps solo con altura, envío a zkq1 con la misma condición. Detalle
+  en la sección "Clientes" de la especificación.
+- [x] Comisión del minero (13/10): sobre v2 con ciphertext X-Wing en el campo
+  efímero, etiqueta `zoka-hybrid-fee-claim-v2`; sin cambio de consenso (la regla de
+  bloques solo exige campos no vacíos, y hay prueba). Sale v2 solo con la feature,
+  la altura fijada y la wallet del minero local.
 - [x] Prueba en red local de tres nodos (dos corridas): la v2 espera en el
   mempool hasta la altura, entra con sus cuerpos, el destinatario la ve y la
   gasta, los saldos cierran exactos y un nodo sin la activación rechaza el
