@@ -65,6 +65,11 @@ sobre `checkpoints-autoritativos`:
 - **2.1.0:** procedimiento en [docs/RELEASE-2.1.0-testnet.md](docs/RELEASE-2.1.0-testnet.md)
   (el `PROTOCOL_FREEZE_ID` no cambia; las alturas se fijan el día de publicar) y
   sección 2.1.0 en el borrador de anuncio.
+- **Etapa de gasto sin key images** (rama `etapa5-investigacion`): construcción
+  elegida, provisoria, **Ironwood** (el circuito corregido de Orchard sobre Halo 2,
+  sin trusted setup), con el cifrado de notas X-Wing. Medido en el teléfono: 20 s
+  por envío, 40 s para armar la clave al abrir, 111 MB. Ver
+  [docs/ETAPA5-gasto-sin-key-images.md](docs/ETAPA5-gasto-sin-key-images.md).
 - **Instalar en la PC:** el clasificador de permisos frenó dos veces reemplazar el
   `zoka.exe` instalado. Queda `scripts/instalar-en-pc.ps1`, que corre el usuario
   con ZSilent cerrado: instala el nodo de `target/release` y Tor 0.4.9.14, con
@@ -296,6 +301,12 @@ en el teléfono ARMv7. X-Wing incluye expansión interna de claves. No son tiemp
 de escaneo completo ni una comparación aislada del coste del combinador.
 
 ### 4. Circuito de privacidad y eliminación de key images
+
+**13/10: no se diseña un circuito propio.** Construcción elegida (provisoria):
+Ironwood, mediante el crate `orchard`, con el cifrado de notas X-Wing; quita además
+el trusted setup de los gastos. Criterio, medición y próximos pasos en
+[docs/ETAPA5-gasto-sin-key-images.md](docs/ETAPA5-gasto-sin-key-images.md). Las tareas
+de abajo se cumplen adoptando ese circuito, salvo la revisión externa.
 
 - [ ] Diseñar un circuito que demuestre propiedad de cada nota, pertenencia al árbol,
   derivación correcta de nullifiers y conservación de valor.

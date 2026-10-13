@@ -1,0 +1,37 @@
+{
+  "date": "2026-10-13",
+  "purpose": "Etapa 5: costo de probar un gasto con el circuito de Ironwood (Orchard corregido, Halo 2) en la PC y en el telefono de pruebas",
+  "tool": "crates/ironwood-bench (orchard 0.16.0, BundleVersion::ironwood_v3, circuito PostNu6_3), datos sinteticos",
+  "notes": [
+    "Un bundle con salidas y sin gastos reales lleva acciones completas (gasto ficticio + salida): el costo de la prueba es el de un gasto real.",
+    "Orchard rellena a 2 acciones como minimo: 1 y 2 salidas cuestan lo mismo.",
+    "halo2_proofs 0.4 no serializa las claves: la de prueba se arma en cada arranque.",
+    "En el telefono la memoria es VmHWM de /proc/self/status; en Windows no se mide."
+  ],
+  "results": [
+    {
+      "device": "PC del usuario, Windows 10, x86_64",
+      "threads": 4,
+      "iterations": 3,
+      "proving_key_ms": 2824,
+      "verifying_key_ms": 1921,
+      "peak_rss_kb": null,
+      "runs": [
+        {"outputs": 1, "actions": 2, "proof_bytes": 7264, "prove_ms": [2037, 2046, 2059], "verify_ms": [16, 17, 17]},
+        {"outputs": 2, "actions": 2, "proof_bytes": 7264, "prove_ms": [2053, 2073, 2066], "verify_ms": [17, 18, 16]}
+      ]
+    },
+    {
+      "device": "Samsung SM-A135M (Galaxy A13), armeabi-v7a (32 bits), 8 nucleos, 3,7 GB",
+      "threads": 8,
+      "iterations": 2,
+      "proving_key_ms": 39675,
+      "verifying_key_ms": 26793,
+      "peak_rss_kb": 111364,
+      "runs": [
+        {"outputs": 1, "actions": 2, "proof_bytes": 7264, "prove_ms": [19465, 19718], "verify_ms": [171, 175]},
+        {"outputs": 2, "actions": 2, "proof_bytes": 7264, "prove_ms": [19393, 20161], "verify_ms": [173, 179]}
+      ]
+    }
+  ]
+}

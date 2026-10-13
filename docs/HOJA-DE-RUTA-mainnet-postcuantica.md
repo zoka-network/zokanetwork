@@ -271,6 +271,12 @@ cuentas; el resto lo armo yo.
 Objetivo: que una computadora cuántica futura no pueda reconstruir qué salida gastó
 cada transacción. Es la etapa más grande y **arranca investigando**.
 
+**13/10/2026: construcción elegida (provisoria) → Ironwood** (el circuito corregido de
+Orchard, Halo 2, sin trusted setup), con el cifrado de notas X-Wing de la etapa 3.
+Medido en el teléfono de pruebas: 20 s por envío y 40 s para armar la clave al abrir.
+Criterio, opciones y fuentes en [ETAPA5-gasto-sin-key-images.md](ETAPA5-gasto-sin-key-images.md).
+Reemplaza el plan de abajo de un circuito Groth16 propio (5.3 a 5.5).
+
 **Hallazgo del 2026-10-11, más grave que lo cuántico:** hoy **no hace falta una
 computadora cuántica** para saber qué nota gasta cada transacción. `PrivateTransaction`
 publica `input_commitments` ("Commitments of consumed notes") e `input_public_keys`
