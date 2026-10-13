@@ -55,8 +55,8 @@ cuando la red fija la altura).
    las de economía) se actualizan para fijar las nuevas.
 4. **Probar.** `cargo test --release` completo, con y sin `pq-experimental`;
    Gradle de ZSilent y de ZKAPriv. Además, **red local de los checkpoints**
-   (todavía no se hizo: hay pruebas unitarias de la firma, la aceptación y la
-   obediencia, pero no de punta a punta): dos nodos con su `ZOKA_HOME`, una
+   (hecha el 13/10: todo bien, resultados en
+   [CHECKPOINTS-AUTORITATIVOS.md](CHECKPOINTS-AUTORITATIVOS.md#prueba-en-red-local-13102026)): nodos con su `ZOKA_HOME`, una
    clave de prueba y `ZOKA_CHECKPOINT_AUTHORITY_PUBKEY`, por debajo de la altura
    296 (los checkpoints compilados de Zenith no coincidirían con una cadena
    local). Comprobar que la autoridad firma cada 30 bloques, que el otro nodo lo

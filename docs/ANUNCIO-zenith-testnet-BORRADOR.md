@@ -40,12 +40,12 @@ Zoka Quantic arranca de cero:
 Vamos a anunciar la fecha de Zoka Quantic recién cuando el diseño esté
 implementado, probado en la testnet y revisado.
 
-### Versión 2.1.0 (completar las alturas y la fecha al publicar)
+### Versión 2.1.0 (13/10/2026)
 
-**Zenith 2.1.0: hay que actualizar antes del bloque {ALTURA_BUNDLES}.**
+**Zenith 2.1.0: hay que actualizar antes del bloque 30.284.**
 
-- Desde el bloque {ALTURA_BUNDLES} cada bloque lleva adentro los cuerpos de sus
-  transacciones privadas, y desde el {ALTURA_V2} la red acepta las direcciones
+- Desde el bloque 30.284 cada bloque lleva adentro los cuerpos de sus
+  transacciones privadas, y desde el 31.004 la red acepta las direcciones
   postcuánticas `zkq1` (X-Wing: X25519 + ML-KEM-768) para probarlas. Es la
   primera prueba pública de esta parte de Quantic; la red sigue siendo de prueba.
 - Un nodo que no actualice queda en otra rama desde esa altura.
@@ -92,12 +92,12 @@ Zoka Quantic starts from zero:
 We will announce a Zoka Quantic date only once the design is implemented,
 tested on the testnet and reviewed.
 
-### Release 2.1.0 (fill in heights and date when publishing)
+### Release 2.1.0 (October 13, 2026)
 
-**Zenith 2.1.0: update before block {HEIGHT_BUNDLES}.**
+**Zenith 2.1.0: update before block 30,284.**
 
-- From block {HEIGHT_BUNDLES} every block carries the bodies of its private
-  transactions, and from block {HEIGHT_V2} the network accepts post-quantum
+- From block 30,284 every block carries the bodies of its private
+  transactions, and from block 31,004 the network accepts post-quantum
   `zkq1` addresses (X-Wing: X25519 + ML-KEM-768) for testing. This is the first
   public test of this part of Quantic; the network is still a testnet.
 - A node that does not update ends up on a different branch from that height.

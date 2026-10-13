@@ -198,9 +198,13 @@ pub const PRIVATE_TX_HASHES_PER_BLOCK_LIMIT: usize = 128;
 /// staging app can exercise the compact v2-i1 profile against the test nodes
 /// (which already run with these activations enabled). This ONLY affects the
 /// phone's local gate — node/server binaries never enable `mobile`, so their
-/// consensus default stays `None`/env-controlled and is untouched.
+/// consensus default is the non-mobile constant below (env-overridable).
+///
+/// Zenith (testnet), versión 2.1.0, fijada el 13/10/2026: la punta de ese día
+/// (25.244, la red estaba quieta) más 5.040 bloques, una semana al objetivo de
+/// 120 s. Ver `docs/RELEASE-2.1.0-testnet.md`.
 #[cfg(not(feature = "mobile"))]
-pub const PRIVATE_TX_CANONICAL_BUNDLE_ACTIVATION_HEIGHT: Option<u64> = None;
+pub const PRIVATE_TX_CANONICAL_BUNDLE_ACTIVATION_HEIGHT: Option<u64> = Some(30_284);
 #[cfg(feature = "mobile")]
 pub const PRIVATE_TX_CANONICAL_BUNDLE_ACTIVATION_HEIGHT: Option<u64> = Some(0);
 /// Compact mobile Groth16 profile remains disabled until the final i1 CRS,
@@ -290,7 +294,9 @@ pub enum PqFeature {
     HybridSnapshotSignatures,
 }
 
-pub const PQ_HYBRID_ADDRESSES_ACTIVATION_HEIGHT: Option<u64> = None;
+/// Zenith (testnet), versión 2.1.0: un día (720 bloques) después de los bundles
+/// canónicos, para ver los bundles andando antes de sumar la v2.
+pub const PQ_HYBRID_ADDRESSES_ACTIVATION_HEIGHT: Option<u64> = Some(31_004);
 pub const PQ_SPEND_CIRCUIT_ACTIVATION_HEIGHT: Option<u64> = None;
 pub const PQ_HYBRID_SNAPSHOT_SIGNATURES_ACTIVATION_HEIGHT: Option<u64> = None;
 
@@ -600,10 +606,11 @@ mod tests {
                 && !hash.bytes().any(|byte| byte.is_ascii_uppercase())));
     }
 
-    // Esta prueba describe la configuracion de consenso, donde estas
-    // activaciones estan dormidas. El build `mobile` las enciende desde genesis
-    // a proposito -- es la compuerta local del telefono, documentada en
-    // economics.rs -- asi que aca no puede pasar y no deberia intentarlo.
+    // Esta prueba describe la configuracion de consenso de los nodos (desde la
+    // 2.1.0, con la altura de Zenith fijada). El build `mobile` enciende los
+    // bundles desde genesis a proposito -- es la compuerta local del telefono,
+    // documentada en economics.rs -- asi que aca no puede pasar y no deberia
+    // intentarlo.
     //
     // Sin este marcado, `cargo test --features mobile` quedaba con cinco rojos
     // permanentes y dejaba de servir como senal: un fallo real se perdia entre
@@ -611,10 +618,15 @@ mod tests {
     // protocolo nuevo.
     #[cfg(not(feature = "mobile"))]
     #[test]
-    fn canonical_private_bundle_stays_dormant_until_height_is_fixed() {
-        assert_eq!(PRIVATE_TX_CANONICAL_BUNDLE_ACTIVATION_HEIGHT, None);
-        assert!(!private_tx_canonical_bundle_required(0));
-        assert!(!private_tx_canonical_bundle_required(u64::MAX));
+    fn canonical_private_bundle_activates_at_the_2_1_0_height() {
+        // Zenith 2.1.0: antes de la altura la cadena valida exactamente como
+        // antes; desde ahí cada bloque lleva los cuerpos de sus tx privadas.
+        assert_eq!(PRIVATE_TX_CANONICAL_BUNDLE_ACTIVATION_HEIGHT, Some(30_284));
+        if std::env::var_os("ZOKA_PRIVATE_TX_CANONICAL_BUNDLE_ACTIVATION_HEIGHT").is_none() {
+            assert!(!private_tx_canonical_bundle_required(0));
+            assert!(!private_tx_canonical_bundle_required(30_283));
+            assert!(private_tx_canonical_bundle_required(30_284));
+        }
         assert!(!private_tx_canonical_bundle_required_at(9, Some(10)));
         assert!(private_tx_canonical_bundle_required_at(10, Some(10)));
         assert!(private_tx_canonical_bundle_required_at(11, Some(10)));
@@ -658,11 +670,21 @@ mod tests {
     }
 
     // Incluir las primitivas post-cuanticas no puede cambiar Zenith: ninguna
-    // funcion tiene altura hasta que se acuerde y se fije en los binarios.
-    // Vale tambien para la build `mobile`, a diferencia de v2-i1.
+    // funcion tiene altura hasta que se acuerde y se fije en los binarios
+    // (la 2.1.0 fijo la de las direcciones hibridas). Vale tambien para la
+    // build `mobile`, a diferencia de v2-i1.
     #[test]
-    fn pq_features_stay_dormant_until_a_height_is_fixed() {
-        for feature in PqFeature::ALL {
+    fn pq_features_activate_only_where_a_height_is_fixed() {
+        // Zenith 2.1.0 fija solo la de las direcciones híbridas; las demás
+        // siguen dormidas hasta que se acuerde la suya.
+        assert_eq!(
+            PqFeature::HybridAddresses.compiled_activation_height(),
+            Some(31_004)
+        );
+        for feature in [
+            PqFeature::SpendCircuitWithoutKeyImages,
+            PqFeature::HybridSnapshotSignatures,
+        ] {
             assert_eq!(
                 feature.compiled_activation_height(),
                 None,
@@ -716,8 +738,13 @@ mod tests {
         assert!(!pq_hybrid_outputs_active_at(79, Some(80), Some(70)));
         assert!(pq_hybrid_outputs_active_at(80, Some(80), Some(70)));
         assert!(!pq_hybrid_outputs_active_at(u64::MAX, Some(80), None));
-        if std::env::var_os(PqFeature::HybridAddresses.activation_env_var()).is_none() {
-            assert_eq!(pq_hybrid_outputs_activation_height(), None);
+        // Zenith 2.1.0: la v2 rige desde la mayor de las dos alturas, la suya.
+        // En la build `mobile` los bundles valen desde 0 y el resultado es el
+        // mismo.
+        if std::env::var_os(PqFeature::HybridAddresses.activation_env_var()).is_none()
+            && std::env::var_os("ZOKA_PRIVATE_TX_CANONICAL_BUNDLE_ACTIVATION_HEIGHT").is_none()
+        {
+            assert_eq!(pq_hybrid_outputs_activation_height(), Some(31_004));
         }
     }
 

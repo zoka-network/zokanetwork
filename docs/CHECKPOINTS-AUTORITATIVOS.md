@@ -121,6 +121,29 @@ se reorganizan hacia esa rama aunque no esté en la propia:
 **Nunca firmar un hash que no sea de un bloque real:** todos los nodos que
 obedecen quedarían en cuarentena esperando una rama que no existe.
 
+## Prueba en red local (13/10/2026)
+
+Tres nodos en la PC, cada uno con su `ZOKA_HOME`, sin manifiesto de red ni iroh,
+con una clave de prueba (`ZOKA_CHECKPOINT_AUTHORITY_PUBKEY`) y dificultad de
+ensayo. Binario de `e142e349`. Resultado:
+
+1. **La autoridad firma**: A minaba sola y firmó el checkpoint 16 en cuanto B se
+   conectó (punta 22: la punta menos 6).
+2. **Llega por gossip**: B lo tuvo en el mismo segundo, aun antes de tener ese
+   bloque (estaba en el 12).
+3. **Corrección a mano**: `checkpoint-sign --post` le entregó a B un checkpoint en
+   el 17 y B lo aceptó.
+4. **Una rama más pesada no arrastra a la autoridad**: C minó sola hasta el 64 una
+   rama distinta desde el génesis (A estaba en 24) y se conectó a A. A la rechazó
+   ("checkpoint mismatch at height 16") y siguió en su rama.
+5. **El nodo desviado obedece**: C recibió el checkpoint a los pocos segundos,
+   dejó de minar (cuarentena), entró en modo de recuperación y en menos de dos
+   minutos tenía en el 16 el bloque firmado, bajando la rama de A.
+
 ## Pendiente
 
 - **Firma híbrida** (versión 2: Ed25519 + ML-DSA-65), con la etapa 5.
+- **Mientras un par anuncia una punta más alta, la autoridad no firma** (figura
+  sincronizando). Es lo correcto si esa punta es real; un par que mienta su
+  altura puede frenar las firmas nuevas, no las viejas (el vigente se reenvía
+  igual). Revisar antes de Quantic.
