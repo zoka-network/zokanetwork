@@ -5,6 +5,26 @@ Proyecto: `C:\Users\mderramus\ZOKA`.
 
 ## Punto de partida
 
+**13/10/2026, a pedido del usuario: SALIÓ LA 2.1.0 DE TESTNET.** Publicada en
+`github.com/zoka-network` (y espejada en GitLab), probada antes en una red local:
+
+- Nodo `v2.1.0` (rama `release-2.1.0`, código de `b542a83f`, `pq-experimental`):
+  `zoka.exe` `0ac64cfb…`, `zokahd.exe` `6ec21042…`. Fork en Zenith: **bundles
+  canónicos desde 30.284 y salidas v2 / `zkq1` desde 31.004** (punta del día:
+  25.244, la red estaba quieta). `PROTOCOL_FREEZE_ID` sin cambios.
+- ZSilent `v2.1.0`: MSI `a8d3814b…` (verificado por dentro: mismo `zoka.exe`, Tor
+  0.4.9.14). ZKAPriv `v2.1.0` (la `v1.1.0` ya existía de 2025): APK `e9176c93…`,
+  mismo certificado `061376f8…`. Release `trusted-setup-mainnet-v1` con el `DIGEST`.
+- **Instalado:** PC con ZSilent 2.1.0 (respaldo entero en
+  `%LOCALAPPDATA%\ZSilent Core.respaldo-20261013-v2.0.2`) y teléfono con ZKAPriv
+  2.1.0 (abre y carga el motor). **Falta que el usuario abra ZSilent y desbloquee**
+  para que el nodo 2.1.0 corra y siga firmando checkpoints.
+- **Falta:** el anuncio (texto listo en
+  [docs/ANUNCIO-zenith-testnet-BORRADOR.md](docs/ANUNCIO-zenith-testnet-BORRADOR.md),
+  lo publica el usuario), alguien que mine para llegar a 30.284, binario Linux
+  (WSL no arrancó) y, después de 31.004, los envíos reales `zkq1` entre las apps.
+  `main` sigue sin tocar: la versión está en las ramas `release-2.1.0`.
+
 **La web y los papers están publicados. La base criptográfica experimental está
 integrada al nodo detrás de la feature `pq-experimental`, apagada por defecto
 (rama `postcuantica-integracion-nodo`), y Zenith se presenta como testnet en la

@@ -1,5 +1,9 @@
 # Versión 2.1.0 de testnet (Zenith): procedimiento
 
+**Ejecutado y publicado el 13/10/2026** (alturas 30.284 y 31.004; releases `v2.1.0`
+del nodo, ZSilent y ZKAPriv, y `trusted-setup-mainnet-v1`). Quedan el anuncio y
+los envíos `zkq1` reales después de la activación; ver la hoja de traspaso.
+
 Preparado el 13/10/2026. Esta versión activa en Zenith lo que ya está en código y
 probado en la red local. **Nada de esto está publicado.** Las alturas de
 activación se fijan el día en que se compila para publicar, con la punta de ese
