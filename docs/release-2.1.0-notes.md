@@ -11,7 +11,7 @@ Repositories and tags:
 
 - Node: `zoka-network/zokanetwork`, tag `v2.1.0`
 - Desktop: `zoka-network/zsilent-core`, tag `v2.1.0` (embeds node 2.1.0 and Tor 0.4.9.14)
-- Android: `zoka-network/zkapriv`, tag `v1.1.0`
+- Android: `zoka-network/zkapriv`, tag `v2.1.0` (ZKAPriv now follows the network version)
 
 ## Activation heights
 

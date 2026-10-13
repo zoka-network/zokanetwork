@@ -43,7 +43,7 @@ cuando la red fija la altura).
      `minimum_client_version` en `docs/mainnet-network.v1.json` igual. La prueba
      `tests/mainnet_recovery_policy.rs` exige que coincidan.
    - ZSilent: `releaseVersion` en `zsilent-core/build.gradle.kts`.
-   - ZKAPriv: `versionName = "1.1.0"` y `versionCode` + 1 en
+   - ZKAPriv: `versionName = "2.1.0"` (la v1.1.0 ya existia de 2025) y `versionCode` + 1 en
      `zkapriv/app/build.gradle.kts`.
 3. **Alturas.** Leer la punta del nodo de la PC (`GET /chain/height`) y escribir
    en `src/economics.rs`:
