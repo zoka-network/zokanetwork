@@ -27,12 +27,30 @@ ve nada), y la comisión del minero viaja en un sobre v2 que **no cambia el
 consenso**. Ramas `etapa3-apps-zkq1` (ZKAPriv `3ee8956`, `f2f8953`; ZSilent
 `a55423f`) y `etapa3-direcciones-hibridas` (nodo). Nada instalado ni publicado.
 
-**Siguiente paso natural:** decisiones del usuario antes de seguir con la etapa 3:
-(a) instalar el APK y el ZSilent nuevos para probar envíos reales entre las dos apps
-en una red local con la activación fijada; (b) formato JSON del ciphertext (abierto
-6 de la especificación) antes de activar; (c) fijar alturas en Zenith (primero los
-bundles canónicos, después la v2), que exige que la red actualice antes. Sin esas
-decisiones, lo que sigue es la etapa 4 (circuito sin key images), que es diseño.
+**13/10, más tarde: el usuario delegó sus decisiones ("tomalas tú, menos la
+VPS")** y pidió que **su PC sea el nodo autoritario** de Zenith y de Quantic.
+
+- Decisiones tomadas y su criterio: [docs/DECISIONES-2026-10-13.md](docs/DECISIONES-2026-10-13.md).
+  El ciphertext queda como arreglo JSON; los bundles canónicos y la v2 se activan
+  en Zenith con la 2.1.0 (punta + una semana; la v2, un día después); las pruebas
+  reales de `zkq1` entre apps van después de activar.
+- **Nodo autoritario:** rama `checkpoints-autoritativos` (`9bcb6ad9`, sobre
+  `etapa3-direcciones-hibridas`). Diseño en
+  [docs/CHECKPOINTS-AUTORITATIVOS.md](docs/CHECKPOINTS-AUTORITATIVOS.md). La clave de
+  Zenith está en la PC (`%APPDATA%\Zoka\.zoka\mainnet\checkpoint-authority.key`,
+  pública `bf5c9215…7bd4`, compilada). **Es la única copia: el usuario tiene que
+  respaldarla fuera de la PC.** Los demás nodos obedecen recién con un binario que
+  la traiga (2.1.0). Suite: 904 + 81 + 1, sin fallos.
+- VPS: paquete listo en `deploy/vps/` (`ed304d43`); no se contrata ni se arranca
+  nada hasta que el usuario consiga los servidores.
+
+**Siguiente paso natural:** instalar en la PC el `zoka.exe` de
+`checkpoints-autoritativos` para que empiece a firmar (pendiente de que el usuario
+lo autorice; release compilado de `9bcb6ad9` con features por defecto: `zoka.exe`
+SHA-256 `18179F27…`, `zokahd.exe` `3F61962E…`; `checkpoint-status` confirma que
+reconoce la clave local), y armar la 2.1.0 de testnet: alturas de activación, versiones
+alineadas, release en `github.com/zoka-network` y anuncio. Después, la etapa 4
+(gastar sin key images), que es diseño.
 
 Las ramas del nodo están apiladas, cada una sobre la anterior:
 `postcuantica-integracion-nodo` → `zenith-testnet` → `arreglo-sync-only` →
