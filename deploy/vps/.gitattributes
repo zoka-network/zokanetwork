@@ -1,0 +1,3 @@
+# Estos archivos se ejecutan o se leen en Linux: con core.autocrlf=true en
+# Windows saldrian con CRLF y bash/systemd/Caddy fallarian en el servidor.
+* text eol=lf

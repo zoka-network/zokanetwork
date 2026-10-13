@@ -1,0 +1,18 @@
+[Unit]
+Description=Publicar los datos del explorador de Zoka
+After=zoka-nodo.service
+Requires=zoka-nodo.service
+
+[Service]
+Type=oneshot
+User=zoka
+Group=zoka
+# Lee la API local del nodo y escribe JSON estatico que sirve Caddy.
+ExecStart=/usr/bin/python3 /opt/zoka/explorador/publish.py --node http://127.0.0.1:3000 --out /srv/zoka/explorador-datos
+TimeoutStartSec=20min
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/zoka/explorador-datos
+PrivateTmp=true

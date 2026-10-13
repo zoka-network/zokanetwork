@@ -1,0 +1,31 @@
+[Unit]
+Description=Nodo de Zoka (sin wallet y sin mineria)
+After=network-online.target tor.service
+Wants=network-online.target tor.service
+
+[Service]
+Type=simple
+User=zoka
+Group=zoka
+WorkingDirectory=/var/lib/zoka
+EnvironmentFile=/etc/zoka/nodo.env
+# $ZOKA_ARGS sin llaves: systemd lo separa en argumentos por los espacios.
+ExecStart=/opt/zoka/bin/zoka fullnode $ZOKA_ARGS
+Restart=on-failure
+RestartSec=15
+LimitNOFILE=65536
+
+# El nodo solo escribe en su carpeta.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/zoka
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

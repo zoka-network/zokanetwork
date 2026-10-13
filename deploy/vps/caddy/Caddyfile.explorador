@@ -1,0 +1,15 @@
+# Sirve los datos del explorador: JSON estatico que escribe publish.py.
+# instalar.sh reemplaza __DOMINIO__. Caddy saca el certificado solo, siempre que
+# el registro DNS del dominio ya apunte a este servidor.
+__DOMINIO__ {
+	root * /srv/zoka/explorador-datos
+	header {
+		# Datos publicos de solo lectura: cualquier sitio puede leerlos.
+		Access-Control-Allow-Origin "*"
+		# publish.py escribe archivos sin extension con la misma ruta que la API.
+		Content-Type "application/json"
+		Cache-Control "public, max-age=30"
+		X-Content-Type-Options "nosniff"
+	}
+	file_server
+}
