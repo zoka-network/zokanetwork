@@ -54,7 +54,14 @@ cuando la red fija la altura).
    suponen alturas nulas (`pq_features_stay_dormant_until_a_height_is_fixed` y
    las de economía) se actualizan para fijar las nuevas.
 4. **Probar.** `cargo test --release` completo, con y sin `pq-experimental`;
-   Gradle de ZSilent y de ZKAPriv.
+   Gradle de ZSilent y de ZKAPriv. Además, **red local de los checkpoints**
+   (todavía no se hizo: hay pruebas unitarias de la firma, la aceptación y la
+   obediencia, pero no de punta a punta): dos nodos con su `ZOKA_HOME`, una
+   clave de prueba y `ZOKA_CHECKPOINT_AUTHORITY_PUBKEY`, por debajo de la altura
+   296 (los checkpoints compilados de Zenith no coincidirían con una cadena
+   local). Comprobar que la autoridad firma cada 30 bloques, que el otro nodo lo
+   recibe por gossip (`GET /checkpoint/latest`), que una rama que lo contradice
+   queda en cuarentena y que `checkpoint-sign --post` corrige.
 5. **Compilar.**
    - Nodo: `cargo build --release --features pq-experimental`.
    - Motor móvil: `native/build-android.ps1` (los dos ABIs; toma las alturas del
