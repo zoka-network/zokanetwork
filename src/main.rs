@@ -4181,6 +4181,58 @@ fn load_private_wallet_manager_for_network(
     password: Option<&str>,
     network: NetworkProfile,
 ) -> Result<PrivateWalletManager, String> {
+    let manager = read_private_wallet_manager(storage, password)?;
+    let Ok(mining_state) = load_user_mining_state_for_network(network) else {
+        return Ok(manager);
+    };
+    let has_mature_reward = mining_state.pending_rewards.iter().any(|reward| {
+        reward.unlock_height <= mining_state.chain_height
+            && resolve_private_wallet_name(&manager, &reward.wallet_address).is_some()
+    });
+    if !has_mature_reward {
+        return Ok(manager);
+    }
+    // Acreditar una recompensa madura guarda las wallets. Sobre la copia de
+    // arriba, leída sin el candado, pisaría lo que otro proceso guardó entre
+    // la lectura y la escritura: la reserva de un envío, por ejemplo. Por eso
+    // se relee con el candado tomado.
+    with_fresh_private_wallets(storage, password, |manager| {
+        if let Ok(mut mining_state) = load_user_mining_state_for_network(network) {
+            let _ = settle_mature_mining_rewards(
+                storage,
+                manager,
+                password,
+                network,
+                &mut mining_state,
+            );
+        }
+        Ok(())
+    })
+    .map(|((), manager)| manager)
+}
+
+/// Corre `change` sobre las wallets tal como están en disco ahora, con el
+/// candado tomado desde la lectura hasta que `change` termina (y con él, lo que
+/// guarde). Es la forma de escribir desde un proceso que tiene una copia en
+/// memoria que pudo quedar vieja: esa copia no se guarda nunca.
+fn with_fresh_private_wallets<T>(
+    storage: &WalletStorage,
+    password: Option<&str>,
+    change: impl FnOnce(&mut PrivateWalletManager) -> Result<T, String>,
+) -> Result<(T, PrivateWalletManager), String> {
+    let _wallet_lock = storage
+        .lock_private_wallets()
+        .map_err(|e| format!("failed to lock wallet directory: {e}"))?;
+    let mut manager = read_private_wallet_manager(storage, password)?;
+    let output = change(&mut manager)?;
+    Ok((output, manager))
+}
+
+/// Lee las wallets del disco sin escribir nada.
+fn read_private_wallet_manager(
+    storage: &WalletStorage,
+    password: Option<&str>,
+) -> Result<PrivateWalletManager, String> {
     let mut manager = PrivateWalletManager::new();
     let wallets = storage
         .load_all_private_wallets(password)
@@ -4214,15 +4266,6 @@ fn load_private_wallet_manager_for_network(
     // Y el guardia de comisiones ya cobradas, por el mismo motivo: si arranca
     // vacio, volver a escanear un bloque viejo las acredita de nuevo.
     manager.rebuild_claimed_fee_tx_hashes();
-    if let Ok(mut mining_state) = load_user_mining_state_for_network(network) {
-        let _ = settle_mature_mining_rewards(
-            storage,
-            &mut manager,
-            password,
-            network,
-            &mut mining_state,
-        );
-    }
     Ok(manager)
 }
 
@@ -4263,12 +4306,13 @@ fn should_replace_duplicate_private_wallet(
 
 /// Punto único por el que pasa toda escritura de wallet.
 ///
-/// El lock se toma **aquí** y no sólo en las secuencias largas porque aparecían
-/// caminos que escribían sin pasar por ellas — el cierre del ciclo de minería,
-/// por ejemplo, persiste con su copia en memoria de larga vida. Cada uno de
-/// esos podía borrar la reserva de notas de un envío hecho desde otro proceso.
-/// Poniendolo en el cuello de botella, un camino nuevo queda cubierto sin que
-/// nadie tenga que acordarse.
+/// El lock de acá solo ordena las escrituras: no impide guardar una copia vieja.
+/// Quien escribe tiene que haber leído con el lock ya tomado, o la escritura
+/// pisa lo que otro proceso guardó desde esa lectura. Así se perdían reservas
+/// de envíos: el cierre del ciclo de minería y `wallet-balance` guardaban la
+/// copia que habían leído antes y la nota volvía a figurar disponible (saldo
+/// inflado, y el envío siguiente la gastaba otra vez). Con una copia de larga
+/// vida, escribir con [`with_fresh_private_wallets`].
 ///
 /// Es reentrante, así que anida sin trabarse con quien ya lo tomó arriba.
 fn persist_private_wallet(
@@ -6544,13 +6588,20 @@ fn run_mining_batch_with_progress(
         state.avg_solve_time_secs = state.virtual_time_elapsed_secs / state.total_blocks as f64;
     }
     state.last_updated = now_secs();
-    let _ = settle_mature_mining_rewards(
-        &storage,
-        &mut private_manager,
-        config.password.as_deref(),
-        network,
-        &mut state,
-    )?;
+    // `private_manager` se leyó al empezar la tanda (o en el último bloque con
+    // cambios) y en el medio pudo haber un envío desde otro proceso. Acreditar
+    // sobre esa copia y guardarla le borraba la reserva al envío: sus notas
+    // volvían a figurar disponibles, el saldo se inflaba y el envío siguiente
+    // las gastaba de nuevo. Se acredita sobre lo que hay en disco.
+    with_fresh_private_wallets(&storage, config.password.as_deref(), |fresh| {
+        settle_mature_mining_rewards(
+            &storage,
+            fresh,
+            config.password.as_deref(),
+            network,
+            &mut state,
+        )
+    })?;
     save_user_mining_state_for_network(network, &state)?;
 
     Ok(MiningBatchSummary {
@@ -10669,24 +10720,21 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     //
     // Este camino LIBERA notas, asi que es el que mas cuidado necesita: si
     // corre sobre una vista vieja de la wallet puede soltar una reserva que
-    // otro proceso acaba de crear. El lock cubre leer-decidir-escribir como
-    // una sola operacion. Con `--sync-only` el gestor de wallets esta vacio a
-    // proposito y no hay nada que liberar.
-    {
-        let _wallet_lock = storage
-            .lock_private_wallets()
-            .map_err(|error| format!("failed to lock wallet directory: {error}"))?;
-        let released = private_wallet_manager.release_retired_exchange_reservations();
-        if released > 0 {
-            for name in private_wallet_manager.get_private_wallet_names() {
-                if let Some(wallet) = private_wallet_manager.get_private_wallet(&name) {
-                    storage
-                        .save_private_wallet(wallet, password.as_deref())
-                        .map_err(|error| {
-                            format!("failed to persist released wallet {name}: {error}")
-                        })?;
+    // otro proceso acaba de crear. Por eso relee las wallets con el lock
+    // tomado y cubre leer-decidir-escribir como una sola operacion. Con
+    // `--sync-only` el gestor de wallets esta vacio a proposito y no hay nada
+    // que liberar (ni contrasena con que leerlas).
+    if !sync_only {
+        let (released, fresh) =
+            with_fresh_private_wallets(&storage, password.as_deref(), |fresh| {
+                let released = fresh.release_retired_exchange_reservations();
+                if released > 0 {
+                    persist_all_private_wallets(&storage, fresh, password.as_deref())?;
                 }
-            }
+                Ok(released)
+            })?;
+        private_wallet_manager = fresh;
+        if released > 0 {
             startup_notes.push(format!(
                 "Released {released} note reservation(s) left by retired P2P exchange offers."
             ));
@@ -13608,6 +13656,18 @@ fn cmd_private_wallet_list(args: &[String]) -> Result<(), String> {
         }
         disk_wallets.push(wallet);
     }
+    // Con contraseña este comando sincroniza y guarda: el candado va antes de
+    // leer (ver `persist_private_wallet`). ZSilent lo llama seguido para
+    // refrescar el saldo, así que es el que más se cruza con un envío.
+    let _wallet_lock = if password.is_some() {
+        Some(
+            storage
+                .lock_private_wallets()
+                .map_err(|e| format!("failed to lock wallet directory: {e}"))?,
+        )
+    } else {
+        None
+    };
     let mut manager =
         load_private_wallet_manager_for_network(&storage, password.as_deref(), network)?;
     if password.is_some() {
@@ -13753,6 +13813,11 @@ fn cmd_private_balance(args: &[String]) -> Result<(), String> {
         option_value(args, "--db").or_else(|| Some(network.default_db_path().to_string()))
     };
     let as_json = has_flag(args, "--json");
+    // Sincroniza y guarda: el candado va antes de leer (ver
+    // `persist_private_wallet`).
+    let _wallet_lock = storage
+        .lock_private_wallets()
+        .map_err(|e| format!("failed to lock wallet directory: {e}"))?;
     let mut manager =
         load_private_wallet_manager_for_network(&storage, password.as_deref(), network)?;
     let wallet_name = resolve_private_wallet_name_required(&manager, &wallet_selector)?;
@@ -13876,6 +13941,11 @@ fn cmd_private_history(args: &[String]) -> Result<(), String> {
     let as_json = has_flag(args, "--json");
     let verbose = has_flag(args, "--verbose");
     let limit = parse_u64_arg(option_value(args, "--limit"), 20, "--limit")? as usize;
+    // Sincroniza y guarda: el candado va antes de leer (ver
+    // `persist_private_wallet`).
+    let _wallet_lock = storage
+        .lock_private_wallets()
+        .map_err(|e| format!("failed to lock wallet directory: {e}"))?;
     let mut manager =
         load_private_wallet_manager_for_network(&storage, password.as_deref(), network)?;
     let wallet_name = resolve_private_wallet_name_required(&manager, &wallet_selector)?;
@@ -14173,6 +14243,11 @@ fn cmd_private_tx_import(args: &[String]) -> Result<(), String> {
     let db_path = required_option_value(args, "--db")?;
     let tx_hash = required_option_value(args, "--hash")?;
     let (network, storage) = wallet_storage_for_args(args)?;
+    // Lee, aplica y guarda: el candado va antes de leer (ver
+    // `persist_private_wallet`).
+    let _wallet_lock = storage
+        .lock_private_wallets()
+        .map_err(|e| format!("failed to lock wallet directory: {e}"))?;
     let mut manager =
         load_private_wallet_manager_for_network(&storage, password.as_deref(), network)?;
     let wallet_name = resolve_private_wallet_name_required(&manager, &wallet_selector)?;
@@ -15153,6 +15228,12 @@ fn cmd_wallet_change_passphrase_unified(args: &[String]) -> Result<(), String> {
     }
 
     let (network, storage) = wallet_storage_for_args(args)?;
+    // Sin lock, el nodo puede persistir su copia -- cifrada con la contrasena
+    // vieja -- justo despues, y el cambio se pierde en silencio. Y se toma
+    // antes de leer: guardar lo leido antes pisaria un envio hecho en el medio.
+    let _wallet_lock = storage
+        .lock_private_wallets()
+        .map_err(|e| format!("failed to lock wallet directory: {e}"))?;
     let mut manager =
         load_private_wallet_manager_for_network(&storage, old_password.as_deref(), network)?;
     let wallet_name = resolve_private_wallet_name_required(&manager, &wallet_selector)?;
@@ -15161,11 +15242,6 @@ fn cmd_wallet_change_passphrase_unified(args: &[String]) -> Result<(), String> {
         .ok_or_else(|| format!("wallet not found: {wallet_name}"))?;
     wallet.normalize_key_material();
     let address = user_private_address_display(&wallet.commitment_key);
-    // Sin lock, el nodo puede persistir su copia -- cifrada con la contrasena
-    // vieja -- justo despues, y el cambio se pierde en silencio.
-    let _wallet_lock = storage
-        .lock_private_wallets()
-        .map_err(|e| format!("failed to lock wallet directory: {e}"))?;
     storage
         .save_private_wallet(wallet, Some(&new_password))
         .map_err(|e| format!("failed to change wallet passphrase: {e}"))?;
@@ -19207,6 +19283,50 @@ mod tests {
             .set_last_block_hash(&hash)
             .expect("set test last hash");
         hash
+    }
+
+    #[test]
+    fn writing_from_a_stale_copy_no_longer_erases_a_send_reservation() {
+        let tmp = tempfile::TempDir::new().expect("temp wallet dir");
+        let storage = WalletStorage::from_base_dir(tmp.path()).expect("wallet storage");
+        let mut manager = PrivateWalletManager::new();
+        manager.create_private_wallet("minero").expect("create");
+        manager
+            .deposit_to_private_wallet("minero", 5)
+            .expect("first note");
+        persist_all_private_wallets(&storage, &manager, None).expect("persist");
+
+        // El minero lee al empezar la tanda...
+        let stale = read_private_wallet_manager(&storage, None).expect("stale copy");
+        // ...y en el medio un envío, desde otro proceso, reserva la nota y guarda.
+        let mut sender = read_private_wallet_manager(&storage, None).expect("sender copy");
+        let note = &mut sender.get_private_wallet_mut("minero").unwrap().private_notes[0];
+        note.reserved = true;
+        note.reserved_by_tx = Some("envio".to_string());
+        persist_all_private_wallets(&storage, &sender, None).expect("send persists");
+
+        // Al cerrar la tanda acredita una recompensa madura. Antes lo hacía
+        // sobre `stale` y la guardaba: la nota del envío volvía a estar libre.
+        let ((), _) = with_fresh_private_wallets(&storage, None, |fresh| {
+            fresh
+                .deposit_to_private_wallet("minero", 7)
+                .map_err(|e| e.to_string())?;
+            persist_all_private_wallets(&storage, fresh, None)
+        })
+        .expect("settle on the copy on disk");
+        drop(stale);
+
+        let on_disk = read_private_wallet_manager(&storage, None).expect("reload");
+        let wallet = on_disk.get_private_wallet("minero").unwrap();
+        assert_eq!(wallet.private_notes.len(), 2, "entra la recompensa");
+        assert!(
+            wallet
+                .private_notes
+                .iter()
+                .any(|note| note.reserved_by_tx.as_deref() == Some("envio")),
+            "y la reserva del envío sigue en pie"
+        );
+        assert_eq!(wallet.private_balance, 7, "solo la nota nueva queda disponible");
     }
 
     #[test]
