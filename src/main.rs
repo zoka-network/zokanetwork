@@ -7518,6 +7518,29 @@ async fn handle_fullnode_network_message(
     unsafe_rehearsal_difficulty_bits: Option<u32>,
 ) -> Option<String> {
     match message {
+        zoka::network::message::ZokaMessage::SignedCheckpoint(checkpoint) => {
+            let storage = storage?;
+            let Some(authority) = zoka::checkpoint_authority::authority_key_for_chain(chain_id) else {
+                return None;
+            };
+            match zoka::checkpoint_authority::accept_signed_checkpoint(
+                storage,
+                chain_id,
+                checkpoint,
+                &authority,
+            ) {
+                Ok(zoka::checkpoint_authority::Acceptance::Accepted) => Some(format!(
+                    "Signed checkpoint accepted: {} at {}.",
+                    &checkpoint.block_hash[..12],
+                    checkpoint.height
+                )),
+                Ok(zoka::checkpoint_authority::Acceptance::AlreadyKnown) => None,
+                Err(error @ zoka::checkpoint_authority::CheckpointError::Conflict { .. }) => {
+                    Some(format!("ALERT: {error}"))
+                }
+                Err(error) => Some(format!("Ignored signed checkpoint: {error}")),
+            }
+        }
         zoka::network::message::ZokaMessage::TeamAdvertise(advertisement) => {
             let Some(source) = source else {
                 return Some(
@@ -10689,6 +10712,10 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         )
     };
 
+    // Modo autoridad: este nodo firma checkpoints si tiene la clave del equipo.
+    let checkpoint_signer =
+        load_checkpoint_authority(network.local_dir(), &chain_id, &mut startup_notes);
+
     // Receiver half of the API → fullnode-main-loop channel; populated
     // only when the HTTP API is spun up (i.e. `--db` path present).
     let mut private_tx_recv_outer: Option<
@@ -11722,6 +11749,8 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut next_sync_state_at = tokio::time::Instant::now();
     let mut next_team_tick_at = tokio::time::Instant::now();
     let mut next_team_work_at = tokio::time::Instant::now();
+    let mut next_checkpoint_tick_at = tokio::time::Instant::now();
+    let mut last_checkpoint_broadcast: Option<tokio::time::Instant> = None;
     // publish_recent_chain_blocks re-gossips up to `sync_rebroadcast_recent_blocks`
     // full block payloads. Running that on the same 3s cadence as the cheap
     // height/announce broadcasts turned into a self-inflicted gossip storm: a
@@ -11806,6 +11835,24 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut team_share_task: Option<TeamShareTask> = None;
     let mut pending_team_solution: Option<zoka::team_mining::NetworkSolution> = None;
     loop {
+        if tokio::time::Instant::now() >= next_checkpoint_tick_at {
+            if let (Some(signer), Some(storage)) =
+                (checkpoint_signer.as_ref(), chain_storage_outer.as_deref())
+            {
+                if let Some(event) = run_checkpoint_authority(
+                    &mut node,
+                    storage,
+                    &chain_id,
+                    signer,
+                    &mut last_checkpoint_broadcast,
+                )
+                .await
+                {
+                    last_event = event;
+                }
+            }
+            next_checkpoint_tick_at = tokio::time::Instant::now() + Duration::from_secs(10);
+        }
         if tokio::time::Instant::now() >= next_team_tick_at {
             if let Err(error) = publish_team_mining_messages(&mut node, &team_mining_runtime).await
             {
@@ -14299,6 +14346,195 @@ fn cmd_private_tx_publish(args: &[String]) -> Result<(), String> {
     }
     if !txs.is_empty() && published_txs == 0 && !all_errors.is_empty() {
         return Err("no private tx bodies were published".to_string());
+    }
+    Ok(())
+}
+
+/// Clave del equipo para firmar checkpoints, si este nodo es la autoridad: el
+/// archivo existe en la carpeta de la red y su clave pública es la compilada
+/// para esta cadena. Si no coincide no firma: nadie aceptaría esas firmas.
+fn load_checkpoint_authority(
+    local_dir: &str,
+    chain_id: &str,
+    notes: &mut Vec<String>,
+) -> Option<ed25519_dalek::SigningKey> {
+    let path = PathBuf::from(local_dir).join(zoka::checkpoint_authority::AUTHORITY_KEY_FILE);
+    if !path.exists() {
+        return None;
+    }
+    let key = match zoka::checkpoint_authority::load_signing_key(&path) {
+        Ok(key) => key,
+        Err(error) => {
+            notes.push(format!("Checkpoint authority key unreadable: {error}"));
+            return None;
+        }
+    };
+    match zoka::checkpoint_authority::authority_key_for_chain(chain_id) {
+        Some(expected) if expected == key.verifying_key() => {
+            notes.push(format!(
+                "Checkpoint authority: this node signs a checkpoint every {} blocks.",
+                zoka::checkpoint_authority::AUTHORITY_SIGN_INTERVAL
+            ));
+            Some(key)
+        }
+        Some(_) => {
+            notes.push(
+                "Checkpoint authority key does not match the key compiled for this chain; not signing."
+                    .to_string(),
+            );
+            None
+        }
+        None => {
+            notes.push(
+                "Checkpoint authority key found, but this chain has no compiled authority; not signing."
+                    .to_string(),
+            );
+            None
+        }
+    }
+}
+
+/// Firma un checkpoint cuando toca (cada `AUTHORITY_SIGN_INTERVAL` bloques,
+/// `AUTHORITY_CONFIRMATIONS` por debajo de la punta) y reenvía el vigente cada
+/// cinco minutos, para que lo reciba quien se conecte tarde. Solo firma con el
+/// nodo al día (ver `checkpoint_signing_allowed`); reenviar el vigente no
+/// depende de eso, porque ya está decidido.
+async fn run_checkpoint_authority(
+    node: &mut Node,
+    storage: &RocksDbStorage,
+    chain_id: &str,
+    signer: &ed25519_dalek::SigningKey,
+    last_broadcast: &mut Option<tokio::time::Instant>,
+) -> Option<String> {
+    let tip = storage.get_chain_height().ok()?;
+    let status = zoka::api::global_network_runtime()
+        .sync_status_snapshot(tip, 0)
+        .await;
+    let latest = zoka::checkpoint_authority::latest_signed_checkpoint(storage)
+        .ok()
+        .flatten();
+    let next_height = if checkpoint_signing_allowed(&status) {
+        zoka::checkpoint_authority::next_height_to_sign(
+            tip,
+            latest.as_ref().map(|checkpoint| checkpoint.height),
+        )
+    } else {
+        None
+    };
+    if let Some(height) = next_height {
+        let hash = storage.get_canonical_block_hash_at_height(height).ok().flatten()?;
+        let checkpoint =
+            zoka::checkpoint_authority::SignedCheckpoint::sign(signer, chain_id, height, &hash);
+        return Some(
+            match zoka::checkpoint_authority::accept_signed_checkpoint(
+                storage,
+                chain_id,
+                &checkpoint,
+                &signer.verifying_key(),
+            ) {
+                Ok(_) => {
+                    let _ = node.publish_message(
+                        &zoka::network::message::ZokaMessage::SignedCheckpoint(checkpoint),
+                    );
+                    *last_broadcast = Some(tokio::time::Instant::now());
+                    format!("Signed checkpoint {height} ({}).", &hash[..12])
+                }
+                Err(error) => format!("Checkpoint signing failed: {error}"),
+            },
+        );
+    }
+    let latest = latest?;
+    let due = last_broadcast
+        .map(|at| at.elapsed() >= Duration::from_secs(300))
+        .unwrap_or(true);
+    if due {
+        let _ = node.publish_message(&zoka::network::message::ZokaMessage::SignedCheckpoint(latest));
+        *last_broadcast = Some(tokio::time::Instant::now());
+    }
+    None
+}
+
+/// Firmar fija la cadena para todos, así que pide más que `caught_up`: con
+/// `--min-mine-peers 0` una PC sin pares también figura al día y firmaría la
+/// rama que mina sola, atándose a ella. Exige al menos un par, una punta
+/// anunciada por la red (`ready_to_mine`) y ninguna rama en resolución
+/// (`mode`, que vale `backfill` mientras se baja una rama competidora).
+fn checkpoint_signing_allowed(status: &zoka::api::SyncStatusSnapshot) -> bool {
+    status.status == "caught_up"
+        && status.mode == "caught_up"
+        && status.ready_to_mine
+        && status.connected_peers > 0
+}
+
+/// `zoka checkpoint-keygen [--network testnet]`: crea la clave del equipo en la
+/// carpeta de la red e imprime la pública, que se compila en
+/// `economics::CHECKPOINT_AUTHORITY_KEYS`. No sobrescribe una existente.
+fn cmd_checkpoint_keygen(args: &[String]) -> Result<(), String> {
+    let network = NetworkProfile::from_args(args)?;
+    let path = PathBuf::from(network.local_dir()).join(zoka::checkpoint_authority::AUTHORITY_KEY_FILE);
+    let public = zoka::checkpoint_authority::generate_signing_key(&path)?;
+    let shown = std::env::current_dir()
+        .map(|dir| dir.join(&path))
+        .unwrap_or_else(|_| path.clone());
+    println!("Checkpoint authority key created: {}", shown.display());
+    println!("Chain: {}", network.chain_id());
+    println!("Public key: {public}");
+    println!("Back up that file offline: it is the only copy. Compile the public key into");
+    println!("economics::CHECKPOINT_AUTHORITY_KEYS for this chain and release new binaries.");
+    Ok(())
+}
+
+/// `zoka checkpoint-status [--network testnet] [--db <path>] [--json]`.
+fn cmd_checkpoint_status(args: &[String]) -> Result<(), String> {
+    let network = NetworkProfile::from_args(args)?;
+    let chain_id = network.chain_id();
+    let db_path = option_value(args, "--db").unwrap_or_else(|| network.default_db_path().to_string());
+    let authority = zoka::checkpoint_authority::authority_key_for_chain(chain_id)
+        .map(|key| hex::encode(key.to_bytes()));
+    let key_path = PathBuf::from(network.local_dir()).join(zoka::checkpoint_authority::AUTHORITY_KEY_FILE);
+    let local_key = if key_path.exists() {
+        Some(
+            zoka::checkpoint_authority::load_signing_key(&key_path)
+                .map(|key| hex::encode(key.verifying_key().to_bytes()))?,
+        )
+    } else {
+        None
+    };
+    let signs = matches!((&authority, &local_key), (Some(a), Some(l)) if a == l);
+    let latest = match open_storage(&db_path) {
+        Ok(storage) => zoka::checkpoint_authority::latest_signed_checkpoint(&storage)
+            .map_err(|e| e.to_string())?,
+        Err(error) => return Err(format!("{error} (stop the node or pass --db)")),
+    };
+    if has_flag(args, "--json") {
+        println!(
+            "{}",
+            serde_json::json!({
+                "chain_id": chain_id,
+                "authority_public_key": authority,
+                "local_key_public": local_key,
+                "this_node_signs": signs,
+                "latest_signed_checkpoint": latest,
+            })
+        );
+        return Ok(());
+    }
+    println!("Chain: {chain_id}");
+    println!(
+        "Authority public key: {}",
+        authority.as_deref().unwrap_or("none compiled (no signed checkpoints on this chain)")
+    );
+    match &local_key {
+        Some(key) if signs => println!("This node is the authority (key {key})."),
+        Some(key) => println!("Local key {key} is NOT the compiled authority; it does not sign."),
+        None => println!("This node has no authority key."),
+    }
+    match latest {
+        Some(checkpoint) => println!(
+            "Latest signed checkpoint: height {} hash {}",
+            checkpoint.height, checkpoint.block_hash
+        ),
+        None => println!("Latest signed checkpoint: none accepted yet."),
     }
     Ok(())
 }
@@ -17060,6 +17296,8 @@ async fn run() -> Result<(), String> {
         "private-tx-import" => cmd_private_tx_import(tail),
         "private-tx-publish" => cmd_private_tx_publish(tail),
         "private-tx-audit" => cmd_private_tx_audit(tail),
+        "checkpoint-keygen" => cmd_checkpoint_keygen(tail),
+        "checkpoint-status" => cmd_checkpoint_status(tail),
         "private-pending-diagnostics" => cmd_private_pending_diagnostics(tail),
         "tx-pending" => cmd_pending_transfers(tail),
         "estimate-fee" => cmd_estimate_fee(tail),
@@ -18434,6 +18672,51 @@ mod tests {
             super::ibd_prefetch_window(15881, None, 15884, 8),
             Some((15882, 15884))
         );
+    }
+
+    fn sync_status_for_signing(
+        status: &str,
+        mode: &str,
+        ready_to_mine: bool,
+        connected_peers: u64,
+    ) -> zoka::api::SyncStatusSnapshot {
+        zoka::api::SyncStatusSnapshot {
+            status: status.to_string(),
+            mode: mode.to_string(),
+            ready_to_mine,
+            local_height: 25_300,
+            target_height: 25_300,
+            lag: 0,
+            connected_peers,
+            min_peers: 0,
+            startup_ready: true,
+            startup_phase: "ready".to_string(),
+            rpc_fallback_active: false,
+            last_sync_source: None,
+            last_sync_event: None,
+            last_sync_error: None,
+            last_block_at: 0,
+            last_updated: 0,
+            gossip_rx_block_response: 0,
+            gossip_publish_err: 0,
+        }
+    }
+
+    #[test]
+    fn the_authority_only_signs_when_the_network_confirms_its_tip() {
+        let signs = |status, mode, ready, peers| {
+            super::checkpoint_signing_allowed(&sync_status_for_signing(status, mode, ready, peers))
+        };
+        assert!(signs("caught_up", "caught_up", true, 3));
+        // Con `--min-mine-peers 0` y sin pares el nodo figura al dia; firmar
+        // ahi ataria la red a la rama que la PC mina sola.
+        assert!(!signs("caught_up", "caught_up", true, 0));
+        // Pares conectados que todavia no anunciaron su punta.
+        assert!(!signs("caught_up", "caught_up", false, 3));
+        // Bajando una rama competidora: todavia no se sabe cual gana.
+        assert!(!signs("caught_up", "backfill", true, 3));
+        assert!(!signs("syncing", "syncing", false, 3));
+        assert!(!signs("isolated", "isolated", false, 0));
     }
     use super::*;
 

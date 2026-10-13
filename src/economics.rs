@@ -114,6 +114,18 @@ pub const MAINNET_RECOVERY_MIN_INDEPENDENT_OBSERVATIONS: usize = 2;
 pub const MAINNET_RECOVERY_REQUIRE_RELEASE_ARTIFACT_SHA256: bool = true;
 pub const MAINNET_RECOVERY_AUTOMATIC_DB_DELETION: bool = false;
 pub const MAINNET_RECOVERY_MISMATCH_ACTION: &str = "quarantine";
+/// Clave pública (Ed25519, hex) del nodo del equipo que firma checkpoints, por
+/// cadena. Los nodos no siguen ninguna rama que contradiga el último
+/// checkpoint firmado con esta clave (`checkpoint_authority`,
+/// `docs/CHECKPOINTS-AUTORITATIVOS.md`). Una cadena sin clave no tiene
+/// checkpoints firmados: rige solo el trabajo acumulado y los compilados.
+pub const CHECKPOINT_AUTHORITY_KEYS: &[(&str, &str)] = &[(
+    MAINNET_CHAIN_ID,
+    // Zenith (testnet): la PC del equipo, creada el 13/10/2026 con
+    // `zoka checkpoint-keygen`. La privada no sale de esa PC.
+    "bf5c92154ee0e250f4419d47cf0a16c263c586244274ccad196234d339c47bd4",
+)];
+
 pub const MAINNET_EMERGENCY_CHECKPOINTS: &[(u64, &str)] = &[
     (
         MAINNET_EMERGENCY_CHECKPOINT_HEIGHT,

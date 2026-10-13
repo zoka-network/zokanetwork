@@ -1178,6 +1178,7 @@ impl RbacConfig {
         endpoint_permissions.insert("/team-mining/disband", ApiRole::Write);
         endpoint_permissions.insert("/team-mining/start", ApiRole::Write);
         endpoint_permissions.insert("/team-mining/stop", ApiRole::Write);
+        endpoint_permissions.insert("/checkpoint", ApiRole::Write);
         endpoint_permissions.insert("/private/view-scan", ApiRole::Write);
         endpoint_permissions.insert("/private/view-scan-key", ApiRole::Write);
         endpoint_permissions.insert("/private/wallet/send-from-seed", ApiRole::Write);
@@ -1527,6 +1528,7 @@ fn rate_limit_bucket(method: &str, path: &str) -> &'static str {
             || path.starts_with("/blocks")
             || path.starts_with("/mempool")
             || path == "/private/pending"
+            || path == "/checkpoint/latest"
             || path.starts_with("/private/tx/"))
     {
         "public-read"
@@ -4863,6 +4865,54 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// Último checkpoint firmado por el nodo del equipo que este nodo aceptó.
+async fn get_latest_signed_checkpoint(
+    State(app_state): State<Arc<AppState>>,
+) -> Result<Json<crate::checkpoint_authority::SignedCheckpoint>, (StatusCode, String)> {
+    let storage = app_state.state_manager.raw_storage();
+    match crate::checkpoint_authority::latest_signed_checkpoint(&storage) {
+        Ok(Some(checkpoint)) => Ok(Json(checkpoint)),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            "no signed checkpoint accepted yet".to_string(),
+        )),
+        Err(error) => Err((StatusCode::INTERNAL_SERVER_ERROR, error.to_string())),
+    }
+}
+
+/// Recibe un checkpoint firmado y lo verifica igual que uno que llega por la
+/// red. Sirve para inyectarlo a mano si el gossip no llega.
+async fn post_signed_checkpoint(
+    State(app_state): State<Arc<AppState>>,
+    Json(checkpoint): Json<crate::checkpoint_authority::SignedCheckpoint>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let chain_id = global_startup_status().snapshot().chain_id.ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the node does not know its chain yet".to_string(),
+    ))?;
+    let authority = crate::checkpoint_authority::authority_key_for_chain(&chain_id).ok_or((
+        StatusCode::NOT_FOUND,
+        format!("chain {chain_id} has no checkpoint authority"),
+    ))?;
+    let storage = app_state.state_manager.raw_storage();
+    match crate::checkpoint_authority::accept_signed_checkpoint(
+        &storage,
+        &chain_id,
+        &checkpoint,
+        &authority,
+    ) {
+        Ok(acceptance) => Ok(Json(serde_json::json!({
+            "accepted": acceptance == crate::checkpoint_authority::Acceptance::Accepted,
+            "height": checkpoint.height,
+        }))),
+        Err(
+            error @ (crate::checkpoint_authority::CheckpointError::Conflict { .. }
+            | crate::checkpoint_authority::CheckpointError::Stale { .. }),
+        ) => Err((StatusCode::CONFLICT, error.to_string())),
+        Err(error) => Err((StatusCode::BAD_REQUEST, error.to_string())),
+    }
+}
+
 async fn get_mempool_transaction(
     State(app_state): State<Arc<AppState>>,
     Path(hash): Path<String>,
@@ -5674,6 +5724,8 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         .route("/mempool/pending", get(get_mempool_pending))
         .route("/mempool/metrics", get(get_mempool_metrics))
         .route("/mempool/tx/:hash", get(get_mempool_transaction))
+        .route("/checkpoint/latest", get(get_latest_signed_checkpoint))
+        .route("/checkpoint", post(post_signed_checkpoint))
         .route("/state/snapshot", post(create_snapshot))
         .route("/state/snapshots", get(list_snapshots))
         .route("/state/restore/:height", post(restore_snapshot))

@@ -2,6 +2,7 @@
 pub mod admin;
 pub mod api;
 pub mod block;
+pub mod checkpoint_authority;
 pub mod cli;
 pub mod consensus;
 pub mod crypto;

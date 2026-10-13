@@ -172,6 +172,12 @@ impl MessageHandler for DefaultMessageHandler {
                     update.state.team_id, update.state.epoch
                 );
             }
+            ZokaMessage::SignedCheckpoint(checkpoint) => {
+                info!(
+                    "Signed checkpoint received: {} at {}",
+                    checkpoint.chain_id, checkpoint.height
+                );
+            }
         }
 
         let mut count = self.processed_count.write().await;

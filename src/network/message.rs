@@ -76,6 +76,9 @@ pub enum ZokaMessage {
     /// Authoritative membership, share counters, payout turn and candidate
     /// template. The backup persists this so failover does not erase work.
     TurnUpdate(crate::team_mining::TeamTurnUpdate),
+    /// Checkpoint firmado por el nodo del equipo (`checkpoint_authority`). Va
+    /// por su propio tópico: los nodos viejos no se suscriben.
+    SignedCheckpoint(crate::checkpoint_authority::SignedCheckpoint),
     /// Respuesta de consulta (sin exponer metadata sensible)
     UserQueryResponse {
         username: String,
@@ -420,6 +423,7 @@ impl ZokaMessage {
             ZokaMessage::TeamJoin(message) => message.timestamp,
             ZokaMessage::ShareSubmit(message) => message.timestamp,
             ZokaMessage::TurnUpdate(message) => message.timestamp,
+            ZokaMessage::SignedCheckpoint(_) => 0,
             ZokaMessage::UserRegistry { .. } => 0,
             ZokaMessage::UserQuery { .. } => 0,
             ZokaMessage::UserQueryResponse { .. } => 0,

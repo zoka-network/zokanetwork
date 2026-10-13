@@ -221,7 +221,30 @@ fn canonical_hash_at_height(
     Ok(Some(hash))
 }
 
-/// Verify every compiled checkpoint that the local canonical height has
+/// Checkpoints que rigen para `chain_id`: los compilados (solo Zenith) y el
+/// último firmado por el nodo del equipo, si hay uno aceptado en la base. El
+/// firmado ya se verificó al guardarse (`checkpoint_authority`).
+pub fn active_checkpoints(
+    storage: &RocksDbStorage,
+    chain_id: &str,
+) -> Result<Vec<(u64, String)>, ChainError> {
+    let mut checkpoints: Vec<(u64, String)> = if chain_id == crate::economics::MAINNET_CHAIN_ID {
+        crate::economics::MAINNET_EMERGENCY_CHECKPOINTS
+            .iter()
+            .map(|(height, hash)| (*height, (*hash).to_string()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let signed = crate::checkpoint_authority::latest_signed_checkpoint(storage)
+        .map_err(|e| ChainError::Storage(e.to_string()))?;
+    if let Some(signed) = signed.filter(|cp| cp.chain_id == chain_id) {
+        checkpoints.push((signed.height, signed.block_hash));
+    }
+    Ok(checkpoints)
+}
+
+/// Verify every active checkpoint that the local canonical height has
 /// already crossed. This is intentionally read-only: callers use the error to
 /// quarantine mining while normal block ingestion continues collecting the
 /// checkpoint-valid recovery branch.
@@ -229,12 +252,13 @@ pub fn validate_mainnet_checkpoint_history(
     storage: &RocksDbStorage,
     chain_id: &str,
 ) -> Result<(), ChainError> {
-    if chain_id != crate::economics::MAINNET_CHAIN_ID {
+    let checkpoints = active_checkpoints(storage, chain_id)?;
+    if checkpoints.is_empty() {
         return Ok(());
     }
 
     let head_height = storage.get_chain_height()?;
-    for (height, expected) in crate::economics::MAINNET_EMERGENCY_CHECKPOINTS {
+    for (height, expected) in &checkpoints {
         if head_height < *height {
             continue;
         }
@@ -243,7 +267,7 @@ pub fn validate_mainnet_checkpoint_history(
         if actual != *expected {
             return Err(ChainError::MainnetCheckpointMismatch {
                 height: *height,
-                expected: (*expected).to_string(),
+                expected: expected.clone(),
                 actual,
             });
         }
@@ -292,11 +316,7 @@ fn validate_candidate_mainnet_checkpoints(
     chain_id: &str,
     candidate: &Block,
 ) -> Result<(), ChainError> {
-    if chain_id != crate::economics::MAINNET_CHAIN_ID {
-        return Ok(());
-    }
-
-    for (height, expected) in crate::economics::MAINNET_EMERGENCY_CHECKPOINTS {
+    for (height, expected) in &active_checkpoints(storage, chain_id)? {
         if candidate.header.block_height < *height {
             continue;
         }
@@ -305,7 +325,7 @@ fn validate_candidate_mainnet_checkpoints(
         if actual != *expected {
             return Err(ChainError::MainnetCheckpointMismatch {
                 height: *height,
-                expected: (*expected).to_string(),
+                expected: expected.clone(),
                 actual,
             });
         }
@@ -1122,6 +1142,129 @@ mod tests {
         .expect("seed validated side metadata");
 
         (wrong_head.header.hash, candidate)
+    }
+
+    const SIGNED_TEST_CHAIN: &str = "zoka-test-signed-checkpoints";
+
+    /// Como el de abajo, en una cadena sin checkpoints compilados: la rama
+    /// canónica local, con más trabajo, tiene en la altura 10 otro bloque que
+    /// el que firmó la autoridad. El firmado está guardado aparte, con menos
+    /// trabajo.
+    fn seed_signed_checkpoint_fixture(storage: &RocksDbStorage) -> (String, Block) {
+        let firmado = "a".repeat(64);
+        let common = recovery_fixture_block(9, "common-9", "common-8", Vec::new());
+        let wrong = recovery_fixture_block(10, "wrong-10", &common.header.hash, Vec::new());
+        let wrong_head = recovery_fixture_block(11, "wrong-11", &wrong.header.hash, Vec::new());
+        for block in [&common, &wrong, &wrong_head] {
+            storage.save_block_body(block).expect("seed body");
+            storage
+                .set_block_hash_at_height(block.header.block_height, &block.header.hash)
+                .expect("seed index");
+        }
+        storage.set_chain_height(11).expect("seed height");
+        storage.set_last_block_hash(&wrong_head.header.hash).expect("seed head");
+        storage.set_total_supply_emitted(99).expect("seed supply");
+        storage.set_cumulative_work(50_000).expect("seed work");
+        storage
+            .set_current_difficulty_bits(economics::POW_INITIAL_DIFFICULTY_BITS)
+            .expect("seed difficulty");
+
+        let candidate = recovery_fixture_block(10, &firmado, &common.header.hash, Vec::new());
+        storage.save_block_body(&candidate).expect("seed side body");
+        save_block_meta(
+            storage,
+            &candidate.header.hash,
+            &BlockChainMeta {
+                height: 10,
+                total_supply_emitted: 88,
+                cumulative_work: 10,
+                difficulty_bits: economics::POW_INITIAL_DIFFICULTY_BITS,
+            },
+        )
+        .expect("seed side metadata");
+        (wrong_head.header.hash, candidate)
+    }
+
+    fn sign_test_checkpoint(storage: &RocksDbStorage, height: u64, hash: &str) {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let checkpoint = crate::checkpoint_authority::SignedCheckpoint::sign(
+            &key,
+            SIGNED_TEST_CHAIN,
+            height,
+            hash,
+        );
+        crate::checkpoint_authority::accept_signed_checkpoint(
+            storage,
+            SIGNED_TEST_CHAIN,
+            &checkpoint,
+            &key.verifying_key(),
+        )
+        .expect("accept test checkpoint");
+    }
+
+    // El pedido del usuario del 13/10: un nodo con otra rama, aunque tenga más
+    // trabajo, obedece el checkpoint que firmó el nodo del equipo. Deja de
+    // minar (cuarentena) y pasa a la rama firmada cuando la tiene.
+    #[test]
+    fn un_nodo_obedece_el_checkpoint_firmado_aunque_tenga_mas_trabajo() {
+        let (storage, _dir) = open_temp_storage();
+        let storage = Arc::new(storage);
+        let (old_head_hash, candidate) = seed_signed_checkpoint_fixture(&storage);
+        sign_test_checkpoint(&storage, 10, &candidate.header.hash);
+
+        let mining_err = next_block_metadata(&storage, SIGNED_TEST_CHAIN)
+            .expect_err("a branch that contradicts the signed checkpoint cannot mine");
+        assert!(matches!(
+            mining_err,
+            ChainError::MainnetCheckpointMismatch { height: 10, .. }
+        ));
+
+        let old_head = read_chain_head(&storage)
+            .expect("read old head")
+            .expect("old head exists");
+        assert_eq!(old_head.hash, old_head_hash);
+        let promoted = maybe_promote_known_side_branch(
+            &storage,
+            SIGNED_TEST_CHAIN,
+            &candidate,
+            Some(&old_head),
+        )
+        .expect("signed branch remains ingestible")
+        .expect("the signed checkpoint overrides higher work");
+        assert_eq!(promoted.hash, candidate.header.hash);
+        assert_eq!(promoted.cumulative_work, 10);
+        assert_eq!(
+            canonical_hash_at_height(&storage, 10).expect("index"),
+            Some(candidate.header.hash.clone())
+        );
+        assert_eq!(canonical_hash_at_height(&storage, 11).expect("index"), None);
+        validate_mainnet_checkpoint_history(&storage, SIGNED_TEST_CHAIN)
+            .expect("the promoted history obeys the signed checkpoint");
+    }
+
+    // Control: la misma situación sin checkpoint firmado. Gana el trabajo
+    // acumulado, así que lo que decidió arriba fue la firma.
+    #[test]
+    fn sin_checkpoint_firmado_gana_el_trabajo_acumulado() {
+        let (storage, _dir) = open_temp_storage();
+        let (old_head_hash, candidate) = seed_signed_checkpoint_fixture(&storage);
+        validate_mainnet_checkpoint_history(&storage, SIGNED_TEST_CHAIN)
+            .expect("no checkpoints, nothing to contradict");
+        let old_head = read_chain_head(&storage)
+            .expect("read old head")
+            .expect("old head exists");
+        let promoted = maybe_promote_known_side_branch(
+            &storage,
+            SIGNED_TEST_CHAIN,
+            &candidate,
+            Some(&old_head),
+        )
+        .expect("side branch is ingestible");
+        assert!(promoted.is_none(), "lower work must not win without the checkpoint");
+        assert_eq!(
+            read_chain_head(&storage).expect("head").expect("head").hash,
+            old_head_hash
+        );
     }
 
     #[test]
