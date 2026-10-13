@@ -6,7 +6,9 @@
 # Opciones: -SoloNodo, -SoloTor, -NodeDir <carpeta con zoka.exe>.
 #
 # No toca los datos (%APPDATA%\Zoka): la cadena, las wallets y la clave de
-# checkpoints quedan donde estan. Volver atras es copiar los respaldos.
+# checkpoints quedan donde estan. No borra ni pisa nada: lo anterior queda
+# renombrado (zoka.exe.bak-FECHA, backup-tor-VERSION-FECHA) y volver atras es
+# renombrarlo de nuevo.
 param(
     [string]$NodeDir = (Join-Path $PSScriptRoot "..\target\release"),
     [switch]$SoloNodo,
@@ -40,12 +42,15 @@ if (-not $SoloTor) {
             $informe += "$nombre ya estaba instalado ($hashNuevo)"
             continue
         }
+        # Nada se borra ni se pisa: el anterior cambia de nombre y queda entero.
+        # Volver atras es renombrarlo de nuevo.
         $respaldo = "$destino.bak-$Stamp"
         if (Test-Path $respaldo) { throw "Ya existe $respaldo; no piso un respaldo." }
-        Copy-Item $destino $respaldo
-        Copy-Item $nuevo $destino -Force
+        Rename-Item -LiteralPath $destino -NewName (Split-Path $respaldo -Leaf)
+        Copy-Item $nuevo $destino
         if ((Get-FileHash $destino -Algorithm SHA256).Hash -ne $hashNuevo) {
-            Copy-Item $respaldo $destino -Force
+            Rename-Item -LiteralPath $destino -NewName "$nombre.fallido-$Stamp"
+            Rename-Item -LiteralPath $respaldo -NewName $nombre
             throw "La copia de $nombre no coincide; deje el anterior."
         }
         $informe += "$nombre $hashViejo -> $hashNuevo (respaldo $nombre.bak-$Stamp)"
@@ -69,21 +74,22 @@ if (-not $SoloNodo) {
         $informe += "Tor $torVersion ya estaba instalado"
     } else {
         $respaldoTor = Join-Path $app "backup-tor-$($instalado.tor_version)-$Stamp"
-        if (Test-Path $respaldoTor) { throw "Ya existe $respaldoTor; no piso un respaldo." }
-        Copy-Item $torDir $respaldoTor -Recurse
+        $nuevoTor = "$torDir.nuevo-$Stamp"
+        foreach ($ruta in @($respaldoTor, $nuevoTor)) {
+            if (Test-Path $ruta) { throw "Ya existe $ruta; no lo piso." }
+        }
         # gpg viene con Git; la verificacion de la firma lo necesita en el PATH.
         if (-not (Get-Command gpg -ErrorAction SilentlyContinue)) {
             $env:PATH = "C:\Program Files\Git\usr\bin;$env:PATH"
         }
-        try {
-            & (Join-Path $PSScriptRoot "..\zsilent-core\scripts\prepare-tor-expert-bundle-windows.ps1") `
-                -Url $torUrl -Sha256 $torSha -AscUrl "$torUrl.asc" `
-                -ExpectedTorVersion $torVersion -VerifySignature -OutDir $torDir
-        } catch {
-            if (Test-Path $torDir) { Remove-Item -LiteralPath $torDir -Recurse -Force }
-            Copy-Item $respaldoTor $torDir -Recurse
-            throw "Fallo la instalacion de Tor; deje el $($instalado.tor_version). $_"
-        }
+        # El paquete se prepara y verifica en una carpeta nueva; recien con todo
+        # verificado se mueve el Tor anterior al respaldo y el nuevo a su lugar.
+        # Nada se borra: volver atras es mover las carpetas al reves.
+        & (Join-Path $PSScriptRoot "..\zsilent-core\scripts\prepare-tor-expert-bundle-windows.ps1") `
+            -Url $torUrl -Sha256 $torSha -AscUrl "$torUrl.asc" `
+            -ExpectedTorVersion $torVersion -VerifySignature -OutDir $nuevoTor
+        Move-Item -LiteralPath $torDir -Destination $respaldoTor
+        Move-Item -LiteralPath $nuevoTor -Destination $torDir
         $informe += "Tor $($instalado.tor_version) -> $torVersion (respaldo $(Split-Path $respaldoTor -Leaf))"
     }
 }
