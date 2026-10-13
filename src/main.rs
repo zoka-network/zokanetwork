@@ -14488,7 +14488,10 @@ async fn run_checkpoint_authority(
     let latest = zoka::checkpoint_authority::latest_signed_checkpoint(storage)
         .ok()
         .flatten();
-    let next_height = if checkpoint_signing_allowed(&status) {
+    let on_latest_checkpoint = chain_contains_checkpoint(latest.as_ref(), |height| {
+        storage.get_canonical_block_hash_at_height(height).ok().flatten()
+    });
+    let next_height = if checkpoint_signing_allowed(&status) && on_latest_checkpoint {
         zoka::checkpoint_authority::next_height_to_sign(
             tip,
             latest.as_ref().map(|checkpoint| checkpoint.height),
@@ -14541,6 +14544,22 @@ fn checkpoint_signing_allowed(status: &zoka::api::SyncStatusSnapshot) -> bool {
         && status.connected_peers > 0
 }
 
+/// La cadena local contiene el último checkpoint aceptado. Si no la contiene
+/// (uno firmado a mano para corregir la rama, o uno por encima de la punta),
+/// la autoridad no firma: estaría fijando de nuevo, más arriba, la rama que ese
+/// checkpoint vino a corregir. Firma otra vez cuando se reorganiza.
+fn chain_contains_checkpoint(
+    latest: Option<&zoka::checkpoint_authority::SignedCheckpoint>,
+    canonical_hash_at: impl Fn(u64) -> Option<String>,
+) -> bool {
+    match latest {
+        None => true,
+        Some(checkpoint) => {
+            canonical_hash_at(checkpoint.height).as_deref() == Some(checkpoint.block_hash.as_str())
+        }
+    }
+}
+
 /// `zoka checkpoint-keygen [--network testnet]`: crea la clave del equipo en la
 /// carpeta de la red e imprime la pública, que se compila en
 /// `economics::CHECKPOINT_AUTHORITY_KEYS`. No sobrescribe una existente.
@@ -14557,6 +14576,97 @@ fn cmd_checkpoint_keygen(args: &[String]) -> Result<(), String> {
     println!("Back up that file offline: it is the only copy. Compile the public key into");
     println!("economics::CHECKPOINT_AUTHORITY_KEYS for this chain and release new binaries.");
     Ok(())
+}
+
+/// `zoka checkpoint-sign --height <h> --hash <hash> [--network testnet]
+/// [--post <rpc>] [--json]`: firma a mano el checkpoint indicado con la clave
+/// de autoridad de esta PC.
+///
+/// Es la salida de emergencia si la autoridad firmó una rama equivocada: ella
+/// misma queda atada a esa rama. Un checkpoint más alto sobre la rama correcta
+/// reemplaza al anterior en todos los nodos, que se reorganizan hacia ella.
+/// Con `--post` se entrega a un nodo (`POST /checkpoint`); si ese nodo es la
+/// autoridad, lo reenvía a la red en el próximo ciclo.
+fn cmd_checkpoint_sign(args: &[String]) -> Result<(), String> {
+    let network = NetworkProfile::from_args(args)?;
+    let chain_id = network.chain_id();
+    let height = parse_u64_arg(
+        Some(required_option_value(args, "--height")?),
+        0,
+        "--height",
+    )?;
+    let hash = required_option_value(args, "--hash")?;
+    let key_path =
+        PathBuf::from(network.local_dir()).join(zoka::checkpoint_authority::AUTHORITY_KEY_FILE);
+    let checkpoint = sign_manual_checkpoint(
+        &key_path,
+        chain_id,
+        zoka::checkpoint_authority::authority_key_for_chain(chain_id),
+        height,
+        &hash,
+    )?;
+    let posted = match option_value(args, "--post") {
+        Some(rpc) => Some(rpc_http_post_json(
+            &rpc,
+            "/checkpoint",
+            &serde_json::to_value(&checkpoint).map_err(|e| e.to_string())?,
+            10,
+        )?),
+        None => None,
+    };
+    if has_flag(args, "--json") {
+        println!(
+            "{}",
+            serde_json::json!({ "checkpoint": checkpoint, "posted": posted })
+        );
+        return Ok(());
+    }
+    println!(
+        "{}",
+        serde_json::to_string(&checkpoint).map_err(|e| e.to_string())?
+    );
+    match posted {
+        Some(reply) => println!("Node reply: {reply}"),
+        None => println!(
+            "Not delivered: POST it to a node's /checkpoint, or run again with --post <rpc>."
+        ),
+    }
+    Ok(())
+}
+
+/// Firma un checkpoint con la clave de `key_path`, solo si es la autoridad de
+/// la cadena, y lo verifica antes de devolverlo: nunca sale uno que los nodos
+/// rechazarían.
+fn sign_manual_checkpoint(
+    key_path: &Path,
+    chain_id: &str,
+    authority: Option<ed25519_dalek::VerifyingKey>,
+    height: u64,
+    hash: &str,
+) -> Result<zoka::checkpoint_authority::SignedCheckpoint, String> {
+    if !key_path.exists() {
+        return Err(format!(
+            "no checkpoint authority key at {}: only the authority node can sign",
+            key_path.display()
+        ));
+    }
+    let key = zoka::checkpoint_authority::load_signing_key(key_path)?;
+    let authority = authority
+        .ok_or_else(|| format!("chain {chain_id} has no compiled checkpoint authority"))?;
+    if authority != key.verifying_key() {
+        return Err(
+            "the local key is not the compiled authority for this chain: every node would reject the checkpoint"
+                .to_string(),
+        );
+    }
+    let hash = hash.trim().to_ascii_lowercase();
+    let checkpoint =
+        zoka::checkpoint_authority::SignedCheckpoint::sign(&key, chain_id, height, &hash);
+    // Revisa también la forma: altura mayor que cero y hash de 64 hex.
+    checkpoint
+        .verify(&authority)
+        .map_err(|e| format!("refusing to emit an invalid checkpoint: {e}"))?;
+    Ok(checkpoint)
 }
 
 /// `zoka checkpoint-status [--network testnet] [--db <path>] [--json]`.
@@ -17373,6 +17483,7 @@ async fn run() -> Result<(), String> {
         "private-tx-publish" => cmd_private_tx_publish(tail),
         "private-tx-audit" => cmd_private_tx_audit(tail),
         "checkpoint-keygen" => cmd_checkpoint_keygen(tail),
+        "checkpoint-sign" => cmd_checkpoint_sign(tail),
         "checkpoint-status" => cmd_checkpoint_status(tail),
         "private-pending-diagnostics" => cmd_private_pending_diagnostics(tail),
         "tx-pending" => cmd_pending_transfers(tail),
@@ -18794,6 +18905,27 @@ mod tests {
         assert!(!signs("syncing", "syncing", false, 3));
         assert!(!signs("isolated", "isolated", false, 0));
     }
+
+    #[test]
+    fn the_authority_does_not_sign_over_a_branch_its_latest_checkpoint_corrects() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let fixed = zoka::checkpoint_authority::SignedCheckpoint::sign(
+            &key,
+            "zoka-test",
+            300,
+            &"a".repeat(64),
+        );
+        let local = |hash: &'static str| move |height: u64| (height == 300).then(|| hash.to_string());
+        // Sin checkpoint todavia: nada que contradecir.
+        assert!(super::chain_contains_checkpoint(None, local("")));
+        // La rama local lo contiene: sigue firmando.
+        let same = "a".repeat(64);
+        assert!(super::chain_contains_checkpoint(Some(&fixed), |_| Some(same.clone())));
+        // Uno firmado a mano sobre otra rama: no firma hasta reorganizarse.
+        assert!(!super::chain_contains_checkpoint(Some(&fixed), local("bbbb")));
+        // Uno por encima de la punta local: tampoco.
+        assert!(!super::chain_contains_checkpoint(Some(&fixed), |_| None));
+    }
     use super::*;
 
     fn temp_db_arg() -> (tempfile::TempDir, String) {
@@ -19283,6 +19415,33 @@ mod tests {
             .set_last_block_hash(&hash)
             .expect("set test last hash");
         hash
+    }
+
+    #[test]
+    fn a_manual_checkpoint_is_only_signed_by_the_authority_and_well_formed() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let key_path = dir.path().join("checkpoint-authority.key");
+        let public = zoka::checkpoint_authority::generate_signing_key(&key_path).expect("keygen");
+        let authority = zoka::checkpoint_authority::parse_public_key(&public);
+        let chain = "zoka-test-manual-checkpoint";
+        let hash = "AB".repeat(32);
+
+        let checkpoint =
+            sign_manual_checkpoint(&key_path, chain, authority, 120, &hash).expect("signs");
+        assert_eq!(checkpoint.block_hash, "ab".repeat(32), "hash normalizado");
+        checkpoint
+            .verify(&authority.unwrap())
+            .expect("verifies with the authority key");
+
+        // Una clave que no es la compilada firmaría algo que todos rechazan.
+        let other = Some(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]).verifying_key());
+        assert!(sign_manual_checkpoint(&key_path, chain, other, 120, &hash).is_err());
+        // Sin autoridad compilada, sin clave, con altura 0 o un hash que no es hex.
+        assert!(sign_manual_checkpoint(&key_path, chain, None, 120, &hash).is_err());
+        let missing = dir.path().join("no-existe.key");
+        assert!(sign_manual_checkpoint(&missing, chain, authority, 120, &hash).is_err());
+        assert!(sign_manual_checkpoint(&key_path, chain, authority, 0, &hash).is_err());
+        assert!(sign_manual_checkpoint(&key_path, chain, authority, 120, "xyz").is_err());
     }
 
     #[test]

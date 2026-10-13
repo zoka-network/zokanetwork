@@ -85,6 +85,10 @@ impide usar un checkpoint de Zenith en Quantic o al revés.
   Con `--min-mine-peers 0` un nodo sin pares figura «al día»; sin esta condición,
   una PC aislada que sigue minando sola firmaría su propia rama y quedaría atada
   a ella. El checkpoint vigente se reenvía igual, aunque no toque firmar.
+- **Tampoco firma si su cadena no contiene el último checkpoint aceptado** (uno
+  firmado a mano para corregir la rama, o uno por encima de su punta): firmaría
+  más arriba la misma rama que ese checkpoint vino a corregir y la red volvería
+  a ella. Retoma cuando se reorganiza.
 - `zoka checkpoint-status --network testnet` muestra la clave pública y el último
   checkpoint aceptado.
 - **Respaldo:** el archivo de la clave se guarda fuera de la PC (sin conexión). Es
@@ -96,11 +100,27 @@ impide usar un checkpoint de Zenith en Quantic o al revés.
 - **Zoka Quantic:** otra clave, activa desde el génesis y declarada en el
   whitepaper junto al premine.
 
+## Corregir a mano
+
+Si la autoridad firmara una rama equivocada, quedaría atada a ella. Un
+checkpoint más alto sobre la rama correcta la reemplaza en todos los nodos, que
+se reorganizan hacia esa rama aunque no esté en la propia:
+
+1. Elegir una altura `H` mayor que la del último checkpoint
+   (`zoka checkpoint-status`) en la que no se haya firmado nada.
+2. Tomar el hash del bloque `H` de la rama correcta en un nodo que la siga
+   (`GET /blocks/H`).
+3. En la PC de la autoridad:
+   `zoka checkpoint-sign --network testnet --height H --hash <hash> --post http://127.0.0.1:3000`.
+   El comando firma solo si la clave local es la compilada y verifica el
+   resultado antes de entregarlo.
+4. El nodo de la autoridad lo acepta, queda en cuarentena hasta bajar esa rama
+   y se reorganiza; lo reenvía a la red en el ciclo siguiente (5 minutos como
+   mucho). Los demás nodos lo aceptan porque es más alto.
+
+**Nunca firmar un hash que no sea de un bloque real:** todos los nodos que
+obedecen quedarían en cuarentena esperando una rama que no existe.
+
 ## Pendiente
 
-- **Corregir a mano.** No hay comando para firmar una altura y un hash elegidos.
-  Si la autoridad firmara una rama equivocada, quedaría atada a ella. Los demás
-  nodos aceptan un checkpoint más alto aunque esté en otra rama, y se
-  reorganizan hacia ella, pero hoy no hay forma de emitirlo. Falta
-  `zoka checkpoint-sign --height H --hash X` antes del génesis de Quantic.
 - **Firma híbrida** (versión 2: Ed25519 + ML-DSA-65), con la etapa 5.
