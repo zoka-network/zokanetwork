@@ -56,7 +56,12 @@ pub type PrivateTxBroadcastSender =
 const MINER_HEARTBEAT_TTL_SECS: u64 = 90;
 /// Old clients remain on the pre-recovery protocol and must not be counted as
 /// current miners by public status endpoints.
-pub const NETWORK_MIN_CLIENT_VERSION: &str = "1.9.0";
+///
+/// Es el mismo `minimum_client_version` que anuncia el manifiesto de la red
+/// (ZSilent lo lee para pedir que se actualice); la prueba
+/// `tests/mainnet_recovery_policy.rs` exige que coincidan. Estuvo en 1.9.0
+/// mientras el manifiesto ya decía 2.0.1.
+pub const NETWORK_MIN_CLIENT_VERSION: &str = "2.0.1";
 
 #[derive(Clone, Debug)]
 pub struct ApiSecurityConfig {

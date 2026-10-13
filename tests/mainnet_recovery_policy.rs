@@ -8,22 +8,50 @@ fn mainnet_manifest() -> serde_json::Value {
     serde_json::from_str(&raw).expect("parse mainnet network manifest")
 }
 
+fn version_triplet(raw: &str) -> (u64, u64, u64) {
+    let core = raw
+        .trim()
+        .trim_start_matches('v')
+        .split(['-', '+'])
+        .next()
+        .unwrap_or_default();
+    let mut parts = core
+        .split('.')
+        .map(|part| part.parse::<u64>().expect("numeric version component"));
+    (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    )
+}
+
 #[test]
-fn recovery_manifest_matches_the_compiled_1_9_consensus_policy() {
+fn network_manifest_matches_the_compiled_policy() {
     let manifest = mainnet_manifest();
     let checkpoint = &manifest["recovery"]["checkpoint"];
     let gate = &manifest["recovery"]["release_gate"];
 
-    assert_eq!(env!("CARGO_PKG_VERSION"), "1.9.0");
     assert_eq!(manifest["status"], "release-candidate");
     assert_eq!(manifest["chain_id"], economics::MAINNET_CHAIN_ID);
+    // Cambiar el identificador desconecta en el acto a todo nodo que no
+    // actualice (`PROTOCOL_FREEZE_ID`): este valor fijo obliga a hacerlo a
+    // propósito y no de rebote con un cambio de versión.
     assert_eq!(manifest["protocol_freeze_id"], PROTOCOL_FREEZE_ID);
     assert_eq!(PROTOCOL_FREEZE_ID, "/zoka/1.9.0-mainnet-recovery");
+    // El cliente mínimo que anuncia el manifiesto (ZSilent lo lee para pedir
+    // que se actualice) es el que la API usa para marcar mineros viejos, y
+    // nunca supera la versión de este binario.
     assert_eq!(
         manifest["minimum_client_version"],
         api::NETWORK_MIN_CLIENT_VERSION
     );
-    assert_eq!(api::NETWORK_MIN_CLIENT_VERSION, env!("CARGO_PKG_VERSION"));
+    assert!(
+        version_triplet(api::NETWORK_MIN_CLIENT_VERSION)
+            <= version_triplet(env!("CARGO_PKG_VERSION")),
+        "minimum client {} is newer than this build {}",
+        api::NETWORK_MIN_CLIENT_VERSION,
+        env!("CARGO_PKG_VERSION")
+    );
 
     assert_eq!(checkpoint["status"], "compiled-release-candidate");
     assert_eq!(
