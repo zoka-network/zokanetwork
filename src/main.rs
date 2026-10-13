@@ -11453,6 +11453,13 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         }
     }
 
+    let effective_min_mine_peers =
+        authority_min_mine_peers(min_mine_peers, checkpoint_signer.is_some());
+    if effective_min_mine_peers != min_mine_peers {
+        startup_notes.push("Checkpoint authority: mining does not wait for peers.".to_string());
+        min_mine_peers = effective_min_mine_peers;
+    }
+
     let session_started = Instant::now();
     let mut session_mined_blocks = 0u64;
     let mut session_mined_rewards = 0u64;
@@ -14537,6 +14544,20 @@ async fn run_checkpoint_authority(
 /// rama que mina sola, atándose a ella. Exige al menos un par, una punta
 /// anunciada por la red (`ready_to_mine`) y ninguna rama en resolución
 /// (`mode`, que vale `backfill` mientras se baja una rama competidora).
+/// Mínimo de pares para minar. La autoridad de checkpoints mina aunque no tenga
+/// ninguno: el mínimo existe para que un nodo aislado no mine una rama propia,
+/// pero la cadena de la autoridad es la de referencia, y sin esto una red donde
+/// solo queda ella no avanza nunca (Zenith el 13/10/2026: ninguna otra semilla
+/// respondía). Sin pares igual no firma (`checkpoint_signing_allowed`), así que
+/// lo que mine sola no queda fijado hasta que la red lo vea.
+fn authority_min_mine_peers(requested: usize, is_checkpoint_authority: bool) -> usize {
+    if is_checkpoint_authority {
+        0
+    } else {
+        requested
+    }
+}
+
 fn checkpoint_signing_allowed(status: &zoka::api::SyncStatusSnapshot) -> bool {
     status.status == "caught_up"
         && status.mode == "caught_up"
@@ -18904,6 +18925,14 @@ mod tests {
         assert!(!signs("caught_up", "backfill", true, 3));
         assert!(!signs("syncing", "syncing", false, 3));
         assert!(!signs("isolated", "isolated", false, 0));
+    }
+
+    #[test]
+    fn only_the_checkpoint_authority_mines_without_peers() {
+        // ZSilent pide `--min-mine-peers 1`; la autoridad lo ignora.
+        assert_eq!(super::authority_min_mine_peers(1, true), 0);
+        assert_eq!(super::authority_min_mine_peers(1, false), 1);
+        assert_eq!(super::authority_min_mine_peers(0, false), 0);
     }
 
     #[test]
