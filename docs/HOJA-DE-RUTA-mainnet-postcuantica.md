@@ -271,7 +271,7 @@ cuentas; el resto lo armo yo.
 Objetivo: que una computadora cuántica futura no pueda reconstruir qué salida gastó
 cada transacción. Es la etapa más grande y **arranca investigando**.
 
-**13/10/2026: construcción elegida (provisoria) → Ironwood** (el circuito corregido de
+**13/10/2026: construcción elegida → Ironwood**, confirmada por el usuario (el circuito corregido de
 Orchard, Halo 2, sin trusted setup), con el cifrado de notas X-Wing de la etapa 3.
 Medido en el teléfono de pruebas: 20 s por envío y 40 s para armar la clave al abrir.
 Criterio, opciones y fuentes en [ETAPA5-gasto-sin-key-images.md](ETAPA5-gasto-sin-key-images.md).

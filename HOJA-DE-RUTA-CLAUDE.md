@@ -66,7 +66,7 @@ sobre `checkpoints-autoritativos`:
   (el `PROTOCOL_FREEZE_ID` no cambia; las alturas se fijan el día de publicar) y
   sección 2.1.0 en el borrador de anuncio.
 - **Etapa de gasto sin key images** (rama `etapa5-investigacion`): construcción
-  elegida, provisoria, **Ironwood** (el circuito corregido de Orchard sobre Halo 2,
+  elegida, **confirmada por el usuario**, **Ironwood** (el circuito corregido de Orchard sobre Halo 2,
   sin trusted setup), con el cifrado de notas X-Wing. Medido en el teléfono: 20 s
   por envío, 40 s para armar la clave al abrir, 111 MB. Ver
   [docs/ETAPA5-gasto-sin-key-images.md](docs/ETAPA5-gasto-sin-key-images.md).
@@ -102,6 +102,17 @@ En ZSilent y ZKAPriv: `zenith-testnet` → `quantic-interfaz`.
   pantalla, a propósito.
 - La versión declarada sigue siendo 2.0.2 (ZSilent y nodo) y 1.0.1 (ZKAPriv): no se
   cambió el número; alinear versiones es la etapa 7.4.
+- **13/10, 14:08, el usuario corrió `scripts/instalar-en-pc.ps1`:** `zoka.exe`
+  `1797905D…` y `zokahd.exe` `F50C4E41…` (código de `e142e349`, features por defecto;
+  respaldos `*.bak-20261013`) y Tor 0.4.9.14 (respaldo
+  `ZSilent Core\backup-tor-0.4.9.13-20261013`). Con ZSilent abierto el nodo firmó su
+  primer checkpoint real: altura 25.238 (`a60526f5…`), la punta menos 6. **La red está
+  quieta en 25.244 desde el 12/10: nadie mina.**
+- **Respaldo completo de `%APPDATA%\Zoka` en `D:\Respaldo-Zoka-20261013`** (pedido
+  del usuario; 2.505 archivos, verificado por tamaño y por hash de la clave de
+  autoridad y de `iroh_key`). Incluye la clave de autoridad, las claves de la onion de
+  la seed (`tor\zoka-p2p`), `iroh_key` y las wallets cifradas. Es un disco interno:
+  sigue faltando una copia de la clave en un pendrive desconectado.
 
 Segunda sesión, 11 y 12/10 (Claude): se cerró la integración de la etapa 1 y se
 hizo la etapa 2 (Zenith como testnet) en ramas de los tres repos. El detalle de
@@ -302,8 +313,8 @@ de escaneo completo ni una comparación aislada del coste del combinador.
 
 ### 4. Circuito de privacidad y eliminación de key images
 
-**13/10: no se diseña un circuito propio.** Construcción elegida (provisoria):
-Ironwood, mediante el crate `orchard`, con el cifrado de notas X-Wing; quita además
+**13/10: no se diseña un circuito propio.** Construcción elegida y confirmada por
+el usuario: Ironwood, mediante el crate `orchard`, con el cifrado de notas X-Wing; quita además
 el trusted setup de los gastos. Criterio, medición y próximos pasos en
 [docs/ETAPA5-gasto-sin-key-images.md](docs/ETAPA5-gasto-sin-key-images.md). Las tareas
 de abajo se cumplen adoptando ese circuito, salvo la revisión externa.

@@ -1,8 +1,8 @@
 # Etapa 5: gastar sin key images — elección de la construcción
 
-13/10/2026. **Propuesta con medición; no hay código integrado al nodo.** Tomada por
-Claude con las decisiones que delegó el usuario el 13/10, y sujeta a revisión
-externa antes del génesis de Quantic. En la hoja de traspaso esta etapa figura
+13/10/2026. **Decisión confirmada por el usuario el mismo día; no hay código
+integrado al nodo.** La propuso Claude con las decisiones que delegó el usuario y
+queda sujeta a revisión externa antes del génesis de Quantic. En la hoja de traspaso esta etapa figura
 como la 4 ("Circuito de privacidad y eliminación de key images").
 
 ## El problema
@@ -81,7 +81,7 @@ Dos lecciones para Zoka:
   falsificar pruebas o notas. Las notas recuperables del ZIP 2005 son el camino
   para migrar los fondos el día que haga falta.
 
-## Decisión (provisoria)
+## Decisión (confirmada por el usuario el 13/10)
 
 **Zoka Quantic usa la construcción de Ironwood mediante el crate `orchard`, sin
 modificar el circuito**, con el cifrado de notas reemplazado por el sobre X-Wing
