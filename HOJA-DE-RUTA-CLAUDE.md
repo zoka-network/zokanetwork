@@ -5,6 +5,24 @@ Proyecto: `C:\Users\mderramus\ZOKA`.
 
 ## Punto de partida
 
+**14/10, más tarde: ZSilent 2.1.3, arreglos del explorador** (rama
+`explorador-interno` de zsilent-core; el nodo sigue en 2.1.2, mismo `zoka.exe`).
+Publicada con aprobación del usuario (release `v2.1.3` de zsilent-core, MSI
+`3ce744b0…` verificado por dentro y bajado de GitHub; `main` al día en GitHub y
+GitLab) e instalada en la PC (respaldo `ZSilent Core.respaldo-20261014-v2.1.2`).
+El usuario dudaba de que la altura fuera la correcta: lo era (checkpoint firmado
+en 25.458 con el mismo hash que la cadena local; suministro 25.465 × 12 ZKA =
+305.580, lo que mostraba la pantalla; el "1 peer" era el teléfono con ZKAPriv).
+Lo que fallaba: el panel listaba alturas calculadas sin datos, y los botones
+"Explorer ↗" abrían `zokascan.cc`, muerto desde julio (sus rutas `/rpc` y `/rpc2`
+devuelven la página, sin datos, y dice "v1.6.1"). Ahora: últimos 8 bloques reales
+que se abren con un clic, búsqueda de transacciones privadas con su bloque
+(`GET /private/tx/:hash` da `status` y `block_height`) y los botones abren el
+explorador interno. `prepare-release.ps1` deja que la app vaya adelante del nodo
+solo en el último número. **Ojo:** la API del nodo corta a 1.200 lecturas por
+minuto por cliente y bloquea hasta 64 s a quien se pasa (ZSilent comparte el
+cliente 127.0.0.1): no recorrer la cadena bloque por bloque desde la PC.
+
 **14/10: SALIÓ LA 2.1.2, alturas adelantadas a pedido del usuario: bundles
 canónicos desde 25.570 y v2 / `zkq1` desde 25.630** (antes 30.284 y 31.004: once
 días de minado con la PC sola a 17 bits). Cliente mínimo 2.1.2: la 2.1.0 y la 2.1.1
