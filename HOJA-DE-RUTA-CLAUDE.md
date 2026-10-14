@@ -5,6 +5,14 @@ Proyecto: `C:\Users\mderramus\ZOKA`.
 
 ## Punto de partida
 
+**Después, el mismo 13/10: 2.1.1** (nodo y ZSilent, `main` de los tres repos ya en
+la versión publicada). La autoridad de checkpoints mina aunque no tenga pares: Zenith
+estaba quieta porque ninguna otra semilla respondía y ZSilent pide
+`--min-mine-peers 1`. `zoka.exe` `6c6d8722…`, MSI `e86b1d03…`; instalada en la PC
+(respaldo `ZSilent Core.respaldo-20261013-v2.1.0`). A las 21:58 la red volvió a
+avanzar (25.245, 25.247…), dificultad 17 bits, unos 720 H/s: al 30.284 faltan entre
+4 y 7 días de minado continuo.
+
 **13/10/2026, a pedido del usuario: SALIÓ LA 2.1.0 DE TESTNET.** Publicada en
 `github.com/zoka-network` (y espejada en GitLab), probada antes en una red local:
 
