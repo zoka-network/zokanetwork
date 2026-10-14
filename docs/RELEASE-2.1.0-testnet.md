@@ -4,6 +4,13 @@
 del nodo, ZSilent y ZKAPriv, y `trusted-setup-mainnet-v1`). Quedan el anuncio y
 los envíos `zkq1` reales después de la activación; ver la hoja de traspaso.
 
+**14/10/2026, versión 2.1.2: alturas adelantadas a 25.570 (bundles) y 25.630
+(v2), a pedido del usuario.** La red era solo la PC del equipo (ninguna otra
+semilla respondía) y con la dificultad trabada en 17 bits la "semana" de margen
+se había vuelto unos once días. El margen servía para que actualizaran otros
+nodos, y no había. La 2.1.0 y la 2.1.1 quedan fuera de la cadena: cliente mínimo
+2.1.2.
+
 Preparado el 13/10/2026. Esta versión activa en Zenith lo que ya está en código y
 probado en la red local. **Nada de esto está publicado.** Las alturas de
 activación se fijan el día en que se compila para publicar, con la punta de ese

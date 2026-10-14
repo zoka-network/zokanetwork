@@ -200,11 +200,13 @@ pub const PRIVATE_TX_HASHES_PER_BLOCK_LIMIT: usize = 128;
 /// phone's local gate — node/server binaries never enable `mobile`, so their
 /// consensus default is the non-mobile constant below (env-overridable).
 ///
-/// Zenith (testnet), versión 2.1.0, fijada el 13/10/2026: la punta de ese día
-/// (25.244, la red estaba quieta) más 5.040 bloques, una semana al objetivo de
-/// 120 s. Ver `docs/RELEASE-2.1.0-testnet.md`.
+/// Zenith (testnet). La 2.1.0 la había fijado en 30.284 (una semana de margen
+/// para que actualizaran otros nodos); la 2.1.2, el 14/10/2026, la adelantó a
+/// 25.570, la punta de ese día (25.448) más unas seis horas de bloques: no había
+/// otros nodos en la red y la dificultad trabada en 17 bits volvía la semana
+/// once días. Ver `docs/RELEASE-2.1.0-testnet.md`.
 #[cfg(not(feature = "mobile"))]
-pub const PRIVATE_TX_CANONICAL_BUNDLE_ACTIVATION_HEIGHT: Option<u64> = Some(30_284);
+pub const PRIVATE_TX_CANONICAL_BUNDLE_ACTIVATION_HEIGHT: Option<u64> = Some(25_570);
 #[cfg(feature = "mobile")]
 pub const PRIVATE_TX_CANONICAL_BUNDLE_ACTIVATION_HEIGHT: Option<u64> = Some(0);
 /// Compact mobile Groth16 profile remains disabled until the final i1 CRS,
@@ -294,9 +296,10 @@ pub enum PqFeature {
     HybridSnapshotSignatures,
 }
 
-/// Zenith (testnet), versión 2.1.0: un día (720 bloques) después de los bundles
-/// canónicos, para ver los bundles andando antes de sumar la v2.
-pub const PQ_HYBRID_ADDRESSES_ACTIVATION_HEIGHT: Option<u64> = Some(31_004);
+/// Zenith (testnet), versión 2.1.2: 60 bloques (unas tres horas) después de los
+/// bundles canónicos, para verlos andando antes de sumar la v2. La 2.1.0 la
+/// había fijado en 31.004.
+pub const PQ_HYBRID_ADDRESSES_ACTIVATION_HEIGHT: Option<u64> = Some(25_630);
 pub const PQ_SPEND_CIRCUIT_ACTIVATION_HEIGHT: Option<u64> = None;
 pub const PQ_HYBRID_SNAPSHOT_SIGNATURES_ACTIVATION_HEIGHT: Option<u64> = None;
 
@@ -618,14 +621,14 @@ mod tests {
     // protocolo nuevo.
     #[cfg(not(feature = "mobile"))]
     #[test]
-    fn canonical_private_bundle_activates_at_the_2_1_0_height() {
+    fn canonical_private_bundle_activates_at_the_zenith_height() {
         // Zenith 2.1.0: antes de la altura la cadena valida exactamente como
         // antes; desde ahí cada bloque lleva los cuerpos de sus tx privadas.
-        assert_eq!(PRIVATE_TX_CANONICAL_BUNDLE_ACTIVATION_HEIGHT, Some(30_284));
+        assert_eq!(PRIVATE_TX_CANONICAL_BUNDLE_ACTIVATION_HEIGHT, Some(25_570));
         if std::env::var_os("ZOKA_PRIVATE_TX_CANONICAL_BUNDLE_ACTIVATION_HEIGHT").is_none() {
             assert!(!private_tx_canonical_bundle_required(0));
-            assert!(!private_tx_canonical_bundle_required(30_283));
-            assert!(private_tx_canonical_bundle_required(30_284));
+            assert!(!private_tx_canonical_bundle_required(25_569));
+            assert!(private_tx_canonical_bundle_required(25_570));
         }
         assert!(!private_tx_canonical_bundle_required_at(9, Some(10)));
         assert!(private_tx_canonical_bundle_required_at(10, Some(10)));
@@ -679,7 +682,7 @@ mod tests {
         // siguen dormidas hasta que se acuerde la suya.
         assert_eq!(
             PqFeature::HybridAddresses.compiled_activation_height(),
-            Some(31_004)
+            Some(25_630)
         );
         for feature in [
             PqFeature::SpendCircuitWithoutKeyImages,
@@ -744,7 +747,7 @@ mod tests {
         if std::env::var_os(PqFeature::HybridAddresses.activation_env_var()).is_none()
             && std::env::var_os("ZOKA_PRIVATE_TX_CANONICAL_BUNDLE_ACTIVATION_HEIGHT").is_none()
         {
-            assert_eq!(pq_hybrid_outputs_activation_height(), Some(31_004));
+            assert_eq!(pq_hybrid_outputs_activation_height(), Some(25_630));
         }
     }
 

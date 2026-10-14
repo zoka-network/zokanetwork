@@ -41,7 +41,11 @@ versión se fijan, con la punta y el ritmo de bloques medidos ese día:
 - salidas v2 (zkq1): un día después (720 bloques más al mismo ritmo).
 
 La semana deja tiempo a que los nodos actualicen; el día entre una y otra
-permite ver los bundles andando antes de sumar la v2. Un nodo que no actualice
+permite ver los bundles andando antes de sumar la v2.
+
+**Revisado el 14/10 (versión 2.1.2), a pedido del usuario:** 25.570 para los
+bundles y 25.630 para la v2. No había otros nodos que esperar y, con la
+dificultad trabada en 17 bits, la semana eran unos once días. Un nodo que no actualice
 queda en su rama sin arrastrar a nadie: los que sí actualizaron siguen los
 checkpoints firmados.
 

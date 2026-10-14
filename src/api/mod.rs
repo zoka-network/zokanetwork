@@ -60,9 +60,10 @@ const MINER_HEARTBEAT_TTL_SECS: u64 = 90;
 /// Es el mismo `minimum_client_version` que anuncia el manifiesto de la red
 /// (ZSilent lo lee para pedir que se actualice); la prueba
 /// `tests/mainnet_recovery_policy.rs` exige que coincidan. Estuvo en 1.9.0
-/// mientras el manifiesto ya decía 2.0.1; desde la 2.1.0, que activa los
-/// bundles canónicos y la v2, un cliente anterior queda fuera de la cadena.
-pub const NETWORK_MIN_CLIENT_VERSION: &str = "2.1.0";
+/// mientras el manifiesto ya decía 2.0.1. La 2.1.2 adelantó las alturas de los
+/// bundles canónicos y la v2: un cliente anterior (incluidas la 2.1.0 y la 2.1.1,
+/// que las tienen más altas) queda fuera de la cadena.
+pub const NETWORK_MIN_CLIENT_VERSION: &str = "2.1.2";
 
 #[derive(Clone, Debug)]
 pub struct ApiSecurityConfig {

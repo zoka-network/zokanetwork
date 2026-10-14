@@ -5,6 +5,12 @@ Proyecto: `C:\Users\mderramus\ZOKA`.
 
 ## Punto de partida
 
+**14/10: 2.1.2, alturas adelantadas a pedido del usuario: bundles canónicos desde
+25.570 y v2 / `zkq1` desde 25.630** (antes 30.284 y 31.004: once días de minado con
+la PC sola a 17 bits). Cliente mínimo 2.1.2. Ese día se desactivó también, a pedido
+del usuario, la tarea programada "BOTX WSL" del bot de trading (otro proyecto), que
+prendía WSL al iniciar sesión; para Zoka no hace falta WSL.
+
 **Después, el mismo 13/10: 2.1.1** (nodo y ZSilent, `main` de los tres repos ya en
 la versión publicada). La autoridad de checkpoints mina aunque no tenga pares: Zenith
 estaba quieta porque ninguna otra semilla respondía y ZSilent pide
