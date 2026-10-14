@@ -1,15 +1,35 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
-Actualizada: **13 de octubre de 2026**, Argentina (tercera sesión, Claude).
+Actualizada: **14 de octubre de 2026**, Argentina (Claude).
 Proyecto: `C:\Users\mderramus\ZOKA`.
 
 ## Punto de partida
 
-**14/10: 2.1.2, alturas adelantadas a pedido del usuario: bundles canónicos desde
-25.570 y v2 / `zkq1` desde 25.630** (antes 30.284 y 31.004: once días de minado con
-la PC sola a 17 bits). Cliente mínimo 2.1.2. Ese día se desactivó también, a pedido
-del usuario, la tarea programada "BOTX WSL" del bot de trading (otro proyecto), que
-prendía WSL al iniciar sesión; para Zoka no hace falta WSL.
+**14/10: SALIÓ LA 2.1.2, alturas adelantadas a pedido del usuario: bundles
+canónicos desde 25.570 y v2 / `zkq1` desde 25.630** (antes 30.284 y 31.004: once
+días de minado con la PC sola a 17 bits). Cliente mínimo 2.1.2: la 2.1.0 y la 2.1.1
+quedan fuera de la cadena desde 25.570 y sus releases avisan "Superseded".
+Publicada en `github.com/zoka-network` (`v2.1.2` de nodo, ZSilent y ZKAPriv; `main`
+de los tres en esa versión) y espejada en GitLab:
+
+- Nodo (`9b129cd7`, `pq-experimental`): `zoka.exe` `74c95b7d…`, `zokahd.exe`
+  `0914c854…`, zip `f3398397…`.
+- ZSilent: MSI `7ce4451f…` (verificado por dentro: mismo `zoka.exe`, Tor 0.4.9.14
+  `8c38513b…`). ZKAPriv: versionCode 15, APK `502c69bd…`, mismo certificado
+  `061376f8…`. Lo publicado se bajó de GitHub y coincide byte a byte.
+- **Instalado:** PC con ZSilent 2.1.2 (respaldo
+  `ZSilent Core.respaldo-20261014-v2.1.1`; lo instaló Claude con el OK explícito
+  del usuario) y teléfono con ZKAPriv 2.1.2 (`adb install -r`, conserva la wallet).
+- Ese día, a pedido del usuario y fuera de Zoka: se desactivaron las cuatro tareas
+  "BOTX …" del bot de trading, que prendían WSL al iniciar sesión (para Zoka no
+  hace falta WSL), y se corrió `Desktop\optimizar-windows.ps1` como administrador:
+  telemetría, mapas, fax, informe de errores, impresora, ubicación e indexado de
+  búsqueda deshabilitados; el estado anterior quedó en
+  `Desktop\optimizar-windows-antes.json` y se vuelve atrás con `-Revertir`.
+- **Falta:** que la red llegue a 25.570 y 25.630 con la PC minando, ver que la
+  autoridad siga firmando checkpoints, los envíos `zkq1` reales entre ZSilent y
+  ZKAPriv y el anuncio (texto de la 2.1.2 en
+  [docs/ANUNCIO-zenith-testnet-BORRADOR.md](docs/ANUNCIO-zenith-testnet-BORRADOR.md)).
 
 **Después, el mismo 13/10: 2.1.1** (nodo y ZSilent, `main` de los tres repos ya en
 la versión publicada). La autoridad de checkpoints mina aunque no tenga pares: Zenith
