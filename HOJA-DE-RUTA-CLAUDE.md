@@ -5,6 +5,31 @@ Proyecto: `C:\Users\mderramus\ZOKA`.
 
 ## Punto de partida
 
+**15/10: primera prueba real de `zkq1`** (el 25.630 se minó el 14/10 a las 23:25,
+sin errores).
+
+- **ZSilent → teléfono: OK.** Tx `81cede9a…42fc`, dos salidas v2 (`output_version`
+  2, `kem_ciphertext` de 1.120 bytes), confirmada en el bloque 25.780; ZKAPriv la
+  encontró en su revisión siguiente (100 ZKA, el monto que puso el usuario).
+- **Teléfono → ZSilent: falló dos veces antes de armar la prueba**, con "el
+  sondeo de altura … fue inconcluso … Timeout while waiting for a response". El
+  teléfono llega al nodo solo por Tor (semillas `.onion` fijas en
+  `Constants.ZOKA_P2P_SEEDS`), abre una conexión por consulta (72 en una hora) y
+  parte de los pedidos quedan sin respuesta: a las 08:43 abandonó un lote que el
+  nodo sirvió recién entre las 08:44 y las 08:45. Coincide con la revisión de
+  fondo, que repite 12 cuerpos que nadie tiene. Pendiente: reintentar; si sigue,
+  reproducirlo con `probar_cliente_movil` y arreglarlo en ZKAPriv (reintentar el
+  sondeo, no competir con la revisión de fondo).
+- **Los QR de las `zkq1` son ilegibles** en las dos apps (1.715 caracteres): hay
+  que rediseñarlos.
+- Sin QR, las direcciones se pasaron por adb: la del teléfono, con "Copy" y
+  "Paste" en Enviar y leyendo el campo con `uiautomator dump` (ZKAPriv bloquea
+  las capturas); la de ZSilent, escrita con `input text` en tramos de 40 con
+  pausas (en tramos largos el teclado pierde caracteres) y verificada contra el
+  original.
+- No se leyeron las claves que el usuario dejó en el portapapeles: se pisaron con
+  la `zkq1` del teléfono.
+
 **14/10, 22:43: el bloque 25.570 (bundles canónicos) se minó a las 18:28 sin
 errores en el log; la punta iba en 25.626, a 18 bits y ~6 min por bloque, así
 que el 25.630 (`zkq1`) llegaba esa misma noche.** Checkpoint firmado en 25.608.
