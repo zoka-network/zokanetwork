@@ -5,6 +5,13 @@ Proyecto: `C:\Users\mderramus\ZOKA`.
 
 ## Punto de partida
 
+**14/10, 22:43: el bloque 25.570 (bundles canónicos) se minó a las 18:28 sin
+errores en el log; la punta iba en 25.626, a 18 bits y ~6 min por bloque, así
+que el 25.630 (`zkq1`) llegaba esa misma noche.** Checkpoint firmado en 25.608.
+**Para el 15/10, a pedido del usuario:** confirmar que pasó el 25.630 y hacer los
+envíos reales a `zkq1` ZSilent → teléfono y teléfono → ZSilent (las dos apps
+abiertas).
+
 **14/10, más tarde: ZSilent 2.1.3, arreglos del explorador** (rama
 `explorador-interno` de zsilent-core; el nodo sigue en 2.1.2, mismo `zoka.exe`).
 Publicada con aprobación del usuario (release `v2.1.3` de zsilent-core, MSI
