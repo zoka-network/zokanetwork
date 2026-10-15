@@ -9,6 +9,11 @@ release. La red todavía no es post-cuántica.
 
 ## LEEME PRIMERO
 
+**15/10/2026:** la 2.1.2 activó en Zenith los bundles canónicos (25.570) y las
+`zkq1` (25.630). El usuario pidió una wallet móvil que no tarde minutos y que
+funcione con cualquier nodo: el plan, con el estado de cada etapa pendiente de este
+documento, está en [HOJA-DE-RUTA-wallet-liviana.md](HOJA-DE-RUTA-wallet-liviana.md).
+
 Lo que decidió el usuario el 2026-10-11:
 
 1. **La red actual (Zenith) pasa a ser la testnet.** Nadie pagó dinero por ZKA, así
