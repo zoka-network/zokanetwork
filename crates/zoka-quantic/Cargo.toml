@@ -1,0 +1,37 @@
+[package]
+name = "zoka-quantic"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+description = "Zoka Quantic shielded protocol: the Ironwood circuit (orchard 0.16) with X-Wing note encryption"
+
+[dependencies]
+orchard = "=0.16.0"
+zoka-pq = { path = "../zoka-pq" }
+blake2b_simd = "1"
+bs58 = "0.5"
+chacha20 = { version = "0.10", default-features = false, features = ["cipher"] }
+chacha20poly1305 = { version = "0.11", default-features = false }
+f4jumble = "0.1"
+ff = "0.14"
+group = "0.14"
+incrementalmerkletree = { version = "0.9", features = ["legacy-api"] }
+nonempty = "0.11"
+pasta_curves = "0.6"
+rand = { version = "0.10", features = ["sys_rng"] }
+rand_core = "0.10"
+subtle = "2.6"
+zeroize = "1.8.2"
+zip32 = "0.3"
+
+[dev-dependencies]
+rand = { version = "0.10", features = ["sys_rng", "std_rng"] }
+
+# Halo 2 proofs take minutes without optimization; the crate itself stays fast to build.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
