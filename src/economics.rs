@@ -126,6 +126,12 @@ pub const CHECKPOINT_AUTHORITY_KEYS: &[(&str, &str)] = &[(
     "bf5c92154ee0e250f4419d47cf0a16c263c586244274ccad196234d339c47bd4",
 )];
 
+/// Mitad ML-DSA-65 (hex, 1.952 bytes) de la clave de la autoridad, por cadena.
+/// Con ella compilada, la cadena solo acepta checkpoints híbridos (versión 2).
+/// Zenith todavía no tiene: la crea el usuario con
+/// `zoka checkpoint-keygen --mldsa` en la PC de la autoridad.
+pub const CHECKPOINT_AUTHORITY_MLDSA_KEYS: &[(&str, &str)] = &[];
+
 pub const MAINNET_EMERGENCY_CHECKPOINTS: &[(u64, &str)] = &[
     (
         MAINNET_EMERGENCY_CHECKPOINT_HEIGHT,

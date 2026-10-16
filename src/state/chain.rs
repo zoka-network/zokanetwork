@@ -1197,7 +1197,7 @@ mod tests {
             storage,
             SIGNED_TEST_CHAIN,
             &checkpoint,
-            &key.verifying_key(),
+            &key.verifying_key().into(),
         )
         .expect("accept test checkpoint");
     }

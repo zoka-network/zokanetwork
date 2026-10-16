@@ -4946,7 +4946,7 @@ async fn post_signed_checkpoint(
         StatusCode::SERVICE_UNAVAILABLE,
         "the node does not know its chain yet".to_string(),
     ))?;
-    let authority = crate::checkpoint_authority::authority_key_for_chain(&chain_id).ok_or((
+    let authority = crate::checkpoint_authority::authority_keys_for_chain(&chain_id).ok_or((
         StatusCode::NOT_FOUND,
         format!("chain {chain_id} has no checkpoint authority"),
     ))?;

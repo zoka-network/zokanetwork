@@ -7588,7 +7588,7 @@ async fn handle_fullnode_network_message(
     match message {
         zoka::network::message::ZokaMessage::SignedCheckpoint(checkpoint) => {
             let storage = storage?;
-            let Some(authority) = zoka::checkpoint_authority::authority_key_for_chain(chain_id) else {
+            let Some(authority) = zoka::checkpoint_authority::authority_keys_for_chain(chain_id) else {
                 return None;
             };
             match zoka::checkpoint_authority::accept_signed_checkpoint(
@@ -7606,6 +7606,12 @@ async fn handle_fullnode_network_message(
                 Err(error @ zoka::checkpoint_authority::CheckpointError::Conflict { .. }) => {
                     Some(format!("ALERT: {error}"))
                 }
+                // La autoridad publica las dos versiones mientras haya nodos
+                // viejos; la que no es la de esta cadena se descarta sin ruido.
+                Err(
+                    zoka::checkpoint_authority::CheckpointError::HybridRequired
+                    | zoka::checkpoint_authority::CheckpointError::NoHybridAuthority,
+                ) => None,
                 Err(error) => Some(format!("Ignored signed checkpoint: {error}")),
             }
         }
@@ -14460,7 +14466,7 @@ fn load_checkpoint_authority(
     local_dir: &str,
     chain_id: &str,
     notes: &mut Vec<String>,
-) -> Option<ed25519_dalek::SigningKey> {
+) -> Option<zoka::checkpoint_authority::CheckpointSigner> {
     let path = PathBuf::from(local_dir).join(zoka::checkpoint_authority::AUTHORITY_KEY_FILE);
     if !path.exists() {
         return None;
@@ -14472,13 +14478,14 @@ fn load_checkpoint_authority(
             return None;
         }
     };
-    match zoka::checkpoint_authority::authority_key_for_chain(chain_id) {
-        Some(expected) if expected == key.verifying_key() => {
+    match zoka::checkpoint_authority::authority_keys_for_chain(chain_id) {
+        Some(expected) if expected.ed25519 == key.verifying_key() => {
+            let signer = checkpoint_signer_with_hybrid(local_dir, chain_id, &expected, key, notes)?;
             notes.push(format!(
                 "Checkpoint authority: this node signs a checkpoint every {} blocks.",
                 zoka::checkpoint_authority::AUTHORITY_SIGN_INTERVAL
             ));
-            Some(key)
+            Some(signer)
         }
         Some(_) => {
             notes.push(
@@ -14506,7 +14513,7 @@ async fn run_checkpoint_authority(
     node: &mut Node,
     storage: &RocksDbStorage,
     chain_id: &str,
-    signer: &ed25519_dalek::SigningKey,
+    signer: &zoka::checkpoint_authority::CheckpointSigner,
     last_broadcast: &mut Option<tokio::time::Instant>,
 ) -> Option<String> {
     let tip = storage.get_chain_height().ok()?;
@@ -14529,21 +14536,28 @@ async fn run_checkpoint_authority(
     };
     if let Some(height) = next_height {
         let hash = storage.get_canonical_block_hash_at_height(height).ok().flatten()?;
-        let checkpoint =
-            zoka::checkpoint_authority::SignedCheckpoint::sign(signer, chain_id, height, &hash);
+        let authority = zoka::checkpoint_authority::authority_keys_for_chain(chain_id)?;
+        let mut versions = signer.sign_all(&authority, chain_id, height, &hash).into_iter();
+        let own = versions.next()?;
         return Some(
-            match zoka::checkpoint_authority::accept_signed_checkpoint(
-                storage,
-                chain_id,
-                &checkpoint,
-                &signer.verifying_key(),
-            ) {
+            match zoka::checkpoint_authority::accept_signed_checkpoint(storage, chain_id, &own, &authority) {
                 Ok(_) => {
                     let _ = node.publish_message(
-                        &zoka::network::message::ZokaMessage::SignedCheckpoint(checkpoint),
+                        &zoka::network::message::ZokaMessage::SignedCheckpoint(own.clone()),
                     );
+                    // La otra versión, para los nodos de la otra política.
+                    for compat in versions {
+                        let _ = zoka::checkpoint_authority::store_compat_checkpoint(storage, &compat);
+                        let _ = node.publish_message(
+                            &zoka::network::message::ZokaMessage::SignedCheckpoint(compat),
+                        );
+                    }
                     *last_broadcast = Some(tokio::time::Instant::now());
-                    format!("Signed checkpoint {height} ({}).", &hash[..12])
+                    format!(
+                        "Signed checkpoint {height} ({}, version {}).",
+                        &hash[..12],
+                        own.version
+                    )
                 }
                 Err(error) => format!("Checkpoint signing failed: {error}"),
             },
@@ -14554,10 +14568,73 @@ async fn run_checkpoint_authority(
         .map(|at| at.elapsed() >= Duration::from_secs(300))
         .unwrap_or(true);
     if due {
+        let compat = zoka::checkpoint_authority::latest_compat_checkpoint(storage)
+            .ok()
+            .flatten()
+            .filter(|compat| compat.height == latest.height);
         let _ = node.publish_message(&zoka::network::message::ZokaMessage::SignedCheckpoint(latest));
+        if let Some(compat) = compat {
+            let _ = node.publish_message(&zoka::network::message::ZokaMessage::SignedCheckpoint(compat));
+        }
         *last_broadcast = Some(tokio::time::Instant::now());
     }
     None
+}
+
+/// Suma la mitad ML-DSA a la clave de la autoridad, si su archivo está en la
+/// carpeta de la red. Reglas: si la cadena ya tiene compilada la clave ML-DSA,
+/// sin el archivo (o con otro) no se firma nada, porque los nodos nuevos solo
+/// aceptan la versión 2; si no la tiene, se firma solo la versión 1.
+fn checkpoint_signer_with_hybrid(
+    local_dir: &str,
+    chain_id: &str,
+    authority: &zoka::checkpoint_authority::AuthorityKeys,
+    key: ed25519_dalek::SigningKey,
+    notes: &mut Vec<String>,
+) -> Option<zoka::checkpoint_authority::CheckpointSigner> {
+    let mut signer = zoka::checkpoint_authority::CheckpointSigner::ed25519_only(key);
+    // Zenith tiene nodos de antes de la etapa 6, que solo entienden la versión 1.
+    signer.legacy_v1 = chain_id == MAINNET_CHAIN_ID;
+    #[cfg(feature = "pq-experimental")]
+    {
+        let path = PathBuf::from(local_dir).join(zoka::checkpoint_authority::AUTHORITY_MLDSA_KEY_FILE);
+        let hybrid = if path.exists() {
+            match zoka::hybrid_signature::load_mldsa_seed(&path).and_then(|seed| {
+                zoka::hybrid_signature::HybridSigningKey::from_parts(signer.ed25519.clone(), seed.as_ref())
+                    .map_err(|e| e.to_string())
+            }) {
+                Ok(hybrid) => Some(hybrid),
+                Err(error) => {
+                    notes.push(format!("Checkpoint authority ML-DSA key unreadable: {error}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        match (&authority.mldsa, hybrid) {
+            (Some(expected), Some(hybrid)) if hybrid.verifying_key().mldsa().to_bytes() == expected.to_bytes() => {
+                signer.hybrid = Some(hybrid);
+            }
+            (Some(_), _) => {
+                notes.push(
+                    "This chain requires hybrid checkpoints and the local ML-DSA key is missing or does not match; not signing."
+                        .to_string(),
+                );
+                return None;
+            }
+            (None, Some(_)) => notes.push(
+                "Checkpoint authority ML-DSA key found, but this chain has no compiled ML-DSA authority; signing version 1 only."
+                    .to_string(),
+            ),
+            (None, None) => {}
+        }
+    }
+    #[cfg(not(feature = "pq-experimental"))]
+    {
+        let _ = (local_dir, authority, &notes);
+    }
+    Some(signer)
 }
 
 /// Firmar fija la cadena para todos, así que pide más que `caught_up`: con
@@ -14607,6 +14684,9 @@ fn chain_contains_checkpoint(
 /// `economics::CHECKPOINT_AUTHORITY_KEYS`. No sobrescribe una existente.
 fn cmd_checkpoint_keygen(args: &[String]) -> Result<(), String> {
     let network = NetworkProfile::from_args(args)?;
+    if has_flag(args, "--mldsa") {
+        return cmd_checkpoint_keygen_mldsa(&network);
+    }
     let path = PathBuf::from(network.local_dir()).join(zoka::checkpoint_authority::AUTHORITY_KEY_FILE);
     let public = zoka::checkpoint_authority::generate_signing_key(&path)?;
     let shown = std::env::current_dir()
@@ -14618,6 +14698,38 @@ fn cmd_checkpoint_keygen(args: &[String]) -> Result<(), String> {
     println!("Back up that file offline: it is the only copy. Compile the public key into");
     println!("economics::CHECKPOINT_AUTHORITY_KEYS for this chain and release new binaries.");
     Ok(())
+}
+
+/// `zoka checkpoint-keygen --mldsa`: crea la mitad ML-DSA-65 de la clave de la
+/// autoridad junto a la Ed25519 (etapa 6). Su pública se compila en
+/// `economics::CHECKPOINT_AUTHORITY_MLDSA_KEYS`; desde ese binario la cadena
+/// solo acepta checkpoints híbridos. No sobrescribe una existente.
+fn cmd_checkpoint_keygen_mldsa(network: &NetworkProfile) -> Result<(), String> {
+    #[cfg(feature = "pq-experimental")]
+    {
+        let dir = PathBuf::from(network.local_dir());
+        if !dir.join(zoka::checkpoint_authority::AUTHORITY_KEY_FILE).exists() {
+            return Err(
+                "create the Ed25519 authority key first (zoka checkpoint-keygen): the ML-DSA key is its second half"
+                    .to_string(),
+            );
+        }
+        let path = dir.join(zoka::checkpoint_authority::AUTHORITY_MLDSA_KEY_FILE);
+        let public = zoka::hybrid_signature::generate_mldsa_seed(&path)?;
+        println!("Checkpoint authority ML-DSA-65 key created: {}", path.display());
+        println!("Chain: {}", network.chain_id());
+        println!("ML-DSA public key ({} bytes):", public.len() / 2);
+        println!("{public}");
+        println!("Back up that file offline next to the Ed25519 key. Compile the public key into");
+        println!("economics::CHECKPOINT_AUTHORITY_MLDSA_KEYS: from that release on, the chain only");
+        println!("accepts hybrid (Ed25519 + ML-DSA-65) checkpoints.");
+        Ok(())
+    }
+    #[cfg(not(feature = "pq-experimental"))]
+    {
+        let _ = network;
+        Err("this build has no ML-DSA support; build with --features pq-experimental".to_string())
+    }
 }
 
 /// `zoka checkpoint-sign --height <h> --hash <hash> [--network testnet]
@@ -14640,35 +14752,52 @@ fn cmd_checkpoint_sign(args: &[String]) -> Result<(), String> {
     let hash = required_option_value(args, "--hash")?;
     let key_path =
         PathBuf::from(network.local_dir()).join(zoka::checkpoint_authority::AUTHORITY_KEY_FILE);
-    let checkpoint = sign_manual_checkpoint(
+    let checkpoints = sign_manual_checkpoint(
         &key_path,
         chain_id,
-        zoka::checkpoint_authority::authority_key_for_chain(chain_id),
+        zoka::checkpoint_authority::authority_keys_for_chain(chain_id),
         height,
         &hash,
     )?;
+    // Se entregan todas las versiones: el nodo acepta la de su política y
+    // rechaza la otra, así que un rechazo no es un fallo del comando.
     let posted = match option_value(args, "--post") {
-        Some(rpc) => Some(rpc_http_post_json(
-            &rpc,
-            "/checkpoint",
-            &serde_json::to_value(&checkpoint).map_err(|e| e.to_string())?,
-            10,
-        )?),
+        Some(rpc) => {
+            let mut replies = Vec::new();
+            for checkpoint in &checkpoints {
+                let body = serde_json::to_value(checkpoint).map_err(|e| e.to_string())?;
+                replies.push(match rpc_http_post_json(&rpc, "/checkpoint", &body, 10) {
+                    Ok(reply) => format!("version {}: {reply}", checkpoint.version),
+                    Err(error) => format!("version {}: {error}", checkpoint.version),
+                });
+            }
+            Some(replies)
+        }
         None => None,
     };
     if has_flag(args, "--json") {
         println!(
             "{}",
-            serde_json::json!({ "checkpoint": checkpoint, "posted": posted })
+            serde_json::json!({
+                "checkpoint": checkpoints.first(),
+                "checkpoints": checkpoints,
+                "posted": posted,
+            })
         );
         return Ok(());
     }
-    println!(
-        "{}",
-        serde_json::to_string(&checkpoint).map_err(|e| e.to_string())?
-    );
+    for checkpoint in &checkpoints {
+        println!(
+            "{}",
+            serde_json::to_string(checkpoint).map_err(|e| e.to_string())?
+        );
+    }
     match posted {
-        Some(reply) => println!("Node reply: {reply}"),
+        Some(replies) => {
+            for reply in replies {
+                println!("Node reply, {reply}");
+            }
+        }
         None => println!(
             "Not delivered: POST it to a node's /checkpoint, or run again with --post <rpc>."
         ),
@@ -14676,16 +14805,17 @@ fn cmd_checkpoint_sign(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Firma un checkpoint con la clave de `key_path`, solo si es la autoridad de
-/// la cadena, y lo verifica antes de devolverlo: nunca sale uno que los nodos
-/// rechazarían.
+/// Firma un checkpoint con la clave de `key_path` (y su mitad ML-DSA, si está
+/// al lado), solo si es la autoridad de la cadena, y verifica la versión que
+/// acepta la cadena antes de devolverla: nunca sale una que los nodos
+/// rechazarían. Devuelve primero esa versión y después la de compatibilidad.
 fn sign_manual_checkpoint(
     key_path: &Path,
     chain_id: &str,
-    authority: Option<ed25519_dalek::VerifyingKey>,
+    authority: Option<zoka::checkpoint_authority::AuthorityKeys>,
     height: u64,
     hash: &str,
-) -> Result<zoka::checkpoint_authority::SignedCheckpoint, String> {
+) -> Result<Vec<zoka::checkpoint_authority::SignedCheckpoint>, String> {
     if !key_path.exists() {
         return Err(format!(
             "no checkpoint authority key at {}: only the authority node can sign",
@@ -14695,20 +14825,29 @@ fn sign_manual_checkpoint(
     let key = zoka::checkpoint_authority::load_signing_key(key_path)?;
     let authority = authority
         .ok_or_else(|| format!("chain {chain_id} has no compiled checkpoint authority"))?;
-    if authority != key.verifying_key() {
+    if authority.ed25519 != key.verifying_key() {
         return Err(
             "the local key is not the compiled authority for this chain: every node would reject the checkpoint"
                 .to_string(),
         );
     }
+    let local_dir = key_path
+        .parent()
+        .and_then(|dir| dir.to_str())
+        .unwrap_or(".")
+        .to_string();
+    let mut notes = Vec::new();
+    let signer = checkpoint_signer_with_hybrid(&local_dir, chain_id, &authority, key, &mut notes)
+        .ok_or_else(|| notes.join(" "))?;
     let hash = hash.trim().to_ascii_lowercase();
-    let checkpoint =
-        zoka::checkpoint_authority::SignedCheckpoint::sign(&key, chain_id, height, &hash);
+    let checkpoints = signer.sign_all(&authority, chain_id, height, &hash);
     // Revisa también la forma: altura mayor que cero y hash de 64 hex.
-    checkpoint
+    checkpoints
+        .first()
+        .ok_or_else(|| "nothing to sign".to_string())?
         .verify(&authority)
         .map_err(|e| format!("refusing to emit an invalid checkpoint: {e}"))?;
-    Ok(checkpoint)
+    Ok(checkpoints)
 }
 
 /// `zoka checkpoint-status [--network testnet] [--db <path>] [--json]`.
@@ -14716,9 +14855,18 @@ fn cmd_checkpoint_status(args: &[String]) -> Result<(), String> {
     let network = NetworkProfile::from_args(args)?;
     let chain_id = network.chain_id();
     let db_path = option_value(args, "--db").unwrap_or_else(|| network.default_db_path().to_string());
-    let authority = zoka::checkpoint_authority::authority_key_for_chain(chain_id)
-        .map(|key| hex::encode(key.to_bytes()));
+    let authority_keys = zoka::checkpoint_authority::authority_keys_for_chain(chain_id);
+    let hybrid_required = authority_keys
+        .as_ref()
+        .map(|keys| keys.requires_hybrid())
+        .unwrap_or(false);
+    let authority = authority_keys
+        .as_ref()
+        .map(|keys| hex::encode(keys.ed25519.to_bytes()));
     let key_path = PathBuf::from(network.local_dir()).join(zoka::checkpoint_authority::AUTHORITY_KEY_FILE);
+    let local_mldsa_key = PathBuf::from(network.local_dir())
+        .join(zoka::checkpoint_authority::AUTHORITY_MLDSA_KEY_FILE)
+        .exists();
     let local_key = if key_path.exists() {
         Some(
             zoka::checkpoint_authority::load_signing_key(&key_path)
@@ -14741,6 +14889,8 @@ fn cmd_checkpoint_status(args: &[String]) -> Result<(), String> {
                 "authority_public_key": authority,
                 "local_key_public": local_key,
                 "this_node_signs": signs,
+                "hybrid_required": hybrid_required,
+                "local_mldsa_key": local_mldsa_key,
                 "latest_signed_checkpoint": latest,
             })
         );
@@ -14756,10 +14906,15 @@ fn cmd_checkpoint_status(args: &[String]) -> Result<(), String> {
         Some(key) => println!("Local key {key} is NOT the compiled authority; it does not sign."),
         None => println!("This node has no authority key."),
     }
+    println!(
+        "Hybrid checkpoints (Ed25519 + ML-DSA-65): {}; local ML-DSA key: {}.",
+        if hybrid_required { "required on this chain" } else { "not required on this chain" },
+        if local_mldsa_key { "present" } else { "absent" }
+    );
     match latest {
         Some(checkpoint) => println!(
-            "Latest signed checkpoint: height {} hash {}",
-            checkpoint.height, checkpoint.block_hash
+            "Latest signed checkpoint: height {} hash {} (version {})",
+            checkpoint.height, checkpoint.block_hash, checkpoint.version
         ),
         None => println!("Latest signed checkpoint: none accepted yet."),
     }
@@ -19472,26 +19627,73 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let key_path = dir.path().join("checkpoint-authority.key");
         let public = zoka::checkpoint_authority::generate_signing_key(&key_path).expect("keygen");
-        let authority = zoka::checkpoint_authority::parse_public_key(&public);
+        let authority: Option<zoka::checkpoint_authority::AuthorityKeys> =
+            zoka::checkpoint_authority::parse_public_key(&public).map(Into::into);
         let chain = "zoka-test-manual-checkpoint";
         let hash = "AB".repeat(32);
 
-        let checkpoint =
-            sign_manual_checkpoint(&key_path, chain, authority, 120, &hash).expect("signs");
+        let checkpoints =
+            sign_manual_checkpoint(&key_path, chain, authority.clone(), 120, &hash).expect("signs");
+        assert_eq!(checkpoints.len(), 1, "una cadena sin clave ML-DSA: solo la versión 1");
+        let checkpoint = &checkpoints[0];
         assert_eq!(checkpoint.block_hash, "ab".repeat(32), "hash normalizado");
         checkpoint
-            .verify(&authority.unwrap())
+            .verify(authority.as_ref().unwrap())
             .expect("verifies with the authority key");
 
         // Una clave que no es la compilada firmaría algo que todos rechazan.
-        let other = Some(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]).verifying_key());
+        let other = Some(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]).verifying_key().into());
         assert!(sign_manual_checkpoint(&key_path, chain, other, 120, &hash).is_err());
         // Sin autoridad compilada, sin clave, con altura 0 o un hash que no es hex.
         assert!(sign_manual_checkpoint(&key_path, chain, None, 120, &hash).is_err());
         let missing = dir.path().join("no-existe.key");
-        assert!(sign_manual_checkpoint(&missing, chain, authority, 120, &hash).is_err());
-        assert!(sign_manual_checkpoint(&key_path, chain, authority, 0, &hash).is_err());
+        assert!(sign_manual_checkpoint(&missing, chain, authority.clone(), 120, &hash).is_err());
+        assert!(sign_manual_checkpoint(&key_path, chain, authority.clone(), 0, &hash).is_err());
         assert!(sign_manual_checkpoint(&key_path, chain, authority, 120, "xyz").is_err());
+    }
+
+    #[cfg(feature = "pq-experimental")]
+    #[test]
+    fn with_the_ml_dsa_half_the_authority_signs_hybrid_checkpoints() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let key_path = dir.path().join(zoka::checkpoint_authority::AUTHORITY_KEY_FILE);
+        let mldsa_path = dir.path().join(zoka::checkpoint_authority::AUTHORITY_MLDSA_KEY_FILE);
+        let public = zoka::checkpoint_authority::generate_signing_key(&key_path).expect("keygen");
+        let ed25519 = zoka::checkpoint_authority::parse_public_key(&public).unwrap();
+        let chain = "zoka-test-hybrid-checkpoint";
+        let hash = "cd".repeat(32);
+
+        // La cadena exige la versión 2 y falta la mitad ML-DSA: no firma nada.
+        let other_mldsa = zoka::pq::MlDsa65SecretKey::from_seed(&[3u8; 32]).unwrap().public_key();
+        let wrong = zoka::checkpoint_authority::AuthorityKeys {
+            ed25519,
+            mldsa: Some(other_mldsa),
+        };
+        assert!(sign_manual_checkpoint(&key_path, chain, Some(wrong.clone()), 120, &hash).is_err());
+
+        let mldsa_public = zoka::hybrid_signature::generate_mldsa_seed(&mldsa_path).expect("mldsa keygen");
+        // Con otra clave ML-DSA compilada tampoco: los nodos la rechazarían.
+        assert!(sign_manual_checkpoint(&key_path, chain, Some(wrong), 120, &hash).is_err());
+        let hybrid = zoka::checkpoint_authority::AuthorityKeys {
+            ed25519,
+            mldsa: zoka::checkpoint_authority::parse_mldsa_public_key(&mldsa_public),
+        };
+        let checkpoints = sign_manual_checkpoint(&key_path, chain, Some(hybrid.clone()), 120, &hash)
+            .expect("signs both halves");
+        assert_eq!(checkpoints.len(), 1, "fuera de Zenith no hace falta la versión 1");
+        assert_eq!(checkpoints[0].version, zoka::checkpoint_authority::SIGNED_CHECKPOINT_HYBRID_VERSION);
+        checkpoints[0].verify(&hybrid).expect("hybrid verifies");
+
+        // En Zenith publica también la versión 1, para los nodos viejos.
+        let zenith = sign_manual_checkpoint(&key_path, MAINNET_CHAIN_ID, Some(hybrid.clone()), 120, &hash)
+            .expect("signs for zenith");
+        assert_eq!(zenith.len(), 2);
+        assert_eq!(zenith[1].version, zoka::checkpoint_authority::SIGNED_CHECKPOINT_VERSION);
+        zenith[1].verify(&ed25519.into()).expect("v1 for old nodes");
+        assert_eq!(
+            zenith[1].verify(&hybrid),
+            Err(zoka::checkpoint_authority::CheckpointError::HybridRequired)
+        );
     }
 
     #[test]

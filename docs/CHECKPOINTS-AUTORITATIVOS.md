@@ -47,6 +47,35 @@ Mensaje firmado: `"zoka-signed-checkpoint-v1" ‖ 0x1f ‖ chain_id ‖ 0x1f ‖
 height (u64 little-endian) ‖ 0x1f ‖ block_hash`. El `chain_id` dentro de la firma
 impide usar un checkpoint de Zenith en Quantic o al revés.
 
+### Versión 2: firma híbrida (etapa 6, 16/10/2026)
+
+```json
+{"version":2,"chain_id":"…","height":25300,"block_hash":"…64 hex…",
+ "signature":"…128 hex (mitad Ed25519)…","mldsa_signature":"…6.618 hex (mitad ML-DSA-65)…"}
+```
+
+- Las dos firmas son obligatorias y cubren el mismo mensaje:
+  `"zoka-signed-checkpoint-v2" ‖ 0x1f ‖ chain_id ‖ 0x1f ‖ height ‖ 0x1f ‖
+  block_hash`; ML-DSA usa además el dominio como contexto. Implementación en
+  `src/hybrid_signature.rs` (con `pq-experimental`, que llevan los releases).
+- **Política:** un binario que tiene compilada la mitad ML-DSA de la clave de una
+  cadena (`economics::CHECKPOINT_AUTHORITY_MLDSA_KEYS`) solo acepta la versión 2
+  de esa cadena; uno que no la tiene, solo la 1. Aceptar las dos dejaría entrar a
+  quien rompa Ed25519.
+- La mitad Ed25519 de una v2 no sirve como v1: el dominio es otro.
+- Un nodo viejo recibe la v2 (el campo nuevo se ignora en el JSON), la rechaza
+  por versión y sigue funcionando. La v1 se serializa igual que antes.
+- **La autoridad** firma la v2 si tiene el archivo `checkpoint-authority-mldsa.key`
+  al lado de la clave Ed25519 y coincide con la compilada. En Zenith publica
+  también la v1 para los nodos de antes de la etapa 6 (la guarda aparte para
+  reenviarla); en Quantic, solo la v2. Si la cadena exige la v2 y falta la mitad
+  ML-DSA, no firma nada.
+- La versión que no es la de la política de un nodo no lo ensucia: la capa P2P
+  la deja pasar y el nodo la descarta sin mensaje.
+- Crear la mitad ML-DSA: `zoka checkpoint-keygen --mldsa` en la PC de la
+  autoridad (nunca sobrescribe). **Hoy Zenith no tiene ninguna compilada: no
+  cambia nada hasta que el usuario la cree y salga un binario con ella.**
+
 ## Cómo lo aplican los nodos
 
 1. **Aceptación** (al recibirlo por la red, por la API o del propio firmador):
@@ -142,7 +171,8 @@ ensayo. Binario de `e142e349`. Resultado:
 
 ## Pendiente
 
-- **Firma híbrida** (versión 2: Ed25519 + ML-DSA-65), con la etapa 5.
+- Crear la mitad ML-DSA de la clave de Zenith (la crea el usuario en la PC) y
+  compilarla; la de Quantic, antes del génesis.
 - **Mientras un par anuncia una punta más alta, la autoridad no firma** (figura
   sincronizando). Es lo correcto si esa punta es real; un par que mienta su
   altura puede frenar las firmas nuevas, no las viejas (el vigente se reenvía

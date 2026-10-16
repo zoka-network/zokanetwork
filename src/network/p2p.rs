@@ -1538,10 +1538,17 @@ impl Node {
             }
             ZokaMessage::SignedCheckpoint(checkpoint) => {
                 // Se verifica la firma antes de reenviar: sin la clave del
-                // equipo un checkpoint no pasa de este nodo.
-                checkpoint
-                    .verify_for_declared_chain()
-                    .map_err(|_| "invalid signed checkpoint")?;
+                // equipo un checkpoint no pasa de este nodo. Mientras convivan
+                // las versiones 1 y 2, la que no es la de esta cadena no es un
+                // ataque: sigue de largo y el nodo la descarta sin ruido.
+                match checkpoint.verify_for_declared_chain() {
+                    Ok(())
+                    | Err(
+                        crate::checkpoint_authority::CheckpointError::HybridRequired
+                        | crate::checkpoint_authority::CheckpointError::NoHybridAuthority,
+                    ) => {}
+                    Err(_) => return Err("invalid signed checkpoint"),
+                }
             }
             ZokaMessage::BlockRequest { .. } | ZokaMessage::Ping(_) => {}
         }

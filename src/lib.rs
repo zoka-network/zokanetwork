@@ -9,6 +9,8 @@ pub mod crypto;
 pub mod economics;
 pub mod genesis;
 pub mod health;
+#[cfg(feature = "pq-experimental")]
+pub mod hybrid_signature;
 pub mod identity;
 pub mod mempool;
 pub mod metrics;
