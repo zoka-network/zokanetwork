@@ -6345,6 +6345,7 @@ fn run_mining_batch_with_progress(
             private_nullifiers: private_nullifiers_for_block.clone(),
             private_fee_claims: private_fee_claims_for_block.clone(),
             private_coinbase: Some(private_coinbase.clone()),
+            quantic_transactions: Vec::new(),
         };
         block.header.merkle_root = block.compute_merkle_root();
         block.header.hash = block.compute_hash();
@@ -6372,6 +6373,7 @@ fn run_mining_batch_with_progress(
             private_nullifiers: Vec::new(),
             private_fee_claims: Vec::new(),
             private_coinbase: None,
+            quantic_transactions: Vec::new(),
         };
 
         zoka::mining::block_validator::validate_pow_block(

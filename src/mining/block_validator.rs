@@ -208,6 +208,15 @@ pub fn validate_pow_block(
     candidate: &Block,
     ctx: &PowBlockContext<'_>,
 ) -> Result<(), BlockValidationError> {
+    if economics::is_quantic_chain_id(ctx.chain_id) {
+        // Zoka Quantic: ninguna regla de Zenith sobre el cuerpo. Lo de Quantic
+        // (coinbase, pruebas, árbol, anclas) lo valida `crate::quantic`, que
+        // necesita la base; acá queda lo que es igual en las dos redes.
+        validate_chain_link(candidate, ctx)?;
+        validate_header_self_consistency(candidate)?;
+        validate_quantic_pow(candidate, ctx)?;
+        return Ok(());
+    }
     validate_coinbase_shape(candidate)?;
     validate_private_fee_claims(candidate)?;
     validate_canonical_private_tx_bodies(candidate)?;
@@ -485,6 +494,47 @@ fn validate_header_self_consistency(block: &Block) -> Result<(), BlockValidation
     Ok(())
 }
 
+/// La prueba de trabajo de Quantic: la misma búsqueda y dificultad que Zenith,
+/// sobre una entrada que compromete el cuerpo del bloque
+/// ([`pow::build_quantic_pow_input`]).
+fn validate_quantic_pow(block: &Block, ctx: &PowBlockContext<'_>) -> Result<(), BlockValidationError> {
+    let canonical_algorithm = economics::pow_algorithm_for_chain(ctx.chain_id);
+    let engine = pow::engine_for(ctx.chain_id, block.header.block_height)
+        .map_err(|e| PowEngine(e.to_string()))?;
+    if engine.algorithm_id() != canonical_algorithm {
+        return Err(WrongAlgorithm {
+            expected: canonical_algorithm.to_string(),
+            chain_id: ctx.chain_id.to_string(),
+            got: engine.algorithm_id().to_string(),
+        });
+    }
+    let preimage = pow::build_quantic_pow_input(
+        ctx.chain_id,
+        &block.header.prev_hash,
+        &block.header.merkle_root,
+        &block.header.state_root,
+        block.header.block_height,
+        block.header.timestamp,
+        block.header.nonce,
+    );
+    let computed = engine
+        .calculate_hash(&preimage)
+        .map_err(|e| PowEngine(e.to_string()))?;
+    if !pow::hash_meets_difficulty(&computed, ctx.expected_difficulty_bits) {
+        return Err(PowBelowDifficulty {
+            needed: ctx.expected_difficulty_bits,
+            actual: pow::leading_zero_bits(&computed),
+        });
+    }
+    if block.header.seal.0 != computed {
+        return Err(PowSealMismatch {
+            header: hex::encode(&block.header.seal.0),
+            computed: hex::encode(&computed),
+        });
+    }
+    Ok(())
+}
+
 fn validate_pow(block: &Block, ctx: &PowBlockContext<'_>) -> Result<(), BlockValidationError> {
     let canonical_algorithm = economics::pow_algorithm_for_chain(ctx.chain_id);
     let engine = pow::engine_for(ctx.chain_id, block.header.block_height)
@@ -584,6 +634,7 @@ mod tests {
             private_nullifiers: vec![],
             private_fee_claims: vec![],
             private_coinbase: None,
+            quantic_transactions: Vec::new(),
         }
     }
 
@@ -635,6 +686,7 @@ mod tests {
             private_nullifiers: vec![],
             private_fee_claims: vec![],
             private_coinbase: Some(dummy_private_coinbase(height, miner_address)),
+            quantic_transactions: Vec::new(),
         };
         block.header.merkle_root = block.compute_merkle_root();
         block.header.hash = block.compute_hash();
@@ -1190,6 +1242,7 @@ mod tests {
             private_nullifiers: vec![],
             private_fee_claims: vec![],
             private_coinbase: Some(dummy_private_coinbase(1, "zka1miner")),
+            quantic_transactions: Vec::new(),
         };
         block.header.merkle_root = block.compute_merkle_root();
         block.header.hash = block.compute_hash();

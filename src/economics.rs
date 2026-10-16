@@ -413,8 +413,29 @@ pub const POW_ALGORITHM_TESTNET: &str = "zoka-cpu-fallback-v1";
 
 /// Returns the canonical PoW algorithm id for a given chain id. Used by
 /// `mining::pow::engine_for` and by block validation.
+/// Zoka Quantic (etapa 5): cadenas nuevas, con Ironwood y X-Wing desde su
+/// primer bloque. Los nombres son los de `crates/zoka-quantic` (`Network`).
+pub const QUANTIC_MAINNET_CHAIN_ID: &str = "zoka-quantic-v1";
+pub const QUANTIC_TESTNET_CHAIN_ID: &str = "zoka-quantic-testnet-v1";
+/// Redes locales de prueba de Quantic: prueba de trabajo liviana.
+pub const QUANTIC_REGTEST_CHAIN_ID: &str = "zoka-quantic-regtest-v1";
+
+pub fn is_quantic_chain_id(chain_id: &str) -> bool {
+    chain_id == QUANTIC_MAINNET_CHAIN_ID
+        || chain_id == QUANTIC_TESTNET_CHAIN_ID
+        || chain_id == QUANTIC_REGTEST_CHAIN_ID
+}
+
+/// Las cadenas públicas usan RandomX: Zenith y las dos de Quantic.
+pub fn chain_uses_randomx(chain_id: &str) -> bool {
+    chain_id == MAINNET_CHAIN_ID
+        || chain_id == TESTNET_CHAIN_ID
+        || chain_id == QUANTIC_MAINNET_CHAIN_ID
+        || chain_id == QUANTIC_TESTNET_CHAIN_ID
+}
+
 pub fn pow_algorithm_for_chain(chain_id: &str) -> &'static str {
-    if chain_id == MAINNET_CHAIN_ID || chain_id == TESTNET_CHAIN_ID {
+    if chain_uses_randomx(chain_id) {
         POW_ALGORITHM_MAINNET
     } else {
         POW_ALGORITHM_TESTNET

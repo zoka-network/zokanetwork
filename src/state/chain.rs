@@ -97,6 +97,9 @@ pub enum ChainError {
     #[error("invalid canonical private transaction bundle: {0}")]
     InvalidPrivateTxBundle(String),
 
+    #[error("invalid Zoka Quantic block: {0}")]
+    InvalidQuanticBlock(String),
+
     #[error("mainnet checkpoint mismatch at height {height}: expected {expected}, got {actual}")]
     MainnetCheckpointMismatch {
         height: u64,
@@ -159,6 +162,7 @@ pub fn genesis_parent_for(chain_id: &str) -> Block {
         private_nullifiers: Vec::new(),
         private_fee_claims: Vec::new(),
         private_coinbase: None,
+        quantic_transactions: Vec::new(),
     }
 }
 
@@ -683,6 +687,67 @@ fn index_block_nullifiers(storage: &RocksDbStorage, block: &Block) -> Result<(),
     Ok(())
 }
 
+#[cfg(feature = "quantic")]
+type QuanticValidation = crate::quantic::ValidatedBlock;
+#[cfg(not(feature = "quantic"))]
+type QuanticValidation = ();
+
+/// Zoka Quantic: valida el cuerpo con `crate::quantic`. En Zenith no hace nada.
+/// Una build sin la feature `quantic` rechaza toda cadena de Quantic en vez de
+/// aceptar bloques que no sabe validar.
+fn validate_quantic_body(
+    storage: &RocksDbStorage,
+    chain_id: &str,
+    candidate: &Block,
+    parent: &Block,
+) -> Result<Option<QuanticValidation>, ChainError> {
+    if !crate::economics::is_quantic_chain_id(chain_id) {
+        return Ok(None);
+    }
+    #[cfg(feature = "quantic")]
+    {
+        crate::quantic::validate_block(storage, chain_id, candidate, parent)
+            .map(Some)
+            .map_err(|e| ChainError::InvalidQuanticBlock(e.to_string()))
+    }
+    #[cfg(not(feature = "quantic"))]
+    {
+        let _ = (storage, candidate, parent);
+        Err(ChainError::InvalidQuanticBlock(
+            "this build cannot validate Zoka Quantic blocks (needs the quantic feature)".to_string(),
+        ))
+    }
+}
+
+#[cfg(feature = "quantic")]
+fn quantic_minted(validated: &QuanticValidation) -> u64 {
+    validated.minted
+}
+
+#[cfg(not(feature = "quantic"))]
+fn quantic_minted(_validated: &QuanticValidation) -> u64 {
+    0
+}
+
+#[cfg(feature = "quantic")]
+fn store_quantic_state(
+    storage: &RocksDbStorage,
+    candidate: &Block,
+    validated: &QuanticValidation,
+) -> Result<(), ChainError> {
+    crate::quantic::store_block_state(storage, candidate, validated)
+        .map_err(|e| ChainError::Storage(e.to_string()))
+}
+
+#[cfg(not(feature = "quantic"))]
+fn store_quantic_state(
+    _storage: &RocksDbStorage,
+    _candidate: &Block,
+    _validated: &QuanticValidation,
+) -> Result<(), ChainError> {
+    Ok(())
+}
+
 fn apply_block_inner(
     storage: &RocksDbStorage,
     chain_id: &str,
@@ -749,12 +814,18 @@ fn apply_block_inner(
     crate::state::sync::validate_private_tx_bundle_policy_for_block(candidate)
         .map_err(ChainError::InvalidPrivateTxBundle)?;
     validate_private_nullifiers(storage, candidate, extends_head)?;
+    let quantic = validate_quantic_body(storage, chain_id, candidate, &parent)?;
 
-    let coinbase_amount = candidate
-        .transactions
-        .first()
-        .map(|tx| tx.amount)
-        .unwrap_or(0);
+    let coinbase_amount = match &quantic {
+        // En Quantic la emisión es el premine o el subsidio; las comisiones
+        // salen y vuelven al pool, no se emiten.
+        Some(validated) => quantic_minted(validated),
+        None => candidate
+            .transactions
+            .first()
+            .map(|tx| tx.amount)
+            .unwrap_or(0),
+    };
     let new_total_supply = parent_meta
         .total_supply_emitted
         .saturating_add(coinbase_amount);
@@ -769,6 +840,9 @@ fn apply_block_inner(
         difficulty_bits: new_difficulty_bits,
     };
 
+    if let Some(validated) = &quantic {
+        store_quantic_state(storage, candidate, validated)?;
+    }
     if extends_head {
         storage.save_block(candidate)?;
         save_block_meta(storage, &candidate.header.hash, &new_meta)?;
@@ -1027,6 +1101,7 @@ mod tests {
             private_nullifiers: Vec::new(),
             private_fee_claims: Vec::new(),
             private_coinbase: Some(dummy_private_coinbase(height, miner)),
+            quantic_transactions: Vec::new(),
         };
         block.header.merkle_root = block.compute_merkle_root();
         block.header.hash = block.compute_hash();
@@ -1057,6 +1132,7 @@ mod tests {
             private_nullifiers: nullifiers,
             private_fee_claims: Vec::new(),
             private_coinbase: None,
+            quantic_transactions: Vec::new(),
         }
     }
 
@@ -1793,6 +1869,7 @@ mod tests {
             private_nullifiers: Vec::new(),
             private_fee_claims: Vec::new(),
             private_coinbase: Some(dummy_private_coinbase(1, "zka1miner")),
+            quantic_transactions: Vec::new(),
         };
         block.header.merkle_root = block.compute_merkle_root();
         block.header.hash = block.compute_hash();

@@ -276,6 +276,29 @@ pub struct Block {
     /// the block subsidy is non-zero.
     #[serde(default)]
     pub private_coinbase: Option<PrivateCoinbaseOutput>,
+    /// Zoka Quantic transactions, coinbase first, each in the binary format of
+    /// `crates/zoka-quantic` (hex in the JSON). Always empty on Zenith, and then
+    /// omitted, so Zenith blocks keep their exact JSON, Merkle root and hash.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", with = "hex_byte_vecs")]
+    pub quantic_transactions: Vec<Vec<u8>>,
+}
+
+/// `Vec<Vec<u8>>` as a list of hex strings: a Quantic transaction is about
+/// 11 KB, and a JSON array of numbers would make it four times larger.
+mod hex_byte_vecs {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(items: &[Vec<u8>], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(items.iter().map(hex::encode))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Vec<u8>>, D::Error> {
+        let items = Vec::<String>::deserialize(deserializer)?;
+        items
+            .iter()
+            .map(|item| hex::decode(item).map_err(serde::de::Error::custom))
+            .collect()
+    }
 }
 
 impl Block {
@@ -306,6 +329,7 @@ impl Block {
             private_nullifiers: Vec::new(),
             private_fee_claims: Vec::new(),
             private_coinbase: None,
+            quantic_transactions: Vec::new(),
         };
 
         block.header.merkle_root = block.compute_merkle_root();
@@ -372,6 +396,7 @@ impl Block {
             && self.private_nullifiers.is_empty()
             && self.private_fee_claims.is_empty()
             && self.private_coinbase.is_none()
+            && self.quantic_transactions.is_empty()
         {
             return String::from("0");
         }
@@ -449,6 +474,13 @@ impl Block {
             hasher.update(&coinbase.encrypted_amount);
             hasher.update([0x1f]);
             hasher.update(&coinbase.commitment_blind);
+            hashes.push(hasher.finalize().to_vec());
+        }
+        // Zoka Quantic. Absent on Zenith, so its roots do not change.
+        for tx in &self.quantic_transactions {
+            let mut hasher = Sha256::new();
+            hasher.update(b"quantic-tx-v1:");
+            hasher.update(tx);
             hashes.push(hasher.finalize().to_vec());
         }
 

@@ -773,6 +773,7 @@ mod tests {
             private_nullifiers: Vec::new(),
             private_fee_claims: Vec::new(),
             private_coinbase: Some(dummy_private_coinbase(height, miner)),
+            quantic_transactions: Vec::new(),
         };
         block.header.merkle_root = block.compute_merkle_root();
         block.header.hash = block.compute_hash();

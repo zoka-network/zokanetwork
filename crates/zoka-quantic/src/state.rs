@@ -230,6 +230,227 @@ pub fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     blake2b_256(MERKLE_NODE, &[&count, &level[0]])
 }
 
+/// Rules of a transfer that need neither the chain nor the proof: network,
+/// kind, flags, value balance, expiry, size and nullifiers repeated inside it.
+pub fn check_transfer_shape(
+    params: &ConsensusParams,
+    tx: &QuanticTransaction,
+    height: u32,
+) -> Result<(), ConsensusError> {
+    if tx.network() != params.network {
+        return Err(ConsensusError::WrongNetwork);
+    }
+    if tx.kind() != TxKind::Transfer {
+        return Err(ConsensusError::NotTransfer);
+    }
+    if *tx.flags() != Flags::ENABLED {
+        return Err(ConsensusError::TransferFlags);
+    }
+    if tx.value_balance() < 0 {
+        return Err(ConsensusError::NegativeValueBalance);
+    }
+    if tx.height() != 0 && height > tx.height() {
+        return Err(ConsensusError::Expired {
+            expiry: tx.height(),
+            height,
+        });
+    }
+    if tx.actions().len() > MAX_ACTIONS_PER_TX {
+        return Err(ConsensusError::TooManyActions);
+    }
+    let mut seen = HashSet::new();
+    if !tx.nullifiers().all(|nf| seen.insert(nf.to_bytes())) {
+        return Err(ConsensusError::DuplicateNullifier);
+    }
+    Ok(())
+}
+
+/// The coinbase of block `height` that collects `fees`. Returns what it
+/// mints besides the fees (premine or subsidy).
+pub fn check_coinbase(
+    params: &ConsensusParams,
+    height: u32,
+    coinbase: &QuanticTransaction,
+    fees: u64,
+) -> Result<u64, ConsensusError> {
+    let cb = coinbase;
+    if cb.network() != params.network {
+        return Err(ConsensusError::WrongNetwork);
+    }
+    if cb.kind() != TxKind::Coinbase {
+        return Err(ConsensusError::NotCoinbase);
+    }
+    if cb.height() != height {
+        return Err(ConsensusError::CoinbaseHeight);
+    }
+    if *cb.flags() != Flags::SPENDS_DISABLED {
+        return Err(ConsensusError::CoinbaseFlags);
+    }
+    if cb.anchor().to_bytes() != Anchor::empty_tree().to_bytes() {
+        return Err(ConsensusError::CoinbaseAnchor);
+    }
+    if cb.actions().len() > MAX_ACTIONS_PER_TX {
+        return Err(ConsensusError::TooManyActions);
+    }
+    let minted = params.minted_at(height);
+    let expected = minted
+        .checked_add(fees)
+        .ok_or(ConsensusError::ValueOverflow)?;
+    if cb
+        .value_balance()
+        .checked_neg()
+        .and_then(|v| u64::try_from(v).ok())
+        != Some(expected)
+    {
+        return Err(ConsensusError::CoinbaseValue {
+            expected,
+            found: cb.value_balance(),
+        });
+    }
+    if height == params.genesis_height {
+        if let Some(premine) = &params.premine {
+            let [action] = cb.actions() else {
+                return Err(ConsensusError::PremineMismatch);
+            };
+            if !verify_public_output(
+                &premine.recipient,
+                NoteValue::from_raw(premine.value),
+                &action.nf,
+                &action.cmx,
+                &action.cv_net,
+                &action.envelope,
+            ) {
+                return Err(ConsensusError::PremineMismatch);
+            }
+        }
+    }
+    Ok(minted)
+}
+
+/// What [`check_block_shape`] found in a block.
+#[derive(Clone, Debug)]
+pub struct BlockChecks {
+    pub fees: u64,
+    pub minted: u64,
+    /// Every nullifier of the block, coinbase included, in block order.
+    pub nullifiers: Vec<[u8; 32]>,
+}
+
+/// Every rule of a block except the three that need the chain (anchors,
+/// nullifiers spent before, total supply) and the proofs and signatures.
+pub fn check_block_shape(
+    params: &ConsensusParams,
+    block: &QuanticBlock,
+) -> Result<BlockChecks, ConsensusError> {
+    let mut seen = HashSet::new();
+    let mut nullifiers = Vec::new();
+    let mut fees = 0u64;
+    let mut actions = 0usize;
+    for tx in &block.transactions {
+        check_transfer_shape(params, tx, block.height)?;
+        fees = fees
+            .checked_add(tx.fee().ok_or(ConsensusError::NegativeValueBalance)?)
+            .ok_or(ConsensusError::ValueOverflow)?;
+        actions += tx.actions().len();
+    }
+    if actions > MAX_BLOCK_ACTIONS {
+        return Err(ConsensusError::TooManyActions);
+    }
+    let minted = check_coinbase(params, block.height, &block.coinbase, fees)?;
+    // Coinbase nullifiers are random, but must be unique like any other.
+    for nf in block
+        .all_transactions()
+        .flat_map(QuanticTransaction::nullifiers)
+    {
+        if !seen.insert(nf.to_bytes()) {
+            return Err(ConsensusError::DuplicateNullifier);
+        }
+        nullifiers.push(nf.to_bytes());
+    }
+    Ok(BlockChecks {
+        fees,
+        minted,
+        nullifiers,
+    })
+}
+
+/// Height of the block whose coinbase notes enter the tree at `height`, if
+/// any (the genesis enters at once, so it never matures later).
+pub fn maturing_coinbase_height(params: &ConsensusParams, height: u32) -> Option<u32> {
+    let source = height.checked_sub(params.coinbase_maturity)?;
+    (source > params.genesis_height && params.coinbase_maturity > 0).then_some(source)
+}
+
+/// The commitments block `height` appends, in order, given the coinbase
+/// commitments of the block that matures now ([`maturing_coinbase_height`]).
+/// The same order as [`CommitmentSchedule`], without keeping state: what a
+/// node that follows several branches needs.
+pub fn block_commitments(
+    params: &ConsensusParams,
+    height: u32,
+    maturing: &[ExtractedNoteCommitment],
+    block: &QuanticBlock,
+) -> Vec<ExtractedNoteCommitment> {
+    let mut out = maturing.to_vec();
+    if height == params.genesis_height {
+        out.extend(block.coinbase.note_commitments().copied());
+    }
+    out.extend(
+        block
+            .transactions
+            .iter()
+            .flat_map(|tx| tx.note_commitments().copied()),
+    );
+    out
+}
+
+/// Encodes a note commitment tree as its frontier: what a node stores after
+/// each block (about 1 KB at most).
+pub fn encode_tree(tree: &NoteCommitmentTree) -> Vec<u8> {
+    let frontier = tree.to_frontier();
+    match frontier.value() {
+        None => vec![0],
+        Some(frontier) => {
+            let mut out = vec![1];
+            out.extend_from_slice(&u64::from(frontier.position()).to_le_bytes());
+            out.extend_from_slice(&frontier.leaf().to_bytes());
+            out.push(frontier.ommers().len() as u8);
+            for ommer in frontier.ommers() {
+                out.extend_from_slice(&ommer.to_bytes());
+            }
+            out
+        }
+    }
+}
+
+pub fn decode_tree(bytes: &[u8]) -> Option<NoteCommitmentTree> {
+    let node = |chunk: &[u8]| -> Option<MerkleHashOrchard> {
+        Option::from(MerkleHashOrchard::from_bytes(chunk.try_into().ok()?))
+    };
+    match bytes.first()? {
+        0 if bytes.len() == 1 => Some(CommitmentTree::empty()),
+        1 => {
+            let position = u64::from_le_bytes(bytes.get(1..9)?.try_into().ok()?);
+            let leaf = node(bytes.get(9..41)?)?;
+            let count = *bytes.get(41)? as usize;
+            if bytes.len() != 42 + 32 * count {
+                return None;
+            }
+            let ommers = (0..count)
+                .map(|i| node(&bytes[42 + 32 * i..74 + 32 * i]))
+                .collect::<Option<Vec<_>>>()?;
+            let frontier = incrementalmerkletree::frontier::Frontier::<MerkleHashOrchard, TREE_DEPTH>::from_parts(
+                position.into(),
+                leaf,
+                ommers,
+            )
+            .ok()?;
+            Some(CommitmentTree::from_frontier(&frontier))
+        }
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConsensusError {
     WrongHeight { expected: u32, found: u32 },
@@ -370,92 +591,14 @@ impl ChainState {
         tx: &QuanticTransaction,
         height: u32,
     ) -> Result<(), ConsensusError> {
-        if tx.network() != self.params.network {
-            return Err(ConsensusError::WrongNetwork);
-        }
-        if tx.kind() != TxKind::Transfer {
-            return Err(ConsensusError::NotTransfer);
-        }
-        if *tx.flags() != Flags::ENABLED {
-            return Err(ConsensusError::TransferFlags);
-        }
-        if tx.value_balance() < 0 {
-            return Err(ConsensusError::NegativeValueBalance);
-        }
-        if tx.height() != 0 && height > tx.height() {
-            return Err(ConsensusError::Expired {
-                expiry: tx.height(),
-                height,
-            });
-        }
-        if tx.actions().len() > MAX_ACTIONS_PER_TX {
-            return Err(ConsensusError::TooManyActions);
-        }
+        check_transfer_shape(&self.params, tx, height)?;
         if !self.is_valid_anchor(tx.anchor()) {
             return Err(ConsensusError::UnknownAnchor);
         }
-        let mut seen = HashSet::new();
-        for nf in tx.nullifiers() {
-            if !seen.insert(nf.to_bytes()) {
-                return Err(ConsensusError::DuplicateNullifier);
-            }
-            if self.is_spent(nf) {
-                return Err(ConsensusError::SpentNullifier);
-            }
+        if tx.nullifiers().any(|nf| self.is_spent(nf)) {
+            return Err(ConsensusError::SpentNullifier);
         }
         Ok(())
-    }
-
-    fn check_coinbase(&self, block: &QuanticBlock, fees: u64) -> Result<u64, ConsensusError> {
-        let cb = &block.coinbase;
-        if cb.network() != self.params.network {
-            return Err(ConsensusError::WrongNetwork);
-        }
-        if cb.kind() != TxKind::Coinbase {
-            return Err(ConsensusError::NotCoinbase);
-        }
-        if cb.height() != block.height {
-            return Err(ConsensusError::CoinbaseHeight);
-        }
-        if *cb.flags() != Flags::SPENDS_DISABLED {
-            return Err(ConsensusError::CoinbaseFlags);
-        }
-        if cb.anchor().to_bytes() != Anchor::empty_tree().to_bytes() {
-            return Err(ConsensusError::CoinbaseAnchor);
-        }
-        let minted = self.params.minted_at(block.height);
-        let expected = minted
-            .checked_add(fees)
-            .ok_or(ConsensusError::ValueOverflow)?;
-        if cb
-            .value_balance()
-            .checked_neg()
-            .and_then(|v| u64::try_from(v).ok())
-            != Some(expected)
-        {
-            return Err(ConsensusError::CoinbaseValue {
-                expected,
-                found: cb.value_balance(),
-            });
-        }
-        if block.height == self.params.genesis_height {
-            if let Some(premine) = &self.params.premine {
-                let [action] = cb.actions() else {
-                    return Err(ConsensusError::PremineMismatch);
-                };
-                if !verify_public_output(
-                    &premine.recipient,
-                    NoteValue::from_raw(premine.value),
-                    &action.nf,
-                    &action.cmx,
-                    &action.cv_net,
-                    &action.envelope,
-                ) {
-                    return Err(ConsensusError::PremineMismatch);
-                }
-            }
-        }
-        Ok(minted)
     }
 
     /// Checks `block` entirely and, only if it is valid, applies it.
@@ -471,31 +614,24 @@ impl ChainState {
                 found: block.height,
             });
         }
-        let mut block_nullifiers = HashSet::new();
-        let mut fees = 0u64;
-        let mut actions = 0usize;
+        let checks = check_block_shape(&self.params, block)?;
         for tx in &block.transactions {
-            self.check_transfer(tx, block.height)?;
-            for nf in tx.nullifiers() {
-                if !block_nullifiers.insert(nf.to_bytes()) {
-                    return Err(ConsensusError::DuplicateNullifier);
-                }
-            }
-            fees = fees
-                .checked_add(tx.fee().ok_or(ConsensusError::NegativeValueBalance)?)
-                .ok_or(ConsensusError::ValueOverflow)?;
-            actions += tx.actions().len();
-        }
-        if actions > MAX_BLOCK_ACTIONS || block.coinbase.actions().len() > MAX_ACTIONS_PER_TX {
-            return Err(ConsensusError::TooManyActions);
-        }
-        let minted = self.check_coinbase(block, fees)?;
-        // Coinbase nullifiers are random, but must be unique like any other.
-        for nf in block.coinbase.nullifiers() {
-            if self.is_spent(nf) || !block_nullifiers.insert(nf.to_bytes()) {
-                return Err(ConsensusError::DuplicateNullifier);
+            if !self.is_valid_anchor(tx.anchor()) {
+                return Err(ConsensusError::UnknownAnchor);
             }
         }
+        if checks
+            .nullifiers
+            .iter()
+            .any(|nf| self.nullifiers.contains(nf))
+        {
+            return Err(ConsensusError::SpentNullifier);
+        }
+        let BlockChecks {
+            fees,
+            minted,
+            nullifiers: block_nullifiers,
+        } = checks;
         let issued = self
             .issued
             .checked_add(minted)
@@ -563,15 +699,67 @@ mod tests {
     }
 
     #[test]
+    fn a_tree_survives_its_encoding() {
+        let cmx = |b: u8| -> ExtractedNoteCommitment {
+            // Below the field modulus whatever b is.
+            let mut bytes = [b; 32];
+            bytes[31] &= 0x3f;
+            Option::from(ExtractedNoteCommitment::from_bytes(&bytes)).unwrap()
+        };
+        let mut tree = NoteCommitmentTree::empty();
+        assert_eq!(
+            decode_tree(&encode_tree(&tree)).unwrap().root(),
+            tree.root()
+        );
+        for i in 0..37u8 {
+            tree.append(MerkleHashOrchard::from_cmx(&cmx(i))).unwrap();
+            let decoded = decode_tree(&encode_tree(&tree)).unwrap();
+            assert_eq!(decoded.root(), tree.root(), "after {} leaves", i + 1);
+            // And it keeps growing the same way.
+            let mut a = decoded;
+            let mut b = tree.clone();
+            a.append(MerkleHashOrchard::from_cmx(&cmx(200))).unwrap();
+            b.append(MerkleHashOrchard::from_cmx(&cmx(200))).unwrap();
+            assert_eq!(a.root(), b.root());
+        }
+        assert!(decode_tree(&[]).is_none());
+        assert!(decode_tree(&[2]).is_none());
+        let mut bad = encode_tree(&tree);
+        bad.pop();
+        assert!(decode_tree(&bad).is_none());
+    }
+
+    #[test]
+    fn the_maturing_coinbase_is_the_one_of_maturity_blocks_ago() {
+        let mut params = ConsensusParams::new(Network::Regtest, None);
+        params.genesis_height = 1;
+        params.coinbase_maturity = 60;
+        assert_eq!(
+            maturing_coinbase_height(&params, 61),
+            None,
+            "the genesis entered at once"
+        );
+        assert_eq!(maturing_coinbase_height(&params, 62), Some(2));
+        assert_eq!(maturing_coinbase_height(&params, 10), None);
+    }
+
+    #[test]
     fn the_genesis_can_be_at_any_height() {
         let mut params = ConsensusParams::new(Network::Regtest, None);
         params.genesis_height = 1;
         params.coinbase_maturity = 2;
         assert_eq!(params.minted_at(1), 0, "no premine announced");
         assert_eq!(params.minted_at(2), 12 * ATOMS_PER_ZKA);
-        assert_eq!(params.minted_at(1 + FIRST_ERA_BLOCKS + 1), 6 * ATOMS_PER_ZKA);
+        assert_eq!(
+            params.minted_at(1 + FIRST_ERA_BLOCKS + 1),
+            6 * ATOMS_PER_ZKA
+        );
         let schedule = params.schedule();
-        assert_eq!(schedule.insertion_height(1), 1, "the genesis enters at once");
+        assert_eq!(
+            schedule.insertion_height(1),
+            1,
+            "the genesis enters at once"
+        );
         assert_eq!(schedule.insertion_height(2), 4);
         let chain = ChainState::new(params);
         assert_eq!(chain.next_height(), 1);

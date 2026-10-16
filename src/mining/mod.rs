@@ -107,6 +107,7 @@ impl UserMiner {
             private_nullifiers: Vec::new(),
             private_fee_claims: Vec::new(),
             private_coinbase: None,
+            quantic_transactions: Vec::new(),
         };
 
         loop {

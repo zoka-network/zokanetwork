@@ -50,6 +50,11 @@ mobile = []
 # y el .so de la wallet movil (que usa `mobile` sin default features) no la
 # arrastra. Solo expone `zoka::pq` para pruebas y trabajo de integracion.
 pq-experimental = ["dep:zoka-pq"]
+# Zoka Quantic (etapa 5): perfil de red `quantic-testnet` con el circuito de
+# Ironwood (crate orchard) y el cifrado de notas X-Wing (crates/zoka-quantic).
+# Arrastra orchard y Halo 2. Implica pq-experimental (firmas hibridas de la
+# etapa 6, que Quantic exige desde el genesis). Zenith no cambia con ella.
+quantic = ["pq-experimental", "dep:zoka-quantic"]
 
 [dependencies]
 randomx-rs = { version = "1.3", optional = true }
@@ -115,6 +120,9 @@ fs4 = "0.8"
 # Ver la feature `pq-experimental`. Tiene su propio Cargo.lock para compilarse
 # suelta en el telefono; dentro del nodo manda el Cargo.lock de la raiz.
 zoka-pq = { path = "crates/zoka-pq", optional = true }
+# Ver la feature `quantic`. Tiene su propio Cargo.lock para compilarse suelta;
+# dentro del nodo manda el Cargo.lock de la raiz.
+zoka-quantic = { path = "crates/zoka-quantic", optional = true }
 
 [dev-dependencies]
 proptest = "1.0"
@@ -171,4 +179,39 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.pasta_curves]
+opt-level = 3
+
+# Zoka Quantic (feature `quantic`): sin optimizar, una prueba Halo 2 tarda
+# minutos y las pruebas del nodo que arman bloques serian inusables.
+[profile.dev.package.halo2_proofs]
+opt-level = 3
+
+[profile.dev.package.halo2_gadgets]
+opt-level = 3
+
+[profile.dev.package.halo2_poseidon]
+opt-level = 3
+
+[profile.dev.package.orchard]
+opt-level = 3
+
+[profile.dev.package.ff]
+opt-level = 3
+
+[profile.dev.package.group]
+opt-level = 3
+
+[profile.dev.package.blake2b_simd]
+opt-level = 3
+
+[profile.dev.package.reddsa]
+opt-level = 3
+
+[profile.dev.package.ml-kem]
+opt-level = 3
+
+[profile.dev.package.ml-dsa]
+opt-level = 3
+
+[profile.dev.package.x-wing]
 opt-level = 3

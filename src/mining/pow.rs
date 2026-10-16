@@ -119,6 +119,33 @@ pub fn build_pow_input(
     input
 }
 
+/// Proof-of-work input of a Zoka Quantic block. Unlike [`build_pow_input`],
+/// which Zenith uses and which leaves the body out (the work only binds the
+/// parent, the miner address, height, time and nonce), this one commits to
+/// `merkle_root` and `state_root`: the work cannot be moved to another body.
+/// A Quantic block has no public miner address to bind instead.
+pub fn build_quantic_pow_input(
+    chain_id: &str,
+    prev_hash: &str,
+    merkle_root: &str,
+    state_root: &str,
+    height: u64,
+    timestamp: u64,
+    nonce: u64,
+) -> Vec<u8> {
+    let mut input = Vec::with_capacity(320);
+    input.extend_from_slice(b"zoka-quantic-pow-v1");
+    for part in [chain_id, prev_hash, merkle_root, state_root] {
+        input.push(0x1f);
+        input.extend_from_slice(part.as_bytes());
+    }
+    input.push(0x1f);
+    input.extend_from_slice(&height.to_le_bytes());
+    input.extend_from_slice(&timestamp.to_le_bytes());
+    input.extend_from_slice(&nonce.to_le_bytes());
+    input
+}
+
 /// Builds a backend for `(chain_id, height)`, picking the algorithm declared
 /// canonical for the chain id. Returns `BackendNotAvailable` when the binary
 /// was built without the required feature.
@@ -143,7 +170,7 @@ pub fn engine_pool_for(
 /// rules, which is intentional — unknown networks are dev/test, never
 /// allowed to claim the mainnet algorithm.
 pub fn canonical_algorithm_for(chain_id: &str) -> AlgorithmId {
-    if chain_id == economics::MAINNET_CHAIN_ID || chain_id == economics::TESTNET_CHAIN_ID {
+    if economics::chain_uses_randomx(chain_id) {
         economics::POW_ALGORITHM_MAINNET
     } else {
         economics::POW_ALGORITHM_TESTNET

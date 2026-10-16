@@ -497,8 +497,16 @@ fn an_anchor_older_than_the_window_is_refused_and_the_genesis_can_be_block_one()
 
     let genesis = QuanticBlock {
         height: 1,
-        coinbase: build_coinbase(NETWORK, 1, &team.address(), PREMINE_ATOMS, true, &keys().0, &mut rng)
-            .unwrap(),
+        coinbase: build_coinbase(
+            NETWORK,
+            1,
+            &team.address(),
+            PREMINE_ATOMS,
+            true,
+            &keys().0,
+            &mut rng,
+        )
+        .unwrap(),
         transactions: vec![],
     };
     apply(&mut chain, &mut [&mut team], &genesis, &mut rng);
@@ -527,7 +535,10 @@ fn an_anchor_older_than_the_window_is_refused_and_the_genesis_can_be_block_one()
     }
     assert_eq!(chain.issued(), PREMINE_ATOMS + 5 * 12 * ZKA);
     // Matured coinbases changed the tree: the old root left the window.
-    assert_eq!(chain.check_transfer(&late, 7).unwrap_err(), ConsensusError::UnknownAnchor);
+    assert_eq!(
+        chain.check_transfer(&late, 7).unwrap_err(),
+        ConsensusError::UnknownAnchor
+    );
     // Rebuilt on the current anchor, the same payment goes in.
     let fresh = team.pay(&miner.address(), ZKA, &mut rng);
     chain.check_transfer(&fresh, 7).unwrap();

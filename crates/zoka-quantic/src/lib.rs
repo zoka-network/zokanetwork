@@ -7,6 +7,9 @@
 //! or read its notes. Nothing here is used by Zenith.
 #![forbid(unsafe_code)]
 
+/// The exact `orchard` this crate builds on, for dependents that need its types.
+pub use orchard;
+
 pub mod address;
 pub mod builder;
 pub mod compact;
@@ -22,3 +25,10 @@ pub mod wallet;
 pub use address::{AddressError, QuanticAddress};
 pub use keys::{KeyError, QuanticFullViewingKey, QuanticSpendingKey};
 pub use network::Network;
+
+/// Operating-system randomness with the `rand_core` 0.10 traits this crate
+/// takes, for callers that use another `rand` (the node uses 0.8). Panics if
+/// the OS cannot provide randomness, as `rand::rngs::OsRng` does.
+pub fn os_rng() -> rand_core::UnwrapErr<rand::rngs::SysRng> {
+    rand_core::UnwrapErr(rand::rngs::SysRng)
+}

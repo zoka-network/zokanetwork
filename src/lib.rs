@@ -19,6 +19,8 @@ pub mod mobile;
 pub mod mobile_net;
 pub mod network;
 pub mod private_wallet;
+#[cfg(feature = "quantic")]
+pub mod quantic;
 pub mod snapshot;
 pub mod state;
 pub mod storage;

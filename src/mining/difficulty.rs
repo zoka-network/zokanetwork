@@ -257,6 +257,7 @@ mod tests {
             private_nullifiers: Vec::new(),
             private_fee_claims: Vec::new(),
             private_coinbase: None,
+            quantic_transactions: Vec::new(),
         };
         assert_eq!(
             difficulty_after_applying(&dummy, 0),
