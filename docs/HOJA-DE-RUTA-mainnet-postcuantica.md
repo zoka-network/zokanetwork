@@ -9,6 +9,13 @@ release. La red todavía no es post-cuántica.
 
 ## LEEME PRIMERO
 
+**16/10/2026:** etapa 5 implementada como biblioteca en `crates/zoka-quantic`
+(Ironwood del crate `orchard` 0.16 sin tocar el circuito, cifrado de notas X-Wing,
+txid verificable y bloques compactos para la wallet liviana; diseño en
+[ETAPA5-diseno-quantic.md](ETAPA5-diseno-quantic.md)). Etapa 6 en el nodo:
+checkpoints y snapshots con firma híbrida Ed25519 + ML-DSA-65. Ninguna de las dos
+cambia Zenith. Falta integrar Quantic al nodo y a las apps.
+
 **15/10/2026:** la 2.1.2 activó en Zenith los bundles canónicos (25.570) y las
 `zkq1` (25.630). El usuario pidió una wallet móvil que no tarde minutos y que
 funcione con cualquier nodo: el plan, con el estado de cada etapa pendiente de este
@@ -282,6 +289,17 @@ Medido en el teléfono de pruebas: 20 s por envío y 40 s para armar la clave al
 Criterio, opciones y fuentes en [ETAPA5-gasto-sin-key-images.md](ETAPA5-gasto-sin-key-images.md).
 Reemplaza el plan de abajo de un circuito Groth16 propio (5.3 a 5.5).
 
+**16/10/2026: implementada como biblioteca** (`crates/zoka-quantic`, rama
+`etapa5-ironwood`): claves ZIP 32 + X-Wing, direcciones `zq1` con F4Jumble,
+sobre X-Wing en lugar del cifrado de Orchard, formato binario y txid estilo
+ZIP 244, armado por los roles PCZT, consenso de referencia (emisión exacta de
+23M, premine público verificable, maduración del coinbase por inserción
+diferida en el árbol, anclas, nullifiers) y wallet de referencia, también sobre
+bloques compactos. Envío de 2 acciones: 11.351 bytes. 31 pruebas unitarias y 5
+de punta a punta con pruebas Halo 2 reales. Diseño:
+[ETAPA5-diseno-quantic.md](ETAPA5-diseno-quantic.md). Falta: perfil Quantic en
+el nodo, motor del teléfono y ZSilent, medir en el teléfono, revisión externa.
+
 **Hallazgo del 2026-10-11, más grave que lo cuántico:** hoy **no hace falta una
 computadora cuántica** para saber qué nota gasta cada transacción. `PrivateTransaction`
 publica `input_commitments` ("Commitments of consumed notes") e `input_public_keys`
@@ -311,9 +329,18 @@ el nullifier y la raíz del árbol, nunca el compromiso ni la clave de la nota g
 5.4 Costo: una prueba en cada envío (unos 14 s en el teléfono con el perfil v1).
 5.5 Cambia los circuitos, así que la ceremonia de la Etapa 7 tiene que ser posterior.
 
-### Etapa 6 — Firmas híbridas de snapshots
+### Etapa 6 — Firmas híbridas de snapshots y checkpoints
 
-6.1 `src/snapshot.rs`: Ed25519 + ML-DSA-65, las dos obligatorias.
+**16/10/2026, rama `etapa6-firmas-hibridas`:** firma híbrida con las dos mitades
+obligatorias (`src/hybrid_signature.rs`). Checkpoints de la autoridad versión 2
+(ver [CHECKPOINTS-AUTORITATIVOS.md](CHECKPOINTS-AUTORITATIVOS.md)) y snapshots
+con firma híbrida (`snapshot-export --mldsa-key-file`; un firmante híbrido en
+`snapshot_signers` hace que solo valgan snapshots híbridos). **En Zenith no cambia
+nada** hasta que el usuario cree la mitad ML-DSA de la clave de la autoridad
+(`zoka checkpoint-keygen --mldsa`) y salga un binario con su pública compilada.
+
+6.1 `src/snapshot.rs`: Ed25519 + ML-DSA-65, las dos obligatorias. ✅
+6.1b Checkpoints de la autoridad con el mismo esquema. ✅
 6.2 Opcional: firmar los releases con el mismo esquema.
 
 ### Etapa 7 — Lo que hay que cerrar antes del génesis

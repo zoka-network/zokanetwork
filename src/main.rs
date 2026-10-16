@@ -10880,30 +10880,15 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                             } else {
                                 match zoka::snapshot::deserialize(&bytes) {
                                     Ok(snapshot) => {
-                                        let mut verified = false;
-                                        let mut last_verify_err = String::new();
-                                        for signer_hex in &trusted_signers {
-                                            let Ok(decoded) = hex::decode(signer_hex.trim()) else {
-                                                continue;
+                                        let (verified, last_verify_err) =
+                                            match zoka::snapshot::verify_against_trusted_signers(
+                                                &snapshot,
+                                                chain_id.as_str(),
+                                                &trusted_signers,
+                                            ) {
+                                                Ok(_) => (true, String::new()),
+                                                Err(e) => (false, e.to_string()),
                                             };
-                                            if decoded.len() != 32 {
-                                                continue;
-                                            }
-                                            let mut pubkey = [0u8; 32];
-                                            pubkey.copy_from_slice(&decoded);
-                                            let opts = zoka::snapshot::VerifyOptions {
-                                                expected_chain_id: chain_id.as_str(),
-                                                require_signature: true,
-                                                expected_pubkey: Some(&pubkey),
-                                            };
-                                            match zoka::snapshot::verify(&snapshot, &opts) {
-                                                Ok(_) => {
-                                                    verified = true;
-                                                    break;
-                                                }
-                                                Err(e) => last_verify_err = e.to_string(),
-                                            }
-                                        }
                                         if verified {
                                             zoka::api::global_startup_status().set_phase(
                                                 "importing_snapshot",
@@ -18044,6 +18029,8 @@ fn cmd_snapshot_info(args: &[String]) -> Result<(), String> {
         expected_chain_id: MAINNET_CHAIN_ID,
         require_signature: require_signature || pubkey_ref.is_some(),
         expected_pubkey: pubkey_ref,
+        expected_hybrid_pubkey: None,
+        require_hybrid: false,
     };
     let digest = zoka::snapshot::verify(&snapshot, &opts)
         .map_err(|e| format!("snapshot verify failed: {e}"))?;
@@ -18132,8 +18119,29 @@ fn cmd_snapshot_export(args: &[String]) -> Result<(), String> {
         }
         let mut key = [0u8; 32];
         key.copy_from_slice(&bytes);
-        zoka::snapshot::sign(&mut snapshot, &key)
-            .map_err(|e| format!("snapshot signing failed: {e}"))?;
+        match option_value(args, "--mldsa-key-file") {
+            // Firma híbrida (etapa 6): la clave Ed25519 de --sign-key-hex más
+            // la semilla ML-DSA-65 de ese archivo.
+            #[cfg(feature = "pq-experimental")]
+            Some(mldsa_path) => {
+                let seed = zoka::hybrid_signature::load_mldsa_seed(Path::new(&mldsa_path))?;
+                let hybrid = zoka::hybrid_signature::HybridSigningKey::from_parts(
+                    ed25519_dalek::SigningKey::from_bytes(&key),
+                    seed.as_ref(),
+                )
+                .map_err(|e| format!("hybrid snapshot key: {e}"))?;
+                zoka::snapshot::sign_hybrid(&mut snapshot, &hybrid)
+                    .map_err(|e| format!("snapshot signing failed: {e}"))?;
+            }
+            #[cfg(not(feature = "pq-experimental"))]
+            Some(_) => {
+                return Err("--mldsa-key-file needs a build with --features pq-experimental".to_string())
+            }
+            None => zoka::snapshot::sign(&mut snapshot, &key)
+                .map_err(|e| format!("snapshot signing failed: {e}"))?,
+        }
+    } else if option_value(args, "--mldsa-key-file").is_some() {
+        return Err("--mldsa-key-file is the second half of --sign-key-hex; pass both".to_string());
     }
 
     let bytes = zoka::snapshot::serialize(&snapshot)
@@ -18228,6 +18236,8 @@ fn cmd_snapshot_import(args: &[String]) -> Result<(), String> {
         expected_chain_id: MAINNET_CHAIN_ID,
         require_signature: require_signature || pubkey_ref.is_some(),
         expected_pubkey: pubkey_ref,
+        expected_hybrid_pubkey: None,
+        require_hybrid: false,
     };
     let digest = zoka::snapshot::verify(&snapshot, &opts)
         .map_err(|e| format!("snapshot verify failed: {e}"))?;
@@ -18282,25 +18292,7 @@ fn snapshot_signed_by_trusted(
     chain_id: &str,
     signers: &[String],
 ) -> bool {
-    for signer_hex in signers {
-        let Ok(decoded) = hex::decode(signer_hex.trim()) else {
-            continue;
-        };
-        if decoded.len() != 32 {
-            continue;
-        }
-        let mut pubkey = [0u8; 32];
-        pubkey.copy_from_slice(&decoded);
-        let opts = zoka::snapshot::VerifyOptions {
-            expected_chain_id: chain_id,
-            require_signature: true,
-            expected_pubkey: Some(&pubkey),
-        };
-        if zoka::snapshot::verify(snapshot, &opts).is_ok() {
-            return true;
-        }
-    }
-    false
+    zoka::snapshot::verify_against_trusted_signers(snapshot, chain_id, signers).is_ok()
 }
 
 /// If this is a fresh node (empty chain) and the manifest advertises iroh
@@ -18707,6 +18699,8 @@ fn cmd_snapshot_fetch_iroh(args: &[String]) -> Result<(), String> {
         expected_chain_id: MAINNET_CHAIN_ID,
         require_signature: require_signature || pubkey_ref.is_some(),
         expected_pubkey: pubkey_ref,
+        expected_hybrid_pubkey: None,
+        require_hybrid: false,
     };
     let digest = zoka::snapshot::verify(&snapshot, &opts)
         .map_err(|e| format!("snapshot verify failed: {e}"))?;

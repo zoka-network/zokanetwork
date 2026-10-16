@@ -73,6 +73,17 @@ pub struct ChainSnapshotV1 {
     /// key it expects (passed via `--public-key`).
     #[serde(default)]
     pub signer_pubkey_hex: Option<String>,
+    /// ML-DSA-65 half of a hybrid signature (stage 6), hex. When present,
+    /// `signature_hex` is the Ed25519 half and both sign
+    /// `"zoka-snapshot-hybrid-v1" ‖ 0x1f ‖ canonical bytes`. Absent fields
+    /// are not serialized, so an unsigned or Ed25519-only snapshot keeps the
+    /// exact bytes older nodes expect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mldsa_signature_hex: Option<String>,
+    /// ML-DSA-65 public key of the signer (hex, 1952 bytes). Informational,
+    /// like `signer_pubkey_hex`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_mldsa_pubkey_hex: Option<String>,
 }
 
 #[derive(Debug, Clone, Error)]
@@ -117,6 +128,12 @@ pub enum SnapshotError {
     )]
     SignerPubkeyMismatch { got: String, expected: String },
 
+    #[error("a hybrid (Ed25519 + ML-DSA-65) snapshot signature is required")]
+    HybridSignatureRequired,
+    #[error("this build cannot verify hybrid snapshot signatures (needs pq-experimental)")]
+    HybridSignatureUnsupported,
+    #[error("no configured snapshot signer accepts this snapshot")]
+    NoTrustedSigner,
     #[error("snapshot signature was required but no signature field is present")]
     SignatureRequired,
 
@@ -184,6 +201,8 @@ pub fn export_from_storage(
         blocks,
         signature_hex: None,
         signer_pubkey_hex: None,
+        mldsa_signature_hex: None,
+        signer_mldsa_pubkey_hex: None,
     })
 }
 
@@ -229,6 +248,33 @@ pub fn sign(
     Ok(())
 }
 
+/// Domain of hybrid snapshot signatures (Ed25519 + ML-DSA-65).
+pub const HYBRID_SIGNING_DOMAIN: &[u8] = b"zoka-snapshot-hybrid-v1";
+/// Length of a hybrid public key (version, Ed25519, ML-DSA-65) in hex, as
+/// it appears in `snapshot_signers`.
+pub const HYBRID_SIGNER_HEX_LEN: usize = (1 + 32 + 1952) * 2;
+
+/// Attach a hybrid Ed25519 + ML-DSA-65 signature (stage 6). Both halves
+/// sign the same message; a verifier that trusts a hybrid key accepts
+/// neither half alone.
+#[cfg(feature = "pq-experimental")]
+pub fn sign_hybrid(
+    snapshot: &mut ChainSnapshotV1,
+    key: &crate::hybrid_signature::HybridSigningKey,
+) -> Result<(), SnapshotError> {
+    let bytes = canonical_signed_bytes(snapshot)?;
+    let signature = key
+        .sign(HYBRID_SIGNING_DOMAIN, &bytes)
+        .map_err(|e| SnapshotError::BadSignature(e.to_string()))?;
+    let (ed25519, mldsa) = signature.to_hex_parts();
+    let public = key.verifying_key();
+    snapshot.signature_hex = Some(ed25519);
+    snapshot.signer_pubkey_hex = Some(hex::encode(public.ed25519().to_bytes()));
+    snapshot.mldsa_signature_hex = Some(mldsa);
+    snapshot.signer_mldsa_pubkey_hex = Some(hex::encode(public.mldsa().to_bytes()));
+    Ok(())
+}
+
 /// Serialize a complete (possibly signed) snapshot to JSON bytes ready
 /// to be written to disk.
 pub fn serialize(snapshot: &ChainSnapshotV1) -> Result<Vec<u8>, SnapshotError> {
@@ -251,6 +297,11 @@ pub struct VerifyOptions<'a> {
     pub require_signature: bool,
     /// When `Some`, the signature MUST verify against this verifying key.
     pub expected_pubkey: Option<&'a [u8; 32]>,
+    /// When `Some`, the snapshot MUST carry a hybrid signature by exactly
+    /// this hybrid public key (raw bytes: version, Ed25519, ML-DSA-65).
+    pub expected_hybrid_pubkey: Option<&'a [u8]>,
+    /// Refuse Ed25519-only signatures.
+    pub require_hybrid: bool,
 }
 
 impl<'a> VerifyOptions<'a> {
@@ -259,6 +310,8 @@ impl<'a> VerifyOptions<'a> {
             expected_chain_id: economics::MAINNET_CHAIN_ID,
             require_signature: true,
             expected_pubkey: None,
+            expected_hybrid_pubkey: None,
+            require_hybrid: false,
         }
     }
 }
@@ -335,6 +388,14 @@ pub fn verify(
     if opts.require_signature && signature_hex.is_none() {
         return Err(SnapshotError::SignatureRequired);
     }
+    let hybrid = snapshot.mldsa_signature_hex.is_some() || snapshot.signer_mldsa_pubkey_hex.is_some();
+    if (opts.require_hybrid || opts.expected_hybrid_pubkey.is_some()) && !hybrid {
+        return Err(SnapshotError::HybridSignatureRequired);
+    }
+    if hybrid {
+        verify_hybrid_signature(snapshot, opts)?;
+        return Ok(digest);
+    }
     if let Some(sig_hex) = signature_hex {
         let signer_pubkey_hex = snapshot
             .signer_pubkey_hex
@@ -367,6 +428,111 @@ pub fn verify(
     }
 
     Ok(digest)
+}
+
+#[cfg(feature = "pq-experimental")]
+fn verify_hybrid_signature(
+    snapshot: &ChainSnapshotV1,
+    opts: &VerifyOptions<'_>,
+) -> Result<(), SnapshotError> {
+    let missing = |what: &str| SnapshotError::BadSignature(format!("hybrid signature without {what}"));
+    let ed_hex = snapshot.signature_hex.as_deref().ok_or_else(|| missing("its Ed25519 half"))?;
+    let ml_hex = snapshot.mldsa_signature_hex.as_deref().ok_or_else(|| missing("its ML-DSA half"))?;
+    let ed_key_hex = snapshot.signer_pubkey_hex.as_deref().ok_or(SnapshotError::SignatureWithoutPubkey)?;
+    let ml_key_hex = snapshot
+        .signer_mldsa_pubkey_hex
+        .as_deref()
+        .ok_or(SnapshotError::SignatureWithoutPubkey)?;
+    let mut key_bytes = vec![crate::hybrid_signature::HYBRID_KEY_VERSION];
+    key_bytes.extend(
+        hex::decode(ed_key_hex).map_err(|e| SnapshotError::BadSignature(format!("signer pubkey hex decode: {e}")))?,
+    );
+    key_bytes.extend(
+        hex::decode(ml_key_hex).map_err(|e| SnapshotError::BadSignature(format!("ML-DSA pubkey hex decode: {e}")))?,
+    );
+    let key = crate::hybrid_signature::HybridVerifyingKey::from_bytes(&key_bytes)
+        .map_err(|e| SnapshotError::BadSignature(e.to_string()))?;
+    if let Some(expected) = opts.expected_hybrid_pubkey {
+        if key.to_bytes() != expected {
+            return Err(SnapshotError::SignerPubkeyMismatch {
+                got: hex::encode(key.ed25519().to_bytes()),
+                expected: hex::encode(expected.get(1..33).unwrap_or_default()),
+            });
+        }
+    }
+    if let Some(expected) = opts.expected_pubkey {
+        if key.ed25519().as_bytes() != expected {
+            return Err(SnapshotError::SignerPubkeyMismatch {
+                got: hex::encode(key.ed25519().to_bytes()),
+                expected: hex::encode(expected),
+            });
+        }
+    }
+    let signature = crate::hybrid_signature::HybridSignature::from_hex_parts(ed_hex, ml_hex)
+        .map_err(|e| SnapshotError::BadSignature(e.to_string()))?;
+    let bytes = canonical_signed_bytes(snapshot)?;
+    key.verify(HYBRID_SIGNING_DOMAIN, &bytes, &signature)
+        .map_err(|e| SnapshotError::BadSignature(e.to_string()))
+}
+
+#[cfg(not(feature = "pq-experimental"))]
+fn verify_hybrid_signature(
+    _snapshot: &ChainSnapshotV1,
+    _opts: &VerifyOptions<'_>,
+) -> Result<(), SnapshotError> {
+    Err(SnapshotError::HybridSignatureUnsupported)
+}
+
+/// Checks `snapshot` against the `snapshot_signers` of a network config:
+/// Ed25519 keys (64 hex) or hybrid keys ([`HYBRID_SIGNER_HEX_LEN`] hex).
+/// If any hybrid signer is listed, only a hybrid signature by one of them is
+/// accepted: trusting Ed25519 alone would let whoever breaks it in.
+/// Returns the digest, or the last verification error.
+pub fn verify_against_trusted_signers(
+    snapshot: &ChainSnapshotV1,
+    chain_id: &str,
+    signers: &[String],
+) -> Result<String, SnapshotError> {
+    let decoded: Vec<Vec<u8>> = signers
+        .iter()
+        .filter_map(|signer| hex::decode(signer.trim()).ok())
+        .collect();
+    let hybrid: Vec<&Vec<u8>> = decoded
+        .iter()
+        .filter(|key| key.len() * 2 == HYBRID_SIGNER_HEX_LEN)
+        .collect();
+    let mut last_error = SnapshotError::NoTrustedSigner;
+    if !hybrid.is_empty() {
+        for key in hybrid {
+            let opts = VerifyOptions {
+                expected_chain_id: chain_id,
+                require_signature: true,
+                expected_pubkey: None,
+                expected_hybrid_pubkey: Some(key),
+                require_hybrid: true,
+            };
+            match verify(snapshot, &opts) {
+                Ok(digest) => return Ok(digest),
+                Err(error) => last_error = error,
+            }
+        }
+        return Err(last_error);
+    }
+    for key in decoded.iter().filter(|key| key.len() == 32) {
+        let pubkey: [u8; 32] = key.as_slice().try_into().expect("32 bytes");
+        let opts = VerifyOptions {
+            expected_chain_id: chain_id,
+            require_signature: true,
+            expected_pubkey: Some(&pubkey),
+            expected_hybrid_pubkey: None,
+            require_hybrid: false,
+        };
+        match verify(snapshot, &opts) {
+            Ok(digest) => return Ok(digest),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
 }
 
 /// Replay every block in `snapshot` through `state::chain::apply_block`,
@@ -407,6 +573,11 @@ pub struct SnapshotFileManifest {
     /// Hex-encoded ed25519 verifying key of the signer.
     #[serde(default)]
     pub signer_pubkey_hex: Option<String>,
+    /// ML-DSA-65 half of a hybrid signature, if any (stage 6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mldsa_signature_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_mldsa_pubkey_hex: Option<String>,
 }
 
 /// Returns the sidecar path for a given `.snap` file path.
@@ -445,6 +616,8 @@ pub fn write_manifest_sidecar(
         download_urls,
         signature_hex: snapshot.signature_hex.clone(),
         signer_pubkey_hex: snapshot.signer_pubkey_hex.clone(),
+        mldsa_signature_hex: snapshot.mldsa_signature_hex.clone(),
+        signer_mldsa_pubkey_hex: snapshot.signer_mldsa_pubkey_hex.clone(),
     };
     let sidecar_path = manifest_path_for(snap_path);
     let json = serde_json::to_vec_pretty(&manifest)
@@ -687,6 +860,8 @@ mod tests {
             expected_chain_id: chain_id,
             require_signature: true,
             expected_pubkey: Some(&pk),
+            expected_hybrid_pubkey: None,
+            require_hybrid: false,
         };
         verify(&snap, &opts).expect("must verify");
     }
@@ -703,6 +878,8 @@ mod tests {
             expected_chain_id: chain_id,
             require_signature: true,
             expected_pubkey: Some(&wrong),
+            expected_hybrid_pubkey: None,
+            require_hybrid: false,
         };
         let err = verify(&snap, &opts).unwrap_err();
         assert!(matches!(err, SnapshotError::SignerPubkeyMismatch { .. }));
@@ -722,6 +899,8 @@ mod tests {
             expected_chain_id: chain_id,
             require_signature: true,
             expected_pubkey: Some(&pk),
+            expected_hybrid_pubkey: None,
+            require_hybrid: false,
         };
         let err = verify(&snap, &opts).unwrap_err();
         assert!(matches!(err, SnapshotError::BadSignature(_)));
@@ -736,6 +915,8 @@ mod tests {
             expected_chain_id: chain_id,
             require_signature: true,
             expected_pubkey: None,
+            expected_hybrid_pubkey: None,
+            require_hybrid: false,
         };
         let err = verify(&snap, &opts).unwrap_err();
         assert!(matches!(err, SnapshotError::SignatureRequired));
@@ -750,6 +931,8 @@ mod tests {
             expected_chain_id: chain_id,
             require_signature: false,
             expected_pubkey: None,
+            expected_hybrid_pubkey: None,
+            require_hybrid: false,
         };
         verify(&snap, &opts).expect("unsigned ok");
     }
@@ -763,6 +946,8 @@ mod tests {
             expected_chain_id: "zoka-other-net",
             require_signature: false,
             expected_pubkey: None,
+            expected_hybrid_pubkey: None,
+            require_hybrid: false,
         };
         let err = verify(&snap, &opts).unwrap_err();
         assert!(matches!(err, SnapshotError::ChainIdMismatch { .. }));
@@ -780,6 +965,8 @@ mod tests {
             expected_chain_id: chain_id,
             require_signature: false,
             expected_pubkey: None,
+            expected_hybrid_pubkey: None,
+            require_hybrid: false,
         };
         let err = verify(&snap, &opts).unwrap_err();
         assert!(matches!(err, SnapshotError::BlockHeightDrift { .. }));
@@ -884,5 +1071,96 @@ mod tests {
                 other => panic!("expected BlockAlreadyKnown, got: {other:?}"),
             }
         }
+    }
+
+    #[cfg(feature = "pq-experimental")]
+    fn hybrid_key(byte: u8) -> crate::hybrid_signature::HybridSigningKey {
+        crate::hybrid_signature::HybridSigningKey::from_parts(SigningKey::from_bytes(&[byte; 32]), &[byte ^ 0x11; 32])
+            .expect("hybrid key")
+    }
+
+    #[cfg(feature = "pq-experimental")]
+    #[test]
+    fn a_hybrid_snapshot_verifies_only_with_both_halves() {
+        let chain_id = "zoka-test-net";
+        let (storage, _dir) = build_chain_with_blocks(chain_id, 2);
+        let mut snap = export_from_storage(&storage, chain_id, 1).expect("export");
+        let key = hybrid_key(4);
+        sign_hybrid(&mut snap, &key).expect("sign");
+        let public = key.verifying_key().to_bytes();
+        let opts = VerifyOptions {
+            expected_chain_id: chain_id,
+            require_signature: true,
+            expected_pubkey: None,
+            expected_hybrid_pubkey: Some(&public),
+            require_hybrid: true,
+        };
+        let digest = verify(&snap, &opts).expect("verifies");
+        // The digest does not depend on who signed nor how.
+        assert_eq!(digest, compute_digest(&snap).unwrap());
+
+        // Its Ed25519 half alone is not a v1 signature: the message differs.
+        let mut stripped = snap.clone();
+        stripped.mldsa_signature_hex = None;
+        stripped.signer_mldsa_pubkey_hex = None;
+        let pk = key.verifying_key().ed25519().to_bytes();
+        let v1_opts = VerifyOptions {
+            expected_chain_id: chain_id,
+            require_signature: true,
+            expected_pubkey: Some(&pk),
+            expected_hybrid_pubkey: None,
+            require_hybrid: false,
+        };
+        assert!(verify(&stripped, &v1_opts).is_err());
+        assert!(matches!(verify(&stripped, &opts), Err(SnapshotError::HybridSignatureRequired)));
+
+        // Another signer, or one byte of a block changed.
+        let other = hybrid_key(5).verifying_key().to_bytes();
+        let wrong = VerifyOptions { expected_hybrid_pubkey: Some(&other), ..opts.clone() };
+        assert!(verify(&snap, &wrong).is_err());
+        let mut tampered = snap.clone();
+        tampered.header.generated_unix_secs += 1;
+        assert!(verify(&tampered, &opts).is_err());
+
+        // The JSON goes through serialize/deserialize unchanged.
+        let again = deserialize(&serialize(&snap).unwrap()).unwrap();
+        verify(&again, &opts).expect("verifies after a round trip");
+    }
+
+    #[cfg(feature = "pq-experimental")]
+    #[test]
+    fn listing_a_hybrid_signer_refuses_ed25519_only_snapshots() {
+        let chain_id = "zoka-test-net";
+        let (storage, _dir) = build_chain_with_blocks(chain_id, 2);
+        let key = hybrid_key(6);
+        let ed_hex = hex::encode(key.verifying_key().ed25519().to_bytes());
+        let hybrid_hex = key.verifying_key().to_hex();
+        assert_eq!(hybrid_hex.len(), HYBRID_SIGNER_HEX_LEN);
+
+        let mut v1 = export_from_storage(&storage, chain_id, 1).expect("export");
+        sign(&mut v1, &key.ed25519().to_bytes()).expect("sign v1");
+        let mut v2 = export_from_storage(&storage, chain_id, 1).expect("export");
+        sign_hybrid(&mut v2, &key).expect("sign v2");
+
+        // Only the Ed25519 key listed: v1 passes, as before.
+        verify_against_trusted_signers(&v1, chain_id, &[ed_hex.clone()]).expect("v1 trusted");
+        // The hybrid key listed (even next to the Ed25519 one): only v2 passes.
+        let both = [ed_hex, hybrid_hex.clone()];
+        assert!(verify_against_trusted_signers(&v1, chain_id, &both).is_err());
+        verify_against_trusted_signers(&v2, chain_id, &both).expect("v2 trusted");
+        verify_against_trusted_signers(&v2, chain_id, &[hybrid_hex]).expect("v2 trusted");
+        // Nobody listed, or someone else.
+        assert!(verify_against_trusted_signers(&v2, chain_id, &[]).is_err());
+        let stranger = hybrid_key(7).verifying_key().to_hex();
+        assert!(verify_against_trusted_signers(&v2, chain_id, &[stranger]).is_err());
+    }
+
+    #[test]
+    fn an_unsigned_snapshot_keeps_the_json_older_nodes_read() {
+        let chain_id = "zoka-test-net";
+        let (storage, _dir) = build_chain_with_blocks(chain_id, 1);
+        let snap = export_from_storage(&storage, chain_id, 1).expect("export");
+        let json = String::from_utf8(serialize(&snap).unwrap()).unwrap();
+        assert!(!json.contains("mldsa"), "no new field when there is no hybrid signature");
     }
 }

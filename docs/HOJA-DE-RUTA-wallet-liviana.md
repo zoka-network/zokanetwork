@@ -96,7 +96,9 @@ ofrecerá delegarla **solo en un nodo marcado como propio** (A4).
   autorización de gasto, que nunca sale de él).
 - **A5 — Quantic, antes del génesis:** formato compacto de Ironwood y un id de
   transacción que se compone de las partes (como el ZIP 244 de Zcash), para que el
-  resumen se pueda verificar contra el id. Cierra el ataque 3.
+  resumen se pueda verificar contra el id. Cierra el ataque 3. **Hecho el 16/10
+  en `crates/zoka-quantic` (`compact`):** 1.236 bytes por acción, verificado
+  contra la raíz de txid del encabezado.
 
 Las A1 a A3 sirven también en Zenith; A1 exige que la PC corra un nodo con el
 protocolo antes de que los teléfonos lo usen.
@@ -110,8 +112,8 @@ Detalle y criterio en [HOJA-DE-RUTA-mainnet-postcuantica.md](HOJA-DE-RUTA-mainne
 | 3.5 | Envío `zkq1` ZKAPriv → ZSilent en el teléfono real | ZSilent → teléfono OK (bloque 25.780); el otro sentido, trabado por la lentitud de arriba |
 | 3 | QR de las `zkq1`: con 1.715 caracteres no los lee ninguna app | Rediseñar (QR partido, o pago por enlace corto que lleve la dirección completa) |
 | 4 | VPS (nodo sin minar, seeds, explorador) | En espera del usuario; servidor Linux en casa como paso intermedio |
-| 5 | Ironwood (Orchard corregido, Halo 2, sin trusted setup) en nodo y teléfono | Elegido el 13/10; medido 20 s/envío y 40 s de clave en el teléfono; falta integrar |
-| 6 | Firmas híbridas Ed25519 + ML-DSA-65 en snapshots, y también en los checkpoints de la autoridad | Sin empezar |
+| 5 | Ironwood (Orchard corregido, Halo 2, sin trusted setup) en nodo y teléfono | Biblioteca hecha el 16/10 (`crates/zoka-quantic`, con A5); falta el perfil Quantic del nodo y las apps |
+| 6 | Firmas híbridas Ed25519 + ML-DSA-65 en snapshots, y también en los checkpoints de la autoridad | Hecho el 16/10 en el nodo; falta que el usuario cree la mitad ML-DSA de la clave |
 | 7.1 | libp2p a la versión mayor nueva | Sin empezar |
 | 7.2 | Tiempo de bloque y dificultad: con la PC sola Zenith va a 16–18 bits y 3–6 min por bloque | Fijar con números antes del génesis |
 | 7.3 | Premine de 5M en el génesis, público y verificable | Diseñado |
