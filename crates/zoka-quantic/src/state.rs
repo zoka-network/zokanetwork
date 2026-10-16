@@ -10,13 +10,16 @@
 //!   once and must be a public output that matches the announcement.
 //! - **Transfers:** spends and outputs enabled, value balance ≥ 0 (it is the
 //!   fee; nothing else can leave the pool), anchor = the tree root at the end
-//!   of some earlier block, fresh nullifiers, unexpired.
+//!   of one of the [`ANCHOR_WINDOW`] previous blocks, fresh nullifiers,
+//!   unexpired.
+//! - **Genesis height:** the premine block. The node numbers its blocks from
+//!   1, so its Quantic genesis is height 1; heights are otherwise absolute.
 //! - **Proofs and signatures** of the whole block are checked in one batch.
 //!
 //! Reorganizations are the node's business (it rebuilds this state); this
 //! module only moves forward.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fmt;
 
 use incrementalmerkletree::frontier::CommitmentTree;
@@ -51,6 +54,10 @@ pub const MAX_BLOCK_ACTIONS: usize = 512;
 /// about who built the transaction.
 pub const MARGINAL_FEE: u64 = ATOMS_PER_ZKA / 10_000;
 pub const GRACE_ACTIONS: usize = 2;
+/// A transfer anchors in the final tree root of one of this many previous
+/// blocks (about 3.3 hours at 120 s). Zcash accepts any past root; a window
+/// keeps reorganizations simple and costs wallets nothing (they use the last).
+pub const ANCHOR_WINDOW: usize = 100;
 
 /// Depth of the note commitment tree, as the `u8` that `incrementalmerkletree` wants.
 pub const TREE_DEPTH: u8 = 32;
@@ -58,7 +65,10 @@ const _: () = assert!(TREE_DEPTH as usize == NOTE_COMMITMENT_TREE_DEPTH);
 
 pub type NoteCommitmentTree = CommitmentTree<MerkleHashOrchard, TREE_DEPTH>;
 
-pub fn block_subsidy(height: u32) -> u64 {
+/// Subsidy of the block `blocks_after_genesis` blocks after the genesis
+/// (the genesis itself carries the premine instead).
+pub fn block_subsidy(blocks_after_genesis: u32) -> u64 {
+    let height = blocks_after_genesis;
     if height == 0 {
         0
     } else if height <= FIRST_ERA_BLOCKS {
@@ -85,7 +95,10 @@ pub struct Premine {
 #[derive(Clone, Debug)]
 pub struct ConsensusParams {
     pub network: Network,
+    /// Height of the genesis block (the premine).
+    pub genesis_height: u32,
     pub coinbase_maturity: u32,
+    pub anchor_window: usize,
     pub premine: Option<Premine>,
 }
 
@@ -93,9 +106,25 @@ impl ConsensusParams {
     pub fn new(network: Network, premine: Option<Premine>) -> Self {
         Self {
             network,
+            genesis_height: 0,
             coinbase_maturity: COINBASE_MATURITY,
+            anchor_window: ANCHOR_WINDOW,
             premine,
         }
+    }
+
+    /// What the coinbase of block `height` mints, besides the fees: the
+    /// premine at the genesis, the subsidy afterwards.
+    pub fn minted_at(&self, height: u32) -> u64 {
+        if height == self.genesis_height {
+            self.premine.as_ref().map_or(0, |p| p.value)
+        } else {
+            block_subsidy(height.saturating_sub(self.genesis_height))
+        }
+    }
+
+    pub fn schedule(&self) -> CommitmentSchedule {
+        CommitmentSchedule::new(self.genesis_height, self.coinbase_maturity)
     }
 }
 
@@ -103,21 +132,23 @@ impl ConsensusParams {
 /// follow the same schedule, so it lives in one place.
 #[derive(Clone, Debug, Default)]
 pub struct CommitmentSchedule {
+    genesis_height: u32,
     maturity: u32,
     pending: BTreeMap<u32, Vec<ExtractedNoteCommitment>>,
 }
 
 impl CommitmentSchedule {
-    pub fn new(maturity: u32) -> Self {
+    pub fn new(genesis_height: u32, maturity: u32) -> Self {
         Self {
+            genesis_height,
             maturity,
             pending: BTreeMap::new(),
         }
     }
 
     pub fn insertion_height(&self, coinbase_height: u32) -> u32 {
-        if coinbase_height == 0 {
-            0
+        if coinbase_height == self.genesis_height {
+            coinbase_height
         } else {
             coinbase_height + self.maturity
         }
@@ -286,20 +317,21 @@ pub struct ChainState {
     next_height: u32,
     tree: NoteCommitmentTree,
     schedule: CommitmentSchedule,
-    anchors: HashSet<[u8; 32]>,
+    /// Final roots of the last `anchor_window` blocks, oldest first.
+    recent_roots: VecDeque<[u8; 32]>,
     nullifiers: HashSet<[u8; 32]>,
     issued: u64,
 }
 
 impl ChainState {
     pub fn new(params: ConsensusParams) -> Self {
-        let schedule = CommitmentSchedule::new(params.coinbase_maturity);
+        let schedule = params.schedule();
         Self {
+            next_height: params.genesis_height,
             params,
-            next_height: 0,
             tree: CommitmentTree::empty(),
             schedule,
-            anchors: HashSet::from([Anchor::empty_tree().to_bytes()]),
+            recent_roots: VecDeque::new(),
             nullifiers: HashSet::new(),
             issued: 0,
         }
@@ -317,8 +349,9 @@ impl ChainState {
         Anchor::from(self.tree.root())
     }
 
+    /// Whether a transfer of the next block may anchor in `anchor`.
     pub fn is_valid_anchor(&self, anchor: &Anchor) -> bool {
-        self.anchors.contains(&anchor.to_bytes())
+        self.recent_roots.contains(&anchor.to_bytes())
     }
 
     pub fn is_spent(&self, nf: &orchard::note::Nullifier) -> bool {
@@ -390,11 +423,7 @@ impl ChainState {
         if cb.anchor().to_bytes() != Anchor::empty_tree().to_bytes() {
             return Err(ConsensusError::CoinbaseAnchor);
         }
-        let minted = if block.height == 0 {
-            self.params.premine.as_ref().map_or(0, |p| p.value)
-        } else {
-            block_subsidy(block.height)
-        };
+        let minted = self.params.minted_at(block.height);
         let expected = minted
             .checked_add(fees)
             .ok_or(ConsensusError::ValueOverflow)?;
@@ -409,7 +438,7 @@ impl ChainState {
                 found: cb.value_balance(),
             });
         }
-        if block.height == 0 {
+        if block.height == self.params.genesis_height {
             if let Some(premine) = &self.params.premine {
                 let [action] = cb.actions() else {
                     return Err(ConsensusError::PremineMismatch);
@@ -494,7 +523,10 @@ impl ChainState {
         }
         self.nullifiers.extend(block_nullifiers);
         let final_root = self.root();
-        self.anchors.insert(final_root.to_bytes());
+        self.recent_roots.push_back(final_root.to_bytes());
+        if self.recent_roots.len() > self.params.anchor_window {
+            self.recent_roots.pop_front();
+        }
         self.issued = issued;
         self.next_height += 1;
         Ok(BlockEffects {
@@ -531,6 +563,21 @@ mod tests {
     }
 
     #[test]
+    fn the_genesis_can_be_at_any_height() {
+        let mut params = ConsensusParams::new(Network::Regtest, None);
+        params.genesis_height = 1;
+        params.coinbase_maturity = 2;
+        assert_eq!(params.minted_at(1), 0, "no premine announced");
+        assert_eq!(params.minted_at(2), 12 * ATOMS_PER_ZKA);
+        assert_eq!(params.minted_at(1 + FIRST_ERA_BLOCKS + 1), 6 * ATOMS_PER_ZKA);
+        let schedule = params.schedule();
+        assert_eq!(schedule.insertion_height(1), 1, "the genesis enters at once");
+        assert_eq!(schedule.insertion_height(2), 4);
+        let chain = ChainState::new(params);
+        assert_eq!(chain.next_height(), 1);
+    }
+
+    #[test]
     fn the_conventional_fee_depends_only_on_the_action_count() {
         assert_eq!(conventional_fee(0), 200);
         assert_eq!(conventional_fee(2), 200);
@@ -539,7 +586,7 @@ mod tests {
 
     #[test]
     fn coinbase_notes_wait_for_maturity_and_the_premine_does_not() {
-        let mut schedule = CommitmentSchedule::new(2);
+        let mut schedule = CommitmentSchedule::new(0, 2);
         let cmx = |b: u8| -> ExtractedNoteCommitment {
             Option::from(ExtractedNoteCommitment::from_bytes(&[b; 32])).unwrap()
         };

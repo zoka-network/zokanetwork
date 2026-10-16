@@ -482,3 +482,53 @@ fn a_light_wallet_on_compact_blocks_sees_the_same_and_catches_a_lying_node() {
     let b2 = block(2, &bob.address(), vec![spend], &mut rng);
     chain.apply_block(&b2, &keys().1, &mut rng).unwrap();
 }
+
+#[test]
+fn an_anchor_older_than_the_window_is_refused_and_the_genesis_can_be_block_one() {
+    let mut rng = StdRng::seed_from_u64(17);
+    let team_sk = QuanticSpendingKey::from_root(&[1; 32], NETWORK, 0).unwrap();
+    let mut params = params(&team_sk.full_viewing_key().address());
+    // As in the node: the genesis is block 1, and a short window for the test.
+    params.genesis_height = 1;
+    params.anchor_window = 2;
+    let mut team = Party::new(1, &params);
+    let miner = Party::new(2, &params);
+    let mut chain = ChainState::new(params.clone());
+
+    let genesis = QuanticBlock {
+        height: 1,
+        coinbase: build_coinbase(NETWORK, 1, &team.address(), PREMINE_ATOMS, true, &keys().0, &mut rng)
+            .unwrap(),
+        transactions: vec![],
+    };
+    apply(&mut chain, &mut [&mut team], &genesis, &mut rng);
+    assert_eq!(team.wallet.balance(), PREMINE_ATOMS);
+    // Built now, sent too late.
+    let late = team.pay(&miner.address(), ZKA, &mut rng);
+
+    // The subsidy counts from the genesis: block 2 is the first mined block.
+    for height in 2..=6 {
+        let fees = 0;
+        let b = QuanticBlock {
+            height,
+            coinbase: build_coinbase(
+                NETWORK,
+                height,
+                &miner.address(),
+                params.minted_at(height) + fees,
+                false,
+                &keys().0,
+                &mut rng,
+            )
+            .unwrap(),
+            transactions: vec![],
+        };
+        apply(&mut chain, &mut [&mut team], &b, &mut rng);
+    }
+    assert_eq!(chain.issued(), PREMINE_ATOMS + 5 * 12 * ZKA);
+    // Matured coinbases changed the tree: the old root left the window.
+    assert_eq!(chain.check_transfer(&late, 7).unwrap_err(), ConsensusError::UnknownAnchor);
+    // Rebuilt on the current anchor, the same payment goes in.
+    let fresh = team.pay(&miner.address(), ZKA, &mut rng);
+    chain.check_transfer(&fresh, 7).unwrap();
+}

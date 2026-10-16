@@ -74,9 +74,9 @@ impl QuanticWallet {
     pub fn new(fvk: QuanticFullViewingKey, params: &ConsensusParams) -> Self {
         Self {
             fvk,
-            next_height: 0,
+            next_height: params.genesis_height,
             tree: CommitmentTree::empty(),
-            schedule: CommitmentSchedule::new(params.coinbase_maturity),
+            schedule: params.schedule(),
             notes: Vec::new(),
             awaiting_tree: HashMap::new(),
         }
