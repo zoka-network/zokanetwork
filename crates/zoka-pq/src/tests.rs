@@ -322,5 +322,30 @@ fn official_xwing_specification_known_answers() {
             key.decapsulate(&ct).unwrap().expose_secret().as_slice(),
             decode(case, "ss")
         );
+        let eseed: [u8; X_WING_ENCAPSULATION_RANDOMNESS_BYTES] =
+            decode(case, "eseed").try_into().unwrap();
+        let (wrapped_ct, wrapped_ss) = public.encapsulate_derand(&eseed);
+        assert_eq!(wrapped_ct.as_bytes(), decode(case, "ct"));
+        assert_eq!(wrapped_ss.expose_secret().as_slice(), decode(case, "ss"));
     }
+}
+
+#[test]
+fn xwing_derandomized_encapsulation_is_repeatable_and_decapsulates() {
+    let key = XWingSecretKey::from_seed(&[33; 32]).unwrap();
+    let public = key.public_key();
+    let (ct, ss) = public.encapsulate_derand(&[7; X_WING_ENCAPSULATION_RANDOMNESS_BYTES]);
+    let (again_ct, again_ss) =
+        public.encapsulate_derand(&[7; X_WING_ENCAPSULATION_RANDOMNESS_BYTES]);
+    assert_eq!(ct.as_bytes(), again_ct.as_bytes());
+    assert_eq!(ss.expose_secret(), again_ss.expose_secret());
+    assert_eq!(
+        ss.expose_secret(),
+        key.decapsulate(&ct).unwrap().expose_secret()
+    );
+    let mut other = [7; X_WING_ENCAPSULATION_RANDOMNESS_BYTES];
+    other[63] ^= 1;
+    let (other_ct, other_ss) = public.encapsulate_derand(&other);
+    assert_ne!(ct.as_bytes(), other_ct.as_bytes());
+    assert_ne!(ss.expose_secret(), other_ss.expose_secret());
 }

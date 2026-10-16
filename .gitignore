@@ -17,6 +17,7 @@ target_*/
 *.log
 *.lock
 !crates/zoka-pq/Cargo.lock
+!crates/zoka-quantic/Cargo.lock
 release/
 releases/
 

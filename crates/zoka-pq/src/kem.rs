@@ -12,6 +12,8 @@ pub const ML_KEM_768_CIPHERTEXT_BYTES: usize = 1088;
 pub const X_WING_SEED_BYTES: usize = 32;
 pub const X_WING_PUBLIC_KEY_BYTES: usize = 1216;
 pub const X_WING_CIPHERTEXT_BYTES: usize = 1120;
+/// Encapsulation randomness: 32 bytes for ML-KEM followed by 32 for X25519.
+pub const X_WING_ENCAPSULATION_RANDOMNESS_BYTES: usize = 64;
 
 /// Experimental profile: the published X-Wing combiner, with explicit rejection
 /// of non-contributory X25519 ciphertexts through RustCrypto's supported variant.
@@ -177,6 +179,26 @@ impl XWingPublicKey {
     /// Uses OS randomness; panics if the OS RNG fails, as in RustCrypto's API.
     pub fn encapsulate(&self) -> (XWingCiphertext, SharedSecret) {
         let (ciphertext, mut shared) = self.0.encapsulate();
+        (
+            XWingCiphertext(ciphertext),
+            SharedSecret::take_from(shared.as_mut()),
+        )
+    }
+
+    /// Encapsulates with caller-supplied randomness, so that whoever knows it can
+    /// recompute and check the ciphertext.
+    ///
+    /// The 64 bytes must be uniformly random or the output of a PRF keyed with a
+    /// secret, and never reused: repeating them for two encapsulations, or
+    /// deriving them from public data, breaks the KEM. Anyone who learns them
+    /// learns the shared secret.
+    pub fn encapsulate_derand(
+        &self,
+        randomness: &[u8; X_WING_ENCAPSULATION_RANDOMNESS_BYTES],
+    ) -> (XWingCiphertext, SharedSecret) {
+        let mut seed = ml_kem::array::Array::<u8, ml_kem::array::sizes::U64>::from(*randomness);
+        let (ciphertext, mut shared) = self.0.encapsulate_deterministic(&seed);
+        seed.zeroize();
         (
             XWingCiphertext(ciphertext),
             SharedSecret::take_from(shared.as_mut()),
