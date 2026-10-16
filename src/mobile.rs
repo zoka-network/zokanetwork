@@ -285,6 +285,152 @@ fn scan_hybrid_outputs(
     Ok(vec![None; outputs.len()])
 }
 
+/// Pedido del escaneo con resúmenes (ver [`scan_with_digests_json`]).
+#[derive(Debug, Deserialize)]
+pub struct MobileDigestScanRequest {
+    pub seed_hex: String,
+    #[serde(default)]
+    pub current_height: u64,
+    #[serde(default)]
+    pub coinbase_outputs: Vec<MobileCoinbaseInput>,
+    /// Resúmenes de las transacciones privadas de la cadena, en orden de cadena.
+    #[serde(default)]
+    pub digests: Vec<crate::private_wallet::digest::PrivateTxDigest>,
+    /// Cuerpos que ya se bajaron porque los pidió una vuelta anterior.
+    #[serde(default)]
+    pub bodies: Vec<PrivateTransaction>,
+    /// Hashes cuyo cuerpo no tiene ningún par: no se vuelven a pedir.
+    #[serde(default)]
+    pub lost: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MobileDigestScanResponse {
+    /// Cuerpos que tocan a la wallet según su resumen y todavía no se bajaron.
+    pub need_bodies: Vec<String>,
+    /// Cuerpos dados que de verdad tocan a la wallet, en orden de cadena: los
+    /// que hay que pasarle al armado de un envío.
+    pub relevant: Vec<String>,
+    /// Saldo gastable con lo aplicado hasta ahora (completo cuando
+    /// `need_bodies` viene vacío).
+    pub balance_atoms: u64,
+    /// Notas propias sin gastar.
+    pub owned_notes: usize,
+    /// Cuerpos dados que no coinciden con su hash: se ignoran.
+    pub invalid_bodies: Vec<String>,
+}
+
+/// Recorre la cadena con resúmenes y dice qué cuerpos hacen falta.
+///
+/// La wallet liviana no baja cada cuerpo de la cadena (en Zenith, ~25 MB por
+/// Tor) sino los resúmenes (`private_wallet::digest`), y llama acá en vueltas:
+///
+/// 1. sin cuerpos, el motor reconoce en los resúmenes los pagos a la wallet y
+///    los pide en `need_bodies`;
+/// 2. con esos cuerpos aplicados ya hay notas, y el motor reconoce las
+///    transacciones que las gastan y las pide también;
+/// 3. cuando `need_bodies` viene vacío, `relevant` es todo lo que el armado de
+///    un envío necesita y `balance_atoms` es el saldo.
+///
+/// Un resumen no se puede verificar contra su hash, así que solo elige qué
+/// bajar. Lo que cuenta son los cuerpos, y cada uno se valida contra su hash
+/// canónico antes de aplicarlo.
+pub fn scan_with_digests_json(request_json: &str) -> Result<String, String> {
+    let mut request: MobileDigestScanRequest = serde_json::from_str(request_json)
+        .map_err(|e| format!("invalid digest scan request: {e}"))?;
+    let mut seed_hex = std::mem::take(&mut request.seed_hex);
+    let seed = hex::decode(seed_hex.trim().trim_start_matches("0x"));
+    seed_hex.zeroize();
+    let seed = seed.map_err(|_| "seed_hex must be hexadecimal".to_string())?;
+    let response = scan_with_digests(seed, request)?;
+    serde_json::to_string(&response).map_err(|e| format!("failed to encode digest scan: {e}"))
+}
+
+fn scan_with_digests(
+    seed: Vec<u8>,
+    request: MobileDigestScanRequest,
+) -> Result<MobileDigestScanResponse, String> {
+    use std::collections::{HashMap, HashSet};
+
+    let mut manager = PrivateWalletManager::new();
+    manager
+        .restore_private_wallet_from_recovery_seed(MOBILE_WALLET_NAME, seed)
+        .map_err(|e| format!("failed to restore in-memory wallet: {e}"))?;
+    for coinbase in &request.coinbase_outputs {
+        if coinbase.output.unlock_height > request.current_height {
+            continue;
+        }
+        manager
+            .claim_private_coinbase_output(
+                MOBILE_WALLET_NAME,
+                &coinbase.source_block_hash,
+                &coinbase.output,
+                coinbase.expected_amount_atoms,
+                request.current_height,
+            )
+            .map_err(|e| format!("failed to import coinbase output: {e}"))?;
+    }
+
+    // En orden de cadena: el gasto de una nota tiene que aplicarse después del
+    // pago que la creó, o la nota queda como si nunca se hubiera gastado.
+    let position: HashMap<&str, usize> = request
+        .digests
+        .iter()
+        .enumerate()
+        .map(|(index, digest)| (digest.tx_hash.as_str(), index))
+        .collect();
+    let mut bodies: Vec<&PrivateTransaction> = request.bodies.iter().collect();
+    bodies.sort_by_key(|tx| position.get(tx.tx_hash.as_str()).copied().unwrap_or(usize::MAX));
+
+    let mut provided = HashSet::new();
+    let mut relevant = Vec::new();
+    let mut invalid_bodies = Vec::new();
+    for tx in bodies {
+        if crate::private_wallet::expected_private_tx_hash(tx) != tx.tx_hash {
+            invalid_bodies.push(tx.tx_hash.clone());
+            continue;
+        }
+        if !provided.insert(tx.tx_hash.clone()) {
+            continue;
+        }
+        match manager.apply_relevant_private_transaction_for_wallet(MOBILE_WALLET_NAME, tx) {
+            Ok(true) => relevant.push(tx.tx_hash.clone()),
+            Ok(false) => {}
+            // Un cuerpo que la wallet no puede aplicar no se cuenta; tampoco se
+            // vuelve a pedir, porque ya está dado.
+            Err(_) => invalid_bodies.push(tx.tx_hash.clone()),
+        }
+    }
+
+    let lost: HashSet<&str> = request.lost.iter().map(String::as_str).collect();
+    let invalid: HashSet<&str> = invalid_bodies.iter().map(String::as_str).collect();
+    let mut need_bodies = Vec::new();
+    for digest in &request.digests {
+        let hash = digest.tx_hash.as_str();
+        if provided.contains(hash) || lost.contains(hash) || invalid.contains(hash) {
+            continue;
+        }
+        if manager
+            .private_tx_digest_relevance(MOBILE_WALLET_NAME, digest)
+            .map_err(|e| format!("failed to scan digest {hash}: {e}"))?
+            .any()
+        {
+            need_bodies.push(digest.tx_hash.clone());
+        }
+    }
+
+    let wallet = manager
+        .get_private_wallet(MOBILE_WALLET_NAME)
+        .ok_or_else(|| "in-memory wallet disappeared".to_string())?;
+    Ok(MobileDigestScanResponse {
+        need_bodies,
+        relevant,
+        balance_atoms: manager.get_private_balance(MOBILE_WALLET_NAME).unwrap_or(0),
+        owned_notes: wallet.private_notes.iter().filter(|note| !note.spent).count(),
+        invalid_bodies,
+    })
+}
+
 pub fn build_private_transfer(
     mut request: MobilePrivateTxBuildRequest,
 ) -> Result<MobilePrivateTxBuildResponse, String> {
@@ -728,5 +874,118 @@ mod tests {
                 serde_json::to_vec(&tx).unwrap().len()
             );
         }
+    }
+
+    use crate::private_wallet::digest::PrivateTxDigest;
+
+    fn escanear(
+        seed: &[u8],
+        digests: &[PrivateTxDigest],
+        bodies: Vec<PrivateTransaction>,
+    ) -> MobileDigestScanResponse {
+        scan_with_digests(
+            seed.to_vec(),
+            MobileDigestScanRequest {
+                seed_hex: String::new(),
+                current_height: 1_000,
+                coinbase_outputs: Vec::new(),
+                digests: digests.to_vec(),
+                bodies,
+                lost: Vec::new(),
+            },
+        )
+        .unwrap()
+    }
+
+    /// La red: alice le paga 30 al teléfono y 5 a carol.
+    fn red_con_un_pago_al_telefono(
+        seed: &[u8],
+    ) -> (PrivateWalletManager, PrivateTransaction, PrivateTransaction, String) {
+        let mut telefono = PrivateWalletManager::new();
+        let direccion = telefono
+            .restore_private_wallet_from_recovery_seed("tel", seed.to_vec())
+            .unwrap();
+        let mut red = PrivateWalletManager::new();
+        red.create_private_wallet("alice").unwrap();
+        let carol = red.create_private_wallet("carol").unwrap();
+        red.deposit_to_private_wallet("alice", 100).unwrap();
+        let pago = red.send_private_transaction("alice", direccion, 30).unwrap();
+        let pago = red.get_private_transaction(&pago).unwrap();
+        let ajena = red.send_private_transaction("alice", carol.clone(), 5).unwrap();
+        let ajena = red.get_private_transaction(&ajena).unwrap();
+        telefono
+            .apply_relevant_private_transaction_for_wallet("tel", &pago)
+            .unwrap();
+        (telefono, pago, ajena, carol)
+    }
+
+    #[test]
+    fn el_escaneo_con_resumenes_pide_solo_el_pago_propio() {
+        let seed = [9u8; 32];
+        let (_, pago, ajena, _) = red_con_un_pago_al_telefono(&seed);
+        let digests = vec![
+            PrivateTxDigest::from_tx(&pago),
+            PrivateTxDigest::from_tx(&ajena),
+        ];
+
+        let primera = escanear(&seed, &digests, Vec::new());
+        assert_eq!(primera.need_bodies, vec![pago.tx_hash.clone()]);
+        assert_eq!(primera.balance_atoms, 0);
+
+        let segunda = escanear(&seed, &digests, vec![pago.clone()]);
+        assert!(segunda.need_bodies.is_empty());
+        assert_eq!(segunda.relevant, vec![pago.tx_hash.clone()]);
+        assert_eq!(segunda.balance_atoms, 30);
+        assert_eq!(segunda.owned_notes, 1);
+    }
+
+    #[test]
+    fn el_escaneo_con_resumenes_ve_el_gasto_del_telefono() {
+        let seed = [11u8; 32];
+        let (mut telefono, pago, ajena, carol) = red_con_un_pago_al_telefono(&seed);
+        let gasto = telefono.send_private_transaction("tel", carol, 10).unwrap();
+        let gasto = telefono.get_private_transaction(&gasto).unwrap();
+        let digests = vec![
+            PrivateTxDigest::from_tx(&pago),
+            PrivateTxDigest::from_tx(&ajena),
+            PrivateTxDigest::from_tx(&gasto),
+        ];
+
+        // Con el pago aplicado, el resumen del gasto se reconoce (gasta la nota
+        // y trae el vuelto). Los cuerpos pueden llegar en cualquier orden: el
+        // motor los aplica en el de la cadena.
+        let primera = escanear(&seed, &digests, Vec::new());
+        assert!(primera.need_bodies.contains(&pago.tx_hash));
+        let completa = escanear(&seed, &digests, vec![gasto.clone(), pago.clone()]);
+        assert!(completa.need_bodies.is_empty());
+        assert_eq!(
+            completa.relevant,
+            vec![pago.tx_hash.clone(), gasto.tx_hash.clone()]
+        );
+        assert_eq!(
+            completa.balance_atoms,
+            telefono.get_private_balance("tel").unwrap()
+        );
+    }
+
+    #[test]
+    fn un_cuerpo_adulterado_se_ignora() {
+        let seed = [13u8; 32];
+        let (_, mut pago, _, _) = red_con_un_pago_al_telefono(&seed);
+        let digests = vec![PrivateTxDigest::from_tx(&pago)];
+        pago.outputs[0].commitment = "00".repeat(32);
+
+        let respuesta = escanear(&seed, &digests, vec![pago.clone()]);
+        assert_eq!(respuesta.invalid_bodies, vec![pago.tx_hash.clone()]);
+        assert!(respuesta.relevant.is_empty());
+        assert_eq!(respuesta.balance_atoms, 0);
+        // No se vuelve a pedir: ya se dio y no sirve.
+        assert!(respuesta.need_bodies.is_empty());
+    }
+
+    #[test]
+    fn el_pedido_de_escaneo_rechaza_una_semilla_que_no_es_hex() {
+        let err = scan_with_digests_json(r#"{"seed_hex":"no-hex"}"#).unwrap_err();
+        assert!(err.contains("hexadecimal"), "{err}");
     }
 }

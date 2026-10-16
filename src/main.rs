@@ -7087,6 +7087,23 @@ fn private_tx_bodies_from_storage(
     PrivateTxBodiesResponse { bodies, missing }
 }
 
+/// Resúmenes de transacciones privadas para wallets livianas, desde la base.
+///
+/// Misma fuente que los cuerpos (`get_private_transaction_bytes`), así que las
+/// dos vías no pueden discrepar sobre qué transacciones existen. Un cuerpo que
+/// no se puede leer se informa como faltante: el resumen tiene que salir del
+/// cuerpo de verdad, nunca de una suposición.
+fn private_tx_digests_from_storage(
+    storage: &RocksDbStorage,
+    request: &zoka::network::private_tx_digests_request_response::PrivateTxDigestsRequest,
+) -> zoka::network::private_tx_digests_request_response::PrivateTxDigestsResponse {
+    zoka::network::private_tx_digests_request_response::answer_request(request, |hash| {
+        let bytes = storage.get_private_transaction_bytes(hash).ok()??;
+        let tx: PrivateTransaction = serde_json::from_slice(&bytes).ok()?;
+        Some(zoka::private_wallet::digest::PrivateTxDigest::from_tx(&tx))
+    })
+}
+
 fn wallet_digests_from_storage(
     storage: &RocksDbStorage,
     request: &zoka::network::wallet_digest_request_response::GetWalletDigests,
@@ -11070,6 +11087,10 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         let bodies_storage = storage.clone();
         node.set_private_tx_bodies_responder(Box::new(move |request| {
             private_tx_bodies_from_storage(&bodies_storage, request)
+        }));
+        let digests_storage = storage.clone();
+        node.set_private_tx_digests_responder(Box::new(move |request| {
+            private_tx_digests_from_storage(&digests_storage, request)
         }));
     }
     // Optionally also serve this node's chain as an iroh snapshot so fresh

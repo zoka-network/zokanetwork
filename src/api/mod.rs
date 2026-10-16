@@ -3386,6 +3386,55 @@ async fn get_private_tx_by_hash(
     Ok(Json(con_estado_de_cadena(&app_state, &hash, valor).await))
 }
 
+/// El resumen público de una transacción privada: lo que manda el protocolo
+/// `/zoka/private-tx-digests/1` a las wallets livianas. Sirve para medir y
+/// depurar desde la PC; trae también lo que pesan el cuerpo y el resumen.
+async fn get_private_tx_digest_by_hash(
+    State(app_state): State<Arc<AppState>>,
+    Path(hash): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let del_pool = match &app_state.private_wallet_manager {
+        Some(manager) => manager.read().await.get_private_transaction(&hash),
+        None => None,
+    };
+    let tx = match del_pool {
+        Some(tx) => tx,
+        None => {
+            let Some(bytes) = app_state
+                .state_manager
+                .get_private_transaction_bytes(&hash)
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to read private tx: {}", e),
+                    )
+                })?
+            else {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    format!("private transaction {} not found", hash),
+                ));
+            };
+            serde_json::from_slice::<crate::private_wallet::PrivateTransaction>(&bytes).map_err(
+                |e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to parse private tx: {}", e),
+                    )
+                },
+            )?
+        }
+    };
+    let digest = crate::private_wallet::digest::PrivateTxDigest::from_tx(&tx);
+    let body_bytes = serde_json::to_vec(&tx).map(|v| v.len()).unwrap_or(0);
+    let digest_bytes = serde_json::to_vec(&digest).map(|v| v.len()).unwrap_or(0);
+    Ok(Json(serde_json::json!({
+        "digest": digest,
+        "body_bytes": body_bytes,
+        "digest_bytes": digest_bytes,
+    })))
+}
+
 /// Si un nulificador ya fue gastado en la cadena, y a que altura.
 ///
 /// Existe porque una wallet no puede averiguarlo sola. El indice vive en la
@@ -5717,6 +5766,7 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
         .route("/private/pending", get(get_pending_private_txs))
         .route("/private/nullifier/:tag", get(get_nullifier_spent))
         .route("/private/tx/:hash", get(get_private_tx_by_hash))
+        .route("/private/tx/:hash/digest", get(get_private_tx_digest_by_hash))
         .route("/blocks/range/:from/:to", get(get_blocks_range))
         .route(
             "/private/coinbases/range/:from/:to",

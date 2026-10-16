@@ -10,6 +10,7 @@ pub mod block_request_response;
 pub mod handler;
 pub mod header_request_response;
 pub mod private_tx_bodies_request_response;
+pub mod private_tx_digests_request_response;
 pub mod wallet_digest_request_response;
 pub mod iroh_snapshot_transfer;
 pub mod message;

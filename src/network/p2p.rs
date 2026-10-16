@@ -58,6 +58,10 @@ use crate::network::private_tx_bodies_request_response::{
     protocol_name as private_tx_bodies_protocol, PrivateTxBodiesOutcome, PrivateTxBodiesRequest,
     PrivateTxBodiesRequestResponseCodec, PrivateTxBodiesResponse,
 };
+use crate::network::private_tx_digests_request_response::{
+    protocol_name as private_tx_digests_protocol, PrivateTxDigestsOutcome,
+    PrivateTxDigestsRequest, PrivateTxDigestsRequestResponseCodec, PrivateTxDigestsResponse,
+};
 use crate::network::wallet_digest_request_response::{
     protocol_name as wallet_digest_protocol, BlockDigest, GetWalletDigests,
     WalletDigestRequestResponseCodec, WalletDigestsResponse,
@@ -878,6 +882,11 @@ pub struct Node {
     received_private_tx_bodies: VecDeque<(PeerId, PrivateTxBodiesResponse)>,
     private_tx_bodies_responder:
         Option<Box<dyn Fn(&PrivateTxBodiesRequest) -> PrivateTxBodiesResponse + Send>>,
+    pending_outbound_private_tx_digests_requests:
+        HashMap<request_response::OutboundRequestId, PeerId>,
+    received_private_tx_digests: VecDeque<(PeerId, PrivateTxDigestsResponse)>,
+    private_tx_digests_responder:
+        Option<Box<dyn Fn(&PrivateTxDigestsRequest) -> PrivateTxDigestsResponse + Send>>,
     pending_outbound_wallet_digest_requests: HashMap<request_response::OutboundRequestId, PeerId>,
     /// Resumenes de bloque recibidos, esperando a que alguien los recoja.
     received_wallet_digests: VecDeque<ReceivedWalletDigestsResponse>,
@@ -920,6 +929,9 @@ pub struct NodeBehaviour {
     header_request_response: request_response::Behaviour<HeaderRequestResponseCodec>,
     private_tx_bodies_request_response:
         request_response::Behaviour<PrivateTxBodiesRequestResponseCodec>,
+    /// Resúmenes de transacciones privadas para wallets livianas.
+    private_tx_digests_request_response:
+        request_response::Behaviour<PrivateTxDigestsRequestResponseCodec>,
     wallet_digest_request_response: request_response::Behaviour<WalletDigestRequestResponseCodec>,
     /// Snapshot manifest discovery.
     snapshot_request_response: request_response::Behaviour<SnapshotRequestResponseCodec>,
@@ -2076,6 +2088,14 @@ impl Node {
                 // sueltos no alcanza.
                 data_request_response_config(),
             );
+            let private_tx_digests_request_response = request_response::Behaviour::with_codec(
+                PrivateTxDigestsRequestResponseCodec,
+                [(
+                    private_tx_digests_protocol(),
+                    request_response::ProtocolSupport::Full,
+                )],
+                data_request_response_config(),
+            );
             let wallet_digest_request_response = request_response::Behaviour::with_codec(
                 WalletDigestRequestResponseCodec,
                 [(
@@ -2104,6 +2124,7 @@ impl Node {
                 private_tx_request_response,
                 header_request_response,
                 private_tx_bodies_request_response,
+                private_tx_digests_request_response,
                 wallet_digest_request_response,
                 snapshot_request_response,
                 // Default: ping every 15s, 20s timeout. Well under the
@@ -2188,6 +2209,9 @@ impl Node {
             pending_outbound_private_tx_bodies_requests: HashMap::new(),
             received_private_tx_bodies: VecDeque::new(),
             private_tx_bodies_responder: None,
+            pending_outbound_private_tx_digests_requests: HashMap::new(),
+            received_private_tx_digests: VecDeque::new(),
+            private_tx_digests_responder: None,
             pending_outbound_wallet_digest_requests: HashMap::new(),
             received_wallet_digests: VecDeque::new(),
             wallet_digest_peer_cursor: 0,
@@ -2816,6 +2840,88 @@ impl Node {
         self.received_private_tx_bodies.pop_front()
     }
 
+    fn handle_private_tx_digests_event(
+        &mut self,
+        event: request_response::Event<PrivateTxDigestsRequest, PrivateTxDigestsResponse>,
+    ) {
+        match event {
+            request_response::Event::Message { peer, message } => match message {
+                request_response::Message::Request {
+                    request, channel, ..
+                } => {
+                    // Igual que el lote de cuerpos: sin responder (una wallet
+                    // no guarda la cadena) se contesta que no hay ninguno, para
+                    // que quien pregunta pase a otro par enseguida.
+                    let respuesta = match self.private_tx_digests_responder.as_ref() {
+                        Some(responder) => responder(&request),
+                        None => PrivateTxDigestsResponse {
+                            missing: request.tx_hashes.clone(),
+                            ..Default::default()
+                        },
+                    };
+                    let _ = self
+                        .swarm
+                        .behaviour_mut()
+                        .private_tx_digests_request_response
+                        .send_response(channel, respuesta);
+                }
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                } => {
+                    // Una respuesta que llega después de que el pedido se dio
+                    // por perdido no le sirve a nadie y no se encola.
+                    if self
+                        .pending_outbound_private_tx_digests_requests
+                        .remove(&request_id)
+                        .is_some()
+                    {
+                        self.received_private_tx_digests.push_back((peer, response));
+                    }
+                }
+            },
+            request_response::Event::OutboundFailure { request_id, .. } => {
+                self.pending_outbound_private_tx_digests_requests
+                    .remove(&request_id);
+            }
+            _ => {}
+        }
+    }
+
+    /// Quien sirve los resúmenes de transacciones privadas.
+    pub fn set_private_tx_digests_responder(
+        &mut self,
+        responder: Box<dyn Fn(&PrivateTxDigestsRequest) -> PrivateTxDigestsResponse + Send>,
+    ) {
+        self.private_tx_digests_responder = Some(responder);
+    }
+
+    /// Pide resúmenes a un par. `None` si no está conectado.
+    pub fn request_private_tx_digests(
+        &mut self,
+        peer: &PeerId,
+        tx_hashes: Vec<String>,
+    ) -> Option<request_response::OutboundRequestId> {
+        if !self.swarm.is_connected(peer) || tx_hashes.is_empty() {
+            return None;
+        }
+        let id = self
+            .swarm
+            .behaviour_mut()
+            .private_tx_digests_request_response
+            .send_request(peer, PrivateTxDigestsRequest { tx_hashes });
+        self.pending_outbound_private_tx_digests_requests
+            .insert(id, *peer);
+        Some(id)
+    }
+
+    /// Saca una respuesta de resúmenes ya recibida, si hay.
+    pub fn take_private_tx_digests_response(
+        &mut self,
+    ) -> Option<(PeerId, PrivateTxDigestsResponse)> {
+        self.received_private_tx_digests.pop_front()
+    }
+
     fn handle_wallet_digest_event(
         &mut self,
         event: request_response::Event<GetWalletDigests, WalletDigestsResponse>,
@@ -3092,6 +3198,116 @@ impl Node {
             dichos_faltantes: dichos_faltantes.into_iter().collect(),
             sin_respuesta,
         }
+    }
+
+    /// Pide resúmenes de transacciones privadas a los pares conectados.
+    ///
+    /// Se le pregunta a un par por vez; lo que uno no tiene o no alcanza a
+    /// contestar va al siguiente. Lo aplazado por el tope de un pedido se
+    /// vuelve a pedir al mismo par. Igual que en el lote de cuerpos, "no lo
+    /// tengo" y "no contestó" quedan separados.
+    pub async fn request_private_tx_digests_from_peers(
+        &mut self,
+        tx_hashes: &[String],
+        max_wait: Duration,
+    ) -> PrivateTxDigestsOutcome {
+        use crate::network::private_tx_digests_request_response::MAX_DIGESTS_PER_REQUEST;
+        use std::collections::HashSet;
+
+        let mut vistos = HashSet::new();
+        let orden: Vec<String> = tx_hashes
+            .iter()
+            .map(|hash| hash.trim().to_string())
+            .filter(|hash| !hash.is_empty() && vistos.insert(hash.clone()))
+            .collect();
+        let mut faltan: HashSet<String> = orden.iter().cloned().collect();
+        let mut dichos_faltantes: HashSet<String> = HashSet::new();
+        let mut conseguidos = Vec::new();
+        if faltan.is_empty() {
+            return PrivateTxDigestsOutcome::default();
+        }
+
+        let limite = Instant::now() + max_wait;
+        for peer in self.connected_peer_ids() {
+            if faltan.is_empty() || Instant::now() >= limite {
+                break;
+            }
+            let mut por_preguntar: Vec<String> = orden
+                .iter()
+                .filter(|hash| faltan.contains(*hash))
+                .cloned()
+                .collect();
+            while !por_preguntar.is_empty() && Instant::now() < limite {
+                let lote: Vec<String> = por_preguntar
+                    .iter()
+                    .take(MAX_DIGESTS_PER_REQUEST)
+                    .cloned()
+                    .collect();
+                let Some(id) = self.request_private_tx_digests(&peer, lote.clone()) else {
+                    break;
+                };
+                let Some(respuesta) = self
+                    .wait_private_tx_digests_response(id, &peer, limite)
+                    .await
+                else {
+                    break;
+                };
+                let aplazados: HashSet<String> = respuesta.deferred.into_iter().collect();
+                for digest in respuesta.digests {
+                    if faltan.remove(&digest.tx_hash) {
+                        dichos_faltantes.remove(&digest.tx_hash);
+                        conseguidos.push(digest);
+                    }
+                }
+                for hash in respuesta.missing {
+                    if faltan.contains(&hash) {
+                        dichos_faltantes.insert(hash);
+                    }
+                }
+                let pedidos: HashSet<&String> = lote.iter().collect();
+                por_preguntar.retain(|hash| {
+                    faltan.contains(hash) && (!pedidos.contains(hash) || aplazados.contains(hash))
+                });
+            }
+        }
+
+        let sin_respuesta = orden
+            .into_iter()
+            .filter(|hash| faltan.contains(hash) && !dichos_faltantes.contains(hash))
+            .collect();
+        PrivateTxDigestsOutcome {
+            conseguidos,
+            dichos_faltantes: dichos_faltantes.into_iter().collect(),
+            sin_respuesta,
+        }
+    }
+
+    /// Espera la respuesta de un pedido de resúmenes hasta `limite`. Si no
+    /// llega, lo abandona para que una respuesta tardía no se mezcle con el
+    /// pedido siguiente.
+    async fn wait_private_tx_digests_response(
+        &mut self,
+        id: request_response::OutboundRequestId,
+        peer: &PeerId,
+        limite: Instant,
+    ) -> Option<PrivateTxDigestsResponse> {
+        while Instant::now() < limite {
+            let _ = self.pump_for(Duration::from_millis(200)).await;
+            while let Some((de, respuesta)) = self.take_private_tx_digests_response() {
+                if de == *peer {
+                    return Some(respuesta);
+                }
+            }
+            if !self
+                .pending_outbound_private_tx_digests_requests
+                .contains_key(&id)
+            {
+                // Falló (el par se fue o no habla el protocolo) sin respuesta.
+                return None;
+            }
+        }
+        self.pending_outbound_private_tx_digests_requests.remove(&id);
+        None
     }
 
     pub async fn request_wallet_digests(
@@ -3932,10 +4148,10 @@ impl Node {
                         SwarmEvent::Behaviour(NodeBehaviourEvent::PrivateTxBodiesRequestResponse(event)) => {
                             self.handle_private_tx_bodies_event(event);
                         }
-                        SwarmEvent::Behaviour(NodeBehaviourEvent::PrivateTxBodiesRequestResponse(event)) => {
-                    self.handle_private_tx_bodies_event(event);
-                }
-                SwarmEvent::Behaviour(NodeBehaviourEvent::WalletDigestRequestResponse(event)) => {
+                        SwarmEvent::Behaviour(NodeBehaviourEvent::PrivateTxDigestsRequestResponse(event)) => {
+                            self.handle_private_tx_digests_event(event);
+                        }
+                        SwarmEvent::Behaviour(NodeBehaviourEvent::WalletDigestRequestResponse(event)) => {
                             self.handle_wallet_digest_event(event);
                         }
                         SwarmEvent::Behaviour(NodeBehaviourEvent::SnapshotRequestResponse(event)) => {
@@ -5034,6 +5250,17 @@ impl Node {
                 }
                 SwarmEvent::Behaviour(NodeBehaviourEvent::HeaderRequestResponse(event)) => {
                     self.handle_header_request_response_event(event);
+                }
+                // Los pedidos en lote también llegan mientras el nodo espera
+                // mensajes acá, que es donde pasa casi todo el tiempo. Antes
+                // caían en `_` y se tiraban sin contestar: el teléfono esperaba
+                // el plazo entero y anotaba "sin respuesta" (15/10/2026: lotes
+                // de cuerpos que nunca volvían mientras los de a uno sí).
+                SwarmEvent::Behaviour(NodeBehaviourEvent::PrivateTxBodiesRequestResponse(event)) => {
+                    self.handle_private_tx_bodies_event(event);
+                }
+                SwarmEvent::Behaviour(NodeBehaviourEvent::PrivateTxDigestsRequestResponse(event)) => {
+                    self.handle_private_tx_digests_event(event);
                 }
                 SwarmEvent::Behaviour(NodeBehaviourEvent::WalletDigestRequestResponse(event)) => {
                     self.handle_wallet_digest_event(event);

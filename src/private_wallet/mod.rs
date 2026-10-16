@@ -31,6 +31,9 @@ mod clsag;
 /// conectado a transacciones ni a consenso.
 #[cfg(feature = "pq-experimental")]
 pub mod hybrid;
+/// Resúmenes públicos y chicos de transacciones privadas, para que una wallet
+/// liviana elija qué cuerpos bajar sin bajarlos todos.
+pub mod digest;
 
 /// Helper function to convert bytes to hex string
 fn bytes_to_hex(bytes: &[u8]) -> String {

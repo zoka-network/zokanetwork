@@ -143,6 +143,15 @@ fn private_bodies_call_timeout(cuantos: usize) -> Duration {
         .saturating_add(MOBILE_CALL_SLACK)
 }
 
+fn private_digests_call_timeout(cuantos: usize) -> Duration {
+    let lotes = cuantos.div_ceil(
+        crate::network::private_tx_digests_request_response::MAX_DIGESTS_PER_REQUEST,
+    );
+    PEER_WAIT
+        .saturating_add(BLOCKS_WAIT.saturating_mul(lotes.clamp(1, 8) as u32))
+        .saturating_add(MOBILE_CALL_SLACK)
+}
+
 fn private_body_call_timeout() -> Duration {
     PEER_WAIT
         .saturating_add(BLOCKS_WAIT)
@@ -223,6 +232,9 @@ enum Cmd {
     PrivateTxBody(String, std_mpsc::Sender<Result<String, String>>),
     /// Muchos cuerpos de una vez. Es el camino de la wallet que arranca.
     PrivateTxBodies(Vec<String>, std_mpsc::Sender<Result<String, String>>),
+    /// Resúmenes de transacciones privadas: lo que necesita una wallet liviana
+    /// para elegir qué cuerpos bajar.
+    PrivateTxDigests(Vec<String>, std_mpsc::Sender<Result<String, String>>),
     Shutdown,
 }
 
@@ -488,6 +500,23 @@ pub fn private_tx_bodies_json(tx_hashes: &[String]) -> Result<String, String> {
     pedir(
         move |tx| Cmd::PrivateTxBodies(hashes.clone(), tx),
         private_bodies_call_timeout(tx_hashes.len()),
+    )?
+}
+
+/// Resúmenes de transacciones privadas, en JSON.
+///
+/// Devuelve `{"digests":[...], "missing":[hash], "unanswered":[hash]}`. Un
+/// resumen pesa entre 1 y 10 KB contra los 59–346 KB del cuerpo: con esto una
+/// wallet recorre la cadena entera de Zenith en un viaje y pide el cuerpo
+/// solo de lo que le toca (ver `private_wallet::digest`).
+pub fn private_tx_digests_json(tx_hashes: &[String]) -> Result<String, String> {
+    if tx_hashes.is_empty() {
+        return Ok("{\"digests\":[],\"missing\":[],\"unanswered\":[]}".to_string());
+    }
+    let hashes = tx_hashes.to_vec();
+    pedir(
+        move |tx| Cmd::PrivateTxDigests(hashes.clone(), tx),
+        private_digests_call_timeout(tx_hashes.len()),
     )?
 }
 
@@ -1186,6 +1215,29 @@ async fn traer_cuerpos_privados(
     serde_json::to_string(&salida).map_err(|e| format!("no pude serializar la respuesta: {e}"))
 }
 
+/// Resúmenes de transacciones privadas a los pares conectados.
+///
+/// No se validan contra el hash (no se puede: el hash cubre el cuerpo entero).
+/// Quien los usa solo elige con ellos qué cuerpos bajar, y esos sí se validan
+/// con `validar_cuerpo` antes de contar nada.
+async fn traer_resumenes_privados(node: &mut Node, hashes: &[String]) -> Result<String, String> {
+    let lotes = hashes.len().div_ceil(
+        crate::network::private_tx_digests_request_response::MAX_DIGESTS_PER_REQUEST,
+    );
+    let resultado = node
+        .request_private_tx_digests_from_peers(
+            hashes,
+            BLOCKS_WAIT.saturating_mul(lotes.clamp(1, 8) as u32),
+        )
+        .await;
+    let salida = serde_json::json!({
+        "digests": resultado.conseguidos,
+        "missing": resultado.dichos_faltantes,
+        "unanswered": resultado.sin_respuesta,
+    });
+    serde_json::to_string(&salida).map_err(|e| format!("no pude serializar los resumenes: {e}"))
+}
+
 /// Comprueba que un cuerpo sea de verdad el que se pidio.
 ///
 /// Las dos comprobaciones importan y son distintas: que el par no haya mandado
@@ -1510,6 +1562,14 @@ async fn run_client(
                 }
                 Some(Cmd::PrivateTxBodies(hashes, resp)) => {
                     let r = traer_cuerpos_privados(&mut node, &mut cache, &seeds, &hashes).await;
+                    let _ = resp.send(r);
+                }
+                Some(Cmd::PrivateTxDigests(hashes, resp)) => {
+                    let r = if esperar_par(&mut node, &seeds).await {
+                        traer_resumenes_privados(&mut node, &hashes).await
+                    } else {
+                        Err("ningun par completo la conexion; revisa Tor".to_string())
+                    };
                     let _ = resp.send(r);
                 }
                 Some(Cmd::PrivateTxBody(hash, resp)) => {
