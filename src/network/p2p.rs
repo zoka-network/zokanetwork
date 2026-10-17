@@ -68,7 +68,7 @@ use crate::network::wallet_digest_request_response::{
 };
 use crate::network::quantic_light_request_response::{
     protocol_name as quantic_light_protocol, QuanticLightCodec, QuanticLightRequest,
-    QuanticLightResponse,
+    QuanticLightResponse, MAX_COMPACT_BLOCKS_PER_REQUEST,
 };
 use crate::private_wallet::PrivateTransaction;
 
@@ -125,6 +125,28 @@ fn wallet_digest_attempt_budget(remaining: Duration, candidates_left: usize) -> 
 
 fn data_request_response_config() -> request_response::Config {
     request_response::Config::default().with_request_timeout(DATA_REQUEST_RESPONSE_TIMEOUT)
+}
+
+/// Lo que un par puede pedirle por minuto a `/zoka-quantic/light/1`, en
+/// unidades de [`quantic_light_cost`]: 600 son doce lotes de 500 bloques
+/// compactos. Un teléfono por Tor no llega ni cerca; un par que pide sin parar
+/// no le come la CPU al nodo (el respondedor corre en el bucle de la red).
+const QUANTIC_LIGHT_BUDGET_PER_MINUTE: u32 = 600;
+
+/// Lo que cuesta atender un pedido: info 1, un envío 5 (verificar la prueba)
+/// y los bloques compactos uno cada 10 bloques.
+fn quantic_light_cost(request: &QuanticLightRequest) -> u32 {
+    match request {
+        QuanticLightRequest::Info => 1,
+        QuanticLightRequest::SubmitTx { .. } => 5,
+        QuanticLightRequest::Compact { from, to } => {
+            let blocks = to
+                .saturating_sub(*from)
+                .saturating_add(1)
+                .min(MAX_COMPACT_BLOCKS_PER_REQUEST);
+            (blocks / 10).max(1) as u32
+        }
+    }
 }
 
 /// `/zoka-quantic/light/1` existe solo en las redes de Quantic: un nodo de
@@ -877,6 +899,8 @@ pub struct Node {
     seen_mixer_batches: SeenIdSet,
     /// Per-peer rate limit buckets for mixer batches.
     mixer_peer_buckets: HashMap<PeerId, (u64, u32)>,
+    /// Lo que pidió cada par a `/zoka-quantic/light/1` en el minuto en curso.
+    quantic_light_peer_buckets: HashMap<PeerId, (u64, u32)>,
     /// Dedup cache for processed stem routes.
     seen_stem_routes: SeenIdSet,
     /// Round-robin cursor for relay hint selection.
@@ -1692,6 +1716,37 @@ impl Node {
         !self.incompatible_protocol_peers.contains(peer_id)
     }
 
+    /// Descuenta `cost` del presupuesto del minuto de `peer`; `false` si no le alcanza.
+    fn allow_quantic_light_from_peer(&mut self, peer: &PeerId, cost: u32) -> bool {
+        let current_minute = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            / 60;
+        self.allow_quantic_light_in_minute(peer, cost, current_minute)
+    }
+
+    fn allow_quantic_light_in_minute(&mut self, peer: &PeerId, cost: u32, current_minute: u64) -> bool {
+        // Solo importa el minuto en curso: lo viejo se tira para que la tabla
+        // no crezca con cada par que pasó.
+        if self.quantic_light_peer_buckets.len() > 1024 {
+            self.quantic_light_peer_buckets
+                .retain(|_, bucket| bucket.0 == current_minute);
+        }
+        let bucket = self
+            .quantic_light_peer_buckets
+            .entry(*peer)
+            .or_insert((current_minute, 0));
+        if bucket.0 != current_minute {
+            *bucket = (current_minute, 0);
+        }
+        if bucket.1.saturating_add(cost) > QUANTIC_LIGHT_BUDGET_PER_MINUTE {
+            return false;
+        }
+        bucket.1 += cost;
+        true
+    }
+
     fn allow_mixer_batch_from_peer(&mut self, peer: &PeerId) -> bool {
         let current_minute = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2283,6 +2338,7 @@ impl Node {
             mixer_batcher: MixerBatcher::new(),
             seen_mixer_batches: SeenIdSet::default(),
             mixer_peer_buckets: HashMap::new(),
+            quantic_light_peer_buckets: HashMap::new(),
             seen_stem_routes: SeenIdSet::default(),
             stem_relay_cursor: 0,
             incompatible_protocol_peers: HashSet::new(),
@@ -3034,17 +3090,23 @@ impl Node {
         event: request_response::Event<QuanticLightRequest, QuanticLightResponse>,
     ) {
         match event {
-            request_response::Event::Message { message, .. } => match message {
+            request_response::Event::Message { peer, message } => match message {
                 request_response::Message::Request {
                     request, channel, ..
                 } => {
                     // Un nodo sin la cadena (una wallet) contesta igual, para
                     // que el teléfono pase enseguida a otro par.
-                    let respuesta = match self.quantic_light_responder.as_ref() {
-                        Some(responder) => responder(&request),
-                        None => QuanticLightResponse::Error {
+                    let respuesta = if self.quantic_light_responder.is_none() {
+                        QuanticLightResponse::Error {
                             message: "this node does not serve Zoka Quantic light wallets".to_string(),
-                        },
+                        }
+                    } else if !self.allow_quantic_light_from_peer(&peer, quantic_light_cost(&request)) {
+                        QuanticLightResponse::Error {
+                            message: "rate limited: ask again in a minute".to_string(),
+                        }
+                    } else {
+                        let responder = self.quantic_light_responder.as_ref().expect("checked above");
+                        responder(&request)
                     };
                     let _ = self
                         .swarm
@@ -7206,6 +7268,28 @@ mod tests {
                 "un nodo completo si tiene que estar en '{ajeno}': {temas_completo:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_peer_cannot_ask_more_than_its_budget_per_minute() {
+        use crate::network::quantic_light_request_response::QuanticLightRequest;
+
+        assert_eq!(quantic_light_cost(&QuanticLightRequest::Info), 1);
+        assert_eq!(quantic_light_cost(&QuanticLightRequest::Compact { from: 1, to: 500 }), 50);
+        assert_eq!(quantic_light_cost(&QuanticLightRequest::Compact { from: 1, to: u64::MAX }), 50);
+        assert_eq!(quantic_light_cost(&QuanticLightRequest::Compact { from: 9, to: 1 }), 1);
+        let mut nodo = Node::new(0).await.expect("nodo");
+        let par = PeerId::random();
+        let otro = PeerId::random();
+        let lote = quantic_light_cost(&QuanticLightRequest::Compact { from: 1, to: 500 });
+        let minuto = 29_000_000;
+        for _ in 0..QUANTIC_LIGHT_BUDGET_PER_MINUTE / lote {
+            assert!(nodo.allow_quantic_light_in_minute(&par, lote, minuto));
+        }
+        assert!(!nodo.allow_quantic_light_in_minute(&par, lote, minuto), "doce lotes por minuto");
+        assert!(!nodo.allow_quantic_light_in_minute(&par, 1, minuto));
+        assert!(nodo.allow_quantic_light_in_minute(&otro, lote, minuto), "cada par tiene el suyo");
+        assert!(nodo.allow_quantic_light_in_minute(&par, lote, minuto + 1), "al minuto siguiente, de nuevo");
     }
 
     /// La dirección completa (con `/p2p/`) de un nodo que escucha en TCP local.
