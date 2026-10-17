@@ -1,0 +1,1 @@
+{"status": "pre-genesis", "note": "The Zoka Quantic testnet has no genesis yet. zoka quantic-genesis writes it here; its hash and premine address then go into economics::QUANTIC_TESTNET_GENESIS."}

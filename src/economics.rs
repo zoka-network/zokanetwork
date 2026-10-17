@@ -420,6 +420,22 @@ pub const QUANTIC_TESTNET_CHAIN_ID: &str = "zoka-quantic-testnet-v1";
 /// Redes locales de prueba de Quantic: prueba de trabajo liviana.
 pub const QUANTIC_REGTEST_CHAIN_ID: &str = "zoka-quantic-regtest-v1";
 
+/// El génesis de una red pública de Quantic: el hash de su bloque 1 y la
+/// dirección que recibe el premine. Fijo en el binario, como el de Bitcoin:
+/// otro bloque 1, aunque pague lo mismo, no es esa red.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuanticGenesis {
+    pub block_hash: &'static str,
+    pub premine_address: &'static str,
+}
+
+/// `None` hasta que se cree: el premine va a la dirección del equipo de la
+/// testnet, que la crea el usuario (`zoka quantic-wallet new --network
+/// quantic-testnet`), y el bloque sale de `zoka quantic-genesis`.
+pub const QUANTIC_TESTNET_GENESIS: Option<QuanticGenesis> = None;
+/// Mainnet: se crea en la etapa 8.
+pub const QUANTIC_MAINNET_GENESIS: Option<QuanticGenesis> = None;
+
 /// Dificultad fija de las redes locales de Quantic (como el regtest de
 /// Bitcoin): sin reajuste, para que una red de prueba en una PC produzca
 /// bloques al ritmo que se le pide. Nunca vale en la testnet ni en mainnet.

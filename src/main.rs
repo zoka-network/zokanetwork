@@ -12033,6 +12033,14 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut team_share_task: Option<TeamShareTask> = None;
     let mut pending_team_solution: Option<zoka::team_mining::NetworkSolution> = None;
     #[cfg(feature = "quantic")]
+    if let Some(storage) = chain_storage_outer.as_deref() {
+        match zoka::quantic::import_embedded_genesis(storage, &chain_id) {
+            Ok(true) => startup_notes.push("Zoka Quantic: genesis block imported from the binary.".to_string()),
+            Ok(false) => {}
+            Err(error) => return Err(format!("the embedded Quantic genesis does not validate: {error}")),
+        }
+    }
+    #[cfg(feature = "quantic")]
     let mut quantic_runtime = quantic_runtime_for(args, network, &chain_id, min_mine_peers)?;
     #[cfg(feature = "quantic")]
     if let Some(runtime) = quantic_runtime.as_ref() {
@@ -14834,7 +14842,7 @@ fn cmd_quantic_wallet(args: &[String]) -> Result<(), String> {
 
 #[cfg(feature = "quantic")]
 fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
-    const USAGE: &str = "usage: zoka quantic-wallet <new|restore|address|list|balance|send|import-regtest-team> --network quantic-regtest|quantic-testnet [--name <wallet>] [--password <p>] [--rpc <url>] [--json]";
+    const USAGE: &str = "usage: zoka quantic-wallet <new|restore|address|list|balance|history|send|import-regtest-team> --network quantic-regtest|quantic-testnet [--name <wallet>] [--password <p>] [--rpc <url>] [--json]";
     let Some((action, rest)) = args.split_first() else {
         return Err(USAGE.to_string());
     };
@@ -14950,6 +14958,48 @@ fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
+        "history" => {
+            let password = required_password_value(rest)?;
+            let (_, wallet, tip) = synced(&password)?;
+            let history = wallet.history();
+            if json {
+                let entries: Vec<serde_json::Value> = history
+                    .iter()
+                    .map(|entry| {
+                        let kind = if entry.coinbase {
+                            "coinbase"
+                        } else if entry.spent > 0 {
+                            "sent"
+                        } else {
+                            "received"
+                        };
+                        serde_json::json!({
+                            "txid": entry.txid.to_hex(),
+                            "height": entry.height,
+                            "kind": kind,
+                            "received_atoms": entry.received,
+                            "spent_atoms": entry.spent,
+                            "net_atoms": entry.net().to_string(),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::json!({ "name": name, "height": tip, "transactions": entries }));
+            } else {
+                for entry in history {
+                    let net = entry.net();
+                    let amount = format_zka(net.unsigned_abs() as u64);
+                    println!(
+                        "{:>8}  {}{}  {}{}",
+                        entry.height,
+                        if net < 0 { "-" } else { "+" },
+                        amount,
+                        &entry.txid.to_hex()[..16],
+                        if entry.coinbase { "  (coinbase)" } else { "" }
+                    );
+                }
+            }
+            Ok(())
+        }
         "send" => {
             let password = required_password_value(rest)?;
             let to = zoka::quantic::protocol::QuanticAddress::decode_for(
@@ -14993,6 +15043,46 @@ fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
         }
         _ => Err(USAGE.to_string()),
     }
+}
+
+/// `zoka quantic-genesis --network quantic-testnet --premine-to <dirección>
+/// [--out <archivo>]`: arma el génesis de una red pública de Quantic (el bloque
+/// 1 con el premine público) y lo escribe. Después se fijan su hash y la
+/// dirección en `economics::QUANTIC_*_GENESIS` y el archivo se embebe.
+#[cfg(feature = "quantic")]
+fn cmd_quantic_genesis(args: &[String]) -> Result<(), String> {
+    let args = args.to_vec();
+    std::thread::Builder::new()
+        .name("quantic-genesis".to_string())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || -> Result<(), String> {
+            let network = NetworkProfile::from_args(&args)?;
+            if network != NetworkProfile::QuanticTestnet {
+                return Err("quantic-genesis is for --network quantic-testnet (mainnet comes in stage 8)".to_string());
+            }
+            let chain_id = network.chain_id();
+            let quantic_network = zoka::quantic::network_for_chain(chain_id).ok_or("unknown network")?;
+            if zoka::quantic::fixed_genesis(quantic_network).is_some() {
+                return Err(format!("{chain_id} already has its genesis compiled in"));
+            }
+            let premine_to = zoka::quantic::protocol::QuanticAddress::decode_for(
+                required_option_value(&args, "--premine-to")?.trim(),
+                quantic_network,
+            )
+            .map_err(|e| format!("--premine-to: {e}"))?;
+            let block = zoka::quantic::build_genesis(chain_id, &premine_to, zoka::quantic::runtime::proving_key(), now_secs())?;
+            let json = serde_json::to_string_pretty(&block).map_err(|e| e.to_string())?;
+            match option_value(&args, "--out") {
+                Some(path) => fs::write(&path, &json).map_err(|e| format!("cannot write {path}: {e}"))?,
+                None => println!("{json}"),
+            }
+            eprintln!("Genesis of {chain_id}: block 1 {}", block.header.hash);
+            eprintln!("Premine: 5,000,000 ZKA to the public output of {}", premine_to.encode());
+            Ok(())
+        })
+        .map_err(|e| format!("cannot start the genesis thread: {e}"))?
+        .join()
+        .map_err(|_| "the genesis thread panicked".to_string())?
 }
 
 /// `zoka checkpoint-keygen [--network testnet]`: crea la clave del equipo en la
@@ -17999,6 +18089,8 @@ async fn run() -> Result<(), String> {
         "checkpoint-sign" => cmd_checkpoint_sign(tail),
         #[cfg(feature = "quantic")]
         "quantic-wallet" => cmd_quantic_wallet(tail),
+        #[cfg(feature = "quantic")]
+        "quantic-genesis" => cmd_quantic_genesis(tail),
         "checkpoint-status" => cmd_checkpoint_status(tail),
         "private-pending-diagnostics" => cmd_private_pending_diagnostics(tail),
         "tx-pending" => cmd_pending_transfers(tail),

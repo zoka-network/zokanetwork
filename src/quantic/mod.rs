@@ -63,6 +63,8 @@ pub enum QuanticBlockError {
     Nullifiers,
     #[error("state_root does not commit to this block's roots")]
     StateRoot,
+    #[error("this is not the genesis block of the network")]
+    NotTheGenesis,
     #[error("missing Quantic state of ancestor {0}")]
     MissingAncestor(String),
     #[error("Quantic storage: {0}")]
@@ -88,9 +90,25 @@ pub const REGTEST_TEAM_ROOT: [u8; 32] = *b"zoka-quantic-regtest-team-root!!";
 /// En regtest el coinbase madura en 2 bloques (60 en las redes públicas).
 pub const REGTEST_COINBASE_MATURITY: u32 = 2;
 
-/// El premine anunciado de cada red. La testnet todavía no tiene génesis: se
-/// fija cuando se cree (paso 7 del diseño).
+/// El génesis fijo de una red pública, si ya existe.
+pub fn fixed_genesis(network: Network) -> Option<crate::economics::QuanticGenesis> {
+    match network {
+        Network::Mainnet => crate::economics::QUANTIC_MAINNET_GENESIS,
+        Network::Testnet => crate::economics::QUANTIC_TESTNET_GENESIS,
+        Network::Regtest => None,
+    }
+}
+
+/// El premine anunciado de cada red: el de su génesis fijo en las públicas.
 fn premine(network: Network) -> Option<Premine> {
+    if let Some(genesis) = fixed_genesis(network) {
+        let recipient = zoka_quantic::QuanticAddress::decode_for(genesis.premine_address, network)
+            .expect("the compiled premine address is a valid address of its network");
+        return Some(Premine {
+            recipient,
+            value: zoka_quantic::state::PREMINE_ATOMS,
+        });
+    }
     match network {
         Network::Regtest => {
             static REGTEST: OnceLock<Option<Premine>> = OnceLock::new();
@@ -377,6 +395,34 @@ fn roots_of(block: &QuanticBlock, tree: &NoteCommitmentTree) -> QuanticRoots {
     }
 }
 
+/// El bloque génesis embebido en el binario, si la red ya tiene uno: así
+/// cada nodo nuevo arranca con él sin depender de pares.
+pub fn embedded_genesis_block(network: Network) -> Option<Block> {
+    const TESTNET: &str = include_str!("../../docs/quantic-testnet-genesis.v1.json");
+    let raw = match network {
+        Network::Testnet => TESTNET,
+        Network::Mainnet | Network::Regtest => return None,
+    };
+    let block: Block = serde_json::from_str(raw).ok()?;
+    let expected = fixed_genesis(network)?;
+    (block.header.hash == expected.block_hash && block.header.block_height == GENESIS_HEIGHT).then_some(block)
+}
+
+/// Si la base está vacía y la red tiene génesis embebido, lo aplica.
+pub fn import_embedded_genesis(storage: &RocksDbStorage, chain_id: &str) -> Result<bool, String> {
+    let Some(network) = network_for_chain(chain_id) else {
+        return Ok(false);
+    };
+    if storage.get_chain_height().map_err(|e| format!("{e:?}"))? > 0 {
+        return Ok(false);
+    }
+    let Some(block) = embedded_genesis_block(network) else {
+        return Ok(false);
+    };
+    crate::state::chain::apply_block(storage, chain_id, &block).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
 fn params_for(chain_id: &str) -> Result<ConsensusParams, QuanticBlockError> {
     network_for_chain(chain_id)
         .map(consensus_params)
@@ -395,6 +441,23 @@ pub fn validate_block(
     parent: &Block,
 ) -> Result<ValidatedBlock, QuanticBlockError> {
     let params = params_for(chain_id)?;
+    if candidate.header.block_height == GENESIS_HEIGHT {
+        if let Some(genesis) = fixed_genesis(params.network) {
+            if candidate.header.hash != genesis.block_hash {
+                return Err(QuanticBlockError::NotTheGenesis);
+            }
+        }
+    }
+    validate_block_with(storage, &params, candidate, parent)
+}
+
+fn validate_block_with(
+    storage: &RocksDbStorage,
+    params: &ConsensusParams,
+    candidate: &Block,
+    parent: &Block,
+) -> Result<ValidatedBlock, QuanticBlockError> {
+    let params = params.clone();
     validate_shape(candidate)?;
     let block = decode_block(candidate)?;
     if u64::from(block.height) < GENESIS_HEIGHT {
@@ -512,6 +575,20 @@ pub fn assemble_block(
     timestamp: u64,
 ) -> Result<(Block, ValidatedBlock), QuanticBlockError> {
     let params = params_for(chain_id)?;
+    let (block, _) = assemble_block_with(storage, &params, parent, coinbase, transactions, timestamp)?;
+    let validated = validate_block(storage, chain_id, &block, parent)?;
+    Ok((block, validated))
+}
+
+fn assemble_block_with(
+    storage: &RocksDbStorage,
+    params: &ConsensusParams,
+    parent: &Block,
+    coinbase: &QuanticTransaction,
+    transactions: &[QuanticTransaction],
+    timestamp: u64,
+) -> Result<(Block, ValidatedBlock), QuanticBlockError> {
+    let params = params.clone();
     let height = parent.header.block_height + 1;
     let decoded = QuanticBlock {
         height: u32::try_from(height).map_err(|_| QuanticBlockError::Height(height))?,
@@ -537,8 +614,63 @@ pub fn assemble_block(
     block.header.state_root = roots_of(&decoded, &state.tree).to_state_root();
     block.header.merkle_root = block.compute_merkle_root();
     block.header.hash = block.compute_hash();
-    let validated = validate_block(storage, chain_id, &block, parent)?;
+    let validated = validate_block_with(storage, &params, &block, parent)?;
     Ok((block, validated))
+}
+
+/// Arma el génesis de una red pública: el bloque 1 con el premine público a
+/// `premine_to`, con su prueba de trabajo resuelta. Para `zoka quantic-genesis`:
+/// una vez creado, su hash y la dirección se fijan en
+/// `economics::QUANTIC_*_GENESIS` y el bloque se embebe en el binario.
+pub fn build_genesis(
+    chain_id: &str,
+    premine_to: &zoka_quantic::QuanticAddress,
+    proving_key: &zoka_quantic::orchard::circuit::ProvingKey,
+    timestamp: u64,
+) -> Result<Block, String> {
+    let network = network_for_chain(chain_id).ok_or_else(|| format!("{chain_id} is not a Quantic chain"))?;
+    if network == Network::Regtest {
+        return Err("regtest has no fixed genesis: any node mines its own".to_string());
+    }
+    if premine_to.network() != network {
+        return Err(format!("the premine address is not a {chain_id} address"));
+    }
+    let mut params = consensus_params(network);
+    params.premine = Some(Premine {
+        recipient: premine_to.clone(),
+        value: zoka_quantic::state::PREMINE_ATOMS,
+    });
+    let coinbase = zoka_quantic::builder::build_coinbase(
+        network,
+        GENESIS_HEIGHT as u32,
+        premine_to,
+        zoka_quantic::state::PREMINE_ATOMS,
+        true,
+        proving_key,
+        &mut zoka_quantic::os_rng(),
+    )
+    .map_err(|e| e.to_string())?;
+    let dir = tempfile_dir()?;
+    let storage = RocksDbStorage::new(dir.to_str().ok_or("temp path")?).map_err(|e| format!("{e:?}"))?;
+    let parent = crate::state::chain::genesis_parent_for(chain_id);
+    let (mut block, _) = assemble_block_with(&storage, &params, &parent, &coinbase, &[], timestamp).map_err(|e| e.to_string())?;
+    solve_pow(chain_id, &mut block, crate::economics::POW_INITIAL_DIFFICULTY_BITS)?;
+    drop(storage);
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(block)
+}
+
+fn tempfile_dir() -> Result<std::path::PathBuf, String> {
+    let dir = std::env::temp_dir().join(format!("zoka-quantic-genesis-{}-{}", std::process::id(), now_nanos()));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
+}
+
+fn now_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

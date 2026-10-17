@@ -206,6 +206,19 @@ fn a_chain_from_the_genesis_with_payments_change_and_mining() {
     assert_eq!(bob.wallet.balance(), 255 * ZKA - 254 * ZKA - fees_of(&b5));
     assert!(alice.wallet.balance() > 1_000 * ZKA);
 
+    // History: Bob received from two senders and then sent most of it.
+    let history = bob.wallet.history();
+    let sent = history.iter().find(|h| h.spent > 0).expect("bob's send");
+    assert_eq!(sent.net(), -(254 * ZKA as i128) - i128::from(fees_of(&b5)));
+    assert_eq!(
+        history
+            .iter()
+            .filter(|h| h.received > 0 && h.spent == 0)
+            .count(),
+        2
+    );
+    assert!(miner.wallet.history().iter().any(|h| h.coinbase));
+
     // All value is accounted for: what the wallets hold is what was issued.
     let held: u64 = [&team, &miner, &alice, &bob]
         .iter()

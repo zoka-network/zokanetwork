@@ -33,6 +33,8 @@ pub struct WalletNote {
     pub txid: TxId,
     pub coinbase: bool,
     pub spent_in: Option<TxId>,
+    /// Altura del bloque que la gastó.
+    pub spent_height: Option<u32>,
     cmx: ExtractedNoteCommitment,
     /// `None` until the note is in the tree (a coinbase waits for maturity).
     witness: Option<IncrementalWitness<MerkleHashOrchard, TREE_DEPTH>>,
@@ -49,6 +51,25 @@ impl WalletNote {
 
     pub fn is_spendable(&self) -> bool {
         self.spent_in.is_none() && self.witness.is_some()
+    }
+}
+
+/// One transaction as the wallet saw it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub txid: TxId,
+    pub height: u32,
+    pub coinbase: bool,
+    /// Value of the wallet's notes this transaction created (payments and change).
+    pub received: u64,
+    /// Value of the wallet's notes this transaction spent.
+    pub spent: u64,
+}
+
+impl HistoryEntry {
+    /// Positive when the wallet gained; for a send, minus (amount + fee).
+    pub fn net(&self) -> i128 {
+        i128::from(self.received) - i128::from(self.spent)
     }
 }
 
@@ -103,6 +124,34 @@ impl QuanticWallet {
 
     pub fn notes(&self) -> &[WalletNote] {
         &self.notes
+    }
+
+    /// The wallet's transactions, newest first.
+    pub fn history(&self) -> Vec<HistoryEntry> {
+        let mut entries: HashMap<[u8; 32], HistoryEntry> = HashMap::new();
+        for note in &self.notes {
+            let created = entries.entry(note.txid.0).or_insert(HistoryEntry {
+                txid: note.txid,
+                height: note.height,
+                coinbase: note.coinbase,
+                received: 0,
+                spent: 0,
+            });
+            created.received += note.value();
+            if let (Some(txid), Some(height)) = (note.spent_in, note.spent_height) {
+                let spending = entries.entry(txid.0).or_insert(HistoryEntry {
+                    txid,
+                    height,
+                    coinbase: false,
+                    received: 0,
+                    spent: 0,
+                });
+                spending.spent += note.value();
+            }
+        }
+        let mut list: Vec<HistoryEntry> = entries.into_values().collect();
+        list.sort_by(|a, b| b.height.cmp(&a.height).then(a.txid.cmp(&b.txid)));
+        list
     }
 
     /// Value that can be spent now.
@@ -201,6 +250,7 @@ impl QuanticWallet {
                     .find(|n| n.spent_in.is_none() && n.nullifier.to_bytes() == nf.to_bytes())
                 {
                     note.spent_in = Some(txid);
+                    note.spent_height = Some(height);
                     summary.spent += note.value();
                 }
                 if let Some((note, scope, memo)) = found {
@@ -216,6 +266,7 @@ impl QuanticWallet {
                         txid,
                         coinbase: kind == TxKind::Coinbase,
                         spent_in: None,
+                        spent_height: None,
                         cmx,
                         witness: None,
                     });

@@ -7,10 +7,10 @@
 //! or read its notes. Nothing here is used by Zenith.
 #![forbid(unsafe_code)]
 
-/// The exact `orchard` this crate builds on, for dependents that need its types.
-pub use orchard;
 /// And the tree crate, for wallets that keep their own witnesses.
 pub use incrementalmerkletree;
+/// The exact `orchard` this crate builds on, for dependents that need its types.
+pub use orchard;
 
 pub mod address;
 pub mod builder;
