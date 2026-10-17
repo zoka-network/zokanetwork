@@ -133,12 +133,18 @@ fn data_request_response_config() -> request_response::Config {
 /// no le come la CPU al nodo (el respondedor corre en el bucle de la red).
 const QUANTIC_LIGHT_BUDGET_PER_MINUTE: u32 = 600;
 
-/// Lo que cuesta atender un pedido: info 1, un envío 5 (verificar la prueba)
-/// y los bloques compactos uno cada 10 bloques.
+/// Lo que cuesta atender un pedido: info 1, los bloques compactos uno cada 10
+/// bloques, y un envío 3 por acción (verificar su prueba lleva tiempo por
+/// acción, dentro del bucle de la red): uno de 2 acciones vale 6 y uno de 64,
+/// casi 200, así que un par no puede frenar el nodo con pruebas falsas grandes.
 fn quantic_light_cost(request: &QuanticLightRequest) -> u32 {
     match request {
         QuanticLightRequest::Info => 1,
-        QuanticLightRequest::SubmitTx { .. } => 5,
+        QuanticLightRequest::SubmitTx { tx_hex } => {
+            // Una acción ocupa unos 4.255 bytes del envío (8.510 en hex).
+            let actions = (tx_hex.len() / 8_510).max(2);
+            3u32.saturating_mul(actions as u32)
+        }
         QuanticLightRequest::Compact { from, to } => {
             let blocks = to
                 .saturating_sub(*from)
@@ -7315,6 +7321,11 @@ mod tests {
         use crate::network::quantic_light_request_response::QuanticLightRequest;
 
         assert_eq!(quantic_light_cost(&QuanticLightRequest::Info), 1);
+        // Un envío de 2 acciones (11.351 bytes) y uno de 64 (275.161).
+        let envio = |bytes: usize| QuanticLightRequest::SubmitTx { tx_hex: "ab".repeat(bytes) };
+        assert_eq!(quantic_light_cost(&envio(11_351)), 6);
+        assert_eq!(quantic_light_cost(&envio(275_161)), 3 * 64);
+        assert_eq!(quantic_light_cost(&QuanticLightRequest::SubmitTx { tx_hex: String::new() }), 6);
         assert_eq!(quantic_light_cost(&QuanticLightRequest::Compact { from: 1, to: 500 }), 50);
         assert_eq!(quantic_light_cost(&QuanticLightRequest::Compact { from: 1, to: u64::MAX }), 50);
         assert_eq!(quantic_light_cost(&QuanticLightRequest::Compact { from: 9, to: 1 }), 1);
