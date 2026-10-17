@@ -14881,7 +14881,7 @@ fn cmd_quantic_wallet(args: &[String]) -> Result<(), String> {
 
 #[cfg(feature = "quantic")]
 fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
-    const USAGE: &str = "usage: zoka quantic-wallet <new|restore|address|list|balance|history|send|import-regtest-team> --network quantic-regtest|quantic-testnet [--name <wallet>] [--password <p>] [--rpc <url>] [--json]";
+    const USAGE: &str = "usage: zoka quantic-wallet <new|restore|address|list|balance|history|send|import-regtest-team> --network quantic-regtest|quantic-testnet [--name <wallet>] [--password <p> | --password-env <VAR> | --password-stdin] [restore: --phrase-env <VAR> or the phrase on stdin] [--rpc <url>] [--json]";
     let Some((action, rest)) = args.split_first() else {
         return Err(USAGE.to_string());
     };
@@ -14930,9 +14930,15 @@ fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
         }
         "restore" => {
             let password = required_password_value(rest)?;
+            // Como en Zenith: la frase nunca tiene por qué ir como argumento del
+            // proceso (la ve cualquiera que liste los procesos). ZSilent la pasa
+            // por una variable de entorno; sin nada, se lee de stdin.
             let phrase = match option_value(rest, "--phrase") {
-                Some(phrase) => phrase,
-                None => stdin_secret("--phrase")?,
+                Some(phrase) => zeroize::Zeroizing::new(phrase),
+                None => match option_value(rest, "--phrase-env").or_else(|| option_value(rest, "--seed-env")) {
+                    Some(var_name) => zeroize::Zeroizing::new(secret_from_env_var(&var_name, "--phrase-env")?),
+                    None => zeroize::Zeroizing::new(stdin_secret("--phrase")?),
+                },
             };
             let address = zoka::quantic::wallet_file::restore(&dir, &name, quantic_network, &phrase, &password)?;
             if json {
