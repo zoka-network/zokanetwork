@@ -31,10 +31,17 @@ red cambió: todo es código en ramas, probado en local.
   `SectionOverlay.tsx` reescritos con lo implementado (Ironwood, X-Wing, sin
   ceremonia, comisiones públicas, checkpoints del equipo declarados). PDFs
   regenerados y revisados. **Sin publicar: lo revisa el usuario.**
-- **libp2p 0.53 → 0.57 (7.1):** rama `libp2p-057` en el worktree
-  `c:\tmp\zoka-libp2p`. Compila; faltaba al escribir esto el resultado de las
-  pruebas completas y la prueba de interoperabilidad con un binario 0.53
-  (`scratchpad/interop/interop.sh` de la sesión).
+- **libp2p 0.53 → 0.57.1 (7.1), hecho:** rama `libp2p-057` (encima de
+  `etapa5-quantic-nodo`; worktree `c:\tmp\zoka-libp2p`). `cargo audit` pasó de 16
+  vulnerabilidades a 0. Todas las pruebas en verde. Interoperabilidad probada en
+  una red Quantic regtest local: un nodo 0.53 y uno 0.57 se sincronizan en los dos
+  sentidos y un envío que entra por el 0.57 lo mina el 0.53.
+- **Arreglo que afecta a Zenith** (commit `53bdcfc5`): un nodo completo cuyo único
+  par es un teléfono dejaba de minar mientras le pedía bloques que el teléfono no
+  tiene (más de un minuto por vez). Ahora el teléfono contesta al toque y el nodo
+  no insiste. Lo encontró `examples/probar_motor_quantic`, que prueba el motor del
+  teléfono de punta a punta contra un nodo real (41 s); también encontró que la
+  prueba de Halo 2 desbordaba una pila de 1 MB (ahora corre en un hilo propio).
 
 **Para contarle al usuario (decisiones suyas):**
 
@@ -52,6 +59,8 @@ red cambió: todo es código en ramas, probado en local.
    dirección; crear la mitad ML-DSA de la clave de la autoridad
    (`zoka checkpoint-keygen --mldsa`).
 6. Pushear las ramas a GitHub y GitLab cuando lo apruebe.
+7. Una release de testnet con el arreglo del teléfono que frena al nodo y con
+   libp2p 0.57: binario nuevo en la PC y `.so` nuevo en ZKAPriv.
 
 **15/10: primera prueba real de `zkq1`** (el 25.630 se minó el 14/10 a las 23:25,
 sin errores).
