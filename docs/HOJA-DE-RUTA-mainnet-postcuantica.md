@@ -300,6 +300,18 @@ de punta a punta con pruebas Halo 2 reales. Diseño:
 [ETAPA5-diseno-quantic.md](ETAPA5-diseno-quantic.md). Falta: perfil Quantic en
 el nodo, motor del teléfono y ZSilent, medir en el teléfono, revisión externa.
 
+**16 y 17/10/2026, en el nodo** (rama `etapa5-quantic-nodo`): perfil Quantic
+(bloques, mempool, minería, P2P, API, `zoka quantic-wallet`) probado en una red
+local de tres nodos con reorganización ([perfil](ETAPA5-perfil-quantic-nodo.md));
+dificultad ASERT (7.2); protocolo P2P de wallets livianas
+`/zoka-quantic/light/1` (info, bloques compactos y envíos, probado entre nodos
+reales); estado guardable de la wallet en la biblioteca, y motor del teléfono
+(`src/mobile_quantic.rs` + `mobile_net`) probado sobre una cadena regtest real.
+Puente JNI en ZKAPriv, rama `quantic-motor` (feature `quantic`, sin tocar la
+interfaz). API del motor: [QUANTIC-MOTOR-MOVIL.md](QUANTIC-MOTOR-MOVIL.md).
+Falta: la interfaz de ZKAPriv y ZSilent (decisión del usuario), medir en el
+teléfono el escaneo con X-Wing, revisión externa.
+
 **Hallazgo del 2026-10-11, más grave que lo cuántico:** hoy **no hace falta una
 computadora cuántica** para saber qué nota gasta cada transacción. `PrivateTransaction`
 publica `input_commitments` ("Commitments of consumed notes") e `input_public_keys`
