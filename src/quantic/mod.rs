@@ -31,6 +31,9 @@ use crate::types::Block;
 
 pub use zoka_quantic as protocol;
 
+pub mod mempool;
+pub mod miner;
+
 /// El nodo numera desde 1 (la altura 0 es el génesis sintético de cada
 /// cadena), así que el génesis de Quantic, con el premine, es el bloque 1.
 pub const GENESIS_HEIGHT: u64 = 1;
@@ -283,6 +286,29 @@ fn ancestors<'a>(storage: &'a RocksDbStorage, parent: &Block) -> Ancestors<'a> {
         storage,
         next: (parent.header.block_height >= GENESIS_HEIGHT).then(|| parent.header.hash.clone()),
     }
+}
+
+/// Las raíces finales de los últimos `window` bloques de la rama que termina
+/// en `tip_hash` (incluido): las anclas válidas para el bloque que sigue.
+pub fn recent_roots_after(
+    storage: &RocksDbStorage,
+    tip_hash: &str,
+    window: usize,
+) -> Result<std::collections::HashSet<[u8; 32]>, QuanticBlockError> {
+    let mut roots = std::collections::HashSet::new();
+    let walk = Ancestors {
+        storage,
+        next: Some(tip_hash.to_string()),
+    };
+    for ancestor in walk.take(window) {
+        let (_, meta) = ancestor?;
+        let root: [u8; 32] = hex::decode(&meta.tree_root)
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| QuanticBlockError::Storage("corrupt tree root".into()))?;
+        roots.insert(root);
+    }
+    Ok(roots)
 }
 
 /// Lo que un bloque necesita de su rama: las raíces finales de los bloques
@@ -653,5 +679,99 @@ mod tests {
         let mut zenith_field = honest.clone();
         zenith_field.private_tx_hashes = vec!["ab".repeat(32)];
         assert!(validate_shape(&zenith_field).is_err());
+    }
+
+    #[test]
+    fn the_mempool_admits_only_what_the_next_block_would_accept_and_the_miner_uses_it() {
+        use std::sync::atomic::AtomicBool;
+        use zoka_quantic::builder::{build_transfer, SpendInput};
+
+        let (storage, _dir) = storage();
+        let params = consensus_params(Network::Regtest);
+        let team_sk = QuanticSpendingKey::from_root(&REGTEST_TEAM_ROOT, Network::Regtest, 0).unwrap();
+        let miner = QuanticSpendingKey::from_root(&[4; 32], Network::Regtest, 0)
+            .unwrap()
+            .full_viewing_key()
+            .address();
+        let alice = QuanticSpendingKey::from_root(&[3; 32], Network::Regtest, 0)
+            .unwrap()
+            .full_viewing_key()
+            .address();
+        let mut team = QuanticWallet::new(team_sk.full_viewing_key(), &params);
+        let mut pool = mempool::QuanticMempool::new();
+
+        // Antes del génesis no hay anclas: no entra nada.
+        let early = || {
+            build_coinbase(Network::Regtest, 9, &alice, 1, false, proving_key(), &mut zoka_quantic::os_rng()).unwrap()
+        };
+        assert!(pool.insert(&storage, CHAIN, early(), 1).is_err(), "a coinbase is never a transfer");
+
+        // El minero arma el génesis aunque le pidan pagarse a sí mismo: paga el premine.
+        let (mut genesis, _) = miner::build_template(&storage, CHAIN, &miner, proving_key(), vec![], 1_800_000_001).unwrap();
+        let stop = AtomicBool::new(false);
+        assert!(matches!(
+            miner::solve_pow_parallel(CHAIN, &mut genesis, BITS, 2, std::time::Duration::from_secs(60), &stop).unwrap(),
+            miner::PowOutcome::Solved
+        ));
+        apply_block_with_expected_difficulty(&storage, CHAIN, &genesis, BITS).expect("genesis from the miner");
+        team.scan_block(&decode_block(&genesis).unwrap());
+        assert_eq!(team.balance(), PREMINE_ATOMS);
+
+        // Una transferencia válida entra una sola vez.
+        let tx = team
+            .create_transfer(&team_sk, vec![Payment::new(alice.clone(), 5 * ZKA)], 0, proving_key(), &mut zoka_quantic::os_rng())
+            .unwrap();
+        let txid = pool.insert(&storage, CHAIN, tx.clone(), 2).expect("admitted");
+        assert_eq!(txid, tx.txid());
+        assert_eq!(pool.insert(&storage, CHAIN, tx.clone(), 3), Err(mempool::MempoolError::AlreadyKnown));
+
+        // Otra que gasta la misma nota choca; una sin la comisión convencional no se retransmite.
+        let twin = team
+            .create_transfer(&team_sk, vec![Payment::new(alice.clone(), 7 * ZKA)], 0, proving_key(), &mut zoka_quantic::os_rng())
+            .unwrap();
+        assert_eq!(pool.insert(&storage, CHAIN, twin, 4), Err(mempool::MempoolError::Conflict));
+        let note = team.notes().iter().find(|n| n.is_spendable()).unwrap().clone();
+        let path = {
+            // El testigo de la única nota del equipo: el árbol tiene una sola hoja.
+            let mut tree = NoteCommitmentTree::empty();
+            tree.append(MerkleHashOrchard::from_cmx(&note.commitment())).unwrap();
+            let witness = zoka_quantic::incrementalmerkletree::witness::IncrementalWitness::from_tree(tree).unwrap();
+            zoka_quantic::orchard::tree::MerklePath::from(witness.path().unwrap())
+        };
+        let cheap = build_transfer(
+            &team_sk,
+            vec![SpendInput { note: note.note, merkle_path: path }],
+            vec![Payment::new(alice.clone(), ZKA)],
+            1,
+            team.anchor(),
+            0,
+            proving_key(),
+            &mut zoka_quantic::os_rng(),
+        )
+        .unwrap();
+        assert!(matches!(pool.insert(&storage, CHAIN, cheap, 5), Err(mempool::MempoolError::FeeTooLow { .. })));
+
+        // El minero la incluye y el bloque vale.
+        let selected = pool.select(512);
+        assert_eq!(selected.len(), 1);
+        let (mut block, validated) =
+            miner::build_template(&storage, CHAIN, &miner, proving_key(), selected, 1_800_000_002).unwrap();
+        assert_eq!(validated.fees, tx.fee().unwrap());
+        miner::solve_pow_parallel(CHAIN, &mut block, BITS, 2, std::time::Duration::from_secs(60), &stop).unwrap();
+        apply_block_with_expected_difficulty(&storage, CHAIN, &block, BITS).expect("block with the mempool tx");
+
+        // Ya en la cadena: sale del mempool y no vuelve a entrar.
+        assert_eq!(pool.revalidate(&storage, CHAIN), 1);
+        assert!(pool.is_empty());
+        assert_eq!(pool.insert(&storage, CHAIN, tx, 6), Err(mempool::MempoolError::Spent));
+
+        // Con una nota del mempool ya gastada en otro bloque, el minero arma el bloque sin ella.
+        let template = miner::build_template(&storage, CHAIN, &miner, proving_key(), vec![block_tx(&block)], 1_800_000_003);
+        let (empty, _) = template.expect("falls back to a block without transfers");
+        assert_eq!(empty.quantic_transactions.len(), 1, "only the coinbase");
+    }
+
+    fn block_tx(block: &Block) -> QuanticTransaction {
+        decode_block(block).unwrap().transactions.remove(0)
     }
 }

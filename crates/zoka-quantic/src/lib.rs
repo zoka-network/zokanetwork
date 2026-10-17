@@ -9,6 +9,8 @@
 
 /// The exact `orchard` this crate builds on, for dependents that need its types.
 pub use orchard;
+/// And the tree crate, for wallets that keep their own witnesses.
+pub use incrementalmerkletree;
 
 pub mod address;
 pub mod builder;
