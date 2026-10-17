@@ -1,9 +1,57 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
-Actualizada: **14 de octubre de 2026**, Argentina (Claude).
+Actualizada: **17 de octubre de 2026**, Argentina (Claude).
 Proyecto: `C:\Users\mderramus\ZOKA`.
 
 ## Punto de partida
+
+**16 y 17/10: desarrollo post-cuántico en modo autónomo** (pedido del usuario:
+"enfocate en el desarrollo post quantic"; "continúa ... cuando no sepas qué hacer
+seguí el roadmap"). **Nada está pusheado ni publicado ni instalado.** Ninguna
+red cambió: todo es código en ramas, probado en local.
+
+- **Nodo, rama `etapa5-quantic-nodo`** (apilada sobre `etapa6-firmas-hibridas` y
+  `etapa5-ironwood`): perfil Zoka Quantic completo detrás de la feature `quantic`
+  (bloques, mempool, minería, P2P, API `/quantic/*`, `zoka quantic-wallet`),
+  probado en una red local de tres nodos con reorganización
+  ([perfil](docs/ETAPA5-perfil-quantic-nodo.md)); dificultad ASERT con trabajo
+  real (7.2, [doc](docs/ETAPA7-dificultad-quantic.md)); protocolo P2P de wallets
+  livianas `/zoka-quantic/light/1` con presupuesto por par; estado guardable de la
+  wallet (biblioteca); motor del teléfono `src/mobile_quantic.rs` con red Quantic
+  en `mobile_net` ([API](docs/QUANTIC-MOTOR-MOVIL.md)); especificación en inglés
+  para la revisión externa ([7.7](docs/REVIEW-zoka-quantic.md)).
+  Pruebas: `cargo test` (921+85+2) y `cargo test --features quantic`
+  (962+86+2+3) en verde con la ASERT; después, las de red y de Quantic de cada
+  cambio. La biblioteca: 34 unitarias y 7 de punta a punta con Halo 2 real.
+- **ZKAPriv, rama `quantic-motor`:** puente JNI del motor (`native/src/quantic.rs`,
+  feature `quantic`), compila para ARMv7. No toca Kotlin. Los `.so` de `jniLibs`
+  modificados sin commitear **no son de este trabajo** (venían de antes): no
+  pisarlos.
+- **Web, rama `whitepaper-ironwood` de `zokaweb`:** whitepaper y litepaper 2.0 y
+  `SectionOverlay.tsx` reescritos con lo implementado (Ironwood, X-Wing, sin
+  ceremonia, comisiones públicas, checkpoints del equipo declarados). PDFs
+  regenerados y revisados. **Sin publicar: lo revisa el usuario.**
+- **libp2p 0.53 → 0.57 (7.1):** rama `libp2p-057` en el worktree
+  `c:\tmp\zoka-libp2p`. Compila; faltaba al escribir esto el resultado de las
+  pruebas completas y la prueba de interoperabilidad con un binario 0.53
+  (`scratchpad/interop/interop.sh` de la sesión).
+
+**Para contarle al usuario (decisiones suyas):**
+
+1. Zenith tiene dos debilidades de consenso que Quantic no hereda: su prueba de
+   trabajo no cubre el cuerpo del bloque, y elige la cadena por la suma de los
+   bits y no por el trabajo. Los checkpoints de la PC las mitigan. ¿Se corrigen
+   con un fork o queda como testnet protegida?
+2. Revisar y aprobar la web (`whitepaper-ironwood`) antes de publicarla; declara
+   los checkpoints del equipo y que las comisiones son públicas.
+3. Prefijos de dirección (`zq1`, `zqtest1`, `zqregtest1`), tamaño del memo (512)
+   y comisión (0,0001 ZKA por acción).
+4. Interfaz de Quantic en ZKAPriv y ZSilent (el motor está; las pantallas no).
+5. Pasos suyos para abrir la testnet de Quantic: crear la wallet del equipo
+   (`zoka quantic-wallet new --network quantic-testnet --name equipo`) y pasar la
+   dirección; crear la mitad ML-DSA de la clave de la autoridad
+   (`zoka checkpoint-keygen --mldsa`).
+6. Pushear las ramas a GitHub y GitLab cuando lo apruebe.
 
 **15/10: primera prueba real de `zkq1`** (el 25.630 se minó el 14/10 a las 23:25,
 sin errores).
