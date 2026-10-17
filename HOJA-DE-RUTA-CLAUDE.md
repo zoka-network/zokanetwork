@@ -48,7 +48,8 @@ red cambió: todo es código en ramas, probado en local.
 1. Zenith tiene dos debilidades de consenso que Quantic no hereda: su prueba de
    trabajo no cubre el cuerpo del bloque, y elige la cadena por la suma de los
    bits y no por el trabajo. Los checkpoints de la PC las mitigan. ¿Se corrigen
-   con un fork o queda como testnet protegida?
+   con un fork o queda como testnet protegida? Opciones y recomendación en
+   [ZENITH-debilidades-consenso.md](docs/ZENITH-debilidades-consenso.md).
 2. Revisar y aprobar la web (`whitepaper-ironwood`) antes de publicarla; declara
    los checkpoints del equipo y que las comisiones son públicas.
 3. Prefijos de dirección (`zq1`, `zqtest1`, `zqregtest1`), tamaño del memo (512)
