@@ -7800,6 +7800,7 @@ dependencies = [
  "iroh",
  "libp2p",
  "merlin",
+ "num-bigint 0.4.6",
  "pasta_curves 0.5.1",
  "proptest",
  "rand 0.8.8",

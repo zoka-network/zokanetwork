@@ -351,6 +351,11 @@ Después del génesis cualquier cambio de estos exige un fork.
     lru 0.12, core2, instant).
 7.2 Emisión: los bloques salen demasiado rápido (dificultad trabada en el piso,
     ~2 bloques por minuto). Fijar tiempo de bloque y dificultad inicial.
+    **16/10/2026, hecho para Quantic:** objetivo de 256 bits con ASERT (τ = 1 h),
+    trabajo real para elegir la cadena, reglas de hora y 120 s por bloque. La
+    revisión encontró que Zenith elige la cadena por la suma de bits (no por el
+    trabajo) y que su prueba de trabajo no cubre el cuerpo del bloque: ver
+    [ETAPA7-dificultad-quantic.md](ETAPA7-dificultad-quantic.md).
 7.3 Premine en el génesis: 5.000.000 ZKA a una dirección del equipo, contado dentro
     del suministro emitido para que `block_reward_for_height` corte la minería en
     18.000.000. Monto y dirección públicos en el génesis, para que cualquiera lo

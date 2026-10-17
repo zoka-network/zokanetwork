@@ -32,6 +32,7 @@ use crate::types::Block;
 pub use zoka_quantic as protocol;
 
 pub mod api;
+pub mod difficulty;
 pub mod mempool;
 pub mod miner;
 pub mod runtime;
@@ -65,6 +66,10 @@ pub enum QuanticBlockError {
     StateRoot,
     #[error("this is not the genesis block of the network")]
     NotTheGenesis,
+    #[error("block time {time} is not after the median {median} of the previous blocks")]
+    TimeTooOld { time: u64, median: u64 },
+    #[error("block time {time} is more than two hours ahead of this node's clock")]
+    TimeTooNew { time: u64 },
     #[error("missing Quantic state of ancestor {0}")]
     MissingAncestor(String),
     #[error("Quantic storage: {0}")]
@@ -185,6 +190,8 @@ impl QuanticRoots {
 struct QuanticBlockMeta {
     height: u64,
     prev_hash: String,
+    #[serde(default)]
+    timestamp: u64,
     tree_root: String,
     coinbase_commitments: Vec<String>,
 }
@@ -423,6 +430,76 @@ pub fn import_embedded_genesis(storage: &RocksDbStorage, chain_id: &str) -> Resu
     Ok(true)
 }
 
+/// Bloques cuya mediana de hora tiene que superar la de uno nuevo.
+pub const MEDIAN_TIME_SPAN: usize = 11;
+/// Cuánto adelante del reloj propio admite un nodo la hora de un bloque.
+pub const MAX_FUTURE_SECS: u64 = 2 * 60 * 60;
+
+/// La mediana de la hora de los últimos [`MEDIAN_TIME_SPAN`] bloques de la
+/// rama que termina en `parent` (incluido). 0 antes del génesis.
+pub fn median_time_past(storage: &RocksDbStorage, parent: &Block) -> Result<u64, QuanticBlockError> {
+    let mut times = Vec::with_capacity(MEDIAN_TIME_SPAN);
+    for ancestor in ancestors(storage, parent).take(MEDIAN_TIME_SPAN) {
+        times.push(ancestor?.1.timestamp);
+    }
+    if times.is_empty() {
+        return Ok(0);
+    }
+    times.sort_unstable();
+    Ok(times[times.len() / 2])
+}
+
+/// El objetivo de prueba de trabajo del hijo de `parent` (ver `difficulty`):
+/// fijo en regtest, el inicial para el génesis y ASERT anclado en el génesis
+/// después.
+pub fn target_for_child(
+    storage: &RocksDbStorage,
+    chain_id: &str,
+    parent: &Block,
+) -> Result<num_bigint::BigUint, QuanticBlockError> {
+    let network = network_for_chain(chain_id).ok_or_else(|| QuanticBlockError::NotQuantic(chain_id.to_string()))?;
+    if network == Network::Regtest {
+        return Ok(difficulty::target_for_bits(crate::economics::QUANTIC_REGTEST_DIFFICULTY_BITS));
+    }
+    let initial = difficulty::target_for_bits(difficulty::TESTNET_INITIAL_DIFFICULTY_BITS);
+    if parent.header.block_height < GENESIS_HEIGHT {
+        return Ok(initial);
+    }
+    // El génesis de la rama: el ancestro de altura 1 (en las redes públicas es
+    // uno solo, fijo en el binario).
+    let mut genesis = None;
+    for ancestor in ancestors(storage, parent) {
+        let (_, meta) = ancestor?;
+        if meta.height == GENESIS_HEIGHT {
+            genesis = Some(meta);
+        }
+    }
+    let genesis = genesis.ok_or_else(|| QuanticBlockError::MissingAncestor("genesis".to_string()))?;
+    let time_delta = parent.header.timestamp as i64 - genesis.timestamp as i64;
+    let height_delta = (parent.header.block_height - GENESIS_HEIGHT) as i64;
+    Ok(difficulty::asert_target(&initial, time_delta, height_delta))
+}
+
+/// Lo mismo, en el formato compacto en que el nodo guarda la dificultad.
+pub fn compact_target_for_child(storage: &RocksDbStorage, chain_id: &str, parent: &Block) -> Result<u32, QuanticBlockError> {
+    target_for_child(storage, chain_id, parent).map(|target| difficulty::to_compact(&target))
+}
+
+/// El objetivo del próximo bloque sobre la punta canónica.
+pub fn compact_target_for_tip(storage: &RocksDbStorage, chain_id: &str) -> Result<u32, QuanticBlockError> {
+    let tip = storage.get_chain_height().map_err(storage_error)?;
+    let parent = if tip == 0 {
+        crate::state::chain::genesis_parent_for(chain_id)
+    } else {
+        let hash = storage.get_last_block_hash().map_err(storage_error)?;
+        storage
+            .get_block(&hash)
+            .map_err(storage_error)?
+            .ok_or_else(|| QuanticBlockError::MissingAncestor(hash.clone()))?
+    };
+    compact_target_for_child(storage, chain_id, &parent)
+}
+
 fn params_for(chain_id: &str) -> Result<ConsensusParams, QuanticBlockError> {
     network_for_chain(chain_id)
         .map(consensus_params)
@@ -459,6 +536,20 @@ fn validate_block_with(
 ) -> Result<ValidatedBlock, QuanticBlockError> {
     let params = params.clone();
     validate_shape(candidate)?;
+    // La hora: después de la mediana de los últimos bloques de la rama, y no
+    // más de dos horas adelante del reloj propio.
+    let median = median_time_past(storage, parent)?;
+    if candidate.header.timestamp <= median {
+        return Err(QuanticBlockError::TimeTooOld {
+            time: candidate.header.timestamp,
+            median,
+        });
+    }
+    if candidate.header.timestamp > now_secs().saturating_add(MAX_FUTURE_SECS) {
+        return Err(QuanticBlockError::TimeTooNew {
+            time: candidate.header.timestamp,
+        });
+    }
     let block = decode_block(candidate)?;
     if u64::from(block.height) < GENESIS_HEIGHT {
         return Err(QuanticBlockError::Height(candidate.header.block_height));
@@ -510,6 +601,7 @@ pub fn store_block_state(
     let meta = QuanticBlockMeta {
         height: candidate.header.block_height,
         prev_hash: candidate.header.prev_hash.clone(),
+        timestamp: candidate.header.timestamp,
         tree_root: hex::encode(validated.roots.tree_root),
         coinbase_commitments: validated
             .coinbase_commitments
@@ -538,7 +630,8 @@ pub fn tree_root_after(
 /// Busca el nonce de un bloque armado con [`assemble_block`], con un solo hilo
 /// (las pruebas y la red local; el minero del nodo reparte la búsqueda). La
 /// entrada compromete el cuerpo, así que el hash del bloque se recalcula.
-pub fn solve_pow(chain_id: &str, block: &mut Block, difficulty_bits: u32) -> Result<(), String> {
+pub fn solve_pow(chain_id: &str, block: &mut Block, compact_target: u32) -> Result<(), String> {
+    let target = difficulty::from_compact(compact_target);
     let engine = crate::mining::pow::engine_for(chain_id, block.header.block_height)
         .map_err(|e| e.to_string())?;
     let mut nonce = 0u64;
@@ -553,7 +646,7 @@ pub fn solve_pow(chain_id: &str, block: &mut Block, difficulty_bits: u32) -> Res
             nonce,
         );
         let hash = engine.calculate_hash(&preimage).map_err(|e| e.to_string())?;
-        if crate::mining::pow::hash_meets_difficulty(&hash, difficulty_bits) {
+        if difficulty::hash_meets_target(&hash, &target) {
             block.header.nonce = nonce;
             block.header.seal = crate::types::Signature(hash);
             block.header.hash = block.compute_hash();
@@ -654,7 +747,8 @@ pub fn build_genesis(
     let storage = RocksDbStorage::new(dir.to_str().ok_or("temp path")?).map_err(|e| format!("{e:?}"))?;
     let parent = crate::state::chain::genesis_parent_for(chain_id);
     let (mut block, _) = assemble_block_with(&storage, &params, &parent, &coinbase, &[], timestamp).map_err(|e| e.to_string())?;
-    solve_pow(chain_id, &mut block, crate::economics::POW_INITIAL_DIFFICULTY_BITS)?;
+    let initial = difficulty::to_compact(&difficulty::target_for_bits(difficulty::TESTNET_INITIAL_DIFFICULTY_BITS));
+    solve_pow(chain_id, &mut block, initial)?;
     drop(storage);
     let _ = std::fs::remove_dir_all(&dir);
     Ok(block)
@@ -664,6 +758,13 @@ fn tempfile_dir() -> Result<std::path::PathBuf, String> {
     let dir = std::env::temp_dir().join(format!("zoka-quantic-genesis-{}-{}", std::process::id(), now_nanos()));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir)
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn now_nanos() -> u128 {
@@ -684,8 +785,10 @@ mod tests {
     use zoka_quantic::QuanticSpendingKey;
 
     const CHAIN: &str = crate::economics::QUANTIC_REGTEST_CHAIN_ID;
-    /// Dificultad mínima: la prueba de trabajo de regtest es la liviana.
-    const BITS: u32 = 1;
+    /// El objetivo fijo de regtest, en el formato compacto que guarda el nodo.
+    fn bits() -> u32 {
+        difficulty::to_compact(&difficulty::target_for_bits(crate::economics::QUANTIC_REGTEST_DIFFICULTY_BITS))
+    }
     const ZKA: u64 = ATOMS_PER_ZKA;
 
     fn proving_key() -> &'static ProvingKey {
@@ -706,9 +809,9 @@ mod tests {
         transactions: &[QuanticTransaction],
     ) -> Block {
         let (mut block, _) =
-            assemble_block(storage, CHAIN, parent, coinbase, transactions, 1_800_000_000 + parent.header.block_height)
+            assemble_block(storage, CHAIN, parent, coinbase, transactions, now_secs() - 100_000 + parent.header.block_height * 10)
                 .expect("assembles");
-        solve_pow(CHAIN, &mut block, BITS).unwrap();
+        solve_pow(CHAIN, &mut block, bits()).unwrap();
         block
     }
 
@@ -759,7 +862,7 @@ mod tests {
         let genesis_parent = genesis_parent_for(CHAIN);
         let b1 = mined(&storage, &genesis_parent, &coinbase(1, &team.fvk().address(), PREMINE_ATOMS, true), &[]);
         assert!(b1.transactions.is_empty() && b1.private_coinbase.is_none());
-        apply_block_with_expected_difficulty(&storage, CHAIN, &b1, BITS).expect("genesis");
+        apply_block_with_expected_difficulty(&storage, CHAIN, &b1, bits()).expect("genesis");
         for wallet in [&mut team, &mut alice] {
             wallet.scan_block(&decode_block(&b1).unwrap());
         }
@@ -772,7 +875,7 @@ mod tests {
             .unwrap();
         let fee = tx.fee().unwrap();
         let b2 = mined(&storage, &b1, &coinbase(2, &miner, params.minted_at(2) + fee, false), std::slice::from_ref(&tx));
-        let head = apply_block_with_expected_difficulty(&storage, CHAIN, &b2, BITS).expect("block 2");
+        let head = apply_block_with_expected_difficulty(&storage, CHAIN, &b2, bits()).expect("block 2");
         assert_eq!(head.height, 2);
         assert_eq!(head.total_supply_emitted, PREMINE_ATOMS + 12 * ZKA, "fees are not emission");
         for wallet in [&mut team, &mut alice] {
@@ -784,7 +887,7 @@ mod tests {
         // Repetir el envío: el índice de nullifiers de siempre lo rechaza.
         let replay = mined(&storage, &b2, &coinbase(3, &miner, params.minted_at(3) + fee, false), std::slice::from_ref(&tx));
         assert!(matches!(
-            apply_block_with_expected_difficulty(&storage, CHAIN, &replay, BITS),
+            apply_block_with_expected_difficulty(&storage, CHAIN, &replay, bits()),
             Err(ChainError::PrivateNullifierDoubleSpend { .. })
         ));
 
@@ -792,9 +895,9 @@ mod tests {
         let mut forged = mined(&storage, &b2, &coinbase(3, &miner, params.minted_at(3), false), &[]);
         forged.header.state_root = QuanticRoots { txid_root: [9; 32], auth_root: [9; 32], tree_root: [9; 32] }.to_state_root();
         forged.header.merkle_root = forged.compute_merkle_root();
-        solve_pow(CHAIN, &mut forged, BITS).unwrap();
+        solve_pow(CHAIN, &mut forged, bits()).unwrap();
         assert!(matches!(
-            apply_block_with_expected_difficulty(&storage, CHAIN, &forged, BITS),
+            apply_block_with_expected_difficulty(&storage, CHAIN, &forged, bits()),
             Err(ChainError::InvalidQuanticBlock(_))
         ));
 
@@ -808,8 +911,8 @@ mod tests {
         };
         swapped.header.merkle_root = swapped.compute_merkle_root();
         swapped.header.hash = swapped.compute_hash();
-        assert!(apply_block_with_expected_difficulty(&storage, CHAIN, &swapped, BITS).is_err());
-        apply_block_with_expected_difficulty(&storage, CHAIN, &honest, BITS).expect("the honest block 3");
+        assert!(apply_block_with_expected_difficulty(&storage, CHAIN, &swapped, bits()).is_err());
+        apply_block_with_expected_difficulty(&storage, CHAIN, &honest, bits()).expect("the honest block 3");
 
         // Un bloque con algo de Zenith no es un bloque de Quantic.
         let mut zenith_field = honest.clone();
@@ -843,13 +946,13 @@ mod tests {
         assert!(pool.insert(&storage, CHAIN, early(), 1).is_err(), "a coinbase is never a transfer");
 
         // El minero arma el génesis aunque le pidan pagarse a sí mismo: paga el premine.
-        let (mut genesis, _) = miner::build_template(&storage, CHAIN, &miner, proving_key(), vec![], 1_800_000_001).unwrap();
+        let (mut genesis, _) = miner::build_template(&storage, CHAIN, &miner, proving_key(), vec![], now_secs()).unwrap();
         let stop = AtomicBool::new(false);
         assert!(matches!(
-            miner::solve_pow_parallel(CHAIN, &mut genesis, BITS, 2, std::time::Duration::from_secs(60), &stop).unwrap(),
+            miner::solve_pow_parallel(CHAIN, &mut genesis, bits(), 2, std::time::Duration::from_secs(60), &stop).unwrap(),
             miner::PowOutcome::Solved
         ));
-        apply_block_with_expected_difficulty(&storage, CHAIN, &genesis, BITS).expect("genesis from the miner");
+        apply_block_with_expected_difficulty(&storage, CHAIN, &genesis, bits()).expect("genesis from the miner");
         team.scan_block(&decode_block(&genesis).unwrap());
         assert_eq!(team.balance(), PREMINE_ATOMS);
 
@@ -891,10 +994,10 @@ mod tests {
         let selected = pool.select(512);
         assert_eq!(selected.len(), 1);
         let (mut block, validated) =
-            miner::build_template(&storage, CHAIN, &miner, proving_key(), selected, 1_800_000_002).unwrap();
+            miner::build_template(&storage, CHAIN, &miner, proving_key(), selected, now_secs() + 1).unwrap();
         assert_eq!(validated.fees, tx.fee().unwrap());
-        miner::solve_pow_parallel(CHAIN, &mut block, BITS, 2, std::time::Duration::from_secs(60), &stop).unwrap();
-        apply_block_with_expected_difficulty(&storage, CHAIN, &block, BITS).expect("block with the mempool tx");
+        miner::solve_pow_parallel(CHAIN, &mut block, bits(), 2, std::time::Duration::from_secs(60), &stop).unwrap();
+        apply_block_with_expected_difficulty(&storage, CHAIN, &block, bits()).expect("block with the mempool tx");
 
         // Ya en la cadena: sale del mempool y no vuelve a entrar.
         assert_eq!(pool.revalidate(&storage, CHAIN), 1);
@@ -902,7 +1005,7 @@ mod tests {
         assert_eq!(pool.insert(&storage, CHAIN, tx, 6), Err(mempool::MempoolError::Spent));
 
         // Con una nota del mempool ya gastada en otro bloque, el minero arma el bloque sin ella.
-        let template = miner::build_template(&storage, CHAIN, &miner, proving_key(), vec![block_tx(&block)], 1_800_000_003);
+        let template = miner::build_template(&storage, CHAIN, &miner, proving_key(), vec![block_tx(&block)], now_secs() + 2);
         let (empty, _) = template.expect("falls back to a block without transfers");
         assert_eq!(empty.quantic_transactions.len(), 1, "only the coinbase");
     }
@@ -937,14 +1040,14 @@ mod tests {
         let mut team = QuanticWallet::new(team_sk.full_viewing_key(), &params);
         let genesis_parent = genesis_parent_for(CHAIN);
         let b1 = mined(&storage, &genesis_parent, &coinbase(1, &team.fvk().address(), PREMINE_ATOMS, true), &[]);
-        apply_block_with_expected_difficulty(&storage, CHAIN, &b1, BITS).unwrap();
+        apply_block_with_expected_difficulty(&storage, CHAIN, &b1, bits()).unwrap();
         team.scan_block(&decode_block(&b1).unwrap());
         let tx = team
             .create_transfer(&team_sk, vec![Payment::new(alice_sk.full_viewing_key().address(), 3 * ZKA)], 0, proving_key(), &mut zoka_quantic::os_rng())
             .unwrap();
         let fee = tx.fee().unwrap();
         let b2 = mined(&storage, &b1, &coinbase(2, &miner, params.minted_at(2) + fee, false), &[tx]);
-        apply_block_with_expected_difficulty(&storage, CHAIN, &b2, BITS).unwrap();
+        apply_block_with_expected_difficulty(&storage, CHAIN, &b2, bits()).unwrap();
 
         // Alice, sincronizada solo con bloques compactos, ve sus 3 ZKA y puede gastarlos.
         let honest = |from: u64, to: u64| Ok((from..=to).map(|h| compact_json(&storage, h)).collect());
@@ -997,24 +1100,24 @@ mod tests {
         let mut team = QuanticWallet::new(team_sk.full_viewing_key(), &params);
 
         let b1 = mined(&storage, &genesis_parent_for(CHAIN), &coinbase(1, &team.fvk().address(), PREMINE_ATOMS, true), &[]);
-        apply_block_with_expected_difficulty(&storage, CHAIN, &b1, BITS).unwrap();
+        apply_block_with_expected_difficulty(&storage, CHAIN, &b1, bits()).unwrap();
         team.scan_block(&decode_block(&b1).unwrap());
         let tx = team
             .create_transfer(&team_sk, vec![Payment::new(alice, 2 * ZKA)], 0, proving_key(), &mut zoka_quantic::os_rng())
             .unwrap();
         let fee = tx.fee().unwrap();
         let b2 = mined(&storage, &b1, &coinbase(2, &miner, params.minted_at(2) + fee, false), std::slice::from_ref(&tx));
-        apply_block_with_expected_difficulty(&storage, CHAIN, &b2, BITS).unwrap();
+        apply_block_with_expected_difficulty(&storage, CHAIN, &b2, bits()).unwrap();
         assert!(runtime::orphaned_transfers(&storage, &b2.header.hash).is_empty(), "b2 is canonical");
 
         // Otra rama desde b1, sin la transferencia y con más trabajo.
         let mut parent = b1.clone();
-        for round in 0..8u64 {
+        for round in 0..12u64 {
             let height = parent.header.block_height + 1;
             let cb = coinbase(height, &other_miner, params.minted_at(height as u32), false);
-            let (mut side, _) = assemble_block(&storage, CHAIN, &parent, &cb, &[], 1_900_000_000 + round).unwrap();
-            solve_pow(CHAIN, &mut side, 8).unwrap();
-            let _ = apply_block_with_expected_difficulty(&storage, CHAIN, &side, BITS);
+            let (mut side, _) = assemble_block(&storage, CHAIN, &parent, &cb, &[], now_secs() - 50_000 + round * 10).unwrap();
+            solve_pow(CHAIN, &mut side, bits()).unwrap();
+            let _ = apply_block_with_expected_difficulty(&storage, CHAIN, &side, bits());
             if storage.get_last_block_hash().unwrap() == side.header.hash {
                 break;
             }
@@ -1028,5 +1131,29 @@ mod tests {
         let mut pool = mempool::QuanticMempool::new();
         pool.insert(&storage, CHAIN, orphaned[0].clone(), 1)
             .expect("the note is unspent again and its anchor is still in the window");
+    }
+
+    #[test]
+    fn a_block_needs_a_time_after_the_median_and_not_far_in_the_future() {
+        let (storage, _dir) = storage();
+        let team = QuanticSpendingKey::from_root(&REGTEST_TEAM_ROOT, Network::Regtest, 0).unwrap();
+        let miner = QuanticSpendingKey::from_root(&[4; 32], Network::Regtest, 0).unwrap().full_viewing_key().address();
+        let params = consensus_params(Network::Regtest);
+        let b1 = mined(&storage, &genesis_parent_for(CHAIN), &coinbase(1, &team.full_viewing_key().address(), PREMINE_ATOMS, true), &[]);
+        apply_block_with_expected_difficulty(&storage, CHAIN, &b1, bits()).unwrap();
+        let cb = coinbase(2, &miner, params.minted_at(2), false);
+        // La misma hora que el génesis (la mediana de un solo bloque): no.
+        assert!(matches!(
+            assemble_block(&storage, CHAIN, &b1, &cb, &[], b1.header.timestamp),
+            Err(QuanticBlockError::TimeTooOld { .. })
+        ));
+        // Tres horas adelante del reloj: no.
+        assert!(matches!(
+            assemble_block(&storage, CHAIN, &b1, &cb, &[], now_secs() + 3 * 3600),
+            Err(QuanticBlockError::TimeTooNew { .. })
+        ));
+        // Un segundo después de la mediana: sí.
+        assert!(assemble_block(&storage, CHAIN, &b1, &cb, &[], b1.header.timestamp + 1).is_ok());
+        assert_eq!(median_time_past(&storage, &b1).unwrap(), b1.header.timestamp);
     }
 }

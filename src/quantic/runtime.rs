@@ -286,8 +286,13 @@ fn mine_once(
 ) -> Result<Option<Block>, String> {
     let timestamp = now_secs();
     let (mut block, _) = miner::build_template(storage, chain_id, &config.address, proving_key(), transactions, timestamp)?;
-    // La misma regla con la que el nodo acepta el bloque.
-    let difficulty = crate::mining::difficulty::expected_for_next_block_for_chain(storage, chain_id)?;
+    // La misma regla con la que el nodo acepta el bloque: el objetivo del hijo
+    // del padre de la plantilla.
+    let parent = storage
+        .get_block(&block.header.prev_hash)
+        .map_err(|e| format!("{e:?}"))?
+        .unwrap_or_else(|| crate::state::chain::genesis_parent_for(chain_id));
+    let difficulty = super::compact_target_for_child(storage, chain_id, &parent).map_err(|e| e.to_string())?;
     match miner::solve_pow_parallel(chain_id, &mut block, difficulty, config.threads, TEMPLATE_LIFETIME, stop)? {
         miner::PowOutcome::Solved => Ok(Some(block)),
         miner::PowOutcome::Interrupted => Ok(None),

@@ -54,7 +54,7 @@ pq-experimental = ["dep:zoka-pq"]
 # Ironwood (crate orchard) y el cifrado de notas X-Wing (crates/zoka-quantic).
 # Arrastra orchard y Halo 2. Implica pq-experimental (firmas hibridas de la
 # etapa 6, que Quantic exige desde el genesis). Zenith no cambia con ella.
-quantic = ["pq-experimental", "dep:zoka-quantic"]
+quantic = ["pq-experimental", "dep:zoka-quantic", "dep:num-bigint"]
 
 [dependencies]
 randomx-rs = { version = "1.3", optional = true }
@@ -123,6 +123,8 @@ zoka-pq = { path = "crates/zoka-pq", optional = true }
 # Ver la feature `quantic`. Tiene su propio Cargo.lock para compilarse suelta;
 # dentro del nodo manda el Cargo.lock de la raiz.
 zoka-quantic = { path = "crates/zoka-quantic", optional = true }
+# Objetivos de 256 bits de la dificultad de Quantic (ASERT).
+num-bigint = { version = "0.4", optional = true }
 
 [dev-dependencies]
 proptest = "1.0"

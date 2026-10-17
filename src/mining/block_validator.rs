@@ -520,7 +520,8 @@ fn validate_quantic_pow(block: &Block, ctx: &PowBlockContext<'_>) -> Result<(), 
     let computed = engine
         .calculate_hash(&preimage)
         .map_err(|e| PowEngine(e.to_string()))?;
-    if !pow::hash_meets_difficulty(&computed, ctx.expected_difficulty_bits) {
+    // En Quantic la "dificultad" es un objetivo compacto de 256 bits (ASERT).
+    if !quantic_hash_meets(&computed, ctx.expected_difficulty_bits) {
         return Err(PowBelowDifficulty {
             needed: ctx.expected_difficulty_bits,
             actual: pow::leading_zero_bits(&computed),
@@ -533,6 +534,17 @@ fn validate_quantic_pow(block: &Block, ctx: &PowBlockContext<'_>) -> Result<(), 
         });
     }
     Ok(())
+}
+
+#[cfg(feature = "quantic")]
+fn quantic_hash_meets(hash: &[u8], compact_target: u32) -> bool {
+    crate::quantic::difficulty::hash_meets_target(hash, &crate::quantic::difficulty::from_compact(compact_target))
+}
+
+/// Sin la feature `quantic` ningún bloque de Quantic vale.
+#[cfg(not(feature = "quantic"))]
+fn quantic_hash_meets(_hash: &[u8], _compact_target: u32) -> bool {
+    false
 }
 
 fn validate_pow(block: &Block, ctx: &PowBlockContext<'_>) -> Result<(), BlockValidationError> {

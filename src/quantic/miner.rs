@@ -42,6 +42,8 @@ pub fn build_template(
     };
     let height = parent.header.block_height + 1;
     let height32 = u32::try_from(height).map_err(|_| "height out of range".to_string())?;
+    // Después de la mediana de los últimos bloques (regla de consenso).
+    let timestamp = timestamp.max(super::median_time_past(storage, &parent).map_err(|e| e.to_string())? + 1);
     let build = |txs: &[QuanticTransaction]| -> Result<(Block, ValidatedBlock), String> {
         let fees: u64 = txs.iter().filter_map(QuanticTransaction::fee).sum();
         let (recipient, value, public) = match (&params.premine, height == GENESIS_HEIGHT) {
@@ -89,11 +91,13 @@ pub enum PowOutcome {
 pub fn solve_pow_parallel(
     chain_id: &str,
     block: &mut Block,
-    difficulty_bits: u32,
+    compact_target: u32,
     threads: usize,
     deadline: Duration,
     stop: &AtomicBool,
 ) -> Result<PowOutcome, String> {
+    let target = super::difficulty::from_compact(compact_target);
+    let target = &target;
     let lanes = threads.max(1);
     let engines = crate::mining::pow::engine_pool_for(chain_id, block.header.block_height, lanes)
         .map_err(|e| e.to_string())?;
@@ -126,7 +130,7 @@ pub fn solve_pow_parallel(
                     match engine.calculate_hash(&input) {
                         Ok(hash) => {
                             attempts.fetch_add(1, Ordering::Relaxed);
-                            if crate::mining::pow::hash_meets_difficulty(&hash, difficulty_bits) {
+                            if super::difficulty::hash_meets_target(&hash, target) {
                                 found.store(true, Ordering::Relaxed);
                                 let _ = sender.send(Ok((hash, nonce)));
                                 return;

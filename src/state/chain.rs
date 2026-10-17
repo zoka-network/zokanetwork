@@ -402,8 +402,10 @@ fn expected_difficulty_after_parent(
     parent: &Block,
     parent_meta: &BlockChainMeta,
 ) -> Result<u32, ChainError> {
-    if let Some(bits) = crate::economics::fixed_difficulty_bits_for_chain(chain_id) {
-        return Ok(bits);
+    #[cfg(feature = "quantic")]
+    if crate::economics::is_quantic_chain_id(chain_id) {
+        return crate::quantic::compact_target_for_child(storage, chain_id, parent)
+            .map_err(|e| ChainError::InvalidQuanticBlock(e.to_string()));
     }
     if parent_meta.height < 2 {
         return Ok(crate::economics::POW_INITIAL_DIFFICULTY_BITS);
@@ -724,6 +726,16 @@ fn validate_quantic_body(
 }
 
 #[cfg(feature = "quantic")]
+fn quantic_block_work(compact_target: u32) -> u128 {
+    crate::quantic::difficulty::work_for_target(&crate::quantic::difficulty::from_compact(compact_target))
+}
+
+#[cfg(not(feature = "quantic"))]
+fn quantic_block_work(_compact_target: u32) -> u128 {
+    0
+}
+
+#[cfg(feature = "quantic")]
 fn quantic_minted(validated: &QuanticValidation) -> u64 {
     validated.minted
 }
@@ -833,10 +845,17 @@ fn apply_block_inner(
     let new_total_supply = parent_meta
         .total_supply_emitted
         .saturating_add(coinbase_amount);
-    let block_work = pow::leading_zero_bits(&candidate.header.seal.0) as u128;
+    let (block_work, new_difficulty_bits) = if crate::economics::is_quantic_chain_id(chain_id) {
+        // Quantic: el trabajo esperado del objetivo que el bloque tenía que
+        // cumplir (2^256 / (objetivo + 1)), no los bits que tuvo de suerte.
+        (quantic_block_work(effective_expected_difficulty), effective_expected_difficulty)
+    } else {
+        (
+            pow::leading_zero_bits(&candidate.header.seal.0) as u128,
+            difficulty::difficulty_after_applying(candidate, effective_expected_difficulty),
+        )
+    };
     let new_cumulative_work = parent_meta.cumulative_work.saturating_add(block_work);
-    let new_difficulty_bits =
-        difficulty::difficulty_after_applying(candidate, effective_expected_difficulty);
     let new_meta = BlockChainMeta {
         height: candidate.header.block_height,
         total_supply_emitted: new_total_supply,

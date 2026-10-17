@@ -37,10 +37,13 @@ use crate::types::Block;
 /// Como [`expected_for_next_block`], pero respetando una cadena que fija su
 /// dificultad (el regtest de Quantic).
 pub fn expected_for_next_block_for_chain(storage: &RocksDbStorage, chain_id: &str) -> Result<u32, String> {
-    match economics::fixed_difficulty_bits_for_chain(chain_id) {
-        Some(bits) => Ok(bits),
-        None => expected_for_next_block(storage),
+    // Zoka Quantic guarda acá un objetivo compacto (ASERT), no bits.
+    #[cfg(feature = "quantic")]
+    if economics::is_quantic_chain_id(chain_id) {
+        return crate::quantic::compact_target_for_tip(storage, chain_id).map_err(|e| e.to_string());
     }
+    let _ = chain_id;
+    expected_for_next_block(storage)
 }
 
 pub fn expected_for_next_block(storage: &RocksDbStorage) -> Result<u32, String> {

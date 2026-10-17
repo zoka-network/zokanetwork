@@ -441,11 +441,6 @@ pub const QUANTIC_MAINNET_GENESIS: Option<QuanticGenesis> = None;
 /// bloques al ritmo que se le pide. Nunca vale en la testnet ni en mainnet.
 pub const QUANTIC_REGTEST_DIFFICULTY_BITS: u32 = 8;
 
-/// La dificultad que fija la cadena, si la fija (solo el regtest de Quantic).
-pub fn fixed_difficulty_bits_for_chain(chain_id: &str) -> Option<u32> {
-    (chain_id == QUANTIC_REGTEST_CHAIN_ID).then_some(QUANTIC_REGTEST_DIFFICULTY_BITS)
-}
-
 pub fn is_quantic_chain_id(chain_id: &str) -> bool {
     chain_id == QUANTIC_MAINNET_CHAIN_ID
         || chain_id == QUANTIC_TESTNET_CHAIN_ID
