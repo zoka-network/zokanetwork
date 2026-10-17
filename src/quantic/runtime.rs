@@ -55,15 +55,56 @@ pub fn submit_from_api(
 
 /// Una transferencia que llegó por la red. El gossip ya la reenvió; acá solo
 /// decide si entra al mempool.
-pub fn accept_network_transaction(storage: &RocksDbStorage, chain_id: &str, tx_hex: &str) -> Option<String> {
+///
+/// Cada par que las reenvía tiene un presupuesto de acciones por minuto
+/// ([`GOSSIP_ACTIONS_PER_PEER_PER_MINUTE`]): verificar una prueba lleva tiempo
+/// y corre en el bucle del nodo. Lo que se pasa se descarta en silencio, para
+/// que un par que inunda tampoco llene el registro.
+pub fn accept_network_transaction(
+    storage: &RocksDbStorage,
+    chain_id: &str,
+    tx_hex: &str,
+    source: Option<libp2p::PeerId>,
+) -> Option<String> {
     let bytes = hex::decode(tx_hex).ok()?;
     let tx = QuanticTransaction::from_bytes(&bytes).ok()?;
+    if let Some(source) = source {
+        if !gossip_budget_allows(&source, tx.actions().len() as u32, now_secs() / 60) {
+            return None;
+        }
+    }
     let mut pool = mempool::global().lock().ok()?;
     match pool.insert(storage, chain_id, tx, now_secs()) {
         Ok(txid) => Some(format!("Quantic transaction {} entered the mempool.", &txid.to_hex()[..12])),
         Err(mempool::MempoolError::AlreadyKnown) => None,
         Err(error) => Some(format!("Ignored Quantic transaction: {error}")),
     }
+}
+
+/// Acciones de transacciones de Quantic que un par puede hacernos verificar por
+/// minuto. Son doce veces lo que entra en la cadena en ese tiempo (96 acciones
+/// cada 120 s): un par honesto no llega; uno que manda pruebas falsas no frena
+/// al nodo.
+pub const GOSSIP_ACTIONS_PER_PEER_PER_MINUTE: u32 = 600;
+
+fn gossip_budget_allows(source: &libp2p::PeerId, actions: u32, minute: u64) -> bool {
+    type Table = std::collections::HashMap<libp2p::PeerId, (u64, u32)>;
+    static BUDGET: OnceLock<std::sync::Mutex<Table>> = OnceLock::new();
+    let Ok(mut table) = BUDGET.get_or_init(Default::default).lock() else {
+        return true;
+    };
+    if table.len() > 1024 {
+        table.retain(|_, bucket| bucket.0 == minute);
+    }
+    let bucket = table.entry(*source).or_insert((minute, 0));
+    if bucket.0 != minute {
+        *bucket = (minute, 0);
+    }
+    if bucket.1.saturating_add(actions) > GOSSIP_ACTIONS_PER_PEER_PER_MINUTE {
+        return false;
+    }
+    bucket.1 += actions;
+    true
 }
 
 fn now_secs() -> u64 {
@@ -296,5 +337,23 @@ fn mine_once(
     match miner::solve_pow_parallel(chain_id, &mut block, difficulty, config.threads, TEMPLATE_LIFETIME, stop)? {
         miner::PowOutcome::Solved => Ok(Some(block)),
         miner::PowOutcome::Interrupted => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_peer_cannot_make_us_verify_more_than_its_budget() {
+        let par = libp2p::PeerId::random();
+        let otro = libp2p::PeerId::random();
+        let minuto = 27_000_000;
+        for _ in 0..GOSSIP_ACTIONS_PER_PEER_PER_MINUTE / 64 {
+            assert!(gossip_budget_allows(&par, 64, minuto));
+        }
+        assert!(!gossip_budget_allows(&par, 64, minuto), "nueve envios de 64 acciones por minuto");
+        assert!(gossip_budget_allows(&otro, 64, minuto), "cada par tiene el suyo");
+        assert!(gossip_budget_allows(&par, 64, minuto + 1), "al minuto siguiente, de nuevo");
     }
 }

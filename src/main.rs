@@ -8061,7 +8061,7 @@ async fn handle_fullnode_network_message(
         }
         #[cfg(feature = "quantic")]
         zoka::network::message::ZokaMessage::QuanticTransaction { tx_hex } => {
-            zoka::quantic::runtime::accept_network_transaction(storage?, chain_id, tx_hex)
+            zoka::quantic::runtime::accept_network_transaction(storage?, chain_id, tx_hex, source)
         }
         zoka::network::message::ZokaMessage::PrivateTransaction(message_tx) => {
             // Persist the gossiped private tx body + mark it pending in
