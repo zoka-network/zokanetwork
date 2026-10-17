@@ -134,9 +134,31 @@ compiten con el mismo trabajo y un nodo que los reenvía puede cambiar qué
 transacciones entran. Arreglarlo en Zenith exige un fork con altura de
 activación; decidirlo con el usuario.
 
+### Génesis de la testnet (preparado, 16/10/2026)
+
+- `zoka quantic-genesis --network quantic-testnet --premine-to <zqtest1…>` arma el
+  bloque 1 con el premine público (77 s en la build de depuración, con RandomX a
+  12 bits) y lo escribe en `docs/quantic-testnet-genesis.v1.json`.
+- Su hash y la dirección van a `economics::QUANTIC_TESTNET_GENESIS`; el bloque
+  queda embebido en el binario y cada nodo nuevo lo importa al arrancar. Otro
+  bloque 1 no vale aunque pague lo mismo.
+- **Ensayo con una wallet descartable** (sin commitear): el nodo importó el
+  génesis, la wallet vio 5.000.000 ZKA, minó con RandomX y un segundo nodo se
+  sincronizó con él. Después se revirtieron los archivos y se recompiló.
+
+Lo que falta para abrir la testnet (pasos del usuario, al final):
+
+1. Crear la wallet del equipo de la testnet en la PC:
+   `zoka quantic-wallet new --network quantic-testnet --name equipo` (anotar la
+   frase de 24 palabras fuera de la PC).
+2. Pasarle la dirección a Claude, que arma el génesis, fija las constantes y
+   compila.
+3. Arrancar el nodo de la PC en `quantic-testnet` minando, y publicarlo como
+   semilla en el manifiesto.
+
 ### Pendiente
 
-7. Génesis de la testnet de Quantic con su premine y la PC como semilla.
+7. Génesis de la testnet de Quantic con su premine y la PC como semilla (ver arriba).
 8. ZSilent y ZKAPriv.
 9. Devolver al mempool las transacciones de bloques que una reorganización
    descarta (hoy la wallet las ve sin gastar y hay que reenviarlas).
