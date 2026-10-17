@@ -55,6 +55,8 @@ red cambió: todo es código en ramas, probado en local.
 3. Prefijos de dirección (`zq1`, `zqtest1`, `zqregtest1`), tamaño del memo (512)
    y comisión (0,0001 ZKA por acción).
 4. Interfaz de Quantic en ZKAPriv y ZSilent (el motor está; las pantallas no).
+   Opciones y recomendación en
+   [PROPUESTA-quantic-en-las-apps.md](docs/PROPUESTA-quantic-en-las-apps.md).
 5. Pasos suyos para abrir la testnet de Quantic: crear la wallet del equipo
    (`zoka quantic-wallet new --network quantic-testnet --name equipo`) y pasar la
    dirección; crear la mitad ML-DSA de la clave de la autoridad
