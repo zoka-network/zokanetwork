@@ -106,6 +106,20 @@ más despacio).
 
 ## Pruebas
 
+- `examples/probar_motor_quantic.rs`: el motor de punta a punta desde la PC,
+  con el mismo código del `.so`, contra un nodo regtest real por P2P: conecta,
+  sincroniza desde el génesis, arma la clave y el envío, lo publica y espera
+  verlo minado. Medido el 17/10 (build de depuración): clave 2,9 s, envío
+  11,3 s, 87 s de punta a punta. Encontró dos fallas que en el teléfono habrían
+  pasado igual: la prueba de Halo 2 desbordaba una pila de 1 MB (ahora corre en
+  un hilo propio de 64 MB) y un nodo completo con el teléfono como único par
+  dejaba de minar mientras le pedía bloques que no tiene (ahora la wallet
+  contesta al toque y el nodo no insiste).
+
+  ```text
+  cargo run --features quantic --example probar_motor_quantic -- /ip4/127.0.0.1/tcp/29413
+  ```
+
 - `quantic::tests::the_phone_engine_follows_a_real_chain_spends_and_resumes`:
   el motor sobre una cadena regtest real (sincroniza desde el génesis, envía, el
   mempool lo admite, sigue desde el estado guardado, detecta la reorganización y
