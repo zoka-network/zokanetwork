@@ -402,6 +402,9 @@ fn expected_difficulty_after_parent(
     parent: &Block,
     parent_meta: &BlockChainMeta,
 ) -> Result<u32, ChainError> {
+    if let Some(bits) = crate::economics::fixed_difficulty_bits_for_chain(chain_id) {
+        return Ok(bits);
+    }
     if parent_meta.height < 2 {
         return Ok(crate::economics::POW_INITIAL_DIFFICULTY_BITS);
     }
@@ -595,7 +598,8 @@ pub fn apply_block(
     chain_id: &str,
     candidate: &Block,
 ) -> Result<ChainHead, ChainError> {
-    let expected = difficulty::expected_for_next_block(storage).map_err(ChainError::Storage)?;
+    let expected =
+        difficulty::expected_for_next_block_for_chain(storage, chain_id).map_err(ChainError::Storage)?;
     apply_block_inner(storage, chain_id, candidate, expected, false)
 }
 

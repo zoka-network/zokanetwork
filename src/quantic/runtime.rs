@@ -242,7 +242,7 @@ fn mine_once(
     let timestamp = now_secs();
     let (mut block, _) = miner::build_template(storage, chain_id, &config.address, proving_key(), transactions, timestamp)?;
     // La misma regla con la que el nodo acepta el bloque.
-    let difficulty = crate::mining::difficulty::expected_for_next_block(storage)?;
+    let difficulty = crate::mining::difficulty::expected_for_next_block_for_chain(storage, chain_id)?;
     match miner::solve_pow_parallel(chain_id, &mut block, difficulty, config.threads, TEMPLATE_LIFETIME, stop)? {
         miner::PowOutcome::Solved => Ok(Some(block)),
         miner::PowOutcome::Interrupted => Ok(None),

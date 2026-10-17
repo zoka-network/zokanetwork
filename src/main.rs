@@ -14820,6 +14820,20 @@ fn chain_contains_checkpoint(
 /// (solo regtest: la wallet del premine, de clave pública a propósito).
 #[cfg(feature = "quantic")]
 fn cmd_quantic_wallet(args: &[String]) -> Result<(), String> {
+    // Armar la clave y la prueba de Halo 2 no entra en la pila del hilo
+    // principal de Windows (1 MB): se corre en uno con pila amplia.
+    let args = args.to_vec();
+    std::thread::Builder::new()
+        .name("quantic-wallet".to_string())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || cmd_quantic_wallet_inner(&args))
+        .map_err(|e| format!("cannot start the wallet thread: {e}"))?
+        .join()
+        .map_err(|_| "the wallet thread panicked".to_string())?
+}
+
+#[cfg(feature = "quantic")]
+fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
     const USAGE: &str = "usage: zoka quantic-wallet <new|restore|address|list|balance|send|import-regtest-team> --network quantic-regtest|quantic-testnet [--name <wallet>] [--password <p>] [--rpc <url>] [--json]";
     let Some((action, rest)) = args.split_first() else {
         return Err(USAGE.to_string());

@@ -34,6 +34,15 @@ use crate::types::Block;
 /// Reads the canonical chain head + the two most recent block timestamps
 /// (when available) to retarget; falls back to
 /// `POW_INITIAL_DIFFICULTY_BITS` during the warmup band.
+/// Como [`expected_for_next_block`], pero respetando una cadena que fija su
+/// dificultad (el regtest de Quantic).
+pub fn expected_for_next_block_for_chain(storage: &RocksDbStorage, chain_id: &str) -> Result<u32, String> {
+    match economics::fixed_difficulty_bits_for_chain(chain_id) {
+        Some(bits) => Ok(bits),
+        None => expected_for_next_block(storage),
+    }
+}
+
 pub fn expected_for_next_block(storage: &RocksDbStorage) -> Result<u32, String> {
     let head_height = storage
         .get_chain_height()

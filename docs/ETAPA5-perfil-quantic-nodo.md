@@ -86,3 +86,58 @@ En un bloque de Quantic:
 7. Génesis de la testnet de Quantic con el premine (dirección del equipo de la
    testnet) y su semilla en la PC.
 8. ZSilent y ZKAPriv.
+
+## Estado (16/10/2026, noche)
+
+Hechos los pasos 1 a 6 en la rama `etapa5-quantic-nodo`:
+
+- Biblioteca: altura del génesis, ventana de anclas, reglas de consenso como
+  funciones puras y la frontera del árbol serializable.
+- Nodo (feature `quantic`): campo `quantic_transactions` en `Block` (Zenith no
+  cambia: 952 pruebas pasan), validación con `crate::quantic`, estado por hash de
+  bloque, mempool, minero, perfiles `quantic-testnet` y `quantic-regtest`,
+  protocolo y tópicos propios (no se mezcla con Zenith), mensaje
+  `QuanticTransaction`, API `/quantic/*` y `zoka quantic-wallet`.
+- **Prueba de trabajo:** la de Quantic compromete `merkle_root` y `state_root`.
+  La de Zenith no cubre el cuerpo del bloque (ver abajo).
+- **Regtest:** dificultad fija de 8 bits (como el regtest de Bitcoin),
+  maduración de 2 bloques y premine a una clave de prueba pública.
+
+### Prueba en red local (16/10/2026)
+
+Tres nodos en la PC, cada uno con su `ZOKA_HOME` en la carpeta temporal, su API
+(3211–3213) y su puerto P2P (29211–29213), sin semillas ni nada de Zenith. Binario
+de depuración con `--features quantic`.
+
+1. A mina desde el génesis: el bloque 1 paga el premine público a la wallet del
+   equipo de regtest; la wallet de línea de comandos ve 5.000.000 ZKA disponibles
+   y el minero 24 ZKA por madurar.
+2. B se conecta a A y valida toda la cadena (pruebas Halo 2 incluidas).
+3. El equipo le paga 100 ZKA a Bob por la API de A (17 s en la build de
+   depuración, con el armado de la clave). Bob los ve consultando a **B**.
+4. Bob le paga 40 ZKA al minero por la API de **B**, que no mina: la
+   transacción viaja por la red a A, que la mina. Saldos exactos: Bob 59,9998;
+   minero 160,0004 = 10 × 12 + 2 comisiones + 40.
+5. **Reorganización:** C se sincroniza con A, se aísla y mina su propia rama, en
+   la que el equipo le paga 7 ZKA a Bob. Al reconectarse, C adopta la rama más
+   pesada de A: los dos quedan con la misma punta, Bob vuelve a 0 y la nota del
+   equipo queda sin gastar.
+
+### Hallazgo en Zenith (sin tocar)
+
+La prueba de trabajo de Zenith (`build_pow_input`) cubre cadena, padre,
+dirección del minero, altura, hora y nonce, **pero no el cuerpo del bloque**: se
+puede tomar el sello de un bloque recién minado y ponerle otro cuerpo (otras
+transacciones privadas, otros nullifiers) con el mismo trabajo. El hash del
+bloque cambia, así que la cadena sigue enlazada, pero dos bloques distintos
+compiten con el mismo trabajo y un nodo que los reenvía puede cambiar qué
+transacciones entran. Arreglarlo en Zenith exige un fork con altura de
+activación; decidirlo con el usuario.
+
+### Pendiente
+
+7. Génesis de la testnet de Quantic con su premine y la PC como semilla.
+8. ZSilent y ZKAPriv.
+9. Devolver al mempool las transacciones de bloques que una reorganización
+   descarta (hoy la wallet las ve sin gastar y hay que reenviarlas).
+10. Bloques de más de 96 acciones: hoy viajan enteros por gossip (1 MB).

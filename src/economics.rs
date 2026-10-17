@@ -420,6 +420,16 @@ pub const QUANTIC_TESTNET_CHAIN_ID: &str = "zoka-quantic-testnet-v1";
 /// Redes locales de prueba de Quantic: prueba de trabajo liviana.
 pub const QUANTIC_REGTEST_CHAIN_ID: &str = "zoka-quantic-regtest-v1";
 
+/// Dificultad fija de las redes locales de Quantic (como el regtest de
+/// Bitcoin): sin reajuste, para que una red de prueba en una PC produzca
+/// bloques al ritmo que se le pide. Nunca vale en la testnet ni en mainnet.
+pub const QUANTIC_REGTEST_DIFFICULTY_BITS: u32 = 8;
+
+/// La dificultad que fija la cadena, si la fija (solo el regtest de Quantic).
+pub fn fixed_difficulty_bits_for_chain(chain_id: &str) -> Option<u32> {
+    (chain_id == QUANTIC_REGTEST_CHAIN_ID).then_some(QUANTIC_REGTEST_DIFFICULTY_BITS)
+}
+
 pub fn is_quantic_chain_id(chain_id: &str) -> bool {
     chain_id == QUANTIC_MAINNET_CHAIN_ID
         || chain_id == QUANTIC_TESTNET_CHAIN_ID
