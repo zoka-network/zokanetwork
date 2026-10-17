@@ -369,8 +369,9 @@ Después del génesis cualquier cambio de estos exige un fork.
     (quedan 3 avisos: clear_on_drop y paste sin mantenimiento, inout retirado).
     Todas las pruebas en verde, y **interoperabilidad probada** en una red
     Quantic regtest local: un nodo 0.53 y uno 0.57 se sincronizan en los dos
-    sentidos y un envío que entra por el 0.57 lo mina el 0.53. Para la red real
-    hace falta un binario nuevo en la PC y en el teléfono.
+    sentidos y un envío que entra por el 0.57 lo mina el 0.53. El motor nativo de
+    ZKAPriv (con `quantic`) compila para ARMv7 con 0.57. Para la red real hace
+    falta un binario nuevo en la PC y en el teléfono.
 7.2 Emisión: los bloques salen demasiado rápido (dificultad trabada en el piso,
     ~2 bloques por minuto). Fijar tiempo de bloque y dificultad inicial.
     **16/10/2026, hecho para Quantic:** objetivo de 256 bits con ASERT (τ = 1 h),
