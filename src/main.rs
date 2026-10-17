@@ -2436,6 +2436,16 @@ impl NetworkProfile {
         }
     }
 
+    /// El puerto P2P por omisión: uno distinto por red, para que la PC pueda
+    /// correr Zenith y Quantic a la vez sin `--listen`.
+    fn default_p2p_port(self) -> u16 {
+        match self {
+            Self::Zenith => 28080,
+            Self::QuanticTestnet => 28180,
+            Self::QuanticRegtest => 28280,
+        }
+    }
+
     /// Lo que reemplaza a `zoka` en los nombres de los tópicos.
     fn topic_prefix(self) -> Option<&'static str> {
         match self {
@@ -10723,7 +10733,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         )?;
     }
     let listen_addr =
-        option_value(args, "--listen").unwrap_or_else(|| "/ip4/0.0.0.0/tcp/28080".to_string());
+        option_value(args, "--listen").unwrap_or_else(|| format!("/ip4/0.0.0.0/tcp/{}", network.default_p2p_port()));
     let seconds = parse_u64_arg(option_value(args, "--seconds"), 0, "--seconds")?;
     let sync_warmup_secs = parse_u64_arg(
         option_value(args, "--sync-warmup-secs"),
@@ -19499,6 +19509,20 @@ mod tests {
             Some((15712, 15719)),
             "hay que adelantar las ocho alturas que el paseo pedira despues"
         );
+    }
+
+    #[test]
+    fn each_network_listens_on_its_own_port_by_default() {
+        // La PC corre Zenith y Quantic a la vez: con el mismo puerto el segundo
+        // nodo no arrancaba sin --listen. Zenith sigue en el de siempre.
+        use super::NetworkProfile;
+        let ports = [
+            NetworkProfile::Zenith.default_p2p_port(),
+            NetworkProfile::QuanticTestnet.default_p2p_port(),
+            NetworkProfile::QuanticRegtest.default_p2p_port(),
+        ];
+        assert_eq!(ports[0], 28080);
+        assert!(ports[0] != ports[1] && ports[1] != ports[2] && ports[0] != ports[2]);
     }
 
     #[test]
