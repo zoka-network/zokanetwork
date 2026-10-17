@@ -28,9 +28,13 @@ pub const MAX_COMPACT_BLOCKS_PER_REQUEST: u64 = 500;
 
 /// Un pedido es chico; una transferencia de 64 acciones en hex, la más grande.
 const REQUEST_SIZE_MAX: u64 = 1024 * 1024;
-/// 500 bloques compactos llenos, con holgura; acota la memoria que un par
-/// puede hacernos reservar.
-const RESPONSE_SIZE_MAX: u64 = 32 * 1024 * 1024;
+/// Lo que se lee de una respuesta comprimida. El nodo corta las suyas en unos
+/// 8 MB de JSON (ver `quantic::light`), que comprimidos son la mitad: esto deja
+/// holgura y acota la memoria que un par puede hacernos reservar.
+const RESPONSE_SIZE_MAX: u64 = 16 * 1024 * 1024;
+/// Lo que se acepta descomprimido: un par no puede mandar una bomba de deflate
+/// que llene la memoria de un teléfono.
+const RESPONSE_DECOMPRESSED_MAX: u64 = 32 * 1024 * 1024;
 
 const FORMATO_JSON_PLANO: u8 = 0;
 const FORMATO_JSON_DEFLATE: u8 = 1;
@@ -106,8 +110,11 @@ fn decode_response(bytes: &[u8]) -> io::Result<QuanticLightResponse> {
         Some((&FORMATO_JSON_DEFLATE, rest)) => {
             let mut json = Vec::new();
             flate2::read::DeflateDecoder::new(rest)
-                .take(RESPONSE_SIZE_MAX * 4)
+                .take(RESPONSE_DECOMPRESSED_MAX + 1)
                 .read_to_end(&mut json)?;
+            if json.len() as u64 > RESPONSE_DECOMPRESSED_MAX {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "response too large once decompressed"));
+            }
             json_decode(&json)
         }
         _ => Err(io::Error::new(io::ErrorKind::InvalidData, "unknown response format")),
@@ -182,6 +189,18 @@ mod tests {
         assert!(bytes.len() < 1300, "deflate shrinks the hex: {}", bytes.len());
         assert_eq!(decode_response(&bytes).unwrap(), response);
         assert!(decode_response(&[9, 1, 2]).is_err());
+    }
+
+    #[test]
+    fn a_deflate_bomb_does_not_fill_the_phone_memory() {
+        // 40 MB de una sola letra: comprimido pesa unos 40 KB.
+        let bomb = encode_response(&QuanticLightResponse::Error {
+            message: "a".repeat(40 * 1024 * 1024),
+        })
+        .unwrap();
+        assert!((bomb.len() as u64) < RESPONSE_SIZE_MAX);
+        let error = decode_response(&bomb).unwrap_err();
+        assert!(error.to_string().contains("too large"), "{error}");
     }
 
     #[test]

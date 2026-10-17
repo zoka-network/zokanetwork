@@ -1130,6 +1130,36 @@ mod tests {
     }
 
     #[test]
+    fn a_compact_response_stops_at_its_byte_budget_and_the_wallet_continues() {
+        let (storage, _dir) = storage();
+        let team = premine(Network::Regtest).unwrap().recipient;
+        let params = consensus_params(Network::Regtest);
+        let mut parent = genesis_parent_for(CHAIN);
+        for height in 1..=3u64 {
+            let value = if height == 1 { PREMINE_ATOMS } else { params.minted_at(height as u32) };
+            let block = mined(&storage, &parent, &coinbase(height, &team, value, height == 1), &[]);
+            apply_block_with_expected_difficulty(&storage, CHAIN, &block, bits()).unwrap();
+            parent = block;
+        }
+        let size = |h: u64| -> usize { compact_json(&storage, h).transactions.iter().map(String::len).sum() };
+        let heights = |blocks: Vec<wallet_sync::CompactBlockJson>| blocks.iter().map(|b| b.height).collect::<Vec<_>>();
+        // Sin presupuesto que alcance, igual va el primero: la wallet avanza.
+        assert_eq!(heights(light::compact_blocks_within(&storage, 1, None, 500, 1).unwrap()), vec![1]);
+        let two = size(1) + size(2);
+        assert_eq!(heights(light::compact_blocks_within(&storage, 1, None, 500, two).unwrap()), vec![1, 2]);
+        assert_eq!(heights(light::compact_blocks_within(&storage, 1, None, 500, two + size(3)).unwrap()), vec![1, 2, 3]);
+        assert_eq!(heights(light::compact_blocks(&storage, 1, None, 500).unwrap()), vec![1, 2, 3]);
+        // La wallet sigue desde donde quedó la respuesta cortada.
+        let team_fvk = QuanticSpendingKey::from_root(&REGTEST_TEAM_ROOT, Network::Regtest, 0).unwrap().full_viewing_key();
+        let wallet = wallet_sync::sync_wallet(team_fvk, 3, |from, to| {
+            light::compact_blocks_within(&storage, from, Some(to), 500, 1)
+        })
+        .unwrap();
+        assert_eq!(wallet.next_height(), 4);
+        assert_eq!(wallet.balance(), PREMINE_ATOMS);
+    }
+
+    #[test]
     fn the_node_answers_light_wallets_with_its_chain() {
         use crate::network::quantic_light_request_response::{QuanticLightRequest, QuanticLightResponse};
 

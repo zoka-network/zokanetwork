@@ -53,13 +53,33 @@ pub fn compact_block_at(storage: &RocksDbStorage, height: u64) -> Result<Option<
     }))
 }
 
+/// Bytes de transacciones compactas (en hex) por respuesta. Con bloques casi
+/// vacíos entran los 500; con bloques llenos (96 acciones, unos 240 KB en hex)
+/// serían más de 100 MB: la respuesta se corta antes y la wallet sigue desde
+/// el último bloque que recibió. Comprimido queda en unos 4 MB, que por Tor
+/// llegan en decenas de segundos.
+pub const MAX_COMPACT_RESPONSE_HEX_BYTES: usize = 8 * 1024 * 1024;
+
 /// Los bloques compactos de `from` a `to` (sin `to`, hasta la punta), como
-/// mucho `limit`. Antes del génesis no hay: empieza en él.
+/// mucho `limit` y hasta [`MAX_COMPACT_RESPONSE_HEX_BYTES`]. Antes del génesis
+/// no hay: empieza en él.
 pub fn compact_blocks(
     storage: &RocksDbStorage,
     from: u64,
     to: Option<u64>,
     limit: u64,
+) -> Result<Vec<CompactBlockWire>, String> {
+    compact_blocks_within(storage, from, to, limit, MAX_COMPACT_RESPONSE_HEX_BYTES)
+}
+
+/// Lo mismo con otro presupuesto de bytes. El primer bloque va siempre, aunque
+/// solo pase el presupuesto (uno lleno son 1,3 MB): así la wallet avanza.
+pub fn compact_blocks_within(
+    storage: &RocksDbStorage,
+    from: u64,
+    to: Option<u64>,
+    limit: u64,
+    max_hex_bytes: usize,
 ) -> Result<Vec<CompactBlockWire>, String> {
     let height = storage.get_chain_height().map_err(|e| format!("{e:?}"))?;
     let from = from.max(GENESIS_HEIGHT);
@@ -68,11 +88,17 @@ pub fn compact_blocks(
         .min(height)
         .min(from.saturating_add(limit.max(1) - 1));
     let mut blocks = Vec::new();
+    let mut hex_bytes = 0usize;
     for height in from..=to {
-        match compact_block_at(storage, height)? {
-            Some(block) => blocks.push(block),
-            None => break,
+        let Some(block) = compact_block_at(storage, height)? else {
+            break;
+        };
+        let size: usize = block.transactions.iter().map(String::len).sum();
+        if !blocks.is_empty() && hex_bytes.saturating_add(size) > max_hex_bytes {
+            break;
         }
+        hex_bytes = hex_bytes.saturating_add(size);
+        blocks.push(block);
     }
     Ok(blocks)
 }
