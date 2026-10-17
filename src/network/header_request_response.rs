@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use futures::prelude::*;
 use libp2p::{request_response, StreamProtocol};
 use serde::{Deserialize, Serialize};
@@ -69,7 +68,6 @@ fn json_encode<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
     serde_json::to_vec(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-#[async_trait]
 impl request_response::Codec for HeaderRequestResponseCodec {
     type Protocol = StreamProtocol;
     type Request = GetHeaders;

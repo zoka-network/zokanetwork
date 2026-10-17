@@ -734,7 +734,13 @@ impl Transport for TorSocksTransport {
         false
     }
 
-    fn dial(&mut self, addr: Multiaddr) -> Result<Self::Dial, TransportError<Self::Error>> {
+    fn dial(
+        &mut self,
+        addr: Multiaddr,
+        _opts: libp2p::core::transport::DialOpts,
+    ) -> Result<Self::Dial, TransportError<Self::Error>> {
+        // Por un proxy SOCKS no hay hole punching: el rol y el uso del puerto
+        // no cambian nada.
         let Some(proxy_endpoint) = self.proxy_endpoint.clone() else {
             return Err(TransportError::MultiaddrNotSupported(addr));
         };
@@ -757,13 +763,6 @@ impl Transport for TorSocksTransport {
         .boxed())
     }
 
-    fn dial_as_listener(
-        &mut self,
-        addr: Multiaddr,
-    ) -> Result<Self::Dial, TransportError<Self::Error>> {
-        self.dial(addr)
-    }
-
     fn poll(
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
@@ -771,9 +770,6 @@ impl Transport for TorSocksTransport {
         Poll::Pending
     }
 
-    fn address_translation(&self, _listen: &Multiaddr, _observed: &Multiaddr) -> Option<Multiaddr> {
-        None
-    }
 }
 
 fn build_tor_socks_transport(
@@ -2318,7 +2314,7 @@ impl Node {
         } else {
             base_transporte
                 .with_dns_config(
-                    libp2p::dns::ResolverConfig::new(),
+                    libp2p::dns::ResolverConfig::from_parts(None, Vec::new(), Vec::new()),
                     libp2p::dns::ResolverOpts::default(),
                 )
                 .with_behaviour(comportamiento)?
@@ -2573,7 +2569,7 @@ impl Node {
         event: request_response::Event<BlockBodyRequest, BlockBodyResponse>,
     ) {
         match event {
-            request_response::Event::Message { peer, message } => match message {
+            request_response::Event::Message { peer, message, .. } => match message {
                 request_response::Message::Request {
                     request, channel, ..
                 } => {
@@ -2704,6 +2700,7 @@ impl Node {
                 peer,
                 request_id,
                 error,
+                ..
             } => {
                 if self
                     .pending_outbound_block_body_requests
@@ -2757,7 +2754,7 @@ impl Node {
         event: request_response::Event<PrivateTxBodyRequest, PrivateTxBodyResponse>,
     ) {
         match event {
-            request_response::Event::Message { peer, message } => match message {
+            request_response::Event::Message { peer, message, .. } => match message {
                 request_response::Message::Request {
                     request, channel, ..
                 } => {
@@ -2815,6 +2812,7 @@ impl Node {
                 peer,
                 request_id,
                 error,
+                ..
             } => {
                 if self
                     .pending_outbound_private_tx_body_requests
@@ -2868,7 +2866,7 @@ impl Node {
         event: request_response::Event<GetHeaders, HeadersResponse>,
     ) {
         match event {
-            request_response::Event::Message { peer, message } => match message {
+            request_response::Event::Message { peer, message, .. } => match message {
                 request_response::Message::Request {
                     request, channel, ..
                 } => {
@@ -2961,7 +2959,7 @@ impl Node {
         event: request_response::Event<PrivateTxBodiesRequest, PrivateTxBodiesResponse>,
     ) {
         match event {
-            request_response::Event::Message { peer, message } => match message {
+            request_response::Event::Message { peer, message, .. } => match message {
                 request_response::Message::Request {
                     request, channel, ..
                 } => {
@@ -3040,7 +3038,7 @@ impl Node {
         event: request_response::Event<PrivateTxDigestsRequest, PrivateTxDigestsResponse>,
     ) {
         match event {
-            request_response::Event::Message { peer, message } => match message {
+            request_response::Event::Message { peer, message, .. } => match message {
                 request_response::Message::Request {
                     request, channel, ..
                 } => {
@@ -3122,7 +3120,7 @@ impl Node {
         event: request_response::Event<QuanticLightRequest, QuanticLightResponse>,
     ) {
         match event {
-            request_response::Event::Message { peer, message } => match message {
+            request_response::Event::Message { peer, message, .. } => match message {
                 request_response::Message::Request {
                     request, channel, ..
                 } => {
@@ -3237,7 +3235,7 @@ impl Node {
         event: request_response::Event<GetWalletDigests, WalletDigestsResponse>,
     ) {
         match event {
-            request_response::Event::Message { peer, message } => match message {
+            request_response::Event::Message { peer, message, .. } => match message {
                 request_response::Message::Request {
                     request, channel, ..
                 } => {
@@ -3291,6 +3289,7 @@ impl Node {
                 peer,
                 request_id,
                 error,
+                ..
             } => {
                 if self
                     .pending_outbound_wallet_digest_requests
@@ -3742,7 +3741,7 @@ impl Node {
         event: request_response::Event<GetSnapshotManifests, SnapshotManifestsResponse>,
     ) {
         match event {
-            request_response::Event::Message { peer, message } => match message {
+            request_response::Event::Message { peer, message, .. } => match message {
                 request_response::Message::Request {
                     request, channel, ..
                 } => {
@@ -7067,6 +7066,7 @@ mod tests {
                 .map(|p| libp2p::StreamProtocol::new(p))
                 .collect(),
             observed_addr: "/ip4/203.0.113.9/tcp/1".parse().expect("observed addr"),
+            signed_peer_record: None,
         }
     }
 
@@ -7154,7 +7154,7 @@ mod tests {
                 .parse()
                 .expect("parse onion3");
 
-        let stream = Transport::dial(&mut transport, onion_addr)
+        let stream = Transport::dial(&mut transport, onion_addr, libp2p::core::transport::DialOpts { role: libp2p::core::Endpoint::Dialer, port_use: libp2p::core::transport::PortUse::Reuse })
             .expect("onion dial should be supported")
             .await
             .expect("mock socks dial should succeed");
@@ -7169,7 +7169,7 @@ mod tests {
             .parse()
             .expect("parse direct addr");
         assert!(matches!(
-            Transport::dial(&mut transport, direct_addr),
+            Transport::dial(&mut transport, direct_addr, libp2p::core::transport::DialOpts { role: libp2p::core::Endpoint::Dialer, port_use: libp2p::core::transport::PortUse::Reuse }),
             Err(TransportError::MultiaddrNotSupported(_))
         ));
     }

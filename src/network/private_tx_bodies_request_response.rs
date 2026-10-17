@@ -17,7 +17,6 @@
 //! real: lote + deflate. Un cuerpo de transaccion privada es JSON con mucha
 //! estructura repetida, asi que comprime bien en conjunto y casi nada de a uno.
 
-use async_trait::async_trait;
 use futures::prelude::*;
 use libp2p::{request_response, StreamProtocol};
 use serde::{Deserialize, Serialize};
@@ -126,7 +125,6 @@ fn decode_response(bytes: &[u8]) -> io::Result<PrivateTxBodiesResponse> {
     }
 }
 
-#[async_trait]
 impl request_response::Codec for PrivateTxBodiesRequestResponseCodec {
     type Protocol = StreamProtocol;
     type Request = PrivateTxBodiesRequest;

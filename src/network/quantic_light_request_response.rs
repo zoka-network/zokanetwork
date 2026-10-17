@@ -14,7 +14,6 @@
 //! mismos bloques. Sí ve cuándo una envía una transacción (como cualquier par
 //! que la reciba primero); por eso conviene usar Tor.
 
-use async_trait::async_trait;
 use futures::prelude::*;
 use libp2p::{request_response, StreamProtocol};
 use serde::{Deserialize, Serialize};
@@ -121,7 +120,6 @@ fn decode_response(bytes: &[u8]) -> io::Result<QuanticLightResponse> {
     }
 }
 
-#[async_trait]
 impl request_response::Codec for QuanticLightCodec {
     type Protocol = StreamProtocol;
     type Request = QuanticLightRequest;

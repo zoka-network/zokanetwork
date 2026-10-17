@@ -23,7 +23,6 @@
 //! quien pregunta le interesa. Sobre Tor el par no sabe quien pregunta, pero
 //! conviene tenerlo presente antes de usar esto contra un par unico y conocido.
 
-use async_trait::async_trait;
 use futures::prelude::*;
 use libp2p::{request_response, StreamProtocol};
 use serde::{Deserialize, Serialize};
@@ -161,7 +160,6 @@ fn decode_response(bytes: &[u8]) -> io::Result<WalletDigestsResponse> {
     }
 }
 
-#[async_trait]
 impl request_response::Codec for WalletDigestRequestResponseCodec {
     type Protocol = StreamProtocol;
     type Request = GetWalletDigests;

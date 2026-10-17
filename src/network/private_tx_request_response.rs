@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use futures::prelude::*;
 use libp2p::{request_response, StreamProtocol};
 use serde::{Deserialize, Serialize};
@@ -44,7 +43,6 @@ fn json_encode<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
     serde_json::to_vec(value).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
-#[async_trait]
 impl request_response::Codec for PrivateTxRequestResponseCodec {
     type Protocol = StreamProtocol;
     type Request = PrivateTxBodyRequest;

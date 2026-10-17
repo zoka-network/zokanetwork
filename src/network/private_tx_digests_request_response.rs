@@ -12,7 +12,6 @@
 //! los mismos resúmenes. Ver `docs/HOJA-DE-RUTA-wallet-liviana.md`.
 
 use crate::private_wallet::digest::PrivateTxDigest;
-use async_trait::async_trait;
 use futures::prelude::*;
 use libp2p::{request_response, StreamProtocol};
 use serde::{Deserialize, Serialize};
@@ -142,7 +141,6 @@ pub fn answer_request(
     response
 }
 
-#[async_trait]
 impl request_response::Codec for PrivateTxDigestsRequestResponseCodec {
     type Protocol = StreamProtocol;
     type Request = PrivateTxDigestsRequest;
