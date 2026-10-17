@@ -373,6 +373,10 @@ Después del génesis cualquier cambio de estos exige un fork.
     18.000.000. Monto y dirección públicos en el génesis, para que cualquiera lo
     verifique.
 7.4 Alinear versiones: crate, `NETWORK_MIN_CLIENT_VERSION` y manifiesto no coinciden.
+    **17/10/2026:** alineadas desde la 2.1.2: `NETWORK_MIN_CLIENT_VERSION` = 2.1.2 =
+    `minimum_client_version` del manifiesto de Zenith, y el crate (2.1.4) no baja de
+    ahí. Quantic no usa versión mínima: cada red tiene su protocolo en el saludo
+    (`/zoka-quantic-testnet/0.1.0`) y un cliente de otra red no conecta.
 7.5 Bug de ZSilent que ofrece notas ya gastadas (saldo inflado).
 7.6 **Ceremonia multiparte del trusted setup** con los circuitos finales. Si los
     parámetros los genera una sola persona, esa persona puede crear monedas.
