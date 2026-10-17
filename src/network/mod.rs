@@ -17,6 +17,7 @@ pub mod message;
 pub mod p2p;
 pub mod peer_store;
 pub mod private_tx_request_response;
+pub mod quantic_light_request_response;
 pub mod snapshot_request_response;
 
 #[allow(unused_imports)]

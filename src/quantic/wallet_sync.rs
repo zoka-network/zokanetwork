@@ -7,22 +7,14 @@
 //! ni cambiarle una salida sin que se note. Lo que no comprueba es la prueba de
 //! trabajo de los encabezados: confía en el nodo propio para eso.
 
-use serde::Deserialize;
 use zoka_quantic::compact::{CompactBlock, CompactTx};
 use zoka_quantic::wallet::QuanticWallet;
 use zoka_quantic::QuanticFullViewingKey;
 
 use super::{consensus_params, QuanticRoots, GENESIS_HEIGHT};
 
-/// Un bloque como lo da `GET /quantic/compact`.
-#[derive(Clone, Debug, Deserialize)]
-pub struct CompactBlockJson {
-    pub height: u64,
-    pub hash: String,
-    pub prev_hash: String,
-    pub state_root: String,
-    pub transactions: Vec<String>,
-}
+/// Un bloque como lo dan `GET /quantic/compact` y `/zoka-quantic/light/1`.
+pub use crate::network::quantic_light_request_response::CompactBlockWire as CompactBlockJson;
 
 /// Bloques por pedido a la API.
 pub const BATCH: u64 = 500;

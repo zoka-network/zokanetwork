@@ -66,6 +66,10 @@ use crate::network::wallet_digest_request_response::{
     protocol_name as wallet_digest_protocol, BlockDigest, GetWalletDigests,
     WalletDigestRequestResponseCodec, WalletDigestsResponse,
 };
+use crate::network::quantic_light_request_response::{
+    protocol_name as quantic_light_protocol, QuanticLightCodec, QuanticLightRequest,
+    QuanticLightResponse,
+};
 use crate::private_wallet::PrivateTransaction;
 
 pub const GENERAL_TOPIC_NAME: &str = "zoka/messages/v1";
@@ -121,6 +125,16 @@ fn wallet_digest_attempt_budget(remaining: Duration, candidates_left: usize) -> 
 
 fn data_request_response_config() -> request_response::Config {
     request_response::Config::default().with_request_timeout(DATA_REQUEST_RESPONSE_TIMEOUT)
+}
+
+/// `/zoka-quantic/light/1` existe solo en las redes de Quantic: un nodo de
+/// Zenith ni lo anuncia ni lo atiende. Las pruebas lo tienen siempre.
+fn quantic_light_protocols() -> Vec<(libp2p::StreamProtocol, request_response::ProtocolSupport)> {
+    if NETWORK_PROTOCOL.get().is_some() || cfg!(test) {
+        vec![(quantic_light_protocol(), request_response::ProtocolSupport::Full)]
+    } else {
+        Vec::new()
+    }
 }
 // Bumped for each release that requires a hard minimum-version cutover: any
 // peer running an older binary reports the old id and gets disconnected
@@ -923,6 +937,11 @@ pub struct Node {
     received_private_tx_digests: VecDeque<(PeerId, PrivateTxDigestsResponse)>,
     private_tx_digests_responder:
         Option<Box<dyn Fn(&PrivateTxDigestsRequest) -> PrivateTxDigestsResponse + Send>>,
+    pending_outbound_quantic_light_requests: HashMap<request_response::OutboundRequestId, PeerId>,
+    /// Respuestas de wallet liviana de Quantic, con el pedido que contestan.
+    received_quantic_light: VecDeque<(request_response::OutboundRequestId, QuanticLightResponse)>,
+    #[allow(clippy::type_complexity)]
+    quantic_light_responder: Option<Box<dyn Fn(&QuanticLightRequest) -> QuanticLightResponse + Send>>,
     pending_outbound_wallet_digest_requests: HashMap<request_response::OutboundRequestId, PeerId>,
     /// Resumenes de bloque recibidos, esperando a que alguien los recoja.
     received_wallet_digests: VecDeque<ReceivedWalletDigestsResponse>,
@@ -969,6 +988,8 @@ pub struct NodeBehaviour {
     private_tx_digests_request_response:
         request_response::Behaviour<PrivateTxDigestsRequestResponseCodec>,
     wallet_digest_request_response: request_response::Behaviour<WalletDigestRequestResponseCodec>,
+    /// Zoka Quantic para wallets livianas (vacío fuera de las redes de Quantic).
+    quantic_light_request_response: request_response::Behaviour<QuanticLightCodec>,
     /// Snapshot manifest discovery.
     snapshot_request_response: request_response::Behaviour<SnapshotRequestResponseCodec>,
     /// Liveness keepalive. Without it, a quiet connection over Tor idles until
@@ -2161,6 +2182,11 @@ impl Node {
                 )],
                 data_request_response_config(),
             );
+            let quantic_light_request_response = request_response::Behaviour::with_codec(
+                QuanticLightCodec,
+                quantic_light_protocols(),
+                data_request_response_config(),
+            );
             let snapshot_request_response = request_response::Behaviour::with_codec(
                 SnapshotRequestResponseCodec,
                 [(
@@ -2183,6 +2209,7 @@ impl Node {
                 private_tx_bodies_request_response,
                 private_tx_digests_request_response,
                 wallet_digest_request_response,
+                quantic_light_request_response,
                 snapshot_request_response,
                 // Default: ping every 15s, 20s timeout. Well under the
                 // libp2p idle timeout (300s) and Tor's circuit idle window,
@@ -2269,6 +2296,9 @@ impl Node {
             pending_outbound_private_tx_digests_requests: HashMap::new(),
             received_private_tx_digests: VecDeque::new(),
             private_tx_digests_responder: None,
+            pending_outbound_quantic_light_requests: HashMap::new(),
+            received_quantic_light: VecDeque::new(),
+            quantic_light_responder: None,
             pending_outbound_wallet_digest_requests: HashMap::new(),
             received_wallet_digests: VecDeque::new(),
             wallet_digest_peer_cursor: 0,
@@ -2977,6 +3007,115 @@ impl Node {
         &mut self,
     ) -> Option<(PeerId, PrivateTxDigestsResponse)> {
         self.received_private_tx_digests.pop_front()
+    }
+
+    fn handle_quantic_light_event(
+        &mut self,
+        event: request_response::Event<QuanticLightRequest, QuanticLightResponse>,
+    ) {
+        match event {
+            request_response::Event::Message { message, .. } => match message {
+                request_response::Message::Request {
+                    request, channel, ..
+                } => {
+                    // Un nodo sin la cadena (una wallet) contesta igual, para
+                    // que el teléfono pase enseguida a otro par.
+                    let respuesta = match self.quantic_light_responder.as_ref() {
+                        Some(responder) => responder(&request),
+                        None => QuanticLightResponse::Error {
+                            message: "this node does not serve Zoka Quantic light wallets".to_string(),
+                        },
+                    };
+                    let _ = self
+                        .swarm
+                        .behaviour_mut()
+                        .quantic_light_request_response
+                        .send_response(channel, respuesta);
+                }
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                } => {
+                    if self
+                        .pending_outbound_quantic_light_requests
+                        .remove(&request_id)
+                        .is_some()
+                    {
+                        self.received_quantic_light.push_back((request_id, response));
+                    }
+                }
+            },
+            request_response::Event::OutboundFailure { request_id, .. } => {
+                self.pending_outbound_quantic_light_requests
+                    .remove(&request_id);
+            }
+            _ => {}
+        }
+    }
+
+    /// Quien atiende a las wallets livianas de Quantic (un nodo con la cadena).
+    pub fn set_quantic_light_responder(
+        &mut self,
+        responder: Box<dyn Fn(&QuanticLightRequest) -> QuanticLightResponse + Send>,
+    ) {
+        self.quantic_light_responder = Some(responder);
+    }
+
+    /// Le hace a `peer` un pedido de wallet liviana de Quantic y espera la
+    /// respuesta hasta `max_wait`. `None` si no está conectado, no habla el
+    /// protocolo o no contestó a tiempo; una respuesta tardía se descarta.
+    pub async fn request_quantic_light(
+        &mut self,
+        peer: &PeerId,
+        request: QuanticLightRequest,
+        max_wait: Duration,
+    ) -> Option<QuanticLightResponse> {
+        if !self.swarm.is_connected(peer) {
+            return None;
+        }
+        let id = self
+            .swarm
+            .behaviour_mut()
+            .quantic_light_request_response
+            .send_request(peer, request);
+        self.pending_outbound_quantic_light_requests.insert(id, *peer);
+        let limite = Instant::now() + max_wait;
+        while Instant::now() < limite {
+            let _ = self.pump_for(Duration::from_millis(200)).await;
+            if let Some(pos) = self
+                .received_quantic_light
+                .iter()
+                .position(|(respondido, _)| *respondido == id)
+            {
+                return self.received_quantic_light.remove(pos).map(|(_, respuesta)| respuesta);
+            }
+            if !self.pending_outbound_quantic_light_requests.contains_key(&id) {
+                // Falló (el par se fue o no habla el protocolo) sin respuesta.
+                return None;
+            }
+        }
+        self.pending_outbound_quantic_light_requests.remove(&id);
+        None
+    }
+
+    /// El mismo pedido a los pares conectados, de a uno, hasta que alguno
+    /// conteste algo que no sea un error. Devuelve quién contestó.
+    pub async fn request_quantic_light_from_peers(
+        &mut self,
+        request: QuanticLightRequest,
+        max_wait_per_peer: Duration,
+    ) -> Option<(PeerId, QuanticLightResponse)> {
+        let peers: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
+        for peer in peers {
+            match self
+                .request_quantic_light(&peer, request.clone(), max_wait_per_peer)
+                .await
+            {
+                None | Some(QuanticLightResponse::Error { .. }) => continue,
+                Some(response) => return Some((peer, response)),
+            }
+        }
+        None
     }
 
     fn handle_wallet_digest_event(
@@ -4211,6 +4350,9 @@ impl Node {
                         SwarmEvent::Behaviour(NodeBehaviourEvent::WalletDigestRequestResponse(event)) => {
                             self.handle_wallet_digest_event(event);
                         }
+                        SwarmEvent::Behaviour(NodeBehaviourEvent::QuanticLightRequestResponse(event)) => {
+                            self.handle_quantic_light_event(event);
+                        }
                         SwarmEvent::Behaviour(NodeBehaviourEvent::SnapshotRequestResponse(event)) => {
                             self.handle_snapshot_request_response_event(event);
                         }
@@ -5321,6 +5463,9 @@ impl Node {
                 }
                 SwarmEvent::Behaviour(NodeBehaviourEvent::WalletDigestRequestResponse(event)) => {
                     self.handle_wallet_digest_event(event);
+                }
+                SwarmEvent::Behaviour(NodeBehaviourEvent::QuanticLightRequestResponse(event)) => {
+                    self.handle_quantic_light_event(event);
                 }
                 SwarmEvent::Behaviour(NodeBehaviourEvent::SnapshotRequestResponse(event)) => {
                     self.handle_snapshot_request_response_event(event);
@@ -7041,6 +7186,124 @@ mod tests {
                 "un nodo completo si tiene que estar en '{ajeno}': {temas_completo:?}"
             );
         }
+    }
+
+    /// La dirección completa (con `/p2p/`) de un nodo que escucha en TCP local.
+    async fn escuchando_en_local(nodo: &mut Node) -> String {
+        nodo.listen("/ip4/127.0.0.1/tcp/0").await.expect("escuchar");
+        for _ in 0..40 {
+            let _ = nodo.pump_for(Duration::from_millis(50)).await;
+            if let Some(addr) = nodo.swarm.listeners().next() {
+                return format!("{addr}/p2p/{}", nodo.peer_id());
+            }
+        }
+        panic!("el nodo tiene que escuchar en algun lado");
+    }
+
+    #[tokio::test]
+    async fn un_telefono_pide_los_datos_de_quantic_a_un_nodo_por_p2p() {
+        // `/zoka-quantic/light/1` entre nodos de verdad: el que tiene la cadena
+        // contesta info, bloques compactos y envios; uno sin la cadena dice que
+        // no la sirve, y el telefono pasa al siguiente par en vez de esperar.
+        use crate::network::quantic_light_request_response::{
+            CompactBlockWire, QuanticLightRequest, QuanticLightResponse,
+        };
+
+        let mut servidor = Node::new(0).await.expect("nodo con la cadena");
+        servidor.set_quantic_light_responder(Box::new(|pedido| match pedido {
+            QuanticLightRequest::Info => QuanticLightResponse::Info {
+                chain_id: "zoka-quantic-regtest-v1".to_string(),
+                height: 300,
+                tip: "ab".repeat(32),
+                tree_root: Some("cd".repeat(32)),
+            },
+            QuanticLightRequest::Compact { from, to } => QuanticLightResponse::Compact {
+                blocks: (*from..=*to)
+                    .map(|height| CompactBlockWire {
+                        height,
+                        hash: format!("{height:064x}"),
+                        prev_hash: format!("{:064x}", height - 1),
+                        state_root: "quantic-v1:...".to_string(),
+                        // Una accion compacta pesa 1.236 bytes.
+                        transactions: vec![format!("{height:04x}").repeat(618)],
+                    })
+                    .collect(),
+            },
+            QuanticLightRequest::SubmitTx { tx_hex } => QuanticLightResponse::Submitted {
+                accepted: tx_hex == "c0ffee",
+                txid: (tx_hex == "c0ffee").then(|| "11".repeat(32)),
+                reason: (tx_hex != "c0ffee").then(|| "invalid proof".to_string()),
+            },
+        }));
+        let direccion_servidor = escuchando_en_local(&mut servidor).await;
+        let id_servidor = servidor.peer_id();
+        let mut sin_cadena = Node::new(0).await.expect("nodo sin la cadena");
+        let direccion_sin_cadena = escuchando_en_local(&mut sin_cadena).await;
+        let id_sin_cadena = sin_cadena.peer_id();
+
+        let mut telefono = Node::new(0).await.expect("telefono");
+        for direccion in [&direccion_sin_cadena, &direccion_servidor] {
+            telefono.connect_to_peer(direccion).await.expect("marcar");
+        }
+        for _ in 0..80 {
+            let _ = telefono.pump_for(Duration::from_millis(30)).await;
+            let _ = servidor.pump_for(Duration::from_millis(30)).await;
+            let _ = sin_cadena.pump_for(Duration::from_millis(30)).await;
+            if telefono.connected_peer_count() >= 2 {
+                break;
+            }
+        }
+        assert_eq!(telefono.connected_peer_count(), 2, "el telefono tiene que ver a los dos");
+
+        let atender = tokio::spawn(async move {
+            for _ in 0..600 {
+                let _ = servidor.pump_for(Duration::from_millis(15)).await;
+                let _ = sin_cadena.pump_for(Duration::from_millis(15)).await;
+            }
+        });
+        let espera = Duration::from_secs(15);
+
+        let no_la_sirve = telefono
+            .request_quantic_light(&id_sin_cadena, QuanticLightRequest::Info, espera)
+            .await;
+        assert!(
+            matches!(no_la_sirve, Some(QuanticLightResponse::Error { .. })),
+            "sin la cadena contesta que no la sirve: {no_la_sirve:?}"
+        );
+        match telefono
+            .request_quantic_light_from_peers(QuanticLightRequest::Info, espera)
+            .await
+        {
+            Some((quien, QuanticLightResponse::Info { height: 300, .. })) => {
+                assert_eq!(quien, id_servidor, "contesta el que tiene la cadena")
+            }
+            otra => panic!("info: {otra:?}"),
+        }
+        match telefono
+            .request_quantic_light(&id_servidor, QuanticLightRequest::Compact { from: 1, to: 500 }, espera)
+            .await
+        {
+            Some(QuanticLightResponse::Compact { blocks }) => {
+                assert_eq!(blocks.len(), 500, "500 bloques compactos en un solo pedido");
+                assert_eq!(blocks[499].height, 500);
+                assert_eq!(blocks[499].transactions[0].len(), 2 * 1236);
+            }
+            otra => panic!("compactos: {otra:?}"),
+        }
+        for (tx_hex, aceptada) in [("c0ffee", true), ("bad", false)] {
+            match telefono
+                .request_quantic_light(
+                    &id_servidor,
+                    QuanticLightRequest::SubmitTx { tx_hex: tx_hex.to_string() },
+                    espera,
+                )
+                .await
+            {
+                Some(QuanticLightResponse::Submitted { accepted, .. }) => assert_eq!(accepted, aceptada),
+                otra => panic!("envio: {otra:?}"),
+            }
+        }
+        atender.abort();
     }
 
     #[tokio::test]

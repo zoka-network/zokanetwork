@@ -33,6 +33,7 @@ pub use zoka_quantic as protocol;
 
 pub mod api;
 pub mod difficulty;
+pub mod light;
 pub mod mempool;
 pub mod miner;
 pub mod runtime;
@@ -1014,16 +1015,61 @@ mod tests {
         decode_block(block).unwrap().transactions.remove(0)
     }
 
+    /// Lo que sirve el nodo (por HTTP y por P2P), que es lo que verifica la wallet.
     fn compact_json(storage: &RocksDbStorage, height: u64) -> wallet_sync::CompactBlockJson {
-        let block = storage.get_canonical_block_by_height(height).unwrap().unwrap();
-        let decoded = decode_block(&block).unwrap();
-        let compact = zoka_quantic::compact::CompactBlock::from_block(&decoded);
-        wallet_sync::CompactBlockJson {
-            height,
-            hash: block.header.hash.clone(),
-            prev_hash: block.header.prev_hash.clone(),
-            state_root: block.header.state_root.clone(),
-            transactions: compact.transactions.iter().map(|tx| hex::encode(tx.to_bytes())).collect(),
+        light::compact_block_at(storage, height).unwrap().expect("the block exists")
+    }
+
+    #[test]
+    fn the_node_answers_light_wallets_with_its_chain() {
+        use crate::network::quantic_light_request_response::{QuanticLightRequest, QuanticLightResponse};
+
+        let (storage, _dir) = storage();
+        let params = consensus_params(Network::Regtest);
+        let team_sk = QuanticSpendingKey::from_root(&REGTEST_TEAM_ROOT, Network::Regtest, 0).unwrap();
+        let alice = QuanticSpendingKey::from_root(&[3; 32], Network::Regtest, 0)
+            .unwrap()
+            .full_viewing_key()
+            .address();
+        let mut team = QuanticWallet::new(team_sk.full_viewing_key(), &params);
+        let ask = |request: QuanticLightRequest| light::answer(&storage, CHAIN, &request);
+
+        // Antes del génesis: altura 0, sin árbol, sin bloques.
+        assert!(matches!(ask(QuanticLightRequest::Info), QuanticLightResponse::Info { height: 0, tree_root: None, .. }));
+        assert_eq!(ask(QuanticLightRequest::Compact { from: 0, to: 10 }), QuanticLightResponse::Compact { blocks: vec![] });
+
+        let b1 = mined(&storage, &genesis_parent_for(CHAIN), &coinbase(1, &team.fvk().address(), PREMINE_ATOMS, true), &[]);
+        apply_block_with_expected_difficulty(&storage, CHAIN, &b1, bits()).unwrap();
+        team.scan_block(&decode_block(&b1).unwrap());
+        match ask(QuanticLightRequest::Info) {
+            QuanticLightResponse::Info { chain_id, height, tip, tree_root } => {
+                assert_eq!((chain_id.as_str(), height, tip.as_str()), (CHAIN, 1, b1.header.hash.as_str()));
+                assert_eq!(tree_root, Some(hex::encode(team.anchor().to_bytes())), "the anchor of the next transfer");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Desde antes del génesis hasta más allá de la punta: lo que hay.
+        assert_eq!(
+            ask(QuanticLightRequest::Compact { from: 0, to: 99 }),
+            QuanticLightResponse::Compact { blocks: vec![compact_json(&storage, 1)] }
+        );
+
+        // Un envío armado en el teléfono entra al mempool; repetido o roto, no.
+        let tx = team
+            .create_transfer(&team_sk, vec![Payment::new(alice, ZKA)], 0, proving_key(), &mut zoka_quantic::os_rng())
+            .unwrap();
+        let tx_hex = hex::encode(tx.to_bytes());
+        match ask(QuanticLightRequest::SubmitTx { tx_hex: tx_hex.clone() }) {
+            QuanticLightResponse::Submitted { accepted: true, txid: Some(txid), reason: None } => {
+                assert_eq!(txid, tx.txid().to_hex())
+            }
+            other => panic!("{other:?}"),
+        }
+        for bad in [tx_hex, "zz".to_string(), "00".to_string()] {
+            assert!(matches!(
+                ask(QuanticLightRequest::SubmitTx { tx_hex: bad }),
+                QuanticLightResponse::Submitted { accepted: false, txid: None, reason: Some(_) }
+            ));
         }
     }
 

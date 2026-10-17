@@ -8,6 +8,9 @@
 //! - `GET /quantic/blocks?from=&to=`: las transacciones de cada bloque, en hex.
 //! - `GET /quantic/compact?from=&to=`: los bloques compactos de la wallet
 //!   liviana (etapa 5, A5), con el `state_root` de cada uno para verificarlos.
+//!
+//! Info y bloques compactos salen de [`super::light`], lo mismo que reciben
+//! los teléfonos por la red P2P.
 
 use std::sync::Arc;
 
@@ -17,13 +20,13 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 
-use super::{decode_block, mempool, runtime, tree_root_after, GENESIS_HEIGHT};
+use super::{light, mempool, runtime, GENESIS_HEIGHT};
 use crate::api::AppState;
 use crate::storage::RocksDbStorage;
 
 /// Bloques por pedido: los enteros pesan, los compactos mucho menos.
 pub const MAX_BLOCKS_PER_REQUEST: u64 = 50;
-pub const MAX_COMPACT_BLOCKS_PER_REQUEST: u64 = 500;
+pub use crate::network::quantic_light_request_response::MAX_COMPACT_BLOCKS_PER_REQUEST;
 
 type ApiError = (StatusCode, String);
 
@@ -50,13 +53,7 @@ pub fn routes(router: Router<Arc<AppState>>) -> Router<Arc<AppState>> {
 async fn get_info(State(app_state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>, ApiError> {
     let chain_id = chain_id()?;
     let storage = app_state.state_manager.raw_storage();
-    let height = storage.get_chain_height().map_err(|e| internal(format!("{e:?}")))?;
-    let tip = storage.get_last_block_hash().map_err(|e| internal(format!("{e:?}")))?;
-    let tree_root = if height >= GENESIS_HEIGHT {
-        tree_root_after(&storage, &tip).map_err(internal)?.map(hex::encode)
-    } else {
-        None
-    };
+    let light::ChainInfo { height, tip, tree_root } = light::chain_info(&storage).map_err(internal)?;
     let mempool_size = mempool::global().lock().map(|pool| pool.len()).unwrap_or(0);
     let network = super::network_for_chain(&chain_id).ok_or_else(|| internal("unknown chain"))?;
     let params = super::consensus_params(network);
@@ -139,20 +136,7 @@ async fn get_compact(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     chain_id()?;
     let storage = app_state.state_manager.raw_storage();
-    let mut blocks = Vec::new();
-    for height in range(&storage, &query, MAX_COMPACT_BLOCKS_PER_REQUEST)? {
-        let Some(block) = storage.get_canonical_block_by_height(height).map_err(|e| internal(format!("{e:?}")))? else {
-            break;
-        };
-        let decoded = decode_block(&block).map_err(internal)?;
-        let compact = zoka_quantic::compact::CompactBlock::from_block(&decoded);
-        blocks.push(serde_json::json!({
-            "height": height,
-            "hash": block.header.hash,
-            "prev_hash": block.header.prev_hash,
-            "state_root": block.header.state_root,
-            "transactions": compact.transactions.iter().map(|tx| hex::encode(tx.to_bytes())).collect::<Vec<_>>(),
-        }));
-    }
+    let blocks = light::compact_blocks(&storage, query.from, query.to, MAX_COMPACT_BLOCKS_PER_REQUEST)
+        .map_err(internal)?;
     Ok(Json(serde_json::json!({ "blocks": blocks })))
 }

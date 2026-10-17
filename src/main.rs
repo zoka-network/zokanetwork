@@ -11214,6 +11214,15 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         node.set_private_tx_digests_responder(Box::new(move |request| {
             private_tx_digests_from_storage(&digests_storage, request)
         }));
+        // Zoka Quantic: los teléfonos piden por P2P lo mismo que la API HTTP.
+        #[cfg(feature = "quantic")]
+        if network.is_quantic() {
+            let light_storage = storage.clone();
+            let light_chain_id = chain_id.clone();
+            node.set_quantic_light_responder(Box::new(move |request| {
+                zoka::quantic::light::answer(&light_storage, &light_chain_id, request)
+            }));
+        }
     }
     // Optionally also serve this node's chain as an iroh snapshot so fresh
     // nodes can bootstrap in a single transfer (QUIC + n0 hole-punching, no
