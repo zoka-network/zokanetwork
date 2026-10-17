@@ -337,7 +337,25 @@ below its height; it cannot make an invalid block valid.
 - **H11 — Hybrid signatures.** No combination of a valid signature of one half
   and a forgery of the other verifies; no signature transfers across domains.
 
-## 12. Known limits
+## 12. Denial of service
+
+Proof verification costs time per action, and several handlers run in the
+node's network loop, so peers are budgeted (`src/network/p2p.rs`,
+`src/quantic/runtime.rs`, `src/quantic/light.rs`):
+
+- `/zoka-quantic/light/1`: 600 units per peer per minute (info 1; compact blocks
+  1 per 10 blocks; a submitted transaction 3 per action).
+- Compact-block responses stop at 8 MB of hex (the first block always goes); the
+  client reads at most 16 MB compressed and 32 MB decompressed.
+- Gossiped Quantic transactions: 600 actions per relaying peer per minute.
+- Blocks are checked for proof of work before their Halo 2 proofs.
+- Peers that keep no chain (wallets) answer block and header requests at once.
+
+Gossipsub forwards a message before the application validates it, as on Zenith;
+the budgets bound what each peer can make a node verify, not what crosses the
+network.
+
+## 13. Known limits
 
 - Validity is classical: a quantum adversary could forge proofs and create
   coins, or spend others' notes. The V3 note format keeps a recovery path
@@ -347,7 +365,7 @@ below its height; it cannot make an invalid block valid.
 - Light wallets trust their peers for proof of work.
 - The team's checkpoint key is a declared trust assumption.
 
-## 13. Running the tests
+## 14. Running the tests
 
 ```sh
 cargo test --manifest-path crates/zoka-quantic/Cargo.toml      # 34 unit, 7 end to end (real Halo 2 proofs)

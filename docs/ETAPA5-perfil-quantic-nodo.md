@@ -156,6 +156,24 @@ Lo que falta para abrir la testnet (pasos del usuario, al final):
 3. Arrancar el nodo de la PC en `quantic-testnet` minando, y publicarlo como
    semilla en el manifiesto.
 
+### Protecciones contra abuso (17/10/2026)
+
+Verificar una prueba Halo 2 cuesta tiempo por acción y varias cosas corren en el
+bucle de la red, así que un par no puede pedir ni mandar sin límite:
+
+- `/zoka-quantic/light/1`: 600 unidades por par y por minuto (info 1, bloques
+  compactos 1 cada 10, un envío 3 por acción). Pasado eso, "rate limited".
+- Cada respuesta de bloques compactos se corta en 8 MB de hex (el primer bloque
+  va siempre) y la wallet sigue desde el último; el teléfono lee hasta 16 MB
+  comprimidos y 32 MB descomprimidos (una bomba de deflate se rechaza).
+- Transacciones por gossip: 600 acciones por minuto por cada par que las
+  reenvía; lo que se pasa se descarta en silencio.
+- Un bloque se valida primero por su prueba de trabajo (barata de chequear y
+  cara de fabricar) y recién después por sus pruebas Halo 2.
+- Una wallet (perfil `Wallet`, el teléfono) contesta al toque que no tiene
+  bloques ni cabeceras, y el tanteo del bloque siguiente sin altura anunciada
+  espera 60 s si nadie lo tiene: un teléfono conectado no frena la minería.
+
 ### Pendiente
 
 7. Génesis de la testnet de Quantic con su premine y la PC como semilla (ver arriba).
