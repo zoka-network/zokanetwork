@@ -1090,6 +1090,13 @@ mod tests {
         let history = resumed["history"].as_array().unwrap();
         assert_eq!(history[0]["net_atoms"], -((25 * ZKA + fee) as i64));
         assert_eq!(history[0]["height"], 3);
+        // El memo viaja cifrado con la nota: Alice lo lee del bloque entero.
+        let mut alice_full = QuanticWallet::new(alice_sk.full_viewing_key(), &params);
+        for block in [&b1, &b2, &b3] {
+            alice_full.scan_block(&decode_block(block).unwrap());
+        }
+        let memo = alice_full.notes()[0].memo.expect("full blocks carry the memo");
+        assert!(memo.starts_with(b"gracias") && memo[7..].iter().all(|b| *b == 0));
         // Alice, desde el génesis con la misma interfaz, ve sus 25 ZKA.
         let alice_view = call(
             quantic_sync_json,

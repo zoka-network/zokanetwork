@@ -14881,7 +14881,7 @@ fn cmd_quantic_wallet(args: &[String]) -> Result<(), String> {
 
 #[cfg(feature = "quantic")]
 fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
-    const USAGE: &str = "usage: zoka quantic-wallet <new|restore|address|list|balance|history|send|import-regtest-team> --network quantic-regtest|quantic-testnet [--name <wallet>] [--password <p> | --password-env <VAR> | --password-stdin] [restore: --phrase-env <VAR> or the phrase on stdin] [--rpc <url>] [--json]";
+    const USAGE: &str = "usage: zoka quantic-wallet <new|restore|address|list|balance|history|send|import-regtest-team> --network quantic-regtest|quantic-testnet [--name <wallet>] [--password <p> | --password-env <VAR> | --password-stdin] [restore: --phrase-env <VAR> or the phrase on stdin] [send: --to <address> --amount <ZKA> [--memo <text>]] [--rpc <url>] [--json]";
     let Some((action, rest)) = args.split_first() else {
         return Err(USAGE.to_string());
     };
@@ -15056,12 +15056,21 @@ fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
             if amount == 0 {
                 return Err("--amount must be positive".to_string());
             }
+            let mut payment = zoka::quantic::protocol::builder::Payment::new(to, amount);
+            // Texto para el destinatario, cifrado con la nota (hasta 512 bytes).
+            if let Some(memo) = option_value(rest, "--memo").filter(|memo| !memo.is_empty()) {
+                let bytes = memo.as_bytes();
+                if bytes.len() > payment.memo.len() {
+                    return Err(format!("--memo has {} bytes; at most {}", bytes.len(), payment.memo.len()));
+                }
+                payment.memo[..bytes.len()].copy_from_slice(bytes);
+            }
             let (key, wallet, tip) = synced(&password)?;
             let proving_key = zoka::quantic::runtime::proving_key();
             let tx = wallet
                 .create_transfer(
                     &key,
-                    vec![zoka::quantic::protocol::builder::Payment::new(to, amount)],
+                    vec![payment],
                     0,
                     proving_key,
                     &mut zoka::quantic::protocol::os_rng(),
