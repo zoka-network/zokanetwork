@@ -377,7 +377,7 @@ fn branch_state(
                 .ok_or_else(|| QuanticBlockError::Storage("corrupt coinbase commitment".into()))?;
         }
         let anchors_done = index + 1 >= params.anchor_window;
-        let maturing_done = maturing_height.map_or(true, |h| meta.height <= h);
+        let maturing_done = maturing_height.is_none_or(|h| meta.height <= h);
         if anchors_done && maturing_done {
             break;
         }

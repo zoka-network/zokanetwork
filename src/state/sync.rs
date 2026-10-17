@@ -129,7 +129,7 @@ impl PeerChainView {
     /// Si toca tantear el bloque siguiente cuando ningún par anunció su altura.
     pub fn speculative_probe_due(&self) -> bool {
         self.speculative_probe_not_before
-            .map_or(true, |not_before| Instant::now() >= not_before)
+            .is_none_or(|not_before| Instant::now() >= not_before)
     }
 
     /// Después de un tanteo que nadie contestó con el bloque: los pares
