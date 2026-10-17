@@ -1,0 +1,23 @@
+{
+  "schema": "zoka-quantic-regtest-network-v1",
+  "status": "local",
+  "chain_id": "zoka-quantic-regtest-v1",
+  "protocol_freeze_id": "/zoka-quantic-regtest/0.1.0",
+  "transport_policy": {
+    "anonymous_transport_preferred": false,
+    "clearnet_requires_explicit_operator_choice": false,
+    "supported": [
+      "tcp"
+    ]
+  },
+  "seed_nodes": [],
+  "public_rpc": [],
+  "desktop": {
+    "local_rpc_url": "http://127.0.0.1:3200"
+  },
+  "snapshot_signers": [],
+  "notes": [
+    "Local Zoka Quantic network for development and tests: no seeds (dial with --seed), light proof of work, coinbase maturity of 2 blocks.",
+    "Its premine goes to a test key that is public on purpose (REGTEST_TEAM_ROOT): regtest coins have no value."
+  ]
+}

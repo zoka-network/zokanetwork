@@ -5812,6 +5812,11 @@ pub fn create_router(app_state: Arc<AppState>) -> Router {
     if app_state.security.enable_block_submit_endpoint {
         router = router.route("/sync/block", post(post_block_submit));
     }
+    // Zoka Quantic: las rutas responden 404 en un nodo de Zenith.
+    #[cfg(feature = "quantic")]
+    {
+        router = crate::quantic::api::routes(router);
+    }
     router
         .layer(DefaultBodyLimit::max(
             app_state.security.max_request_body_bytes,

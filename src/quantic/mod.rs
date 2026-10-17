@@ -31,8 +31,12 @@ use crate::types::Block;
 
 pub use zoka_quantic as protocol;
 
+pub mod api;
 pub mod mempool;
 pub mod miner;
+pub mod runtime;
+pub mod wallet_file;
+pub mod wallet_sync;
 
 /// El nodo numera desde 1 (la altura 0 es el génesis sintético de cada
 /// cadena), así que el génesis de Quantic, con el premine, es el bloque 1.
@@ -773,5 +777,80 @@ mod tests {
 
     fn block_tx(block: &Block) -> QuanticTransaction {
         decode_block(block).unwrap().transactions.remove(0)
+    }
+
+    fn compact_json(storage: &RocksDbStorage, height: u64) -> wallet_sync::CompactBlockJson {
+        let block = storage.get_canonical_block_by_height(height).unwrap().unwrap();
+        let decoded = decode_block(&block).unwrap();
+        let compact = zoka_quantic::compact::CompactBlock::from_block(&decoded);
+        wallet_sync::CompactBlockJson {
+            height,
+            hash: block.header.hash.clone(),
+            prev_hash: block.header.prev_hash.clone(),
+            state_root: block.header.state_root.clone(),
+            transactions: compact.transactions.iter().map(|tx| hex::encode(tx.to_bytes())).collect(),
+        }
+    }
+
+    #[test]
+    fn a_wallet_syncs_from_compact_blocks_and_catches_a_node_that_lies() {
+        let (storage, _dir) = storage();
+        let params = consensus_params(Network::Regtest);
+        let team_sk = QuanticSpendingKey::from_root(&REGTEST_TEAM_ROOT, Network::Regtest, 0).unwrap();
+        let alice_sk = QuanticSpendingKey::from_root(&[3; 32], Network::Regtest, 0).unwrap();
+        let miner = QuanticSpendingKey::from_root(&[4; 32], Network::Regtest, 0)
+            .unwrap()
+            .full_viewing_key()
+            .address();
+        let mut team = QuanticWallet::new(team_sk.full_viewing_key(), &params);
+        let genesis_parent = genesis_parent_for(CHAIN);
+        let b1 = mined(&storage, &genesis_parent, &coinbase(1, &team.fvk().address(), PREMINE_ATOMS, true), &[]);
+        apply_block_with_expected_difficulty(&storage, CHAIN, &b1, BITS).unwrap();
+        team.scan_block(&decode_block(&b1).unwrap());
+        let tx = team
+            .create_transfer(&team_sk, vec![Payment::new(alice_sk.full_viewing_key().address(), 3 * ZKA)], 0, proving_key(), &mut zoka_quantic::os_rng())
+            .unwrap();
+        let fee = tx.fee().unwrap();
+        let b2 = mined(&storage, &b1, &coinbase(2, &miner, params.minted_at(2) + fee, false), &[tx]);
+        apply_block_with_expected_difficulty(&storage, CHAIN, &b2, BITS).unwrap();
+
+        // Alice, sincronizada solo con bloques compactos, ve sus 3 ZKA y puede gastarlos.
+        let honest = |from: u64, to: u64| Ok((from..=to).map(|h| compact_json(&storage, h)).collect());
+        let alice = wallet_sync::sync_wallet(alice_sk.full_viewing_key(), 2, honest).unwrap();
+        assert_eq!(alice.balance(), 3 * ZKA);
+        assert_eq!(alice.anchor().to_bytes(), tree_root_after(&storage, &b2.header.hash).unwrap().unwrap());
+        let spend = alice
+            .create_transfer(&alice_sk, vec![Payment::new(miner.clone(), ZKA)], 0, proving_key(), &mut zoka_quantic::os_rng())
+            .unwrap();
+        let mut pool = mempool::QuanticMempool::new();
+        pool.insert(&storage, CHAIN, spend, 1).expect("a light wallet's spend is valid");
+
+        // Un nodo que le esconde la transferencia del bloque 2.
+        let hiding = |from: u64, to: u64| {
+            Ok((from..=to)
+                .map(|h| {
+                    let mut block = compact_json(&storage, h);
+                    if h == 2 {
+                        block.transactions.truncate(1);
+                    }
+                    block
+                })
+                .collect())
+        };
+        let error = wallet_sync::sync_wallet(alice_sk.full_viewing_key(), 2, hiding).unwrap_err();
+        assert!(error.contains("does not match"), "{error}");
+        // Uno que le cambia la raíz del árbol para hacerle armar envíos inválidos.
+        let wrong_tree = |from: u64, to: u64| {
+            Ok((from..=to)
+                .map(|h| {
+                    let mut block = compact_json(&storage, h);
+                    let mut roots = QuanticRoots::parse(&block.state_root).unwrap();
+                    roots.tree_root = [7; 32];
+                    block.state_root = roots.to_state_root();
+                    block
+                })
+                .collect())
+        };
+        assert!(wallet_sync::sync_wallet(alice_sk.full_viewing_key(), 2, wrong_tree).is_err());
     }
 }

@@ -776,7 +776,7 @@ fn xor_legacy(data: &[u8], password: &str) -> Result<Vec<u8>, BlockError> {
 
 /// Password-based authenticated encryption with Argon2 + AES-256-GCM.
 /// Format: magic(8) || salt(16) || nonce(12) || ciphertext
-fn encrypt_data(data: &[u8], password: &str) -> Result<Vec<u8>, BlockError> {
+pub(crate) fn encrypt_data(data: &[u8], password: &str) -> Result<Vec<u8>, BlockError> {
     use aes_gcm::aead::Aead;
     use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
     use rand::RngCore;
@@ -817,7 +817,7 @@ fn encrypt_data(data: &[u8], password: &str) -> Result<Vec<u8>, BlockError> {
 
 /// Password-based authenticated decryption.
 /// Supports new format and legacy XOR format for backward compatibility.
-fn decrypt_data(encrypted: &[u8], password: &str) -> Result<Vec<u8>, BlockError> {
+pub(crate) fn decrypt_data(encrypted: &[u8], password: &str) -> Result<Vec<u8>, BlockError> {
     use aes_gcm::aead::Aead;
     use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 

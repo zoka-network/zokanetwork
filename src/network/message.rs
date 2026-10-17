@@ -79,6 +79,10 @@ pub enum ZokaMessage {
     /// Checkpoint firmado por el nodo del equipo (`checkpoint_authority`). Va
     /// por su propio tópico: los nodos viejos no se suscriben.
     SignedCheckpoint(crate::checkpoint_authority::SignedCheckpoint),
+    /// Zoka Quantic: una transferencia entera en el formato binario de
+    /// `crates/zoka-quantic`, en hex (unos 22 KB con 2 acciones). Solo circula
+    /// en las redes de Quantic, que usan sus propios tópicos.
+    QuanticTransaction { tx_hex: String },
     /// Respuesta de consulta (sin exponer metadata sensible)
     UserQueryResponse {
         username: String,
@@ -424,6 +428,7 @@ impl ZokaMessage {
             ZokaMessage::ShareSubmit(message) => message.timestamp,
             ZokaMessage::TurnUpdate(message) => message.timestamp,
             ZokaMessage::SignedCheckpoint(_) => 0,
+            ZokaMessage::QuanticTransaction { .. } => 0,
             ZokaMessage::UserRegistry { .. } => 0,
             ZokaMessage::UserQuery { .. } => 0,
             ZokaMessage::UserQueryResponse { .. } => 0,

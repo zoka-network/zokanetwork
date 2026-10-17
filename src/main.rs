@@ -456,10 +456,11 @@ impl MainnetNetworkConfig {
                 network.chain_id()
             ));
         }
-        if self.protocol_freeze_id != PROTOCOL_FREEZE_ID {
+        if self.protocol_freeze_id != network.protocol_id() {
             return Err(format!(
                 "network config protocol '{}' does not match binary protocol '{}'",
-                self.protocol_freeze_id, PROTOCOL_FREEZE_ID
+                self.protocol_freeze_id,
+                network.protocol_id()
             ));
         }
         if self
@@ -799,6 +800,8 @@ fn network_config_path_from_env(network: NetworkProfile) -> Option<PathBuf> {
     // la testnet retirada no se lee: apuntaria a un manifiesto de otra cadena.
     let network_specific = match network {
         NetworkProfile::Zenith => "ZOKA_MAINNET_NETWORK_CONFIG",
+        NetworkProfile::QuanticTestnet => "ZOKA_QUANTIC_TESTNET_NETWORK_CONFIG",
+        NetworkProfile::QuanticRegtest => "ZOKA_QUANTIC_REGTEST_NETWORK_CONFIG",
     };
     env_non_empty(network_specific)
         .or_else(|| env_non_empty("ZOKA_NETWORK_CONFIG"))
@@ -893,10 +896,16 @@ fn load_mainnet_network_config(path: &Path) -> Result<MainnetNetworkConfig, Stri
 /// loader still prefers a real file on disk if it exists (for operators
 /// pointing at a custom config) and falls back to the embedded copy otherwise.
 const EMBEDDED_MAINNET_NETWORK_CONFIG: &str = include_str!("../docs/mainnet-network.v1.json");
+const EMBEDDED_QUANTIC_TESTNET_NETWORK_CONFIG: &str =
+    include_str!("../docs/quantic-testnet-network.v1.json");
+const EMBEDDED_QUANTIC_REGTEST_NETWORK_CONFIG: &str =
+    include_str!("../docs/quantic-regtest-network.v1.json");
 
 fn embedded_network_config_for(network: NetworkProfile) -> &'static str {
     match network {
         NetworkProfile::Zenith => EMBEDDED_MAINNET_NETWORK_CONFIG,
+        NetworkProfile::QuanticTestnet => EMBEDDED_QUANTIC_TESTNET_NETWORK_CONFIG,
+        NetworkProfile::QuanticRegtest => EMBEDDED_QUANTIC_REGTEST_NETWORK_CONFIG,
     }
 }
 
@@ -2343,6 +2352,9 @@ const FEE_MARKET_STEP_ATOMS: u64 = economics::ATOMS_PER_ZKA / 10_000;
 const MAINNET_CHAIN_ID: &str = economics::MAINNET_CHAIN_ID;
 const TESTNET_CHAIN_ID: &str = economics::TESTNET_CHAIN_ID;
 const MAINNET_MINING_MODE: &str = "pow-mainnet";
+/// Quantic mina con su propio camino (`zoka::quantic::miner`); el modo solo se
+/// muestra.
+const QUANTIC_MINING_MODE: &str = "pow-quantic";
 const TESTNET_MINING_MODE: &str = "pow-testnet";
 const POW_TARGET_BLOCK_TIME_SECS: u64 = economics::TARGET_BLOCK_TIME_SECS;
 const POW_INITIAL_DIFFICULTY_BITS: u32 = economics::POW_INITIAL_DIFFICULTY_BITS;
@@ -2368,6 +2380,12 @@ const DEFAULT_CHAIN_DB_PATH: &str = ".zoka/mainnet/blockchain.db";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NetworkProfile {
     Zenith,
+    /// Zoka Quantic: su testnet nueva, con Ironwood y X-Wing desde el bloque
+    /// 1 (etapa 5). Solo en builds con la feature `quantic`.
+    QuanticTestnet,
+    /// Redes locales de Quantic: prueba de trabajo liviana, maduración de 2
+    /// bloques y un premine a una clave de prueba pública.
+    QuanticRegtest,
 }
 
 impl NetworkProfile {
@@ -2384,15 +2402,54 @@ impl NetworkProfile {
             // ZSilent, los scripts de mineria y este mismo binario cuando se
             // relanza a si mismo.
             "testnet" | "zenith" | "mainnet" => Ok(Self::Zenith),
+            "quantic-testnet" => Self::quantic(Self::QuanticTestnet),
+            "quantic-regtest" => Self::quantic(Self::QuanticRegtest),
             other => Err(format!(
-                "invalid --network '{other}'; expected testnet (Zenith). 'mainnet' is still accepted as Zenith's former name"
+                "invalid --network '{other}'; expected testnet (Zenith), quantic-testnet or quantic-regtest. 'mainnet' is still accepted as Zenith's former name"
             )),
+        }
+    }
+
+    /// Los perfiles de Quantic existen en todas las builds para poder
+    /// nombrarlos, pero solo arrancan en una con la feature `quantic`.
+    fn quantic(profile: Self) -> Result<Self, String> {
+        if cfg!(feature = "quantic") {
+            Ok(profile)
+        } else {
+            Err(format!(
+                "{} needs a build with the quantic feature (cargo build --features quantic)",
+                profile.label()
+            ))
+        }
+    }
+
+    fn is_quantic(self) -> bool {
+        matches!(self, Self::QuanticTestnet | Self::QuanticRegtest)
+    }
+
+    /// El protocolo que anuncia el nodo; los manifiestos tienen que coincidir.
+    fn protocol_id(self) -> &'static str {
+        match self {
+            Self::Zenith => PROTOCOL_FREEZE_ID,
+            Self::QuanticTestnet => zoka::network::p2p::QUANTIC_TESTNET_PROTOCOL_ID,
+            Self::QuanticRegtest => zoka::network::p2p::QUANTIC_REGTEST_PROTOCOL_ID,
+        }
+    }
+
+    /// Lo que reemplaza a `zoka` en los nombres de los tópicos.
+    fn topic_prefix(self) -> Option<&'static str> {
+        match self {
+            Self::Zenith => None,
+            Self::QuanticTestnet => Some("zoka-quantic-testnet"),
+            Self::QuanticRegtest => Some("zoka-quantic-regtest"),
         }
     }
 
     fn from_chain_id(chain_id: &str) -> Result<Self, String> {
         match chain_id {
             MAINNET_CHAIN_ID => Ok(Self::Zenith),
+            economics::QUANTIC_TESTNET_CHAIN_ID => Self::quantic(Self::QuanticTestnet),
+            economics::QUANTIC_REGTEST_CHAIN_ID => Self::quantic(Self::QuanticRegtest),
             TESTNET_CHAIN_ID => Err(format!(
                 "chain id '{TESTNET_CHAIN_ID}' was retired: it never ran as a public network. Zenith ({MAINNET_CHAIN_ID}) is the testnet now"
             )),
@@ -2405,42 +2462,56 @@ impl NetworkProfile {
     fn chain_id(self) -> &'static str {
         match self {
             Self::Zenith => MAINNET_CHAIN_ID,
+            Self::QuanticTestnet => economics::QUANTIC_TESTNET_CHAIN_ID,
+            Self::QuanticRegtest => economics::QUANTIC_REGTEST_CHAIN_ID,
         }
     }
 
     fn default_db_path(self) -> &'static str {
         match self {
             Self::Zenith => DEFAULT_CHAIN_DB_PATH,
+            Self::QuanticTestnet => ".zoka/quantic-testnet/blockchain.db",
+            Self::QuanticRegtest => ".zoka/quantic-regtest/blockchain.db",
         }
     }
 
     fn local_dir(self) -> &'static str {
         match self {
             Self::Zenith => ".zoka/mainnet",
+            Self::QuanticTestnet => ".zoka/quantic-testnet",
+            Self::QuanticRegtest => ".zoka/quantic-regtest",
         }
     }
 
     fn default_genesis_path(self) -> &'static str {
         match self {
             Self::Zenith => "docs/genesis.mainnet.v1.json",
+            Self::QuanticTestnet => "docs/genesis.quantic-testnet.v1.json",
+            Self::QuanticRegtest => "docs/genesis.quantic-regtest.v1.json",
         }
     }
 
     fn default_network_config_path(self) -> &'static str {
         match self {
             Self::Zenith => "docs/mainnet-network.v1.json",
+            Self::QuanticTestnet => "docs/quantic-testnet-network.v1.json",
+            Self::QuanticRegtest => "docs/quantic-regtest-network.v1.json",
         }
     }
 
     fn network_config_schema(self) -> &'static str {
         match self {
             Self::Zenith => "zoka-mainnet-network-v1",
+            Self::QuanticTestnet => "zoka-quantic-testnet-network-v1",
+            Self::QuanticRegtest => "zoka-quantic-regtest-network-v1",
         }
     }
 
     fn mining_mode(self) -> &'static str {
         match self {
             Self::Zenith => MAINNET_MINING_MODE,
+            Self::QuanticTestnet => QUANTIC_MINING_MODE,
+            Self::QuanticRegtest => QUANTIC_MINING_MODE,
         }
     }
 
@@ -2450,18 +2521,24 @@ impl NetworkProfile {
     fn label(self) -> &'static str {
         match self {
             Self::Zenith => "mainnet",
+            Self::QuanticTestnet => "quantic-testnet",
+            Self::QuanticRegtest => "quantic-regtest",
         }
     }
 
     fn display_name(self) -> &'static str {
         match self {
             Self::Zenith => economics::ZENITH_DISPLAY_NAME,
+            Self::QuanticTestnet => "Zoka Quantic testnet (Ironwood)",
+            Self::QuanticRegtest => "Zoka Quantic regtest",
         }
     }
 
     fn role(self) -> &'static str {
         match self {
             Self::Zenith => economics::ZENITH_NETWORK_ROLE,
+            Self::QuanticTestnet => "testnet",
+            Self::QuanticRegtest => "regtest",
         }
     }
 }
@@ -7982,6 +8059,10 @@ async fn handle_fullnode_network_message(
                 )),
             }
         }
+        #[cfg(feature = "quantic")]
+        zoka::network::message::ZokaMessage::QuanticTransaction { tx_hex } => {
+            zoka::quantic::runtime::accept_network_transaction(storage?, chain_id, tx_hex)
+        }
         zoka::network::message::ZokaMessage::PrivateTransaction(message_tx) => {
             // Persist the gossiped private tx body + mark it pending in
             // local storage so the local miner picks it up at its next
@@ -10494,11 +10575,56 @@ fn expand_node_config_into_args(args: &[String]) -> Result<Vec<String>, String> 
     Ok(out)
 }
 
+/// El runtime de Quantic del nodo, si el perfil es de Quantic. Con
+/// `--quantic-mine-to <dirección>` también mina (`--quantic-mine-threads`,
+/// `--mine-interval-secs` y `--min-mine-peers` como en Zenith).
+#[cfg(feature = "quantic")]
+fn quantic_runtime_for(
+    args: &[String],
+    network: NetworkProfile,
+    chain_id: &str,
+    min_mine_peers: usize,
+) -> Result<Option<zoka::quantic::runtime::QuanticRuntime>, String> {
+    if !network.is_quantic() {
+        return Ok(None);
+    }
+    let quantic_network = zoka::quantic::network_for_chain(chain_id)
+        .ok_or_else(|| format!("{chain_id} is not a Quantic chain"))?;
+    let mining = match option_value(args, "--quantic-mine-to") {
+        Some(text) => {
+            let address = zoka::quantic::protocol::QuanticAddress::decode_for(text.trim(), quantic_network)
+                .map_err(|e| format!("--quantic-mine-to: {e}"))?;
+            let threads = parse_u64_arg(
+                option_value(args, "--quantic-mine-threads"),
+                default_mining_threads() as u64,
+                "--quantic-mine-threads",
+            )?
+            .clamp(1, 64) as usize;
+            let interval = parse_u64_arg(option_value(args, "--mine-interval-secs"), 0, "--mine-interval-secs")?;
+            Some(zoka::quantic::runtime::QuanticMiningConfig {
+                address,
+                threads,
+                interval: Duration::from_secs(interval),
+                min_peers: min_mine_peers,
+            })
+        }
+        None => None,
+    };
+    zoka::quantic::runtime::QuanticRuntime::new(chain_id, mining).map(Some)
+}
+
 async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let expanded = expand_node_config_into_args(args)?;
     let args: &[String] = &expanded;
     let network = NetworkProfile::from_args(args)?;
     let chain_id = network.chain_id().to_string();
+    // Zoka Quantic: su propio protocolo y sus tópicos, antes de crear el nodo
+    // de red, para que nunca se mezcle con Zenith.
+    if let Some(prefix) = network.topic_prefix() {
+        if !zoka::network::p2p::set_network_protocol(network.protocol_id(), prefix) {
+            return Err("this process already joined another network".to_string());
+        }
+    }
     zoka::api::global_startup_status().reset(
         "starting",
         Some(format!("starting {} fullnode", network.display_name())),
@@ -10527,7 +10653,10 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     //
     // Cuando el usuario inicia sesion, ZSilent reinicia el nodo en modo
     // completo. Para entonces la cadena ya avanzo.
-    let sync_only = has_flag(args, "--sync-only");
+    // En Quantic no hay wallet de Zenith que abrir ni minería de Zenith: el
+    // nodo baja y valida bloques como en --sync-only, y lo de Quantic (mempool
+    // y minería con --quantic-mine-to) lo lleva `zoka::quantic::runtime`.
+    let sync_only = has_flag(args, "--sync-only") || network.is_quantic();
     let tor_proxy = option_value(args, "--tor-proxy")
         .or_else(|| std::env::var("ZOKA_TOR_PROXY").ok())
         .map(|value| value.trim().to_string())
@@ -11903,7 +12032,24 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut mining_task: Option<tokio::task::JoinHandle<Result<MiningBatchSummary, String>>> = None;
     let mut team_share_task: Option<TeamShareTask> = None;
     let mut pending_team_solution: Option<zoka::team_mining::NetworkSolution> = None;
+    #[cfg(feature = "quantic")]
+    let mut quantic_runtime = quantic_runtime_for(args, network, &chain_id, min_mine_peers)?;
+    #[cfg(feature = "quantic")]
+    if let Some(runtime) = quantic_runtime.as_ref() {
+        startup_notes.push(if runtime.is_mining() {
+            "Zoka Quantic: mining to the address of --quantic-mine-to.".to_string()
+        } else {
+            "Zoka Quantic: validating and relaying; pass --quantic-mine-to <address> to mine.".to_string()
+        });
+    }
     loop {
+        #[cfg(feature = "quantic")]
+        if let (Some(runtime), Some(storage)) = (quantic_runtime.as_mut(), chain_storage_outer.as_ref()) {
+            let outcome = runtime.tick(&mut node, storage).await;
+            if let Some(event) = outcome.events.into_iter().last() {
+                last_event = event;
+            }
+        }
         if tokio::time::Instant::now() >= next_checkpoint_tick_at {
             if let (Some(signer), Some(storage)) =
                 (checkpoint_signer.as_ref(), chain_storage_outer.as_deref())
@@ -14663,6 +14809,175 @@ fn chain_contains_checkpoint(
         Some(checkpoint) => {
             canonical_hash_at(checkpoint.height).as_deref() == Some(checkpoint.block_hash.as_str())
         }
+    }
+}
+
+/// `zoka quantic-wallet <acción> --network quantic-regtest|quantic-testnet`:
+/// la wallet de Zoka Quantic de línea de comandos. Habla con el nodo por su API
+/// (`--rpc`, o la del manifiesto) y se sincroniza con bloques compactos que
+/// verifica contra cada bloque. Acciones: `new`, `restore`, `address`, `list`,
+/// `balance`, `send --to <dirección> --amount <ZKA>` e `import-regtest-team`
+/// (solo regtest: la wallet del premine, de clave pública a propósito).
+#[cfg(feature = "quantic")]
+fn cmd_quantic_wallet(args: &[String]) -> Result<(), String> {
+    const USAGE: &str = "usage: zoka quantic-wallet <new|restore|address|list|balance|send|import-regtest-team> --network quantic-regtest|quantic-testnet [--name <wallet>] [--password <p>] [--rpc <url>] [--json]";
+    let Some((action, rest)) = args.split_first() else {
+        return Err(USAGE.to_string());
+    };
+    let network = NetworkProfile::from_args(rest)?;
+    if !network.is_quantic() {
+        return Err("quantic-wallet needs --network quantic-testnet or quantic-regtest".to_string());
+    }
+    let quantic_network = zoka::quantic::network_for_chain(network.chain_id())
+        .ok_or_else(|| "unknown Quantic network".to_string())?;
+    let dir = zoka::quantic::wallet_file::wallets_dir(network.local_dir());
+    let name = option_value(rest, "--name").unwrap_or_else(|| "default".to_string());
+    let json = has_flag(rest, "--json");
+    let rpc = || -> Result<String, String> {
+        option_value(rest, "--rpc")
+            .or_else(|| configured_local_rpc_url(network))
+            .ok_or_else(|| "no node API: pass --rpc <url>".to_string())
+    };
+    let synced = |password: &str| -> Result<(zoka::quantic::protocol::QuanticSpendingKey, zoka::quantic::protocol::wallet::QuanticWallet, u64), String> {
+        let key = zoka::quantic::wallet_file::open(&dir, &name, quantic_network, password)?;
+        let url = rpc()?;
+        let info = rpc_http_get_json(&url, "/quantic/info", 15)?;
+        let tip = info["height"].as_u64().ok_or_else(|| format!("unexpected /quantic/info reply: {info}"))?;
+        let wallet = zoka::quantic::wallet_sync::sync_wallet(key.full_viewing_key(), tip, |from, to| {
+            let reply = rpc_http_get_json(&url, &format!("/quantic/compact?from={from}&to={to}"), 60)?;
+            serde_json::from_value(reply["blocks"].clone()).map_err(|e| format!("unexpected /quantic/compact reply: {e}"))
+        })?;
+        Ok((key, wallet, tip))
+    };
+    match action.as_str() {
+        "new" => {
+            let password = required_password_value(rest)?;
+            let (phrase, address) = zoka::quantic::wallet_file::create(&dir, &name, quantic_network, &password)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "name": name, "address": address, "recovery_phrase": phrase.as_str() })
+                );
+            } else {
+                println!("Zoka Quantic wallet '{name}' created ({}).", network.display_name());
+                println!("Recovery phrase (write it down offline; it is shown only once):");
+                println!("{}", phrase.as_str());
+                println!("Address:");
+                println!("{address}");
+            }
+            Ok(())
+        }
+        "restore" => {
+            let password = required_password_value(rest)?;
+            let phrase = match option_value(rest, "--phrase") {
+                Some(phrase) => phrase,
+                None => stdin_secret("--phrase")?,
+            };
+            let address = zoka::quantic::wallet_file::restore(&dir, &name, quantic_network, &phrase, &password)?;
+            if json {
+                println!("{}", serde_json::json!({ "name": name, "address": address }));
+            } else {
+                println!("Zoka Quantic wallet '{name}' restored.");
+                println!("{address}");
+            }
+            Ok(())
+        }
+        "import-regtest-team" => {
+            if quantic_network != zoka::quantic::protocol::Network::Regtest {
+                return Err("the team wallet with a public key exists only on quantic-regtest".to_string());
+            }
+            let password = required_password_value(rest)?;
+            let address = zoka::quantic::wallet_file::import_regtest_team(&dir, &name, &password)?;
+            println!("{address}");
+            Ok(())
+        }
+        "address" => {
+            let address = zoka::quantic::wallet_file::address(&dir, &name)?;
+            if json {
+                println!("{}", serde_json::json!({ "name": name, "address": address }));
+            } else {
+                println!("{address}");
+            }
+            Ok(())
+        }
+        "list" => {
+            let names = zoka::quantic::wallet_file::list(&dir);
+            if json {
+                println!("{}", serde_json::json!({ "wallets": names }));
+            } else {
+                for wallet in names {
+                    println!("{wallet}");
+                }
+            }
+            Ok(())
+        }
+        "balance" => {
+            let password = required_password_value(rest)?;
+            let (_, wallet, tip) = synced(&password)?;
+            let spendable = wallet.balance();
+            let immature = wallet.immature_balance();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "name": name,
+                        "height": tip,
+                        "spendable_atoms": spendable,
+                        "immature_atoms": immature,
+                        "spendable": format_zka(spendable),
+                        "immature": format_zka(immature),
+                        "notes": wallet.notes().iter().filter(|n| n.spent_in.is_none()).count(),
+                    })
+                );
+            } else {
+                println!("Wallet '{name}' at height {tip}:");
+                println!("Spendable: {}", format_zka(spendable));
+                println!("Immature (coinbase): {}", format_zka(immature));
+            }
+            Ok(())
+        }
+        "send" => {
+            let password = required_password_value(rest)?;
+            let to = zoka::quantic::protocol::QuanticAddress::decode_for(
+                required_option_value(rest, "--to")?.trim(),
+                quantic_network,
+            )
+            .map_err(|e| format!("--to: {e}"))?;
+            let amount = economics::parse_zka_amount(&required_option_value(rest, "--amount")?)?;
+            if amount == 0 {
+                return Err("--amount must be positive".to_string());
+            }
+            let (key, wallet, tip) = synced(&password)?;
+            let proving_key = zoka::quantic::runtime::proving_key();
+            let tx = wallet
+                .create_transfer(
+                    &key,
+                    vec![zoka::quantic::protocol::builder::Payment::new(to, amount)],
+                    0,
+                    proving_key,
+                    &mut zoka::quantic::protocol::os_rng(),
+                )
+                .map_err(|e| e.to_string())?;
+            let reply = rpc_http_post_json(
+                &rpc()?,
+                "/quantic/tx",
+                &serde_json::json!({ "tx_hex": hex::encode(tx.to_bytes()) }),
+                60,
+            )?;
+            let txid = tx.txid().to_hex();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "txid": txid, "fee_atoms": tx.fee(), "height": tip, "node": reply })
+                );
+            } else {
+                println!("Sent {} (fee {}).", format_zka(amount), format_zka(tx.fee().unwrap_or(0)));
+                println!("Transaction: {txid}");
+                println!("Node reply: {reply}");
+            }
+            Ok(())
+        }
+        _ => Err(USAGE.to_string()),
     }
 }
 
@@ -17668,6 +17983,8 @@ async fn run() -> Result<(), String> {
         "private-tx-audit" => cmd_private_tx_audit(tail),
         "checkpoint-keygen" => cmd_checkpoint_keygen(tail),
         "checkpoint-sign" => cmd_checkpoint_sign(tail),
+        #[cfg(feature = "quantic")]
+        "quantic-wallet" => cmd_quantic_wallet(tail),
         "checkpoint-status" => cmd_checkpoint_status(tail),
         "private-pending-diagnostics" => cmd_private_pending_diagnostics(tail),
         "tx-pending" => cmd_pending_transfers(tail),

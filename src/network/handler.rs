@@ -178,6 +178,11 @@ impl MessageHandler for DefaultMessageHandler {
                     checkpoint.chain_id, checkpoint.height
                 );
             }
+            ZokaMessage::QuanticTransaction { tx_hex } => {
+                info!("Quantic transaction received: {} hex chars", tx_hex.len());
+                let mut stats = self.stats.write().await;
+                stats.transactions += 1;
+            }
         }
 
         let mut count = self.processed_count.write().await;

@@ -152,7 +152,43 @@ fn protocol_freeze_enforce_from_env() -> bool {
     }
 }
 
+/// Zoka Quantic (etapa 5): cada red de Quantic anuncia su propio protocolo y
+/// usa sus propios tópicos. Un nodo de Zenith desconecta a uno de Quantic en
+/// el saludo inicial (y al revés), así que las redes nunca se mezclan.
+pub const QUANTIC_TESTNET_PROTOCOL_ID: &str = "/zoka-quantic-testnet/0.1.0";
+pub const QUANTIC_REGTEST_PROTOCOL_ID: &str = "/zoka-quantic-regtest/0.1.0";
+/// Una transferencia de Quantic de 64 acciones pesa unos 270 KB; en hex, el doble.
+const QUANTIC_TX_HEX_MAX: usize = 2 * 300 * 1024;
+
+/// Protocolo y prefijo de tópicos de la red de este proceso. Sin fijar, los
+/// de Zenith. Lo fija el binario una sola vez, antes de crear el nodo.
+static NETWORK_PROTOCOL: std::sync::OnceLock<(&'static str, &'static str)> = std::sync::OnceLock::new();
+
+/// Elige la red de este proceso: `protocol_id` para el saludo y
+/// `topic_prefix` en lugar de `zoka` en los tópicos. Devuelve `false` si ya
+/// estaba elegida otra.
+pub fn set_network_protocol(protocol_id: &'static str, topic_prefix: &'static str) -> bool {
+    NETWORK_PROTOCOL.set((protocol_id, topic_prefix)).is_ok()
+        || NETWORK_PROTOCOL.get() == Some(&(protocol_id, topic_prefix))
+}
+
+/// El protocolo que este proceso anuncia y exige.
+pub fn active_protocol_id() -> &'static str {
+    NETWORK_PROTOCOL.get().map(|(id, _)| *id).unwrap_or(PROTOCOL_FREEZE_ID)
+}
+
+fn topic_name(zenith_name: &str) -> String {
+    match NETWORK_PROTOCOL.get() {
+        Some((_, prefix)) => format!("{prefix}/{}", zenith_name.trim_start_matches("zoka/")),
+        None => zenith_name.to_string(),
+    }
+}
+
 fn advertised_protocol_version(protocol_freeze_enforce: bool) -> &'static str {
+    if NETWORK_PROTOCOL.get().is_some() {
+        // Las redes de Quantic no tienen versiones viejas que tolerar.
+        return active_protocol_id();
+    }
     if protocol_freeze_enforce {
         PROTOCOL_FREEZE_ID
     } else {
@@ -1399,7 +1435,7 @@ impl Node {
     }
 
     fn is_protocol_version_compatible(version: &str) -> bool {
-        version == PROTOCOL_FREEZE_ID
+        version == active_protocol_id()
     }
 
     fn is_hex_digest_64(value: &str) -> bool {
@@ -1548,6 +1584,20 @@ impl Node {
                         | crate::checkpoint_authority::CheckpointError::NoHybridAuthority,
                     ) => {}
                     Err(_) => return Err("invalid signed checkpoint"),
+                }
+            }
+            ZokaMessage::QuanticTransaction { tx_hex } => {
+                // Solo la forma: la prueba y las reglas las revisa el mempool,
+                // que es quien decide si la retransmite al minar.
+                if NETWORK_PROTOCOL.get().is_none() {
+                    return Err("quantic transaction on a non-Quantic network");
+                }
+                if tx_hex.is_empty()
+                    || tx_hex.len() > QUANTIC_TX_HEX_MAX
+                    || tx_hex.len() % 2 != 0
+                    || !tx_hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+                {
+                    return Err("malformed quantic transaction");
                 }
             }
             ZokaMessage::BlockRequest { .. } | ZokaMessage::Ping(_) => {}
@@ -1969,12 +2019,12 @@ impl Node {
             );
         }
 
-        let general_topic = gossipsub::IdentTopic::new(GENERAL_TOPIC_NAME);
-        let pbft_topic = gossipsub::IdentTopic::new(PBFT_TOPIC_NAME);
-        let stem_topic = gossipsub::IdentTopic::new(STEM_TOPIC_NAME);
-        let mixer_topic = gossipsub::IdentTopic::new(MIXER_TOPIC_NAME);
-        let team_mining_topic = gossipsub::IdentTopic::new(TEAM_MINING_TOPIC_NAME);
-        let checkpoints_topic = gossipsub::IdentTopic::new(CHECKPOINTS_TOPIC_NAME);
+        let general_topic = gossipsub::IdentTopic::new(topic_name(GENERAL_TOPIC_NAME));
+        let pbft_topic = gossipsub::IdentTopic::new(topic_name(PBFT_TOPIC_NAME));
+        let stem_topic = gossipsub::IdentTopic::new(topic_name(STEM_TOPIC_NAME));
+        let mixer_topic = gossipsub::IdentTopic::new(topic_name(MIXER_TOPIC_NAME));
+        let team_mining_topic = gossipsub::IdentTopic::new(topic_name(TEAM_MINING_TOPIC_NAME));
+        let checkpoints_topic = gossipsub::IdentTopic::new(topic_name(CHECKPOINTS_TOPIC_NAME));
         let general_topic_for_behaviour = general_topic.clone();
         let pbft_topic_for_behaviour = pbft_topic.clone();
         let stem_topic_for_behaviour = stem_topic.clone();

@@ -70,6 +70,17 @@ pub struct QuanticWallet {
     awaiting_tree: HashMap<[u8; 32], usize>,
 }
 
+impl std::fmt::Debug for QuanticWallet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "QuanticWallet(next height {}, {} notes)",
+            self.next_height,
+            self.notes.len()
+        )
+    }
+}
+
 impl QuanticWallet {
     pub fn new(fvk: QuanticFullViewingKey, params: &ConsensusParams) -> Self {
         Self {
