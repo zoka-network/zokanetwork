@@ -41,7 +41,9 @@ es más Zenith, pasa a ser Quantic") y Zenith es la testnet vieja.
 - Enviar: dirección, monto y memo opcional; la comisión es fija (0,0001 ZKA por
   acción), así que no hay selector de comisión. Tarda unos segundos en la PC
   (la prueba Halo 2).
-- Nodo y minería: `fullnode --network quantic-testnet --quantic-mine-to <dirección>`.
+- Nodo y minería: `fullnode --network quantic-testnet --quantic-mine-to <dirección>`
+  (puerto P2P 28180), y un segundo `HiddenServicePort 28180` en el servicio onion
+  de `TorSupervisor` para que la PC sea semilla por Tor.
 - El explorador interno, con los datos de `/quantic/blocks` (alturas, horas,
   cantidad de transacciones; los montos son privados).
 

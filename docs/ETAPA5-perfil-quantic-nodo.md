@@ -154,7 +154,11 @@ Lo que falta para abrir la testnet (pasos del usuario, al final):
 2. Pasarle la dirección a Claude, que arma el génesis, fija las constantes y
    compila.
 3. Arrancar el nodo de la PC en `quantic-testnet` minando, y publicarlo como
-   semilla en el manifiesto.
+   semilla en el manifiesto. Escucha en el puerto 28180 (Zenith sigue en 28080,
+   así que los dos nodos conviven). Para que la semilla sea alcanzable por Tor,
+   el servicio onion de ZSilent (`TorSupervisor`) necesita un segundo
+   `HiddenServicePort 28180 127.0.0.1:28180` en el mismo servicio: la misma
+   dirección onion sirve para las dos redes.
 
 ### Protecciones contra abuso (17/10/2026)
 
