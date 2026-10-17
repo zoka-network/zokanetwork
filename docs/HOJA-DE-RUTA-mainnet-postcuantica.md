@@ -397,9 +397,10 @@ Después del génesis cualquier cambio de estos exige un fork.
 
 | # | Decisión | Recomendación |
 |---|---|---|
-| D1 | ML-KEM-768 o ML-KEM-512 | 768: es la elección estándar (la usa TLS); 512 ahorra unos 400 bytes por dirección y 300 por salida |
-| D2 | Largo de las direcciones: con 768 rondan los 1.700 caracteres (1.200 con 512) | Aceptarlo y apoyarse en QR y copiar/pegar; las alternativas exigen un directorio de claves, que filtra privacidad |
-| D5 | Tiempo de bloque y dificultad inicial (la curva ya está decidida, ver LEEME) | Revisar con números en la Etapa 7 |
+| D1 | ML-KEM-768 o ML-KEM-512 | **Decidida el 12/10: 768, vía X-Wing** |
+| D2 | Largo de las direcciones: con 768 rondan los 1.700 caracteres (1.200 con 512) | **Decidida el 12/10: largas**, con QR animado en partes y copiar/pegar (en Quantic, unos 1.730 caracteres) |
+| D5 | Tiempo de bloque y dificultad inicial (la curva ya está decidida, ver LEEME) | **Hecha el 16/10 para Quantic:** 120 s y ASERT con τ = 1 h, 14 bits de arranque en la testnet ([7.2](ETAPA7-dificultad-quantic.md)); revisar con la testnet andando |
+| D6 | Prefijos de dirección, tamaño del memo y comisión de Quantic | Propuestos: `zq1`/`zqtest1`/`zqregtest1`, memo de 512 bytes (como Zcash) y 0,0001 ZKA por acción; **los confirma el usuario** antes del génesis |
 
 Decididas el 2026-10-11: nombre **Zoka Quantic**; premine de **5M para el equipo,
 gastable de inmediato, dentro de los 23M**; el exchange **sale entero ya**; los VPS
