@@ -120,9 +120,26 @@ pub struct PeerChainView {
     peer_tips: HashMap<PeerId, PeerChainTip>,
     rejected_sources: HashSet<PeerId>,
     pending_block_responses: BTreeMap<u64, BTreeMap<String, PendingBlockResponse>>,
+    /// Hasta cuándo no se vuelve a tantear el bloque siguiente sin altura
+    /// anunciada (ver [`Self::defer_speculative_probe`]).
+    speculative_probe_not_before: Option<Instant>,
 }
 
 impl PeerChainView {
+    /// Si toca tantear el bloque siguiente cuando ningún par anunció su altura.
+    pub fn speculative_probe_due(&self) -> bool {
+        self.speculative_probe_not_before
+            .map_or(true, |not_before| Instant::now() >= not_before)
+    }
+
+    /// Después de un tanteo que nadie contestó con el bloque: los pares
+    /// conectados no lo tienen (o no guardan la cadena, como un teléfono). No
+    /// se vuelve a tantear hasta `wait` después; un anuncio de altura no
+    /// espera, porque sigue el camino normal.
+    pub fn defer_speculative_probe(&mut self, wait: Duration) {
+        self.speculative_probe_not_before = Some(Instant::now() + wait);
+    }
+
     /// Record a peer-announced height, but only if it's within plausible
     /// reach of `local_height`. A `BlockResponse.block_height` (or
     /// `SyncState.last_height`) arrives unvalidated — straight from the
@@ -1666,6 +1683,16 @@ mod tests {
         block.header.merkle_root = block.compute_merkle_root();
         block.header.hash = block.compute_hash();
         block
+    }
+
+    #[test]
+    fn the_speculative_probe_waits_after_a_miss() {
+        let mut view = PeerChainView::default();
+        assert!(view.speculative_probe_due(), "at first it probes");
+        view.defer_speculative_probe(Duration::from_secs(60));
+        assert!(!view.speculative_probe_due(), "not again right after a miss");
+        view.defer_speculative_probe(Duration::ZERO);
+        assert!(view.speculative_probe_due());
     }
 
     #[test]

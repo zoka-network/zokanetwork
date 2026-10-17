@@ -77,6 +77,23 @@ fn state_hex(wallet: &QuanticWallet) -> String {
     hex::encode(&*wallet.to_state_bytes())
 }
 
+/// Pila del hilo donde corre Halo 2. Armar la clave y la prueba recursa hondo:
+/// la pila de un hilo común (1 MB: la principal en Windows, un hilo de Java en
+/// Android) se desborda. Es reserva de direcciones, no memoria usada.
+const PROVER_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+/// Corre `work` en un hilo propio con [`PROVER_STACK_BYTES`] de pila y espera
+/// el resultado, sea cual sea el hilo que llama.
+fn on_prover_stack<T: Send + 'static>(work: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
+    std::thread::Builder::new()
+        .name("zoka-quantic-prover".to_string())
+        .stack_size(PROVER_STACK_BYTES)
+        .spawn(work)
+        .map_err(|e| format!("could not start the prover thread: {e}"))?
+        .join()
+        .map_err(|_| "the prover panicked".to_string())?
+}
+
 fn encode<T: Serialize>(value: &T) -> Result<String, String> {
     serde_json::to_string(value).map_err(|e| format!("failed to encode the response: {e}"))
 }
@@ -256,6 +273,11 @@ pub struct QuanticTransferResponse {
 /// gastadas hasta que un bloque lo incluya: si la app arma otro antes, puede
 /// elegir las mismas y el nodo rechaza el segundo.
 pub fn quantic_build_transfer_json(request_json: &str) -> Result<String, String> {
+    let request_json = request_json.to_string();
+    on_prover_stack(move || build_transfer(&request_json))
+}
+
+fn build_transfer(request_json: &str) -> Result<String, String> {
     let mut request: QuanticTransferRequest =
         serde_json::from_str(request_json).map_err(|e| format!("invalid transfer request: {e}"))?;
     let network = network_named(&request.network)?;
@@ -295,7 +317,9 @@ pub fn quantic_build_transfer_json(request_json: &str) -> Result<String, String>
 /// Arma la clave de prueba de Halo 2 si todavía no está. La primera vez tarda
 /// (40 s en el teléfono de pruebas); después, nada.
 pub fn quantic_preload_proving_key_json() -> Result<String, String> {
-    let started = Instant::now();
-    let _ = runtime::proving_key();
-    encode(&serde_json::json!({ "ms": started.elapsed().as_millis() as u64 }))
+    on_prover_stack(|| {
+        let started = Instant::now();
+        let _ = runtime::proving_key();
+        encode(&serde_json::json!({ "ms": started.elapsed().as_millis() as u64 }))
+    })
 }

@@ -1009,6 +1009,8 @@ pub struct Node {
     header_responder: Option<Box<dyn Fn(&GetHeaders) -> HeadersResponse + Send>>,
     #[allow(clippy::type_complexity)]
     wallet_digest_responder: Option<Box<dyn Fn(&GetWalletDigests) -> WalletDigestsResponse + Send>>,
+    /// Para qué se usa este nodo: una wallet no guarda la cadena.
+    profile: NodeProfile,
 }
 
 /// Behaviour set for the node.
@@ -2383,6 +2385,7 @@ impl Node {
             block_body_responder: None,
             header_responder: None,
             wallet_digest_responder: None,
+            profile,
         })
     }
 
@@ -2594,6 +2597,23 @@ impl Node {
                                 }
                                 Err(_) => self.record_direct_block_failure(peer),
                             }
+                        }
+                        // Una wallet (el teléfono) no guarda bloques: contesta
+                        // enseguida que no lo tiene. Sin esto el pedido quedaba
+                        // en una cola que nadie atiende, y un nodo completo cuyo
+                        // único par era un teléfono esperaba el plazo entero en
+                        // cada vuelta, con el bucle (y la minería) frenados.
+                        None if self.profile == NodeProfile::Wallet => {
+                            let response = BlockBodyResponse::NotFound {
+                                block_height: request.block_height,
+                                block_hash: request.block_hash.clone(),
+                                reason: "this peer is a wallet and keeps no blocks".to_string(),
+                            };
+                            let _ = self
+                                .swarm
+                                .behaviour_mut()
+                                .block_request_response
+                                .send_response(channel, response);
                         }
                         None => {
                             self.pending_block_body_requests
@@ -2849,7 +2869,13 @@ impl Node {
                     let immediate = self
                         .header_responder
                         .as_ref()
-                        .map(|responder| responder(&request));
+                        .map(|responder| responder(&request))
+                        .or_else(|| {
+                            // Igual que con los bloques: una wallet no tiene cabeceras.
+                            (self.profile == NodeProfile::Wallet).then(|| HeadersResponse::NotFound {
+                                reason: "this peer is a wallet and keeps no blocks".to_string(),
+                            })
+                        });
                     match immediate {
                         Some(response) => {
                             let _ = self
@@ -5403,6 +5429,20 @@ impl Node {
         }
     }
 
+    /// Tantea si algún par conectado tiene el bloque `block_height`, solo por
+    /// pedido directo. Para cuando ningún par anunció su altura todavía: por
+    /// gossip no aparecería nada que un pedido directo no traiga, y una wallet
+    /// contesta enseguida que no lo tiene.
+    pub async fn probe_block_direct(
+        &mut self,
+        block_height: u64,
+        max_wait: Duration,
+    ) -> Result<SourcedBlockResponse, Box<dyn Error>> {
+        let attempts = self.connected_peer_count().max(1) as u32;
+        self.request_block_direct_with_retry(block_height, None, None, false, attempts, max_wait)
+            .await
+    }
+
     /// Request a block and wait for a matching response from any peer.
     pub async fn request_block_with_retry(
         &mut self,
@@ -7302,6 +7342,41 @@ mod tests {
             }
         }
         panic!("el nodo tiene que escuchar en algun lado");
+    }
+
+    #[tokio::test]
+    async fn una_wallet_contesta_al_toque_que_no_tiene_bloques() {
+        // Un telefono no guarda la cadena. Si no contesta, el nodo completo que
+        // le pide un bloque espera el plazo entero con su bucle frenado (asi
+        // se freno la mineria de un nodo cuyo unico par era un telefono).
+        let mut wallet = Node::new_with_profile(0, None, None, NodeProfile::Wallet)
+            .await
+            .expect("wallet");
+        let direccion = escuchando_en_local(&mut wallet).await;
+        let mut completo = Node::new(0).await.expect("nodo completo");
+        completo.connect_to_peer(&direccion).await.expect("marcar");
+        for _ in 0..80 {
+            let _ = completo.pump_for(Duration::from_millis(30)).await;
+            let _ = wallet.pump_for(Duration::from_millis(30)).await;
+            if completo.connected_peer_count() > 0 {
+                break;
+            }
+        }
+        assert_eq!(completo.connected_peer_count(), 1);
+        let atender = tokio::spawn(async move {
+            for _ in 0..400 {
+                let _ = wallet.pump_for(Duration::from_millis(15)).await;
+            }
+        });
+        let inicio = Instant::now();
+        let resultado = completo.probe_block_direct(5, Duration::from_secs(10)).await;
+        assert!(resultado.is_err(), "la wallet no tiene el bloque");
+        assert!(
+            inicio.elapsed() < Duration::from_secs(5),
+            "contesta al toque, no al vencer el plazo: {:?}",
+            inicio.elapsed()
+        );
+        atender.abort();
     }
 
     #[tokio::test]

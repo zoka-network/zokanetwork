@@ -9052,6 +9052,13 @@ fn should_prefer_p2p_sync(node: &Node) -> bool {
     node.connected_peer_count() >= MIN_PEERS_TO_PREFER_P2P_SYNC
 }
 
+/// Cuánto espera el tanteo del bloque siguiente cuando ningún par anunció su
+/// altura: un nodo completo que lo tiene contesta en segundos (también por
+/// Tor), y una wallet nueva contesta al toque que no lo tiene.
+const SPECULATIVE_PROBE_WAIT: Duration = Duration::from_secs(10);
+/// Pausa después de un tanteo sin bloque. Un anuncio de altura no la espera.
+const SPECULATIVE_PROBE_BACKOFF: Duration = Duration::from_secs(60);
+
 async fn run_sync_step(
     node: &mut Node,
     chain_id: &str,
@@ -9066,9 +9073,14 @@ async fn run_sync_step(
         Ok(storage) => storage,
         Err(err) => return Ok(Some(format!("IBD storage open failed ({err})"))),
     };
+    let mut speculative = false;
     let next_request = match zoka::state::sync::next_required_block(&storage, peer_view)? {
         Some(request) => request,
-        None if node.connected_peer_count() > 0 && peer_view.perceived_max_height == 0 => {
+        None if node.connected_peer_count() > 0
+            && peer_view.perceived_max_height == 0
+            && peer_view.speculative_probe_due() =>
+        {
+            speculative = true;
             let local_height = storage
                 .get_chain_height()
                 .map_err(|err| format!("read chain height failed: {err}"))?;
@@ -9090,6 +9102,24 @@ async fn run_sync_step(
         peer_view.take_pending_sourced_block_response(&next_request)
     {
         (cached, source, "cached".to_string())
+    } else if speculative {
+        // Tanteo sin altura anunciada: solo directo, con plazo corto, y una
+        // pausa si nadie lo tiene. Antes caía también al gossip y esperaba dos
+        // plazos de 20 s en cada vuelta: con un teléfono como único par (no
+        // guarda la cadena) el bucle entero, minería incluida, quedaba frenado.
+        match node.probe_block_direct(next_height, SPECULATIVE_PROBE_WAIT).await {
+            Ok(sourced) => {
+                let source_label = format!("peer {}", sourced.source);
+                (sourced.response, Some(sourced.source), source_label)
+            }
+            Err(err) => {
+                peer_view.defer_speculative_probe(SPECULATIVE_PROBE_BACKOFF);
+                return Ok(Some(format!(
+                    "No connected peer has block {next_height} yet ({err}); probing again in {}s.",
+                    SPECULATIVE_PROBE_BACKOFF.as_secs()
+                )));
+            }
+        }
     } else {
         match node
             .request_block_with_affinity(

@@ -24,6 +24,10 @@ path = "src/lib.rs"
 name = "hybrid_scan_bench"
 required-features = ["pq-experimental"]
 
+[[example]]
+name = "probar_motor_quantic"
+required-features = ["quantic"]
+
 [features]
 # `randomx` is on by default so a stock `cargo build --release` produces a
 # binary that can actually mine mainnet. Disable explicitly with
