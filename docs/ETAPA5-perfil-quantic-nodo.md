@@ -159,7 +159,17 @@ Lo que falta para abrir la testnet (pasos del usuario, al final):
 ### Pendiente
 
 7. Génesis de la testnet de Quantic con su premine y la PC como semilla (ver arriba).
-8. ZSilent y ZKAPriv.
-9. Devolver al mempool las transacciones de bloques que una reorganización
-   descarta (hoy la wallet las ve sin gastar y hay que reenviarlas).
-10. Bloques de más de 96 acciones: hoy viajan enteros por gossip (1 MB).
+8. ZSilent y ZKAPriv: el motor del teléfono y su puente JNI están hechos (17/10,
+   [QUANTIC-MOTOR-MOVIL.md](QUANTIC-MOTOR-MOVIL.md)); faltan las pantallas, que
+   decide el usuario.
+9. ~~Devolver al mempool las transacciones de bloques que una reorganización
+   descarta.~~ Hecho el 16/10 (`runtime::orphaned_transfers`).
+10. Bloques de más de 96 acciones: el minero se queda en 96 para que el bloque
+    entre en un mensaje de gossip (1 MB, con cada transacción en hex). Uno más
+    grande igual llegaría (se anuncia y los pares lo bajan directo, hasta 16 MB),
+    pero por Tor tardaría y aumentaría los bloques huérfanos. Antes de subir el
+    tope: bloques compactos (encabezado + txids, el resto sale del mempool) o un
+    cuerpo binario sin hex. 96 acciones por bloque son unas 0,4 transferencias
+    por segundo.
+11. Wallets livianas por P2P: hecho el 17/10 (`/zoka-quantic/light/1`, con
+    presupuesto por par).
