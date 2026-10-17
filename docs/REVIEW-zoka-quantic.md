@@ -354,6 +354,13 @@ cargo test --manifest-path crates/zoka-quantic/Cargo.toml      # 34 unit, 7 end 
 cargo test --features quantic --lib -- quantic:: network::     # the node profile, P2P, light wallets
 ```
 
+Fixed test vectors (keys and addresses on the three networks, a note envelope
+with every input fixed, and a seeded genesis coinbase with its txid and
+authorization digest) are in `crates/zoka-quantic/tests/vectors/quantic-v1.txt`,
+checked by `cargo test --manifest-path crates/zoka-quantic/Cargo.toml --test vectors`.
+Testnet and regtest share `coin_type` 1, so the same root gives the same keys on
+both; only the address prefix differs.
+
 The end-to-end tests cover the genesis allocation, payments with change,
 coinbase maturity, double spends, the frauds of section 7, light wallets that
 detect hidden or altered outputs, saved wallet states, and transactions that stop
