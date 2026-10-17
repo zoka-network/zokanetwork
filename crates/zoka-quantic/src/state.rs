@@ -172,6 +172,25 @@ impl CommitmentSchedule {
         out.extend(transfers);
         out
     }
+
+    pub(crate) fn genesis_height(&self) -> u32 {
+        self.genesis_height
+    }
+
+    pub(crate) fn maturity(&self) -> u32 {
+        self.maturity
+    }
+
+    /// Coinbase commitments that have not matured yet, by the height that
+    /// inserts them. A saved wallet keeps them.
+    pub(crate) fn pending(&self) -> &BTreeMap<u32, Vec<ExtractedNoteCommitment>> {
+        &self.pending
+    }
+
+    pub(crate) fn with_pending(mut self, pending: BTreeMap<u32, Vec<ExtractedNoteCommitment>>) -> Self {
+        self.pending = pending;
+        self
+    }
 }
 
 #[derive(Clone, Debug)]

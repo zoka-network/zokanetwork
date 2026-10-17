@@ -14,7 +14,7 @@ use zoka_quantic::state::{
 };
 use zoka_quantic::tx::QuanticTransaction;
 use zoka_quantic::verify::{proving_key, verify_transactions};
-use zoka_quantic::wallet::QuanticWallet;
+use zoka_quantic::wallet::{QuanticWallet, WalletStateError};
 use zoka_quantic::{Network, QuanticAddress, QuanticSpendingKey};
 
 const NETWORK: Network = Network::Regtest;
@@ -275,6 +275,113 @@ fn transactions_survive_their_wire_format_and_any_change_breaks_them() {
     longer.push(0);
     assert!(QuanticTransaction::from_bytes(&longer).is_err());
     assert!(QuanticTransaction::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+}
+
+/// What a wallet shows, to compare a saved one with the original.
+fn view(wallet: &QuanticWallet) -> (u64, u64, [u8; 32], u32, usize, Vec<zoka_quantic::wallet::HistoryEntry>) {
+    (
+        wallet.balance(),
+        wallet.immature_balance(),
+        wallet.anchor().to_bytes(),
+        wallet.next_height(),
+        wallet.notes().len(),
+        wallet.history(),
+    )
+}
+
+#[test]
+fn a_saved_wallet_resumes_where_it_stopped() {
+    let mut rng = StdRng::seed_from_u64(31);
+    let team_sk = QuanticSpendingKey::from_root(&[1; 32], NETWORK, 0).unwrap();
+    let params = params(&team_sk.full_viewing_key().address());
+    let mut team = Party::new(1, &params);
+    let mut miner = Party::new(2, &params);
+    let mut alice = Party::new(3, &params);
+    let mut bob = Party::new(4, &params);
+    let mut chain = ChainState::new(params.clone());
+
+    let b0 = genesis(&team.address(), &mut rng);
+    apply(&mut chain, &mut [&mut team, &mut miner, &mut alice], &b0, &mut rng);
+    let tx = team.pay(&alice.address(), 40 * ZKA, &mut rng);
+    let b1 = block(1, &miner.address(), vec![tx], &mut rng);
+    apply(&mut chain, &mut [&mut team, &mut miner, &mut alice], &b1, &mut rng);
+    let b2 = block(2, &miner.address(), vec![], &mut rng);
+    apply(&mut chain, &mut [&mut team, &mut miner, &mut alice], &b2, &mut rng);
+    // The team spent the premine and holds change; Alice holds a payment; the
+    // miner holds two coinbases that have not entered the tree yet.
+    assert!(miner.wallet.balance() == 0 && miner.wallet.immature_balance() > 0);
+
+    let mut restored = Vec::new();
+    for party in [&team, &miner, &alice] {
+        let saved = party.wallet.to_state_bytes();
+        let wallet = QuanticWallet::from_state_bytes(&saved, &params).expect("restores");
+        assert_eq!(view(&wallet), view(&party.wallet));
+        assert_eq!(*wallet.to_state_bytes(), *saved, "saving again gives the same bytes");
+        restored.push(wallet);
+    }
+    let [mut team_again, mut miner_again, alice_again] = <[QuanticWallet; 3]>::try_from(restored).unwrap();
+
+    // Both keep scanning the same way: the coinbase of block 1 matures at 3.
+    let b3 = block(3, &miner.address(), vec![], &mut rng);
+    apply(&mut chain, &mut [&mut team, &mut miner], &b3, &mut rng);
+    for wallet in [&mut team_again, &mut miner_again] {
+        wallet.scan_block(&b3);
+    }
+    assert_eq!(view(&miner_again), view(&miner.wallet));
+    assert!(miner_again.balance() > 0);
+
+    // And the restored wallets spend: their witnesses lead to the chain's root.
+    let from_miner = miner_again
+        .create_transfer(&miner.sk, vec![Payment::new(bob.address(), 5 * ZKA)], 0, &keys().0, &mut rng)
+        .unwrap();
+    let from_team = team_again
+        .create_transfer(&team.sk, vec![Payment::new(bob.address(), 7 * ZKA)], 0, &keys().0, &mut rng)
+        .unwrap();
+    chain.check_transfer(&from_miner, 4).unwrap();
+    chain.check_transfer(&from_team, 4).unwrap();
+    let b4 = block(4, &miner.address(), vec![from_miner, from_team], &mut rng);
+    chain.apply_block(&b4, &keys().1, &mut rng).unwrap();
+    bob.wallet.scan_block(&b0);
+    for b in [&b1, &b2, &b3, &b4] {
+        bob.wallet.scan_block(b);
+    }
+    assert_eq!(bob.wallet.balance(), 12 * ZKA);
+
+    // A saved wallet only opens for its own chain, whole.
+    let saved = alice_again.to_state_bytes();
+    let mut other_maturity = params.clone();
+    other_maturity.coinbase_maturity = 60;
+    assert_eq!(
+        QuanticWallet::from_state_bytes(&saved, &other_maturity).unwrap_err(),
+        WalletStateError::OtherChain
+    );
+    assert_eq!(
+        QuanticWallet::from_state_bytes(&saved[..saved.len() - 1], &params).unwrap_err(),
+        WalletStateError::Truncated
+    );
+    let mut longer = saved.to_vec();
+    longer.push(0);
+    assert!(QuanticWallet::from_state_bytes(&longer, &params).is_err());
+    let mut wrong_magic = saved.to_vec();
+    wrong_magic[0] ^= 1;
+    assert_eq!(
+        QuanticWallet::from_state_bytes(&wrong_magic, &params).unwrap_err(),
+        WalletStateError::NotAWalletState
+    );
+    let mut future = saved.to_vec();
+    future[4] = 9;
+    assert_eq!(
+        QuanticWallet::from_state_bytes(&future, &params).unwrap_err(),
+        WalletStateError::UnknownVersion(9)
+    );
+    // Alice's notes in someone else's wallet are refused.
+    let mut foreign = saved.to_vec();
+    let bob_key = bob.wallet.fvk().to_bytes();
+    foreign[5..5 + bob_key.len()].copy_from_slice(bob_key.as_ref());
+    assert_eq!(
+        QuanticWallet::from_state_bytes(&foreign, &params).unwrap_err(),
+        WalletStateError::Invalid("note owner")
+    );
 }
 
 #[test]
