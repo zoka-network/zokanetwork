@@ -114,7 +114,7 @@ Detalle y criterio en [HOJA-DE-RUTA-mainnet-postcuantica.md](HOJA-DE-RUTA-mainne
 | 4 | VPS (nodo sin minar, seeds, explorador) | En espera del usuario; servidor Linux en casa como paso intermedio |
 | 5 | Ironwood (Orchard corregido, Halo 2, sin trusted setup) en nodo y teléfono | Biblioteca, perfil del nodo, protocolo P2P liviano y motor del teléfono hechos el 16 y 17/10; falta la interfaz de las apps |
 | 6 | Firmas híbridas Ed25519 + ML-DSA-65 en snapshots, y también en los checkpoints de la autoridad | Hecho el 16/10 en el nodo; falta que el usuario cree la mitad ML-DSA de la clave |
-| 7.1 | libp2p a la versión mayor nueva | Sin empezar |
+| 7.1 | libp2p a la versión mayor nueva | Hecho el 17/10 en la rama `libp2p-057` (0.57.1; `cargo audit` sin vulnerabilidades; interoperabilidad con 0.53 probada) |
 | 7.2 | Tiempo de bloque y dificultad: con la PC sola Zenith va a 16–18 bits y 3–6 min por bloque | Hecho para Quantic el 16/10 (ASERT, trabajo real, reglas de hora); revisar τ con la testnet andando |
 | 7.3 | Premine de 5M en el génesis, público y verificable | Diseñado |
 | 7.5 | ZSilent ofrecía notas gastadas | Arreglado el 13/10; falta verlo en uso |

@@ -361,6 +361,16 @@ Después del génesis cualquier cambio de estos exige un fork.
 
 7.1 libp2p a la versión mayor nueva (arrastra las alertas sin arreglo: hickory-proto,
     lru 0.12, core2, instant).
+    **17/10/2026, rama `libp2p-057`:** libp2p 0.53 → 0.57.1 (codecs sin
+    `async_trait`, `connection_id` en los eventos, `Transport::dial` con `DialOpts`
+    en el transporte por Tor, DNS vacío con hickory 0.26). Se van hickory-proto
+    0.24, lru 0.12, instant y core2 (multihash 0.19.5); quinn-proto y rustls de
+    iroh a sus versiones corregidas. `cargo audit`: de 16 vulnerabilidades a 0
+    (quedan 3 avisos: clear_on_drop y paste sin mantenimiento, inout retirado).
+    Todas las pruebas en verde, y **interoperabilidad probada** en una red
+    Quantic regtest local: un nodo 0.53 y uno 0.57 se sincronizan en los dos
+    sentidos y un envío que entra por el 0.57 lo mina el 0.53. Para la red real
+    hace falta un binario nuevo en la PC y en el teléfono.
 7.2 Emisión: los bloques salen demasiado rápido (dificultad trabada en el piso,
     ~2 bloques por minuto). Fijar tiempo de bloque y dificultad inicial.
     **16/10/2026, hecho para Quantic:** objetivo de 256 bits con ASERT (τ = 1 h),
