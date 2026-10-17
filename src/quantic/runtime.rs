@@ -153,14 +153,32 @@ impl QuanticRuntime {
         }
 
         // 2. Punta nueva: el mempool se limpia y el minero deja la plantilla vieja.
+        // Si fue una reorganización, lo que traían los bloques descartados vuelve
+        // al mempool (si sigue valiendo en la rama nueva).
         let tip = storage.get_last_block_hash().ok().filter(|hash| !hash.is_empty());
         if tip != self.last_tip {
+            let orphaned = self
+                .last_tip
+                .as_deref()
+                .map(|old| orphaned_transfers(storage, old))
+                .unwrap_or_default();
             self.last_tip = tip;
             self.stop.store(true, Ordering::Relaxed);
             if let Ok(mut pool) = mempool::global().lock() {
                 let removed = pool.revalidate(storage, &self.chain_id);
                 if removed > 0 {
                     outcome.events.push(format!("{removed} Quantic transaction(s) left the mempool."));
+                }
+                let mut returned = 0;
+                for tx in orphaned {
+                    if pool.insert(storage, &self.chain_id, tx, now_secs()).is_ok() {
+                        returned += 1;
+                    }
+                }
+                if returned > 0 {
+                    outcome.events.push(format!(
+                        "{returned} Quantic transaction(s) from reorganized blocks returned to the mempool."
+                    ));
                 }
             }
         }
@@ -222,6 +240,33 @@ impl QuanticRuntime {
         }
         outcome
     }
+}
+
+/// Las transferencias de los bloques que dejaron de ser canónicos, desde
+/// `old_tip` hacia atrás hasta encontrar la rama canónica. Vacío si `old_tip`
+/// sigue en ella (la punta solo avanzó).
+pub fn orphaned_transfers(storage: &RocksDbStorage, old_tip: &str) -> Vec<QuanticTransaction> {
+    /// Más de esto ya no es una reorganización que valga la pena deshacer acá.
+    const MAX_DEPTH: usize = 100;
+    let mut out = Vec::new();
+    let mut hash = old_tip.to_string();
+    for _ in 0..MAX_DEPTH {
+        let Ok(Some(block)) = storage.get_block(&hash) else {
+            break;
+        };
+        let canonical = storage
+            .get_canonical_block_hash_at_height(block.header.block_height)
+            .ok()
+            .flatten();
+        if canonical.as_deref() == Some(hash.as_str()) || block.header.block_height <= super::GENESIS_HEIGHT {
+            break;
+        }
+        if let Ok(decoded) = super::decode_block(&block) {
+            out.extend(decoded.transactions);
+        }
+        hash = block.header.prev_hash.clone();
+    }
+    out
 }
 
 impl Drop for QuanticRuntime {

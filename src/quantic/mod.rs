@@ -853,4 +853,48 @@ mod tests {
         };
         assert!(wallet_sync::sync_wallet(alice_sk.full_viewing_key(), 2, wrong_tree).is_err());
     }
+
+    #[test]
+    fn a_transfer_of_a_reorganized_block_returns_to_the_mempool() {
+        let (storage, _dir) = storage();
+        let params = consensus_params(Network::Regtest);
+        let team_sk = QuanticSpendingKey::from_root(&REGTEST_TEAM_ROOT, Network::Regtest, 0).unwrap();
+        let alice = QuanticSpendingKey::from_root(&[3; 32], Network::Regtest, 0).unwrap().full_viewing_key().address();
+        let miner = QuanticSpendingKey::from_root(&[4; 32], Network::Regtest, 0).unwrap().full_viewing_key().address();
+        let other_miner = QuanticSpendingKey::from_root(&[5; 32], Network::Regtest, 0).unwrap().full_viewing_key().address();
+        let mut team = QuanticWallet::new(team_sk.full_viewing_key(), &params);
+
+        let b1 = mined(&storage, &genesis_parent_for(CHAIN), &coinbase(1, &team.fvk().address(), PREMINE_ATOMS, true), &[]);
+        apply_block_with_expected_difficulty(&storage, CHAIN, &b1, BITS).unwrap();
+        team.scan_block(&decode_block(&b1).unwrap());
+        let tx = team
+            .create_transfer(&team_sk, vec![Payment::new(alice, 2 * ZKA)], 0, proving_key(), &mut zoka_quantic::os_rng())
+            .unwrap();
+        let fee = tx.fee().unwrap();
+        let b2 = mined(&storage, &b1, &coinbase(2, &miner, params.minted_at(2) + fee, false), std::slice::from_ref(&tx));
+        apply_block_with_expected_difficulty(&storage, CHAIN, &b2, BITS).unwrap();
+        assert!(runtime::orphaned_transfers(&storage, &b2.header.hash).is_empty(), "b2 is canonical");
+
+        // Otra rama desde b1, sin la transferencia y con más trabajo.
+        let mut parent = b1.clone();
+        for round in 0..8u64 {
+            let height = parent.header.block_height + 1;
+            let cb = coinbase(height, &other_miner, params.minted_at(height as u32), false);
+            let (mut side, _) = assemble_block(&storage, CHAIN, &parent, &cb, &[], 1_900_000_000 + round).unwrap();
+            solve_pow(CHAIN, &mut side, 8).unwrap();
+            let _ = apply_block_with_expected_difficulty(&storage, CHAIN, &side, BITS);
+            if storage.get_last_block_hash().unwrap() == side.header.hash {
+                break;
+            }
+            parent = side;
+        }
+        assert_ne!(storage.get_last_block_hash().unwrap(), b2.header.hash, "the other branch won");
+
+        let orphaned = runtime::orphaned_transfers(&storage, &b2.header.hash);
+        assert_eq!(orphaned.len(), 1);
+        assert_eq!(orphaned[0].txid(), tx.txid());
+        let mut pool = mempool::QuanticMempool::new();
+        pool.insert(&storage, CHAIN, orphaned[0].clone(), 1)
+            .expect("the note is unspent again and its anchor is still in the window");
+    }
 }
