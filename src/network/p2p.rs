@@ -171,8 +171,22 @@ fn protocol_freeze_enforce_from_env() -> bool {
 /// el saludo inicial (y al revés), así que las redes nunca se mezclan.
 pub const QUANTIC_TESTNET_PROTOCOL_ID: &str = "/zoka-quantic-testnet/0.1.0";
 pub const QUANTIC_REGTEST_PROTOCOL_ID: &str = "/zoka-quantic-regtest/0.1.0";
+/// Lo que reemplaza a `zoka` en los nombres de los tópicos de cada red.
+pub const QUANTIC_TESTNET_TOPIC_PREFIX: &str = "zoka-quantic-testnet";
+pub const QUANTIC_REGTEST_TOPIC_PREFIX: &str = "zoka-quantic-regtest";
 /// Una transferencia de Quantic de 64 acciones pesa unos 270 KB; en hex, el doble.
 const QUANTIC_TX_HEX_MAX: usize = 2 * 300 * 1024;
+
+/// El protocolo y el prefijo de tópicos de una red de Quantic por su nombre
+/// (`quantic-testnet`, `quantic-regtest`), para quien no es el binario del
+/// nodo (la wallet del teléfono). Zenith no tiene: es la red por omisión.
+pub fn quantic_network_protocol(name: &str) -> Option<(&'static str, &'static str)> {
+    match name {
+        "quantic-testnet" => Some((QUANTIC_TESTNET_PROTOCOL_ID, QUANTIC_TESTNET_TOPIC_PREFIX)),
+        "quantic-regtest" => Some((QUANTIC_REGTEST_PROTOCOL_ID, QUANTIC_REGTEST_TOPIC_PREFIX)),
+        _ => None,
+    }
+}
 
 /// Protocolo y prefijo de tópicos de la red de este proceso. Sin fijar, los
 /// de Zenith. Lo fija el binario una sola vez, antes de crear el nodo.
@@ -184,6 +198,12 @@ static NETWORK_PROTOCOL: std::sync::OnceLock<(&'static str, &'static str)> = std
 pub fn set_network_protocol(protocol_id: &'static str, topic_prefix: &'static str) -> bool {
     NETWORK_PROTOCOL.set((protocol_id, topic_prefix)).is_ok()
         || NETWORK_PROTOCOL.get() == Some(&(protocol_id, topic_prefix))
+}
+
+/// Si este proceso ya eligió una red de Quantic (después no puede volver a
+/// Zenith sin reiniciarse).
+pub fn network_protocol_is_set() -> bool {
+    NETWORK_PROTOCOL.get().is_some()
 }
 
 /// El protocolo que este proceso anuncia y exige.

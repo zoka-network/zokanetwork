@@ -18,11 +18,17 @@
 //! **Tor.** El nodo alcanza onions por un proxy SOCKS5 configurable. En el
 //! telefono ese proxy lo levanta Arti (Tor en Rust) dentro del mismo proceso,
 //! asi que no hace falta instalar ninguna otra aplicacion.
+//!
+//! **Zoka Quantic.** Con `"network": "quantic-testnet"` en la configuracion,
+//! el cliente se une a esa red (su protocolo y sus topicos) y habla con los
+//! nodos por `/zoka-quantic/light/1` ([`quantic_light_json`]). La red se elige
+//! una vez por proceso: para volver a Zenith hay que reiniciar la app.
 
 use crate::network::message::ZokaMessage;
 use crate::network::p2p::{
     MobileBlockProbe, Node, NodeProfile, MOBILE_P2P_OPERATION_WAIT, PUBLISH_RETRY_PAUSE,
 };
+use crate::network::quantic_light_request_response::QuanticLightRequest;
 use crate::private_wallet::PrivateTransaction;
 use serde::{Deserialize, Serialize};
 use std::sync::mpsc as std_mpsc;
@@ -152,6 +158,14 @@ fn private_digests_call_timeout(cuantos: usize) -> Duration {
         .saturating_add(MOBILE_CALL_SLACK)
 }
 
+/// Un pedido de Quantic va a los pares de a uno: alcanza para que tres no
+/// contesten antes de rendirse.
+fn quantic_light_call_timeout() -> Duration {
+    PEER_WAIT
+        .saturating_add(BLOCKS_WAIT.saturating_mul(3))
+        .saturating_add(MOBILE_CALL_SLACK)
+}
+
 fn private_body_call_timeout() -> Duration {
     PEER_WAIT
         .saturating_add(BLOCKS_WAIT)
@@ -198,6 +212,50 @@ pub struct MobileNetConfig {
     /// lectura: sin esto el nodo ni arranca.
     #[serde(default)]
     pub data_dir: Option<String>,
+    /// `zenith` (o nada) o una red de Zoka Quantic: `quantic-testnet`,
+    /// `quantic-regtest`. Las semillas tienen que ser de esa red.
+    #[serde(default)]
+    pub network: Option<String>,
+}
+
+/// La red de Quantic pedida en la configuracion; `None` para Zenith.
+fn red_pedida(nombre: Option<&str>) -> Result<Option<(&'static str, &'static str)>, String> {
+    match nombre.map(str::trim).filter(|n| !n.is_empty() && *n != "zenith") {
+        None => Ok(None),
+        Some(nombre) => crate::network::p2p::quantic_network_protocol(nombre)
+            .map(Some)
+            .ok_or_else(|| format!("red desconocida: {nombre}")),
+    }
+}
+
+/// Fija la red del proceso antes de crear el nodo. Zoka Quantic se fija una
+/// sola vez: despues ya no se puede volver a Zenith sin reiniciar.
+fn elegir_red(pedida: Option<(&'static str, &'static str)>) -> Result<(), String> {
+    match pedida {
+        None if crate::network::p2p::network_protocol_is_set() => Err(
+            "este proceso ya se conecto a Zoka Quantic; reinicia la app para volver a Zenith"
+                .to_string(),
+        ),
+        None => Ok(()),
+        Some((protocolo, prefijo)) => {
+            if crate::network::p2p::set_network_protocol(protocolo, prefijo) {
+                Ok(())
+            } else {
+                Err("este proceso ya se conecto a otra red; reinicia la app para cambiar".to_string())
+            }
+        }
+    }
+}
+
+/// Si la red pedida es la que ya usa el proceso.
+fn es_la_red_activa(pedida: Option<(&'static str, &'static str)>) -> bool {
+    match pedida {
+        None => !crate::network::p2p::network_protocol_is_set(),
+        Some((protocolo, _)) => {
+            crate::network::p2p::network_protocol_is_set()
+                && crate::network::p2p::active_protocol_id() == protocolo
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -235,6 +293,8 @@ enum Cmd {
     /// Resúmenes de transacciones privadas: lo que necesita una wallet liviana
     /// para elegir qué cuerpos bajar.
     PrivateTxDigests(Vec<String>, std_mpsc::Sender<Result<String, String>>),
+    /// Un pedido de wallet liviana de Zoka Quantic.
+    QuanticLight(QuanticLightRequest, std_mpsc::Sender<Result<String, String>>),
     Shutdown,
 }
 
@@ -260,14 +320,21 @@ pub fn connect_json(config_json: &str) -> Result<String, String> {
     if config.seeds.is_empty() {
         return Err("no hay semillas a las que conectarse".to_string());
     }
+    let red = red_pedida(config.network.as_deref())?;
 
     let mut slot = handle_slot()
         .lock()
         .map_err(|_| "estado envenenado".to_string())?;
     if slot.is_some() {
         drop(slot);
+        // Cambiar de red con el nodo andando le cambiaria los topicos por
+        // debajo: primero hay que desconectar.
+        if !es_la_red_activa(red) {
+            return Err("la red ya esta conectada a otra cadena; desconecta antes de cambiar".to_string());
+        }
         return status_json();
     }
+    elegir_red(red)?;
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (listo_tx, listo_rx) = std_mpsc::channel();
@@ -517,6 +584,28 @@ pub fn private_tx_digests_json(tx_hashes: &[String]) -> Result<String, String> {
     pedir(
         move |tx| Cmd::PrivateTxDigests(hashes.clone(), tx),
         private_digests_call_timeout(tx_hashes.len()),
+    )?
+}
+
+/// Un pedido de wallet liviana de Zoka Quantic (`/zoka-quantic/light/1`) en el
+/// JSON del protocolo: `{"kind":"info"}`, `{"kind":"compact","from":F,"to":T}`
+/// (hasta 500 bloques) o `{"kind":"submit_tx","tx_hex":"..."}`. Va a los pares
+/// conectados de a uno hasta que alguno conteste algo que no sea un error, y
+/// devuelve esa respuesta, tambien en JSON.
+///
+/// Los bloques compactos se le pasan tal cual a `mobile_quantic::quantic_sync_json`,
+/// que los verifica: el par no tiene que ser de confianza para eso.
+pub fn quantic_light_json(request_json: &str) -> Result<String, String> {
+    let request: QuanticLightRequest =
+        serde_json::from_str(request_json).map_err(|e| format!("pedido invalido: {e}"))?;
+    if let QuanticLightRequest::Compact { from, to } = &request {
+        if from > to {
+            return Err(format!("rango invalido: {from} > {to}"));
+        }
+    }
+    pedir(
+        move |tx| Cmd::QuanticLight(request, tx),
+        quantic_light_call_timeout(),
     )?
 }
 
@@ -1572,6 +1661,18 @@ async fn run_client(
                     };
                     let _ = resp.send(r);
                 }
+                Some(Cmd::QuanticLight(request, resp)) => {
+                    let r = if esperar_par(&mut node, &seeds).await {
+                        match node.request_quantic_light_from_peers(request, BLOCKS_WAIT).await {
+                            Some((_, respuesta)) => serde_json::to_string(&respuesta)
+                                .map_err(|e| format!("respuesta ilegible: {e}")),
+                            None => Err("ningun par conectado sirve Zoka Quantic".to_string()),
+                        }
+                    } else {
+                        Err("ningun par completo la conexion; revisa Tor".to_string())
+                    };
+                    let _ = resp.send(r);
+                }
                 Some(Cmd::PrivateTxBody(hash, resp)) => {
                     let r = if cache.buscar(&hash).is_some() {
                         traer_cuerpo_privado(&mut node, &cache, &hash).await
@@ -1599,6 +1700,28 @@ mod tests {
     use crate::types::{Block, PublicKey, Signature};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn the_phone_asks_for_zenith_or_a_quantic_network_by_name() {
+        // Solo lo puro: elegir la red fija un global de todo el proceso, y las
+        // demas pruebas crean nodos de Zenith.
+        for zenith in [None, Some("zenith"), Some(" "), Some("")] {
+            assert_eq!(red_pedida(zenith).unwrap(), None, "{zenith:?}");
+        }
+        assert_eq!(
+            red_pedida(Some("quantic-testnet")).unwrap(),
+            Some((
+                crate::network::p2p::QUANTIC_TESTNET_PROTOCOL_ID,
+                crate::network::p2p::QUANTIC_TESTNET_TOPIC_PREFIX
+            ))
+        );
+        assert!(red_pedida(Some("quantic-regtest")).unwrap().is_some());
+        assert!(red_pedida(Some("quantic-mainnet")).is_err(), "no existe todavia");
+        assert!(red_pedida(Some("mainnet")).is_err());
+        // Nadie fija Quantic en las pruebas: el proceso sigue en Zenith.
+        assert!(es_la_red_activa(None));
+        assert!(!es_la_red_activa(red_pedida(Some("quantic-testnet")).unwrap()));
+    }
 
     async fn run_multi_peer_height_probe(
         found_on_second_peer: bool,

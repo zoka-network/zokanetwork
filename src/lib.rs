@@ -17,6 +17,8 @@ pub mod metrics;
 pub mod mining;
 pub mod mobile;
 pub mod mobile_net;
+#[cfg(feature = "quantic")]
+pub mod mobile_quantic;
 pub mod network;
 pub mod private_wallet;
 #[cfg(feature = "quantic")]

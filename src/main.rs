@@ -2440,8 +2440,8 @@ impl NetworkProfile {
     fn topic_prefix(self) -> Option<&'static str> {
         match self {
             Self::Zenith => None,
-            Self::QuanticTestnet => Some("zoka-quantic-testnet"),
-            Self::QuanticRegtest => Some("zoka-quantic-regtest"),
+            Self::QuanticTestnet => Some(zoka::network::p2p::QUANTIC_TESTNET_TOPIC_PREFIX),
+            Self::QuanticRegtest => Some(zoka::network::p2p::QUANTIC_REGTEST_TOPIC_PREFIX),
         }
     }
 

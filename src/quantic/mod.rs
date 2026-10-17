@@ -1021,6 +1021,115 @@ mod tests {
     }
 
     #[test]
+    fn the_phone_engine_follows_a_real_chain_spends_and_resumes() {
+        use crate::mobile_quantic::{quantic_build_transfer_json, quantic_sync_json, quantic_wallet_info_json};
+
+        let (storage, _dir) = storage();
+        let team_seed = hex::encode(REGTEST_TEAM_ROOT);
+        let alice_sk = QuanticSpendingKey::from_root(&[3; 32], Network::Regtest, 0).unwrap();
+        let alice = alice_sk.full_viewing_key().address();
+        let miner = QuanticSpendingKey::from_root(&[4; 32], Network::Regtest, 0)
+            .unwrap()
+            .full_viewing_key()
+            .address();
+        let params = consensus_params(Network::Regtest);
+        let call = |f: fn(&str) -> Result<String, String>, request: serde_json::Value| -> Result<serde_json::Value, String> {
+            f(&request.to_string()).map(|json| serde_json::from_str(&json).unwrap())
+        };
+
+        // La dirección del motor es la de la wallet del equipo de regtest.
+        let info = call(quantic_wallet_info_json, serde_json::json!({ "seed_hex": team_seed, "network": "quantic-regtest" })).unwrap();
+        let team_address = info["address"].as_str().unwrap().to_string();
+        assert_eq!(team_address, premine(Network::Regtest).unwrap().recipient.encode());
+
+        let b1 = mined(&storage, &genesis_parent_for(CHAIN), &coinbase(1, &premine(Network::Regtest).unwrap().recipient, PREMINE_ATOMS, true), &[]);
+        apply_block_with_expected_difficulty(&storage, CHAIN, &b1, bits()).unwrap();
+        let b2 = mined(&storage, &b1, &coinbase(2, &miner, params.minted_at(2), false), &[]);
+        apply_block_with_expected_difficulty(&storage, CHAIN, &b2, bits()).unwrap();
+
+        // Desde el génesis, con un estado seguro: la punta es 2 y el seguro queda antes.
+        let blocks = light::compact_blocks(&storage, 0, None, 500).unwrap();
+        let synced = call(
+            quantic_sync_json,
+            serde_json::json!({ "seed_hex": team_seed, "network": "quantic-regtest", "tip_height": 2, "blocks": blocks }),
+        )
+        .unwrap();
+        assert_eq!(synced["balance_atoms"], PREMINE_ATOMS);
+        assert_eq!(synced["current"]["next_height"], 3);
+        assert_eq!(synced["current"]["last_hash"], b2.header.hash.as_str());
+        assert!(synced["safe"].is_null(), "a chain of two blocks has nothing 120 deep");
+        let state = synced["current"]["state_hex"].as_str().unwrap().to_string();
+
+        // El envío que arma el motor lo admite el mempool y entra en un bloque.
+        let sent = call(
+            quantic_build_transfer_json,
+            serde_json::json!({
+                "seed_hex": team_seed, "network": "quantic-regtest", "state_hex": state,
+                "to": alice.encode(), "amount_atoms": 25 * ZKA, "memo_text": "gracias",
+            }),
+        )
+        .unwrap();
+        let tx = QuanticTransaction::from_bytes(&hex::decode(sent["tx_hex"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(sent["txid"], tx.txid().to_hex().as_str());
+        let fee = tx.fee().unwrap();
+        assert_eq!(sent["fee_atoms"], fee);
+        mempool::QuanticMempool::new().insert(&storage, CHAIN, tx.clone(), now_secs()).expect("the phone's transfer is valid");
+        let b3 = mined(&storage, &b2, &coinbase(3, &miner, params.minted_at(3) + fee, false), &[tx]);
+        apply_block_with_expected_difficulty(&storage, CHAIN, &b3, bits()).unwrap();
+
+        // Sigue desde el estado guardado con el bloque nuevo solo.
+        let resumed = call(
+            quantic_sync_json,
+            serde_json::json!({
+                "seed_hex": team_seed, "network": "quantic-regtest", "state_hex": state,
+                "last_hash": b2.header.hash, "tip_height": 3, "blocks": [compact_json(&storage, 3)],
+            }),
+        )
+        .unwrap();
+        assert_eq!(resumed["balance_atoms"], PREMINE_ATOMS - 25 * ZKA - fee);
+        let history = resumed["history"].as_array().unwrap();
+        assert_eq!(history[0]["net_atoms"], -((25 * ZKA + fee) as i64));
+        assert_eq!(history[0]["height"], 3);
+        // Alice, desde el génesis con la misma interfaz, ve sus 25 ZKA.
+        let alice_view = call(
+            quantic_sync_json,
+            serde_json::json!({
+                "seed_hex": hex::encode([3u8; 32]), "network": "quantic-regtest",
+                "blocks": light::compact_blocks(&storage, 1, None, 500).unwrap(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(alice_view["balance_atoms"], 25 * ZKA);
+
+        // Un bloque que no sigue al último escaneado es una reorganización.
+        let reorg = call(
+            quantic_sync_json,
+            serde_json::json!({
+                "seed_hex": team_seed, "network": "quantic-regtest", "state_hex": state,
+                "last_hash": "00".repeat(32), "blocks": [compact_json(&storage, 3)],
+            }),
+        )
+        .unwrap_err();
+        assert!(reorg.starts_with("reorg:"), "{reorg}");
+        // El estado de otra wallet no se abre con esta semilla.
+        let other = call(
+            quantic_sync_json,
+            serde_json::json!({
+                "seed_hex": hex::encode([3u8; 32]), "network": "quantic-regtest", "state_hex": state,
+                "last_hash": b2.header.hash, "blocks": [],
+            }),
+        )
+        .unwrap_err();
+        assert!(other.contains("another wallet"), "{other}");
+        // Ni para otra red.
+        assert!(call(
+            quantic_sync_json,
+            serde_json::json!({ "seed_hex": team_seed, "network": "quantic-testnet", "state_hex": state, "blocks": [] }),
+        )
+        .is_err());
+    }
+
+    #[test]
     fn the_node_answers_light_wallets_with_its_chain() {
         use crate::network::quantic_light_request_response::{QuanticLightRequest, QuanticLightResponse};
 
