@@ -498,6 +498,34 @@ mod tests {
         assert!(try_note_decryption(&carol, &s.nf, &s.cmx, &envelope).is_none());
     }
 
+    /// Atacante cuántico simulado (docs/QUANTIC-INVENTARIO-CRIPTOGRAFICO.md):
+    /// con Shor, de una dirección se saca la `ivk` de Orchard. Acá el atacante
+    /// tiene más todavía —toda la clave de visión de Orchard de Bob— pero no la
+    /// semilla de X-Wing, que no sale de ninguna clave pública de curva.
+    #[test]
+    fn a_quantum_attacker_with_every_orchard_key_still_cannot_read_the_note() {
+        let mut rng = StdRng::seed_from_u64(9);
+        let bob = wallet(2);
+        let s = sample(*bob.address().orchard(), 30_000_000, &mut rng);
+        let envelope = envelope_for(&bob, &s, &memo(b"secreto"), None, &mut rng);
+
+        let mut stolen = bob.to_bytes();
+        rng.fill_bytes(&mut stolen[97..]);
+        let attacker = QuanticFullViewingKey::from_bytes(stolen.as_ref()).unwrap();
+        assert_eq!(attacker.orchard().to_bytes(), bob.orchard().to_bytes());
+
+        assert!(try_note_decryption(&attacker, &s.nf, &s.cmx, &envelope).is_none());
+        assert!(try_compact_note_decryption(
+            &attacker,
+            &s.nf,
+            &s.cmx,
+            envelope.kem_ciphertext(),
+            envelope.enc_ciphertext_compact(),
+        )
+        .is_none());
+        assert!(try_note_decryption(&bob, &s.nf, &s.cmx, &envelope).is_some());
+    }
+
     #[test]
     fn change_is_recognized_as_internal() {
         let mut rng = StdRng::seed_from_u64(2);

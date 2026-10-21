@@ -775,6 +775,32 @@ mod tests {
         assert!(authority_policy(MAINNET_CHAIN_ID, solo_ed25519).is_some());
     }
 
+    /// Atacante cuántico simulado (docs/QUANTIC-INVENTARIO-CRIPTOGRAFICO.md):
+    /// con Shor saca la clave Ed25519 de la autoridad de su pública. Arma una
+    /// clave híbrida con esa mitad verdadera y una ML-DSA propia, y firma un
+    /// checkpoint que a él le conviene. Ningún nodo de Quantic lo acepta.
+    #[cfg(feature = "pq-experimental")]
+    #[test]
+    fn un_atacante_cuantico_con_la_clave_ed25519_no_mueve_los_checkpoints_de_quantic() {
+        use crate::economics::{QUANTIC_MAINNET_CHAIN_ID, QUANTIC_TESTNET_CHAIN_ID};
+        let robada = key(2);
+        let atacante =
+            crate::hybrid_signature::HybridSigningKey::from_parts(robada.clone(), &[0xee; 32]).unwrap();
+        for quantic in [QUANTIC_MAINNET_CHAIN_ID, QUANTIC_TESTNET_CHAIN_ID] {
+            let autoridad = authority_policy(quantic, hybrid_authority(2)).expect("hybrid authority");
+            let (storage, _dir) = storage();
+            let v2 = SignedCheckpoint::sign_hybrid(&atacante, quantic, 40, &hash('e'));
+            assert_eq!(v2.verify(&autoridad), Err(CheckpointError::BadSignature), "{quantic}");
+            assert_eq!(
+                accept_signed_checkpoint(&storage, quantic, &v2, &autoridad),
+                Err(CheckpointError::BadSignature)
+            );
+            let v1 = SignedCheckpoint::sign(&robada, quantic, 40, &hash('e'));
+            assert_eq!(v1.verify(&autoridad), Err(CheckpointError::HybridRequired), "{quantic}");
+            assert_eq!(latest_signed_checkpoint(&storage).unwrap(), None);
+        }
+    }
+
     #[cfg(feature = "pq-experimental")]
     #[test]
     fn un_checkpoint_hibrido_exige_las_dos_firmas() {

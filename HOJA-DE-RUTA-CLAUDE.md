@@ -13,6 +13,17 @@ queda para más adelante.
   versiones anteriores).
 - **Parámetros aprobados:** prefijos `zq1` / `zqtest1` / `zqregtest1`, memo de 512
   bytes, comisión de 0,0001 ZKA por acción con mínimo de 2 acciones.
+- **La mainnet sale solo cuando todo sea postcuántico** (elección "Todo
+  postcuántico antes"). Hoy Quantic es postcuántica en privacidad, no en el
+  gasto: RedPallas, Halo 2 y los compromisos de Orchard caen con Shor. La testnet
+  puede salir antes con Orchard. Inventario y atacante simulado:
+  [QUANTIC-INVENTARIO-CRIPTOGRAFICO.md](docs/QUANTIC-INVENTARIO-CRIPTOGRAFICO.md);
+  pool nuevo (STARK con Plonky3 + Poseidon2, a prototipar y medir, también en el
+  teléfono de 32 bits): [QUANTIC-POOL-POSTCUANTICO.md](docs/QUANTIC-POOL-POSTCUANTICO.md).
+- **Rama `quantic-cadena-completa`:** perfil de mainnet, autoridad híbrida
+  obligatoria, nodo con pila grande, y el minero de Quantic con control en caliente
+  para ZSilent (`--no-mine` + `/mining/start|stop`, `/quantic/mining`, `/stats`,
+  `mine-status` con datos de Quantic).
 
 **16 y 17/10: desarrollo post-cuántico en modo autónomo** (pedido del usuario:
 "enfocate en el desarrollo post quantic"; "continúa ... cuando no sepas qué hacer
