@@ -15027,7 +15027,7 @@ fn cmd_quantic_wallet(args: &[String]) -> Result<(), String> {
 
 #[cfg(feature = "quantic")]
 fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
-    const USAGE: &str = "usage: zoka quantic-wallet <new|restore|address|list|balance|history|estimate-fee|send|show-phrase|change-password|backup|import-backup|import-regtest-team> --network quantic-mainnet|quantic-testnet|quantic-regtest [--name <wallet>] [--password <p> | --password-env <VAR> | --password-stdin] [restore: --phrase-env <VAR> or the phrase on stdin] [estimate-fee: --amount <ZKA>] [send: --to <address> --amount <ZKA> [--memo <text>]] [change-password: --new-password-env <VAR>] [backup: --out <file>] [import-backup: --file <file>] [--rpc <url>] [--json]";
+    const USAGE: &str = "usage: zoka quantic-wallet <new|generate-phrase|restore|address|list|balance|history|estimate-fee|send|show-phrase|change-password|backup|import-backup|import-regtest-team> --network quantic-mainnet|quantic-testnet|quantic-regtest [--name <wallet> | --address <its address>] [--password <p> | --password-env <VAR> | --password-stdin] [history: --limit <n>] [restore: --phrase-env <VAR> or the phrase on stdin] [estimate-fee: --amount <ZKA>] [send: --to <address> --amount <ZKA> [--memo <text>]] [change-password: --new-password-env <VAR>] [backup: --out <file>] [import-backup: --file <file>] [--rpc <url>] [--json]";
     let Some((action, rest)) = args.split_first() else {
         return Err(USAGE.to_string());
     };
@@ -15038,7 +15038,17 @@ fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
     let quantic_network = zoka::quantic::network_for_chain(network.chain_id())
         .ok_or_else(|| "unknown Quantic network".to_string())?;
     let dir = zoka::quantic::wallet_file::wallets_dir(network.local_dir());
-    let name = option_value(rest, "--name").unwrap_or_else(|| "default".to_string());
+    // ZSilent identifica las wallets por su dirección: `--address` elige la que
+    // la tiene, en lugar de `--name`.
+    let name = match (option_value(rest, "--name"), option_value(rest, "--address")) {
+        (Some(name), _) => name,
+        (None, Some(address)) => zoka::quantic::wallet_file::list_with_addresses(&dir)
+            .into_iter()
+            .find(|(_, own)| own == address.trim())
+            .map(|(name, _)| name)
+            .ok_or_else(|| "no Zoka Quantic wallet here has that address".to_string())?,
+        (None, None) => "default".to_string(),
+    };
     let json = has_flag(rest, "--json");
     let rpc = || -> Result<String, String> {
         option_value(rest, "--rpc")
@@ -15120,15 +15130,31 @@ fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
+        "generate-phrase" => {
+            let phrase = zoka::quantic::wallet_file::generate_phrase()?;
+            if json {
+                println!("{}", serde_json::json!({ "words": 24, "recovery_phrase": phrase.as_str() }));
+            } else {
+                println!("{}", phrase.as_str());
+            }
+            Ok(())
+        }
         "list" => {
             let wallets = zoka::quantic::wallet_file::list_with_addresses(&dir);
+            // Con contraseña, dice cuáles abre (lo que necesita el login de ZSilent).
+            let password = password_value(rest)?;
             if json {
                 let names: Vec<&String> = wallets.iter().map(|(name, _)| name).collect();
                 let details: Vec<serde_json::Value> = wallets
                     .iter()
-                    .map(|(name, address)| serde_json::json!({ "name": name, "address": address }))
+                    .map(|(name, address)| {
+                        let unlocked = password.as_deref().is_some_and(|password| {
+                            zoka::quantic::wallet_file::open(&dir, name, quantic_network, password).is_ok()
+                        });
+                        serde_json::json!({ "name": name, "address": address, "unlocked": unlocked })
+                    })
                     .collect();
-                println!("{}", serde_json::json!({ "wallets": names, "details": details }));
+                println!("{}", serde_json::json!({ "network": network.label(), "wallets": names, "details": details }));
             } else {
                 for (wallet, _) in wallets {
                     println!("{wallet}");
@@ -15203,7 +15229,7 @@ fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
                     Ok(plan) => {
                         reply["enough"] = true.into();
                         reply["fee_atoms"] = plan.fee.into();
-                        reply["fee"] = format_zka(plan.fee).into();
+                        reply["fee"] = format_zka_amount(plan.fee).into();
                         reply["inputs"] = plan.inputs.into();
                         reply["actions"] = plan.actions.into();
                         reply["change_atoms"] = plan.change.into();
@@ -15245,8 +15271,8 @@ fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
                         "node_behind": resumed.node_behind,
                         "spendable_atoms": spendable,
                         "immature_atoms": immature,
-                        "spendable": format_zka(spendable),
-                        "immature": format_zka(immature),
+                        "spendable": format_zka_amount(spendable),
+                        "immature": format_zka_amount(immature),
                         "max_sendable_atoms": wallet.max_sendable(),
                         "notes": wallet.notes().iter().filter(|n| n.spent_in.is_none()).count(),
                     })
@@ -15261,8 +15287,15 @@ fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
         "history" => {
             let password = required_password_value(rest)?;
             let (_, resumed, tip) = synced(&password)?;
-            let history = resumed.wallet.history();
+            let total = resumed.wallet.history().len();
+            let limit = parse_u64_arg(option_value(rest, "--limit"), total as u64, "--limit")? as usize;
+            let history: Vec<_> = resumed.wallet.history().into_iter().take(limit).collect();
             if json {
+                // La hora de cada bloque, del nodo propio (no revela nada a terceros).
+                let url = rpc()?;
+                let block_time = |height: u32| -> Option<u64> {
+                    rpc_http_get_json(&url, &format!("/blocks/{height}"), 15).ok()?["timestamp"].as_u64()
+                };
                 let entries: Vec<serde_json::Value> = history
                     .iter()
                     .map(|entry| {
@@ -15280,10 +15313,17 @@ fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
                             "received_atoms": entry.received,
                             "spent_atoms": entry.spent,
                             "net_atoms": entry.net().to_string(),
+                            "amount_atoms": entry.net().unsigned_abs() as u64,
+                            "amount": format_zka_amount(entry.net().unsigned_abs() as u64),
+                            "timestamp": block_time(entry.height),
+                            "confirmations": tip.saturating_sub(u64::from(entry.height)) + 1,
                         })
                     })
                     .collect();
-                println!("{}", serde_json::json!({ "name": name, "height": tip, "transactions": entries }));
+                println!(
+                    "{}",
+                    serde_json::json!({ "name": name, "height": tip, "count": total, "transactions": entries })
+                );
             } else {
                 for entry in history {
                     let net = entry.net();

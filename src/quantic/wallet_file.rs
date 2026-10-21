@@ -100,6 +100,15 @@ pub fn create(dir: &Path, name: &str, network: Network, password: &str) -> Resul
     Ok((Zeroizing::new(phrase), address))
 }
 
+/// Una frase nueva de 24 palabras, sin crear ninguna wallet: para mostrarla y
+/// confirmarla antes, y crear la wallet después con [`restore`].
+pub fn generate_phrase() -> Result<Zeroizing<String>, String> {
+    let mut entropy = Zeroizing::new([0u8; ENTROPY_BYTES]);
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, entropy.as_mut());
+    let phrase = Mnemonic::from_entropy_in(Language::English, entropy.as_ref()).map_err(|e| e.to_string())?;
+    Ok(Zeroizing::new(phrase.to_string()))
+}
+
 /// Restaura una wallet desde su frase (12 o 24 palabras).
 pub fn restore(dir: &Path, name: &str, network: Network, phrase: &str, password: &str) -> Result<String, String> {
     let mnemonic = Mnemonic::parse_in_normalized(Language::English, phrase.trim())
@@ -366,6 +375,12 @@ mod tests {
         assert_eq!(restored, address);
         assert_eq!(list(dir.path()), vec!["copia".to_string(), "main".to_string()]);
         assert!(wallet_path(dir.path(), "../afuera").is_err());
+
+        // La frase generada antes de crear la wallet (lo que hace ZSilent) sirve igual.
+        let generated = generate_phrase().unwrap();
+        assert_eq!(generated.split_whitespace().count(), 24);
+        assert_ne!(*generated, *generate_phrase().unwrap());
+        assert!(restore(dir.path(), "nueva", Network::Regtest, &generated, "x").unwrap().starts_with("zqregtest1"));
     }
 
     #[test]
