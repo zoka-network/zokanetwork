@@ -17,7 +17,7 @@ se puede gastar lo ajeno, crear valor, cambiar una tx del mempool ni leer notas.
 ## Qué cambia respecto de Orchard
 
 | Orchard (hoy) | Pool nuevo |
-|---|---|
+| --- | --- |
 | Halo 2 (IPA sobre Pasta) | STARK con FRI: solo hashes |
 | Compromiso de nota Sinsemilla, árbol Sinsemilla | Poseidon2 sobre un campo de 31 bits, árbol de profundidad 32 |
 | `cv` de Pedersen + firma de balance | El balance se prueba dentro del circuito: una prueba por tx cubre todas sus entradas y salidas, y la comisión es pública |
@@ -43,7 +43,7 @@ atadura:           el txid entra al transcript (Fiat-Shamir)
 ## Sistema de pruebas: candidatos
 
 | | Plonky3 | Stwo | Winterfell |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Campo | BabyBear / KoalaBear (31 bits), Goldilocks, M31 | M31 (Circle STARK) | Goldilocks (64 bits) |
 | Teléfono de 32 bits | Campos de 31 bits, con NEON | M31, de 32 bits | Aritmética de 64 bits, más lenta en ARMv7 |
 | Auditoría pública | Least Authority (2024) | El verificador Stwo-Cairo (zkSecurity, 2025), no el prover | No encontré |
@@ -68,6 +68,62 @@ si Plonky3 no da los tiempos.
    conservadores (≥ 100 bits conjeturados, hash de 256 bits) aunque la prueba pese
    más.
 
+## Primeras medidas (21/10, PC, un hilo)
+
+`crates/zoka-pq-pool`: Plonky3 0.8.0, KoalaBear⁴, Poseidon2 en la traza, en el
+árbol de FRI y en el transcript, FRI con ocultamiento (blowup 4, 16 bits de
+grinding en las consultas). La traza son solo permutaciones de Poseidon2, sin las
+restricciones que las unen en una transferencia: es una cota de abajo.
+
+| Permutaciones | Consultas | Prueba | Probar | Verificar | Seguridad demostrada |
+| --- | --- | --- | --- | --- | --- |
+| 64–128 | 100 | no entra | — | — | — |
+| 256 | 100 | 200 KB | 0,20 s | 13 ms | 102 bits |
+| 256 | 56 | 121 KB | 0,34 s | 12 ms | 71 bits |
+| 512 | 100 | 224 KB | 0,41 s | 14 ms | 101 bits |
+| 1024 | 100 | 248 KB | 0,78 s | 16 ms | 100 bits |
+
+Lo que dicen:
+
+- **El ocultamiento pone un piso.** Con conocimiento cero, una traza de menos de
+  unas 256 filas no alcanza para esconder 100 consultas (`HidingBudgetExceeded`):
+  la prueba de una transferencia, que necesita unas 40 permutaciones, se rellena
+  hasta ahí igual. Por eso el tamaño casi no depende de la transferencia.
+- **Unos 200 KB por transferencia** con ~100 bits demostrados, contra unos pocos
+  KB de Halo 2. Con el límite de bloque de 1 MB entrarían ~5 transferencias por
+  bloque, y la cadena crecería 200 KB por cada una. **Agregar las pruebas del
+  bloque en una sola (recursión) no es opcional**: el bloque guarda una prueba y,
+  por transferencia, solo nullifiers, compromisos y sobres X-Wing (~1,7 KB por
+  salida). Es lo que hace Quantus con Plonky2. El mempool igual viaja con las
+  pruebas enteras.
+- **Probar es rápido en la PC** (0,2 s con un hilo). Falta medirlo en el teléfono
+  de 32 bits; si fuera 30 veces más lento, serían unos 6 s, del orden de lo que
+  tarda hoy Halo 2 ahí.
+- **Verificar es barato** (13 ms): un nodo valida muchas por segundo.
+
+**El riesgo principal es la agregación.** Para Plonky3 no hay recursión publicada
+y estable: `p3-recursion` 0.1.0 en crates.io (agosto de 2025) es un marcador sin
+código, y lo que existe está en el repositorio Plonky3-recursion: activo (commits
+del 17/10/2026), sin versiones, hecho sobre Plonky3 0.9.0-rc.2, con verificación
+recursiva de lotes de pruebas y conocimiento cero, y con un aviso propio de que no
+está auditado ni es para producción. Caminos:
+
+- (a) Depender de ese repositorio por git, fijar un commit y esperar su
+  auditoría.
+- (b) Plonky2, con recursión madura (la usa Quantus), pero en modo de
+  mantenimiento y con un campo de 64 bits, más lento en el teléfono de 32 bits
+  (que igual solo prueba su propia transferencia: agrega el minero, en la PC).
+- (c) Stwo, cuya recursión pasa por Cairo.
+- (d) Sin recursión: pruebas por transferencia, bloques más grandes (unos 8 MB:
+  ~40 transferencias cada 120 s) y los nodos descartan las pruebas viejas después
+  de validarlas. Un nodo nuevo no las necesita: arranca del snapshot firmado por
+  la autoridad híbrida. Es lo más simple de auditar, a cambio de ancho de banda y
+  de que un nodo nuevo confíe en la autoridad para la historia que ya no puede
+  re-verificar (hoy ya obedece sus checkpoints, pero podía revisar las pruebas).
+
+Hay que elegir antes de escribir el circuito de la transferencia, porque fija el
+campo y el hash.
+
 ## Lo que se pierde
 
 - **Prueba delegada**: hoy un dispositivo podría probar sin tener la clave de
@@ -82,13 +138,14 @@ si Plonky3 no da los tiempos.
 
 ## Plan
 
-1. **Prototipo** (`crates/zoka-pq-pool`, experimental, fuera del consenso): una
-   transferencia de 1 entrada y 2 salidas con Plonky3 + Poseidon2. Medir tamaño,
-   tiempo de prueba y de verificación en la PC.
+1. **Prototipo** (`crates/zoka-pq-pool`, experimental, fuera del consenso).
+   Hecho para las permutaciones (tabla de arriba). Falta el circuito de una
+   transferencia de 1 entrada y 2 salidas con sus restricciones.
 2. **El mismo prototipo en el teléfono** (compilado para ARMv7; las medidas las
    toma el usuario con el teléfono conectado por adb).
-3. Con esos números: elegir entre prueba por tx o agregada por bloque, fijar
-   parámetros y escribir la especificación.
+3. **Agregación por bloque**: medir una prueba recursiva que verifique N pruebas
+   de transferencia (lo arma el minero, en la PC). Con eso, fijar parámetros y
+   escribir la especificación.
 4. Implementar el pool en `zoka-quantic` (notas, árbol, nullifiers, wallet,
    bloques compactos), con vectores de prueba y el atacante simulado.
 5. Testnet nueva con el pool, auditoría externa, y recién ahí el génesis de la

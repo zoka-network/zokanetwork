@@ -1,0 +1,26 @@
+[package]
+name = "zoka-pq-pool"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Prototipo del pool privado postcuantico de Zoka Quantic: mide pruebas STARK (Plonky3 + Poseidon2). No es consenso."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+p3-air = "=0.8.0"
+p3-challenger = "=0.8.0"
+p3-commit = "=0.8.0"
+p3-dft = "=0.8.0"
+p3-field = "=0.8.0"
+p3-fri = "=0.8.0"
+p3-koala-bear = "=0.8.0"
+p3-matrix = "=0.8.0"
+p3-merkle-tree = "=0.8.0"
+p3-poseidon2-air = "=0.8.0"
+p3-symmetric = "=0.8.0"
+p3-uni-stark = "=0.8.0"
+rand = { version = "0.10.1", features = ["std_rng"] }
+postcard = { version = "1", features = ["alloc"] }
+
+[profile.release]
+debug = false

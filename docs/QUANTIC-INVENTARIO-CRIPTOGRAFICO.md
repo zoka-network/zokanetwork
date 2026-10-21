@@ -17,7 +17,7 @@ daría Shor (ver «Atacante cuántico simulado»).
 ## Lo que usa una red de Quantic
 
 | Pieza | Biblioteca | Dónde | Problema | Con Shor | Estado |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | Sobre de cada nota | `x-wing` (X25519 + ML-KEM-768), ChaCha20-Poly1305, BLAKE2b | `crates/zoka-quantic/src/note_encryption.rs` | Redes (ML-KEM) | Nada: hace falta romper las dos mitades | **Cerrado** |
 | Recuperación del emisor (`out`) | ChaCha20-Poly1305 con `ock` = BLAKE2b(ovk ‖ cv ‖ cmx ‖ kem) | `note_encryption.rs` | Simétrico | Nada sin la `ovk` | **Cerrado** |
 | Checkpoints y snapshots | `ed25519-dalek` + `ml-dsa` (ML-DSA-65) | `src/checkpoint_authority.rs`, `src/hybrid_signature.rs`, `src/snapshot.rs` | Redes (ML-DSA) | Nada: Quantic exige las dos firmas (`authority_policy`) | **Cerrado** |
@@ -66,7 +66,9 @@ pool nuevo antes de la mainnet.
    del que sacar una clave de visión.
 3. **Transporte**: para iroh, el grupo híbrido X25519MLKEM768 como proveedor de
    `rustls` propio (rustls 0.23 solo lo trae con aws-lc-rs; tenemos `ml-kem` y
-   `x25519-dalek`). Para libp2p no hay Noise postcuántico: evaluar QUIC con el
+   `x25519-dalek`). iroh 1.3 lo admite: `Endpoint::builder().crypto_provider(...)`
+   recibe el proveedor de `ring` con ese grupo primero en `kx_groups` y X25519
+   detrás, así un nodo viejo sigue conectando con el clásico. Para libp2p no hay Noise postcuántico: evaluar QUIC con el
    mismo proveedor, o un handshake híbrido propio. Identidad de los nodos: al
    final, no toca fondos.
 4. **Tor**: seguir lo que haga el proyecto Tor; no está en nuestras manos.
