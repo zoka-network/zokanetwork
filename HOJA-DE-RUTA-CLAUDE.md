@@ -5,6 +5,15 @@ Proyecto: `C:\Users\mderramus\ZOKA`.
 
 ## Punto de partida
 
+**21/10: decisiones del usuario.** Prioridad: terminar la cadena Zoka Quantic
+completa (arquitectura) para lanzar testnet y mainnet, y después ZSilent; ZKAPriv
+queda para más adelante.
+
+- **ZSilent pasa a ser solo de Quantic** (reemplaza a Zenith; Zenith queda en las
+  versiones anteriores).
+- **Parámetros aprobados:** prefijos `zq1` / `zqtest1` / `zqregtest1`, memo de 512
+  bytes, comisión de 0,0001 ZKA por acción con mínimo de 2 acciones.
+
 **16 y 17/10: desarrollo post-cuántico en modo autónomo** (pedido del usuario:
 "enfocate en el desarrollo post quantic"; "continúa ... cuando no sepas qué hacer
 seguí el roadmap"). **Nada está pusheado ni publicado ni instalado.** Ninguna
