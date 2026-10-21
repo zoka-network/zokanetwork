@@ -377,10 +377,21 @@ pub fn authority_keys_for_chain(chain_id: &str) -> Option<AuthorityKeys> {
             Some(text) => Some(parse_mldsa_public_key(&text)?),
             None => None,
         };
-        Some(AuthorityKeys { ed25519, mldsa })
+        authority_policy(chain_id, AuthorityKeys { ed25519, mldsa })
     }
     #[cfg(not(feature = "pq-experimental"))]
-    Some(AuthorityKeys::ed25519_only(ed25519))
+    authority_policy(chain_id, AuthorityKeys::ed25519_only(ed25519))
+}
+
+/// Zoka Quantic exige firmas híbridas desde el génesis: una cadena de Quantic
+/// sin la mitad ML-DSA de la clave no tiene autoridad (rige solo el trabajo),
+/// en vez de aceptar checkpoints de solo Ed25519, que una computadora cuántica
+/// podría falsificar. Zenith acepta los dos hasta que se compile su ML-DSA.
+pub fn authority_policy(chain_id: &str, keys: AuthorityKeys) -> Option<AuthorityKeys> {
+    if crate::economics::is_quantic_chain_id(chain_id) && !keys.requires_hybrid() {
+        return None;
+    }
+    Some(keys)
 }
 
 #[cfg(feature = "pq-experimental")]
@@ -742,6 +753,26 @@ mod tests {
             ed25519: *public.ed25519(),
             mldsa: Some(public.mldsa().clone()),
         }
+    }
+
+    #[cfg(feature = "pq-experimental")]
+    #[test]
+    fn quantic_no_tiene_autoridad_sin_la_mitad_ml_dsa() {
+        use crate::economics::{MAINNET_CHAIN_ID, QUANTIC_MAINNET_CHAIN_ID, QUANTIC_TESTNET_CHAIN_ID};
+        let solo_ed25519 = AuthorityKeys::ed25519_only(key(1).verifying_key());
+        for quantic in [QUANTIC_MAINNET_CHAIN_ID, QUANTIC_TESTNET_CHAIN_ID] {
+            assert!(authority_policy(quantic, solo_ed25519.clone()).is_none(), "{quantic}");
+            let hibrida = authority_policy(quantic, hybrid_authority(2)).expect("hybrid authority");
+            assert!(hibrida.requires_hybrid());
+            // Y entonces solo vale la versión 2: un checkpoint de solo Ed25519 no.
+            let v1 = SignedCheckpoint::sign(&key(2), quantic, 30, &hash('a'));
+            assert!(v1.verify(&hibrida).is_err());
+            SignedCheckpoint::sign_hybrid(&hybrid(2), quantic, 30, &hash('a'))
+                .verify(&hibrida)
+                .unwrap();
+        }
+        // Zenith sigue aceptando la clave de solo Ed25519 hasta que se compile su ML-DSA.
+        assert!(authority_policy(MAINNET_CHAIN_ID, solo_ed25519).is_some());
     }
 
     #[cfg(feature = "pq-experimental")]

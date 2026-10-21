@@ -15189,6 +15189,12 @@ fn cmd_checkpoint_keygen(args: &[String]) -> Result<(), String> {
     println!("Public key: {public}");
     println!("Back up that file offline: it is the only copy. Compile the public key into");
     println!("economics::CHECKPOINT_AUTHORITY_KEYS for this chain and release new binaries.");
+    // Zoka Quantic exige la clave híbrida desde el génesis: sin la mitad ML-DSA
+    // la cadena no tiene autoridad. Se crean las dos mitades juntas.
+    if network.is_quantic() {
+        println!();
+        return cmd_checkpoint_keygen_mldsa(&network);
+    }
     Ok(())
 }
 
@@ -19294,8 +19300,34 @@ fn cmd_genesis_verify(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() {
+/// Pila del hilo donde corre el programa. La principal de Windows tiene 1 MB y
+/// Halo 2 y ML-DSA (la clave híbrida de la autoridad) recursan hondo: un nodo
+/// de Quantic con su clave de autoridad se caía al arrancar. Es reserva de
+/// direcciones, no memoria usada.
+const MAIN_STACK_BYTES: usize = 64 * 1024 * 1024;
+/// La de los hilos de trabajo de tokio (2 MB por omisión).
+const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+fn main() {
+    let program = std::thread::Builder::new()
+        .name("zoka".to_string())
+        .stack_size(MAIN_STACK_BYTES)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(WORKER_STACK_BYTES)
+                .build()
+                .expect("failed to start the tokio runtime")
+                .block_on(async_main())
+        })
+        .expect("failed to start the main thread");
+    if program.join().is_err() {
+        // El pánico ya se imprimió; mismo código que un pánico en main.
+        std::process::exit(101);
+    }
+}
+
+async fn async_main() {
     // The fluid streaming console is the default (see cmd_fullnode_auto), so
     // keep the tracing log stream (p2p gossip INFO, etc.) from drowning it: if
     // the operator didn't pick a level explicitly, default to warn. Only the

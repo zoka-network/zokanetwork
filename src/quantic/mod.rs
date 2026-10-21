@@ -1169,6 +1169,48 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_rebuilds_the_quantic_state_in_a_fresh_node() {
+        let (source, _source_dir) = storage();
+        let (target, _target_dir) = storage();
+        let target = std::sync::Arc::new(target);
+        let params = consensus_params(Network::Regtest);
+        let team_sk = QuanticSpendingKey::from_root(&REGTEST_TEAM_ROOT, Network::Regtest, 0).unwrap();
+        let alice = QuanticSpendingKey::from_root(&[3; 32], Network::Regtest, 0).unwrap().full_viewing_key().address();
+        let miner = QuanticSpendingKey::from_root(&[4; 32], Network::Regtest, 0).unwrap().full_viewing_key().address();
+        let mut team = QuanticWallet::new(team_sk.full_viewing_key(), &params);
+        let b1 = mined(&source, &genesis_parent_for(CHAIN), &coinbase(1, &team.fvk().address(), PREMINE_ATOMS, true), &[]);
+        apply_block_with_expected_difficulty(&source, CHAIN, &b1, bits()).unwrap();
+        team.scan_block(&decode_block(&b1).unwrap());
+        let tx = team
+            .create_transfer(&team_sk, vec![Payment::new(alice, 9 * ZKA)], 0, proving_key(), &mut zoka_quantic::os_rng())
+            .unwrap();
+        let fee = tx.fee().unwrap();
+        let b2 = mined(&source, &b1, &coinbase(2, &miner, params.minted_at(2) + fee, false), &[tx.clone()]);
+        apply_block_with_expected_difficulty(&source, CHAIN, &b2, bits()).unwrap();
+        let b3 = mined(&source, &b2, &coinbase(3, &miner, params.minted_at(3), false), &[]);
+        apply_block_with_expected_difficulty(&source, CHAIN, &b3, bits()).unwrap();
+
+        let snapshot = crate::snapshot::export_from_storage(&source, CHAIN, now_secs()).unwrap();
+        assert_eq!(crate::snapshot::import_into_storage(&target, CHAIN, &snapshot).unwrap(), 3);
+        // La misma punta y el mismo árbol de notas, rearmados bloque por bloque.
+        assert_eq!(target.get_last_block_hash().unwrap(), b3.header.hash);
+        for block in [&b1, &b2, &b3] {
+            assert_eq!(
+                tree_root_after(&target, &block.header.hash).unwrap(),
+                tree_root_after(&source, &block.header.hash).unwrap()
+            );
+        }
+        // Lo gastado sigue gastado: el mismo envío no vuelve a entrar.
+        assert!(mempool::QuanticMempool::new().insert(&target, CHAIN, tx, now_secs()).is_err());
+        // Y la cadena importada sigue: un bloque nuevo encima se acepta.
+        let b4 = mined(&target, &b3, &coinbase(4, &miner, params.minted_at(4), false), &[]);
+        apply_block_with_expected_difficulty(&target, CHAIN, &b4, bits()).unwrap();
+        // Importar dos veces no cambia nada.
+        assert_eq!(crate::snapshot::import_into_storage(&target, CHAIN, &snapshot).unwrap(), 0);
+        assert_eq!(target.get_last_block_hash().unwrap(), b4.header.hash);
+    }
+
+    #[test]
     fn the_node_answers_light_wallets_with_its_chain() {
         use crate::network::quantic_light_request_response::{QuanticLightRequest, QuanticLightResponse};
 
