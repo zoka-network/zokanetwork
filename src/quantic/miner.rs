@@ -79,6 +79,14 @@ pub fn build_template(
     build(&usable).or_else(|_| build(&[]))
 }
 
+/// Hashes calculados por este proceso desde que arrancó. El runtime saca de
+/// acá el hashrate que muestran la API y `mine-status`.
+static HASHES: AtomicU64 = AtomicU64::new(0);
+
+pub fn total_hashes() -> u64 {
+    HASHES.load(Ordering::Relaxed)
+}
+
 /// Resultado de una búsqueda de nonce.
 pub enum PowOutcome {
     Solved,
@@ -102,7 +110,6 @@ pub fn solve_pow_parallel(
     let engines = crate::mining::pow::engine_pool_for(chain_id, block.header.block_height, lanes)
         .map_err(|e| e.to_string())?;
     let found = AtomicBool::new(false);
-    let attempts = AtomicU64::new(0);
     let started = Instant::now();
     let (sender, receiver) = mpsc::channel::<Result<(Vec<u8>, u64), String>>();
     let header = block.header.clone();
@@ -110,7 +117,6 @@ pub fn solve_pow_parallel(
         for (lane, engine) in engines.into_iter().enumerate() {
             let sender = sender.clone();
             let found = &found;
-            let attempts = &attempts;
             let header = &header;
             scope.spawn(move || {
                 let mut nonce = lane as u64;
@@ -129,7 +135,7 @@ pub fn solve_pow_parallel(
                     );
                     match engine.calculate_hash(&input) {
                         Ok(hash) => {
-                            attempts.fetch_add(1, Ordering::Relaxed);
+                            HASHES.fetch_add(1, Ordering::Relaxed);
                             if super::difficulty::hash_meets_target(&hash, target) {
                                 found.store(true, Ordering::Relaxed);
                                 let _ = sender.send(Ok((hash, nonce)));

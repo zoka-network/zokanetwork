@@ -10638,8 +10638,9 @@ fn expand_node_config_into_args(args: &[String]) -> Result<Vec<String>, String> 
 }
 
 /// El runtime de Quantic del nodo, si el perfil es de Quantic. Con
-/// `--quantic-mine-to <dirección>` también mina (`--quantic-mine-threads`,
-/// `--mine-interval-secs` y `--min-mine-peers` como en Zenith).
+/// `--quantic-mine-to <dirección>` también mina (`--quantic-mine-threads` o
+/// `--threads`, `--mine-interval-secs` y `--min-mine-peers` como en Zenith).
+/// Con `--no-mine` además, espera a `/mining/start`, como hace ZSilent.
 #[cfg(feature = "quantic")]
 fn quantic_runtime_for(
     args: &[String],
@@ -10657,7 +10658,7 @@ fn quantic_runtime_for(
             let address = zoka::quantic::protocol::QuanticAddress::decode_for(text.trim(), quantic_network)
                 .map_err(|e| format!("--quantic-mine-to: {e}"))?;
             let threads = parse_u64_arg(
-                option_value(args, "--quantic-mine-threads"),
+                option_value(args, "--quantic-mine-threads").or_else(|| option_value(args, "--threads")),
                 default_mining_threads() as u64,
                 "--quantic-mine-threads",
             )?
@@ -10668,11 +10669,79 @@ fn quantic_runtime_for(
                 threads,
                 interval: Duration::from_secs(interval),
                 min_peers: min_mine_peers,
+                start_enabled: !has_flag(args, "--no-mine"),
             })
         }
         None => None,
     };
     zoka::quantic::runtime::QuanticRuntime::new(chain_id, mining).map(Some)
+}
+
+/// El archivo que lee `mine-status --network quantic-…` (y ZSilent cuando no
+/// llega a la API): lo que el minero de Quantic lleva en esta sesión sumado a
+/// `base`, lo de sesiones anteriores. Las recompensas sin madurar son las de
+/// bloques propios que siguen en la cadena canónica.
+#[cfg(feature = "quantic")]
+fn save_quantic_mining_state(
+    network: NetworkProfile,
+    chain_id: &str,
+    storage: &RocksDbStorage,
+    status: &zoka::quantic::runtime::QuanticMiningStatus,
+    base: &UserMiningState,
+) -> Result<(), String> {
+    use zoka::quantic::difficulty;
+    let chain_height = storage.get_chain_height().unwrap_or(0);
+    let current_difficulty_bits = zoka::quantic::compact_target_for_tip(storage, chain_id)
+        .map(|compact| difficulty::bits_of_target(&difficulty::from_compact(compact)))
+        .unwrap_or(0);
+    let still_ours = |height: u64, hash: &str| {
+        storage
+            .get_canonical_block_hash_at_height(height)
+            .ok()
+            .flatten()
+            .is_some_and(|canonical| canonical == hash)
+    };
+    let address = status.address.clone().unwrap_or_default();
+    let mut pending_rewards: Vec<PendingMiningReward> = base
+        .pending_rewards
+        .iter()
+        .filter(|reward| !status.recent_blocks.iter().any(|block| block.hash == reward.block_hash))
+        .cloned()
+        .chain(status.recent_blocks.iter().map(|block| PendingMiningReward {
+            wallet_address: address.clone(),
+            amount: block.reward_atoms,
+            source_height: block.height,
+            unlock_height: block.unlock_height,
+            block_hash: block.hash.clone(),
+            private_coinbase: None,
+        }))
+        .filter(|reward| reward.unlock_height > chain_height && still_ours(reward.source_height, &reward.block_hash))
+        .collect();
+    pending_rewards.sort_by_key(|reward| reward.source_height);
+    let mined_now = status.blocks_mined > 0;
+    let state = UserMiningState {
+        total_blocks: base.total_blocks.saturating_add(status.blocks_mined),
+        total_rewards: base.total_rewards.saturating_add(status.rewards_atoms),
+        is_mining: status.enabled,
+        chain_height,
+        current_difficulty_bits,
+        estimated_hashrate_hps: if status.enabled { status.hashrate_hps } else { 0 },
+        avg_solve_time_secs: if mined_now { status.avg_solve_secs } else { base.avg_solve_time_secs },
+        last_solve_time_secs: if mined_now { status.last_solve_secs } else { base.last_solve_time_secs },
+        virtual_time_elapsed_secs: 0.0,
+        total_supply_emitted: storage.get_total_supply_emitted().unwrap_or(0),
+        mode: network.mining_mode().to_string(),
+        algorithm: active_pow_algorithm_for_chain(chain_id).to_string(),
+        last_block_hash: status
+            .recent_blocks
+            .last()
+            .map(|block| block.hash.clone())
+            .unwrap_or_else(|| base.last_block_hash.clone()),
+        pending_rewards,
+        last_updated: now_secs(),
+        mining_process_id: status.enabled.then(std::process::id),
+    };
+    save_user_mining_state_for_network(network, &state)
 }
 
 async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
@@ -12115,18 +12184,39 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     let mut quantic_runtime = quantic_runtime_for(args, network, &chain_id, min_mine_peers)?;
     #[cfg(feature = "quantic")]
     if let Some(runtime) = quantic_runtime.as_ref() {
-        startup_notes.push(if runtime.is_mining() {
+        startup_notes.push(if runtime.starts_enabled() {
             "Zoka Quantic: mining to the address of --quantic-mine-to.".to_string()
+        } else if runtime.is_mining() {
+            "Zoka Quantic: mining address set; waiting for /mining/start.".to_string()
         } else {
             "Zoka Quantic: validating and relaying; pass --quantic-mine-to <address> to mine.".to_string()
         });
     }
+    // Lo que `mine-status` ya traía de sesiones anteriores en esta red.
+    #[cfg(feature = "quantic")]
+    let quantic_mining_base = if network.is_quantic() {
+        load_user_mining_state_for_network(network).unwrap_or_default()
+    } else {
+        UserMiningState::default()
+    };
+    #[cfg(feature = "quantic")]
+    let mut next_quantic_state_save_at = tokio::time::Instant::now();
     loop {
         #[cfg(feature = "quantic")]
         if let (Some(runtime), Some(storage)) = (quantic_runtime.as_mut(), chain_storage_outer.as_ref()) {
             let outcome = runtime.tick(&mut node, storage).await;
             if let Some(event) = outcome.events.into_iter().last() {
                 last_event = event;
+            }
+            if runtime.is_mining()
+                && (outcome.mined.is_some() || tokio::time::Instant::now() >= next_quantic_state_save_at)
+            {
+                if let Err(error) =
+                    save_quantic_mining_state(network, &chain_id, storage, runtime.status(), &quantic_mining_base)
+                {
+                    mining_log(&format!("quantic mining state not saved: {error}"));
+                }
+                next_quantic_state_save_at = tokio::time::Instant::now() + Duration::from_secs(5);
             }
         }
         if tokio::time::Instant::now() >= next_checkpoint_tick_at {
@@ -12329,8 +12419,12 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         let team_hashing = team_share_task.is_some();
         let mining_active = mining_task.is_some();
         let mining_control = zoka::api::global_local_mining_control().snapshot();
-        let runtime_mining_enabled =
-            !checkpoint_quarantine && !team_status.enabled && (auto_mine || mining_control.enabled);
+        // En Quantic el control en caliente lo obedece el minero de Quantic; el
+        // de Zenith no tiene nada que minar ahí.
+        let runtime_mining_enabled = !network.is_quantic()
+            && !checkpoint_quarantine
+            && !team_status.enabled
+            && (auto_mine || mining_control.enabled);
         let runtime_mining_threads = if mining_control.threads > 0 {
             mining_control.threads.clamp(1, 128) as usize
         } else {
@@ -12350,7 +12444,11 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
 
         let mut runtime_mining_state =
             load_user_mining_state_for_network(network).unwrap_or_default();
-        if !runtime_mining_enabled && !mining_active && runtime_mining_state.is_mining {
+        if !network.is_quantic()
+            && !runtime_mining_enabled
+            && !mining_active
+            && runtime_mining_state.is_mining
+        {
             runtime_mining_state.is_mining = false;
             runtime_mining_state.mining_process_id = None;
             runtime_mining_state.last_updated = now_secs();
@@ -12370,11 +12468,16 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             .set_kademlia_routing_peers(node.kademlia_routing_peer_count());
         zoka::api::global_network_runtime()
             .set_block_request_response_stats(node.block_request_response_stats());
-        zoka::api::global_network_runtime()
-            .set_local_miner(
-                node.peer_id().to_string(),
+        #[cfg(feature = "quantic")]
+        let quantic_local_miner = quantic_runtime
+            .as_ref()
+            .map(|runtime| (runtime.status().enabled, runtime.status().hashrate_hps));
+        #[cfg(not(feature = "quantic"))]
+        let quantic_local_miner: Option<(bool, u64)> = None;
+        let (local_miner_active, local_miner_hashrate) = match quantic_local_miner {
+            Some((enabled, hashrate)) => (enabled, if enabled { hashrate } else { 0 }),
+            None => (
                 runtime_mining_enabled || mining_active || team_hashing,
-                runtime_chain_height,
                 if team_hashing {
                     team_status
                         .team
@@ -12387,6 +12490,14 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 } else {
                     0
                 },
+            ),
+        };
+        zoka::api::global_network_runtime()
+            .set_local_miner(
+                node.peer_id().to_string(),
+                local_miner_active,
+                runtime_chain_height,
+                local_miner_hashrate,
             )
             .await;
 
@@ -14894,9 +15005,12 @@ fn chain_contains_checkpoint(
 /// `zoka quantic-wallet <acción> --network quantic-regtest|quantic-testnet`:
 /// la wallet de Zoka Quantic de línea de comandos. Habla con el nodo por su API
 /// (`--rpc`, o la del manifiesto) y se sincroniza con bloques compactos que
-/// verifica contra cada bloque. Acciones: `new`, `restore`, `address`, `list`,
-/// `balance`, `send --to <dirección> --amount <ZKA>` e `import-regtest-team`
-/// (solo regtest: la wallet del premine, de clave pública a propósito).
+/// verifica contra cada bloque, retomando desde lo que guardó la vez anterior.
+/// Acciones: `new`, `restore`, `address`, `list`, `balance`, `history`,
+/// `estimate-fee --amount <ZKA>`, `send --to <dirección> --amount <ZKA>`,
+/// `show-phrase`, `change-password --new-password-env <VAR>` e
+/// `import-regtest-team` (solo regtest: la wallet del premine, de clave pública
+/// a propósito).
 #[cfg(feature = "quantic")]
 fn cmd_quantic_wallet(args: &[String]) -> Result<(), String> {
     // Armar la clave y la prueba de Halo 2 no entra en la pila del hilo
@@ -14913,7 +15027,7 @@ fn cmd_quantic_wallet(args: &[String]) -> Result<(), String> {
 
 #[cfg(feature = "quantic")]
 fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
-    const USAGE: &str = "usage: zoka quantic-wallet <new|restore|address|list|balance|history|send|import-regtest-team> --network quantic-mainnet|quantic-testnet|quantic-regtest [--name <wallet>] [--password <p> | --password-env <VAR> | --password-stdin] [restore: --phrase-env <VAR> or the phrase on stdin] [send: --to <address> --amount <ZKA> [--memo <text>]] [--rpc <url>] [--json]";
+    const USAGE: &str = "usage: zoka quantic-wallet <new|restore|address|list|balance|history|estimate-fee|send|show-phrase|change-password|backup|import-backup|import-regtest-team> --network quantic-mainnet|quantic-testnet|quantic-regtest [--name <wallet>] [--password <p> | --password-env <VAR> | --password-stdin] [restore: --phrase-env <VAR> or the phrase on stdin] [estimate-fee: --amount <ZKA>] [send: --to <address> --amount <ZKA> [--memo <text>]] [change-password: --new-password-env <VAR>] [backup: --out <file>] [import-backup: --file <file>] [--rpc <url>] [--json]";
     let Some((action, rest)) = args.split_first() else {
         return Err(USAGE.to_string());
     };
@@ -14931,16 +15045,23 @@ fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
             .or_else(|| configured_local_rpc_url(network))
             .ok_or_else(|| "no node API: pass --rpc <url>".to_string())
     };
-    let synced = |password: &str| -> Result<(zoka::quantic::protocol::QuanticSpendingKey, zoka::quantic::protocol::wallet::QuanticWallet, u64), String> {
-        let key = zoka::quantic::wallet_file::open(&dir, &name, quantic_network, password)?;
+    // Retoma desde lo que guardó la vez anterior (`<nombre>.scan`) en vez de
+    // recorrer la cadena desde el génesis en cada consulta.
+    let synced = |password: &str| -> Result<(zoka::quantic::protocol::QuanticSpendingKey, zoka::quantic::wallet_sync::Resumed, u64), String> {
+        let (key, scan_key) = zoka::quantic::wallet_file::open_for_scan(&dir, &name, quantic_network, password)?;
         let url = rpc()?;
         let info = rpc_http_get_json(&url, "/quantic/info", 15)?;
         let tip = info["height"].as_u64().ok_or_else(|| format!("unexpected /quantic/info reply: {info}"))?;
-        let wallet = zoka::quantic::wallet_sync::sync_wallet(key.full_viewing_key(), tip, |from, to| {
+        let saved = zoka::quantic::wallet_file::load_scan(&dir, &name, &scan_key);
+        let resumed = zoka::quantic::wallet_sync::resume_wallet(key.full_viewing_key(), saved, tip, |from, to| {
             let reply = rpc_http_get_json(&url, &format!("/quantic/compact?from={from}&to={to}"), 60)?;
             serde_json::from_value(reply["blocks"].clone()).map_err(|e| format!("unexpected /quantic/compact reply: {e}"))
         })?;
-        Ok((key, wallet, tip))
+        if !resumed.node_behind {
+            // Si no se puede guardar, la próxima vez solo cuesta volver a escanear.
+            let _ = zoka::quantic::wallet_file::save_scan(&dir, &name, &scan_key, &resumed.points);
+        }
+        Ok((key, resumed, tip))
     };
     match action.as_str() {
         "new" => {
@@ -15000,19 +15121,118 @@ fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "list" => {
-            let names = zoka::quantic::wallet_file::list(&dir);
+            let wallets = zoka::quantic::wallet_file::list_with_addresses(&dir);
             if json {
-                println!("{}", serde_json::json!({ "wallets": names }));
+                let names: Vec<&String> = wallets.iter().map(|(name, _)| name).collect();
+                let details: Vec<serde_json::Value> = wallets
+                    .iter()
+                    .map(|(name, address)| serde_json::json!({ "name": name, "address": address }))
+                    .collect();
+                println!("{}", serde_json::json!({ "wallets": names, "details": details }));
             } else {
-                for wallet in names {
+                for (wallet, _) in wallets {
                     println!("{wallet}");
                 }
             }
             Ok(())
         }
+        "backup" => {
+            let out = PathBuf::from(required_option_value(rest, "--out")?);
+            zoka::quantic::wallet_file::backup(&dir, &name, &out)?;
+            if json {
+                println!("{}", serde_json::json!({ "name": name, "backup": out.display().to_string() }));
+            } else {
+                println!("Wallet '{name}' copied to {} (still encrypted with its password).", out.display());
+            }
+            Ok(())
+        }
+        "import-backup" => {
+            let password = required_password_value(rest)?;
+            let file = PathBuf::from(required_option_value(rest, "--file")?);
+            let address = zoka::quantic::wallet_file::import_backup(&dir, &name, &file, quantic_network, &password)?;
+            if json {
+                println!("{}", serde_json::json!({ "name": name, "address": address }));
+            } else {
+                println!("Wallet '{name}' imported.");
+                println!("{address}");
+            }
+            Ok(())
+        }
+        "show-phrase" => {
+            let password = required_password_value(rest)?;
+            let phrase = zoka::quantic::wallet_file::recovery_phrase(&dir, &name, quantic_network, &password)?;
+            if json {
+                println!("{}", serde_json::json!({ "name": name, "recovery_phrase": phrase.as_str() }));
+            } else {
+                println!("{}", phrase.as_str());
+            }
+            Ok(())
+        }
+        "change-password" => {
+            let password = required_password_value(rest)?;
+            let new_password = zeroize::Zeroizing::new(match option_value(rest, "--new-password-env") {
+                Some(var_name) => secret_from_env_var(&var_name, "--new-password-env")?,
+                None => required_option_value(rest, "--new-password")?,
+            });
+            if new_password.is_empty() {
+                return Err("the new password cannot be empty".to_string());
+            }
+            zoka::quantic::wallet_file::change_password(&dir, &name, quantic_network, &password, &new_password)?;
+            if json {
+                println!("{}", serde_json::json!({ "name": name, "changed": true }));
+            } else {
+                println!("Password of wallet '{name}' changed.");
+            }
+            Ok(())
+        }
+        "estimate-fee" => {
+            let password = required_password_value(rest)?;
+            let amount = economics::parse_zka_amount(&required_option_value(rest, "--amount")?)?;
+            let (_, resumed, tip) = synced(&password)?;
+            let wallet = &resumed.wallet;
+            let plan = wallet.plan_transfer(amount, 1);
+            if json {
+                let mut reply = serde_json::json!({
+                    "name": name,
+                    "height": tip,
+                    "amount_atoms": amount,
+                    "max_sendable_atoms": wallet.max_sendable(),
+                    "spendable_atoms": wallet.balance(),
+                });
+                match &plan {
+                    Ok(plan) => {
+                        reply["enough"] = true.into();
+                        reply["fee_atoms"] = plan.fee.into();
+                        reply["fee"] = format_zka(plan.fee).into();
+                        reply["inputs"] = plan.inputs.into();
+                        reply["actions"] = plan.actions.into();
+                        reply["change_atoms"] = plan.change.into();
+                    }
+                    Err(error) => {
+                        reply["enough"] = false.into();
+                        reply["reason"] = error.to_string().into();
+                    }
+                }
+                println!("{reply}");
+            } else {
+                match plan {
+                    Ok(plan) => println!(
+                        "Fee {} ({} action(s), {} note(s) spent, change {}).",
+                        format_zka(plan.fee),
+                        plan.actions,
+                        plan.inputs,
+                        format_zka(plan.change)
+                    ),
+                    Err(error) => println!("Cannot send {}: {error}", format_zka(amount)),
+                }
+                println!("Most you can send now: {}", format_zka(wallet.max_sendable()));
+            }
+            Ok(())
+        }
         "balance" => {
             let password = required_password_value(rest)?;
-            let (_, wallet, tip) = synced(&password)?;
+            let (_, resumed, tip) = synced(&password)?;
+            let wallet = &resumed.wallet;
             let spendable = wallet.balance();
             let immature = wallet.immature_balance();
             if json {
@@ -15021,10 +15241,13 @@ fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
                     serde_json::json!({
                         "name": name,
                         "height": tip,
+                        "wallet_height": u64::from(wallet.next_height()).saturating_sub(1),
+                        "node_behind": resumed.node_behind,
                         "spendable_atoms": spendable,
                         "immature_atoms": immature,
                         "spendable": format_zka(spendable),
                         "immature": format_zka(immature),
+                        "max_sendable_atoms": wallet.max_sendable(),
                         "notes": wallet.notes().iter().filter(|n| n.spent_in.is_none()).count(),
                     })
                 );
@@ -15037,8 +15260,8 @@ fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
         }
         "history" => {
             let password = required_password_value(rest)?;
-            let (_, wallet, tip) = synced(&password)?;
-            let history = wallet.history();
+            let (_, resumed, tip) = synced(&password)?;
+            let history = resumed.wallet.history();
             if json {
                 let entries: Vec<serde_json::Value> = history
                     .iter()
@@ -15097,9 +15320,13 @@ fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
                 }
                 payment.memo[..bytes.len()].copy_from_slice(bytes);
             }
-            let (key, wallet, tip) = synced(&password)?;
+            let (key, resumed, tip) = synced(&password)?;
+            if resumed.node_behind {
+                return Err("the node is still catching up with the chain; send when it is synced".to_string());
+            }
             let proving_key = zoka::quantic::runtime::proving_key();
-            let tx = wallet
+            let tx = resumed
+                .wallet
                 .create_transfer(
                     &key,
                     vec![payment],
@@ -17473,6 +17700,16 @@ fn cmd_team_stop(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Bloques hasta que se puede gastar una recompensa de minería en esa red.
+fn coinbase_maturity_for_network(network: NetworkProfile) -> u64 {
+    #[cfg(feature = "quantic")]
+    if let Some(quantic) = zoka::quantic::network_for_chain(network.chain_id()) {
+        return u64::from(zoka::quantic::consensus_params(quantic).coinbase_maturity);
+    }
+    let _ = network;
+    COINBASE_MATURITY_BLOCKS
+}
+
 fn cmd_mine_status(args: &[String]) -> Result<(), String> {
     let network = NetworkProfile::from_args(args)?;
     let state = load_user_mining_state_for_display_for_network(network)?;
@@ -17512,7 +17749,7 @@ fn cmd_mine_status(args: &[String]) -> Result<(), String> {
                 "locked_rewards": format_zka_amount(locked_rewards_atoms),
                 "next_reward_unlock_height": next_unlock_height,
                 "next_reward_unlock_in_blocks": next_unlock_in,
-                "coinbase_maturity_blocks": COINBASE_MATURITY_BLOCKS,
+                "coinbase_maturity_blocks": coinbase_maturity_for_network(network),
                 "legacy_pow_sim_detected": legacy_pow_sim_state_detected(&state)
             })
         );
@@ -17608,7 +17845,7 @@ fn cmd_mine_console(args: &[String]) -> Result<(), String> {
                 "supply_remaining": format_zka_amount(EMISSION_MAX_SUPPLY.saturating_sub(state.total_supply_emitted)),
                 "halving_in_blocks": EMISSION_HALVING_INTERVAL - (state.chain_height % EMISSION_HALVING_INTERVAL),
                 "locked_rewards": state.pending_rewards.iter().map(|reward| reward.amount).sum::<u64>(),
-                "coinbase_maturity_blocks": COINBASE_MATURITY_BLOCKS,
+                "coinbase_maturity_blocks": coinbase_maturity_for_network(network),
                 "legacy_pow_sim_detected": legacy_pow_sim_state_detected(&state),
                 "known_height": known_height,
                 "wallet": wallet_snapshot.as_ref().map(|wallet| {

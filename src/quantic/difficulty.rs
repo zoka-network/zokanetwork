@@ -43,6 +43,17 @@ pub fn initial_difficulty_bits(network: zoka_quantic::Network) -> u32 {
     }
 }
 
+/// Los bits de ceros que pide `target`, redondeando para abajo: la cifra de
+/// "dificultad" que muestran las wallets, como la de Zenith.
+pub fn bits_of_target(target: &BigUint) -> u32 {
+    256u32.saturating_sub(target.bits() as u32)
+}
+
+/// Hashes por segundo que hacen falta para un bloque cada 120 s con ese objetivo.
+pub fn network_hashrate_for_target(target: &BigUint) -> u64 {
+    u64::try_from(work_for_target(target) / IDEAL_BLOCK_SECS as u128).unwrap_or(u64::MAX)
+}
+
 /// El objetivo de `bits` bits de ceros: 2^(256 − bits) − 1.
 pub fn target_for_bits(bits: u32) -> BigUint {
     (BigUint::from(1u32) << (256 - bits.min(255) as usize)) - 1u32
@@ -162,6 +173,16 @@ mod tests {
         hash[1] = 0x10; // 11 bits de ceros
         assert!(!hash_meets_target(&hash, &target));
         assert!(!hash_meets_target(&[0u8; 31], &target));
+    }
+
+    #[test]
+    fn the_displayed_bits_survive_the_compact_form() {
+        for bits in [12, 14, 16, 20] {
+            let compact = to_compact(&target_for_bits(bits));
+            assert_eq!(bits_of_target(&from_compact(compact)), bits);
+        }
+        // 14 bits: 16.384 hashes por bloque, 136 H/s para uno cada 120 s.
+        assert_eq!(network_hashrate_for_target(&target_for_bits(14)), 136);
     }
 
     #[test]

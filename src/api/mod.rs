@@ -2757,10 +2757,19 @@ async fn get_stats(State(app_state): State<Arc<AppState>>) -> Json<serde_json::V
     };
 
     let height = app_state.state_manager.get_height().await;
-    let difficulty_bits = app_state.state_manager.get_next_difficulty();
-
-    // Estimated network hashrate in H/s: expected hashes per block / block_time
-    let hashrate_hs = (2u64.pow(difficulty_bits) as f64) / (TARGET_BLOCK_TIME_SECS as f64);
+    // Zoka Quantic: objetivo ASERT de 256 bits y suministro con premine; la
+    // fórmula de Zenith de abajo no le corresponde.
+    #[cfg(feature = "quantic")]
+    let quantic = crate::quantic::api::next_difficulty(&app_state.state_manager.raw_storage())
+        .map(|next| (next.bits, next.network_hashrate_hps as f64));
+    #[cfg(not(feature = "quantic"))]
+    let quantic: Option<(u32, f64)> = None;
+    let quantic_chain = quantic.is_some();
+    let (difficulty_bits, hashrate_hs) = quantic.unwrap_or_else(|| {
+        let bits = app_state.state_manager.get_next_difficulty();
+        // Estimated network hashrate in H/s: expected hashes per block / block_time
+        (bits, (2u64.pow(bits) as f64) / (TARGET_BLOCK_TIME_SECS as f64))
+    });
 
     // Cumulative emission in ZKA from the halving schedule
     let mut emission_zka = 0u64;
@@ -2787,6 +2796,11 @@ async fn get_stats(State(app_state): State<Arc<AppState>>) -> Json<serde_json::V
     // y no debe usarse para mostrar una cifra exacta.
     let emitted_atoms = app_state.state_manager.get_total_supply_emitted_atoms().await;
     let max_atoms = crate::economics::MAX_SUPPLY_ATOMS;
+    let emission_zka_f = if quantic_chain {
+        emitted_atoms as f64 / crate::economics::ATOMS_PER_ZKA as f64
+    } else {
+        emission_zka_f
+    };
 
     Json(serde_json::json!({
         "height": height,

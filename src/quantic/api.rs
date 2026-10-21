@@ -8,6 +8,8 @@
 //! - `GET /quantic/blocks?from=&to=`: las transacciones de cada bloque, en hex.
 //! - `GET /quantic/compact?from=&to=`: los bloques compactos de la wallet
 //!   liviana (etapa 5, A5), con el `state_root` de cada uno para verificarlos.
+//! - `GET /quantic/mining`: el minero de este nodo (encendido, hilos,
+//!   hashrate, bloques propios y cuándo maduran).
 //!
 //! Info y bloques compactos salen de [`super::light`], lo mismo que reciben
 //! los teléfonos por la red P2P.
@@ -48,6 +50,26 @@ pub fn routes(router: Router<Arc<AppState>>) -> Router<Arc<AppState>> {
         .route("/quantic/tx", post(post_tx))
         .route("/quantic/blocks", get(get_blocks))
         .route("/quantic/compact", get(get_compact))
+        .route("/quantic/mining", get(get_mining))
+}
+
+/// La dificultad del próximo bloque: el objetivo compacto, sus bits de ceros
+/// y el hashrate de red que da un bloque cada 120 s con él.
+pub struct NextDifficulty {
+    pub compact: u32,
+    pub bits: u32,
+    pub network_hashrate_hps: u64,
+}
+
+pub fn next_difficulty(storage: &RocksDbStorage) -> Option<NextDifficulty> {
+    let chain_id = chain_id().ok()?;
+    let compact = super::compact_target_for_tip(storage, &chain_id).ok()?;
+    let target = super::difficulty::from_compact(compact);
+    Some(NextDifficulty {
+        compact,
+        bits: super::difficulty::bits_of_target(&target),
+        network_hashrate_hps: super::difficulty::network_hashrate_for_target(&target),
+    })
 }
 
 async fn get_info(State(app_state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>, ApiError> {
@@ -57,6 +79,7 @@ async fn get_info(State(app_state): State<Arc<AppState>>) -> Result<Json<serde_j
     let mempool_size = mempool::global().lock().map(|pool| pool.len()).unwrap_or(0);
     let network = super::network_for_chain(&chain_id).ok_or_else(|| internal("unknown chain"))?;
     let params = super::consensus_params(network);
+    let difficulty = next_difficulty(&storage);
     Ok(Json(serde_json::json!({
         "chain_id": chain_id,
         "height": height,
@@ -66,7 +89,17 @@ async fn get_info(State(app_state): State<Arc<AppState>>) -> Result<Json<serde_j
         "genesis_height": GENESIS_HEIGHT,
         "coinbase_maturity": params.coinbase_maturity,
         "anchor_window": params.anchor_window,
+        "difficulty_compact": difficulty.as_ref().map(|d| d.compact),
+        "difficulty_bits": difficulty.as_ref().map(|d| d.bits),
+        "network_hashrate_hps": difficulty.as_ref().map(|d| d.network_hashrate_hps),
+        "total_supply_emitted_atoms": storage.get_total_supply_emitted().unwrap_or(0),
+        "max_supply_atoms": zoka_quantic::state::MAX_SUPPLY_ATOMS,
     })))
+}
+
+async fn get_mining() -> Result<Json<serde_json::Value>, ApiError> {
+    chain_id()?;
+    serde_json::to_value(runtime::mining_status()).map(Json).map_err(internal)
 }
 
 #[derive(Deserialize)]

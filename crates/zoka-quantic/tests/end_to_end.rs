@@ -170,7 +170,14 @@ fn a_chain_from_the_genesis_with_payments_change_and_mining() {
     assert_eq!(miner.wallet.immature_balance(), 24 * ZKA);
 
     // Height 4: Alice pays Bob, and the miner spends its matured coinbase.
+    // What the wallet shows before confirming is what the transfer pays.
+    let plan = alice.wallet.plan_transfer(250 * ZKA, 1).unwrap();
+    assert_eq!((plan.inputs, plan.actions), (1, 2));
+    assert_eq!(plan.change, 750 * ZKA - plan.fee);
+    assert_eq!(alice.wallet.max_sendable(), 1_000 * ZKA - plan.fee);
+    assert!(alice.wallet.plan_transfer(1_000 * ZKA, 1).is_err(), "the fee does not fit");
     let tx_alice = alice.pay(&bob.address(), 250 * ZKA, &mut rng);
+    assert_eq!(tx_alice.fee(), Some(plan.fee));
     let tx_miner = miner.pay(&bob.address(), 5 * ZKA, &mut rng);
     let b4 = block(
         4,

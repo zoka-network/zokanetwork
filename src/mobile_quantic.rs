@@ -35,10 +35,9 @@ use crate::quantic::protocol::{Network, QuanticAddress, QuanticSpendingKey};
 use crate::quantic::wallet_sync::{scan_compact_blocks, CompactBlockJson};
 use crate::quantic::{consensus_params, runtime};
 
-/// Cuántos bloques detrás de la punta queda el estado seguro: más que la
-/// ventana de anclas (100) y que la distancia entre checkpoints de la
-/// autoridad (30), así una reorganización nunca llega más atrás.
-pub const SAFE_DEPTH: u64 = 120;
+/// Cuántos bloques detrás de la punta queda el estado seguro (el mismo que usa
+/// la wallet de línea de comandos).
+pub use crate::quantic::wallet_sync::SAFE_DEPTH;
 
 fn network_named(name: &str) -> Result<Network, String> {
     match name.trim() {

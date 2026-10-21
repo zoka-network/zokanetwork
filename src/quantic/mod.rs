@@ -805,6 +805,80 @@ mod tests {
         (storage, dir)
     }
 
+    #[test]
+    fn a_saved_scan_resumes_where_it_stopped_and_falls_back_after_a_reorganization() {
+        use std::cell::Cell;
+        let (storage, _dir) = storage();
+        let params = consensus_params(Network::Regtest);
+        let team = QuanticSpendingKey::from_root(&REGTEST_TEAM_ROOT, Network::Regtest, 0).unwrap();
+        let miner_sk = QuanticSpendingKey::from_root(&[4; 32], Network::Regtest, 0).unwrap();
+        let miner = miner_sk.full_viewing_key().address();
+        let mut parent = genesis_parent_for(CHAIN);
+        let mut chain = Vec::new();
+        for height in 1..=4u64 {
+            let coinbase = if height == 1 {
+                coinbase(1, &team.full_viewing_key().address(), PREMINE_ATOMS, true)
+            } else {
+                coinbase(height, &miner, params.minted_at(height as u32), false)
+            };
+            let block = mined(&storage, &parent, &coinbase, &[]);
+            apply_block_with_expected_difficulty(&storage, CHAIN, &block, bits()).unwrap();
+            chain.push(block.clone());
+            parent = block;
+        }
+        let fetches = Cell::new(0);
+        let node = |tip: u64| {
+            let storage = &storage;
+            let fetches = &fetches;
+            move |from: u64, to: u64| {
+                fetches.set(fetches.get() + 1);
+                Ok::<_, String>((from..=to.min(tip)).map(|h| compact_json(storage, h)).collect())
+            }
+        };
+        let fvk = || miner_sk.full_viewing_key();
+        let view = |wallet: &QuanticWallet| (wallet.balance(), wallet.immature_balance(), wallet.anchor().to_bytes());
+        let full = wallet_sync::sync_wallet(fvk(), 4, node(4)).unwrap();
+
+        // Primera vez hasta la 2, después solo lo nuevo.
+        let first = wallet_sync::resume_wallet(fvk(), vec![], 2, node(2)).unwrap();
+        assert_eq!(first.scanned_from, 1);
+        assert_eq!(first.points.iter().map(|p| p.height).collect::<Vec<_>>(), vec![2]);
+        let second = wallet_sync::resume_wallet(fvk(), first.points, 4, node(4)).unwrap();
+        assert_eq!(second.scanned_from, 3, "retoma después del bloque 2");
+        assert_eq!(view(&second.wallet), view(&full));
+        assert_eq!(second.points.iter().map(|p| p.height).collect::<Vec<_>>(), vec![4, 2]);
+
+        // Al día: una sola consulta, la que comprueba que el punto sigue en la cadena.
+        fetches.set(0);
+        let idle = wallet_sync::resume_wallet(fvk(), second.points.clone(), 4, node(4)).unwrap();
+        assert_eq!((idle.scanned_from, fetches.get()), (5, 1));
+        assert_eq!(view(&idle.wallet), view(&full));
+
+        // El punto de la 4 quedó en una rama que el nodo ya no sigue: retoma desde la 2.
+        let mut reorged = second.points.clone();
+        reorged[0].last_hash = "f".repeat(64);
+        let after = wallet_sync::resume_wallet(fvk(), reorged.clone(), 4, node(4)).unwrap();
+        assert_eq!(after.scanned_from, 3);
+        assert_eq!(view(&after.wallet), view(&full));
+        assert_eq!(after.points[0].last_hash, chain[3].header.hash, "el punto nuevo es el de la rama buena");
+        // Ninguno sigue: desde el génesis.
+        reorged[1].last_hash = "e".repeat(64);
+        let again = wallet_sync::resume_wallet(fvk(), reorged, 4, node(4)).unwrap();
+        assert_eq!(again.scanned_from, 1);
+        assert_eq!(view(&again.wallet), view(&full));
+
+        // Un nodo que todavía está sincronizando (va por la 1): lo último verificado, sin tocar nada.
+        let behind = wallet_sync::resume_wallet(fvk(), second.points.clone(), 1, node(1)).unwrap();
+        assert!(behind.node_behind);
+        assert_eq!(view(&behind.wallet), view(&full));
+        assert_eq!(behind.points.len(), 2);
+
+        // Los puntos de otra wallet no se usan.
+        let other = QuanticSpendingKey::from_root(&[9; 32], Network::Regtest, 0).unwrap().full_viewing_key();
+        let foreign = wallet_sync::resume_wallet(other, second.points, 4, node(4)).unwrap();
+        assert_eq!(foreign.scanned_from, 1);
+    }
+
     fn mined(
         storage: &RocksDbStorage,
         parent: &Block,

@@ -80,6 +80,18 @@ impl HistoryEntry {
 }
 
 /// What one block meant for the wallet.
+/// The cost of a transfer before building it ([`QuanticWallet::plan_transfer`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransferPlan {
+    /// Notes it spends.
+    pub inputs: usize,
+    /// Actions of the transaction, which set the fee.
+    pub actions: usize,
+    pub fee: u64,
+    /// What goes back to the wallet.
+    pub change: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScanSummary {
     pub received: u64,
@@ -300,24 +312,16 @@ impl QuanticWallet {
         summary
     }
 
-    /// Picks notes (largest first) and builds a transfer paying the
-    /// conventional fee. The notes stay unspent until a block spends them.
-    pub fn create_transfer<R: Rng + CryptoRng>(
-        &self,
-        sk: &QuanticSpendingKey,
-        payments: Vec<Payment>,
-        expiry_height: u32,
-        pk: &ProvingKey,
-        rng: &mut R,
-    ) -> Result<QuanticTransaction, BuildError> {
-        let target: u64 = payments.iter().map(|p| p.value).sum();
+    /// The notes a transfer of `target` to `payments` recipients would spend
+    /// (largest first) and its conventional fee.
+    fn choose_notes(&self, target: u64, payments: usize) -> Result<(Vec<&WalletNote>, u64), BuildError> {
         let mut candidates: Vec<&WalletNote> =
             self.notes.iter().filter(|n| n.is_spendable()).collect();
         candidates.sort_by_key(|n| std::cmp::Reverse(n.value()));
         let mut chosen = Vec::new();
         let mut total = 0u64;
         // Outputs: the payments plus, almost always, one change note.
-        let outputs = payments.len() + 1;
+        let outputs = payments + 1;
         for note in candidates {
             if chosen.len() == MAX_ACTIONS_PER_TX {
                 break;
@@ -335,6 +339,45 @@ impl QuanticWallet {
                 needed: target + fee,
             });
         }
+        Ok((chosen, fee))
+    }
+
+    /// What a transfer of `target` to `payments` recipients would cost,
+    /// without building or proving anything: what a wallet shows before
+    /// asking for confirmation.
+    pub fn plan_transfer(&self, target: u64, payments: usize) -> Result<TransferPlan, BuildError> {
+        let (chosen, fee) = self.choose_notes(target, payments)?;
+        let total: u64 = chosen.iter().map(|n| n.value()).sum();
+        Ok(TransferPlan {
+            inputs: chosen.len(),
+            actions: chosen.len().max(payments + 1),
+            fee,
+            change: total - target - fee,
+        })
+    }
+
+    /// The most one payment can send now: the largest notes that fit in one
+    /// transaction, minus its fee. Zero if that does not cover the fee.
+    pub fn max_sendable(&self) -> u64 {
+        let mut values: Vec<u64> = self.notes.iter().filter(|n| n.is_spendable()).map(|n| n.value()).collect();
+        values.sort_unstable_by(|a, b| b.cmp(a));
+        values.truncate(MAX_ACTIONS_PER_TX);
+        let total: u64 = values.iter().sum();
+        total.saturating_sub(conventional_fee(values.len().max(2)))
+    }
+
+    /// Picks notes (largest first) and builds a transfer paying the
+    /// conventional fee. The notes stay unspent until a block spends them.
+    pub fn create_transfer<R: Rng + CryptoRng>(
+        &self,
+        sk: &QuanticSpendingKey,
+        payments: Vec<Payment>,
+        expiry_height: u32,
+        pk: &ProvingKey,
+        rng: &mut R,
+    ) -> Result<QuanticTransaction, BuildError> {
+        let target: u64 = payments.iter().map(|p| p.value).sum();
+        let (chosen, fee) = self.choose_notes(target, payments.len())?;
         let spends = chosen
             .into_iter()
             .map(|n| SpendInput {

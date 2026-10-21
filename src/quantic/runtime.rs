@@ -117,14 +117,67 @@ fn now_secs() -> u64 {
 #[derive(Clone, Debug)]
 pub struct QuanticMiningConfig {
     pub address: QuanticAddress,
+    /// Hilos hasta que `/mining/start` pida otros.
     pub threads: usize,
     /// Pausa entre bloques propios (0: seguido).
     pub interval: Duration,
     /// Pares mínimos para minar (0 en una red local o en la autoridad).
     pub min_peers: usize,
+    /// Minar desde el arranque. Con `--no-mine` (lo que hace ZSilent) el nodo
+    /// espera `/mining/start`; en los dos casos `/mining/stop` lo para.
+    pub start_enabled: bool,
 }
 
-type MiningJob = tokio::task::JoinHandle<Result<Option<Block>, String>>;
+/// Bloques propios que se recuerdan para la API (los que maduran se olvidan).
+const RECENT_MINED_BLOCKS: usize = 256;
+/// Ventana mínima para medir el hashrate.
+const HASHRATE_WINDOW: Duration = Duration::from_secs(5);
+
+/// Un bloque que minó este nodo.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct MinedBlock {
+    pub height: u64,
+    pub hash: String,
+    /// Subsidio más comisiones, en átomos.
+    pub reward_atoms: u64,
+    /// Desde cuándo se puede gastar (altura + maduración).
+    pub unlock_height: u64,
+}
+
+/// El minero de Quantic en esta sesión, para la API y para `mine-status`.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct QuanticMiningStatus {
+    /// Si el nodo tiene dirección de minería (`--quantic-mine-to`).
+    pub configured: bool,
+    pub address: Option<String>,
+    /// Lo pedido: encendido salvo `--no-mine`, y lo que digan `/mining/start` y
+    /// `/mining/stop`.
+    pub enabled: bool,
+    /// Si en este momento hay una búsqueda de nonce corriendo.
+    pub hashing: bool,
+    /// Por qué no busca, si está encendido y no busca.
+    pub waiting_for: Option<String>,
+    pub threads: usize,
+    pub hashrate_hps: u64,
+    pub blocks_mined: u64,
+    pub rewards_atoms: u64,
+    pub last_solve_secs: f64,
+    pub avg_solve_secs: f64,
+    /// Los últimos bloques propios, del más viejo al más nuevo.
+    pub recent_blocks: Vec<MinedBlock>,
+}
+
+static STATUS: OnceLock<std::sync::Mutex<QuanticMiningStatus>> = OnceLock::new();
+
+/// Lo último que publicó el runtime (todo en cero si no hay runtime).
+pub fn mining_status() -> QuanticMiningStatus {
+    STATUS
+        .get()
+        .and_then(|status| status.lock().ok().map(|status| status.clone()))
+        .unwrap_or_default()
+}
+
+type MiningJob = tokio::task::JoinHandle<Result<Option<(Block, u64)>, String>>;
 
 pub struct QuanticRuntime {
     chain_id: String,
@@ -134,6 +187,12 @@ pub struct QuanticRuntime {
     next_mine_at: Instant,
     last_tip: Option<String>,
     outbound: mpsc::UnboundedReceiver<Vec<u8>>,
+    status: QuanticMiningStatus,
+    /// Desde cuándo se busca el bloque que sigue a la punta (para el tiempo de
+    /// resolución). `None` mientras no se mina.
+    searching_since: Option<Instant>,
+    solve_secs_total: f64,
+    hash_sample: (Instant, u64),
 }
 
 /// Lo que pasó en una vuelta.
@@ -165,6 +224,16 @@ impl QuanticRuntime {
         OUTBOUND
             .set(sender)
             .map_err(|_| "the Quantic runtime already exists in this process".to_string())?;
+        if let Some(config) = mining.as_ref().filter(|config| config.start_enabled) {
+            crate::api::global_local_mining_control().enable(config.threads as u64);
+        }
+        let status = QuanticMiningStatus {
+            configured: mining.is_some(),
+            address: mining.as_ref().map(|config| config.address.encode()),
+            threads: mining.as_ref().map(|config| config.threads).unwrap_or(0),
+            ..Default::default()
+        };
+        let _ = STATUS.set(std::sync::Mutex::new(status.clone()));
         Ok(Self {
             chain_id: chain_id.to_string(),
             mining,
@@ -173,15 +242,74 @@ impl QuanticRuntime {
             next_mine_at: Instant::now(),
             last_tip: None,
             outbound,
+            status,
+            searching_since: None,
+            solve_secs_total: 0.0,
+            hash_sample: (Instant::now(), miner::total_hashes()),
         })
     }
 
+    /// Si el nodo tiene a qué dirección minar (aunque esté en pausa).
     pub fn is_mining(&self) -> bool {
         self.mining.is_some()
     }
 
+    /// Si el nodo arrancó minando (sin `--no-mine`).
+    pub fn starts_enabled(&self) -> bool {
+        self.mining.as_ref().is_some_and(|config| config.start_enabled)
+    }
+
+    pub fn status(&self) -> &QuanticMiningStatus {
+        &self.status
+    }
+
     pub async fn tick(&mut self, node: &mut Node, storage: &Arc<RocksDbStorage>) -> TickOutcome {
+        let outcome = self.tick_inner(node, storage).await;
+        self.refresh_hashrate();
+        if let Some(status) = STATUS.get() {
+            if let Ok(mut shared) = status.lock() {
+                *shared = self.status.clone();
+            }
+        }
+        outcome
+    }
+
+    fn refresh_hashrate(&mut self) {
+        let (since, hashes) = self.hash_sample;
+        let elapsed = since.elapsed();
+        if elapsed < HASHRATE_WINDOW {
+            return;
+        }
+        // El promedio de la ventana mientras esté encendido, con las pausas y el
+        // armado de cada plantilla adentro: lo que rinde de verdad.
+        let now_hashes = miner::total_hashes();
+        self.status.hashrate_hps = if self.status.enabled {
+            (now_hashes.saturating_sub(hashes) as f64 / elapsed.as_secs_f64()).round() as u64
+        } else {
+            0
+        };
+        self.hash_sample = (Instant::now(), now_hashes);
+    }
+
+    /// Los hilos y si toca minar, según el control en caliente.
+    fn wanted(&self) -> Option<(QuanticMiningConfig, usize)> {
+        let config = self.mining.clone()?;
+        let threads = wanted_threads(&config, &crate::api::global_local_mining_control().snapshot())?;
+        Some((config, threads))
+    }
+
+    async fn tick_inner(&mut self, node: &mut Node, storage: &Arc<RocksDbStorage>) -> TickOutcome {
         let mut outcome = TickOutcome::default();
+        let wanted = self.wanted();
+        self.status.enabled = wanted.is_some();
+        if wanted.is_none() {
+            // Apagado por `/mining/stop` (o nunca encendido): la búsqueda en
+            // curso se corta en el próximo hash.
+            self.stop.store(true, Ordering::Relaxed);
+            self.searching_since = None;
+        } else if self.searching_since.is_none() {
+            self.searching_since = Some(Instant::now());
+        }
 
         // 1. Lo que entró por la API sale a la red.
         while let Ok(bytes) = self.outbound.try_recv() {
@@ -205,6 +333,9 @@ impl QuanticRuntime {
                 .unwrap_or_default();
             self.last_tip = tip;
             self.stop.store(true, Ordering::Relaxed);
+            if self.searching_since.is_some() {
+                self.searching_since = Some(Instant::now());
+            }
             if let Ok(mut pool) = mempool::global().lock() {
                 let removed = pool.revalidate(storage, &self.chain_id);
                 if removed > 0 {
@@ -227,9 +358,12 @@ impl QuanticRuntime {
         // 3. El trabajo de minería que terminó.
         if self.job.as_ref().is_some_and(|job| job.is_finished()) {
             let job = self.job.take().expect("checked above");
+            self.status.hashing = false;
             match job.await {
-                Ok(Ok(Some(block))) => match crate::state::chain::apply_block(storage, &self.chain_id, &block) {
+                Ok(Ok(Some((block, reward_atoms)))) => match crate::state::chain::apply_block(storage, &self.chain_id, &block) {
                     Ok(head) => {
+                        self.record_mined(head.height, &head.hash, reward_atoms);
+                        self.searching_since = self.searching_since.map(|_| Instant::now());
                         let payload = serde_json::to_vec(&block).unwrap_or_default();
                         let _ = node.publish_block_response(block.header.block_height, block.header.hash.clone(), payload);
                         let _ = node.publish_block_announce(
@@ -261,11 +395,17 @@ impl QuanticRuntime {
         }
 
         // 4. Un trabajo nuevo, si toca.
-        if let Some(config) = self.mining.clone() {
-            let ready = self.job.is_none()
-                && Instant::now() >= self.next_mine_at
-                && node.connected_peer_count() >= config.min_peers;
-            if ready {
+        self.status.waiting_for = None;
+        if let Some((config, threads)) = wanted {
+            self.status.threads = threads;
+            let peers = node.connected_peer_count();
+            if self.job.is_some() {
+                self.status.hashing = true;
+            } else if peers < config.min_peers {
+                self.status.waiting_for = Some(format!("peers: {peers} of {}", config.min_peers));
+            } else if Instant::now() < self.next_mine_at {
+                self.status.waiting_for = Some("pause between blocks".to_string());
+            } else {
                 self.stop = Arc::new(AtomicBool::new(false));
                 let stop = Arc::clone(&self.stop);
                 let storage = Arc::clone(storage);
@@ -275,12 +415,50 @@ impl QuanticRuntime {
                     .map(|pool| pool.select(MINER_MAX_BLOCK_ACTIONS))
                     .unwrap_or_default();
                 self.job = Some(tokio::task::spawn_blocking(move || {
-                    mine_once(&storage, &chain_id, &config, transactions, &stop)
+                    mine_once(&storage, &chain_id, &config.address, threads, transactions, &stop)
                 }));
+                self.status.hashing = true;
             }
         }
         outcome
     }
+
+    fn record_mined(&mut self, height: u64, hash: &str, reward_atoms: u64) {
+        let solve = self.searching_since.map(|since| since.elapsed().as_secs_f64()).unwrap_or(0.0);
+        let maturity = network_for_chain(&self.chain_id)
+            .map(|network| u64::from(super::consensus_params(network).coinbase_maturity))
+            .unwrap_or(0);
+        let status = &mut self.status;
+        status.blocks_mined += 1;
+        status.rewards_atoms = status.rewards_atoms.saturating_add(reward_atoms);
+        status.last_solve_secs = solve;
+        self.solve_secs_total += solve;
+        status.avg_solve_secs = self.solve_secs_total / status.blocks_mined as f64;
+        if reward_atoms > 0 {
+            status.recent_blocks.push(MinedBlock {
+                height,
+                hash: hash.to_string(),
+                reward_atoms,
+                unlock_height: height + maturity,
+            });
+            if status.recent_blocks.len() > RECENT_MINED_BLOCKS {
+                status.recent_blocks.remove(0);
+            }
+        }
+    }
+}
+
+/// Con cuántos hilos minar, o `None` si el control dice que no. Los hilos que
+/// pidió `/mining/start` mandan sobre los del arranque.
+fn wanted_threads(config: &QuanticMiningConfig, control: &crate::api::LocalMiningControlSnapshot) -> Option<usize> {
+    if !control.enabled {
+        return None;
+    }
+    Some(if control.threads > 0 {
+        control.threads.clamp(1, 64) as usize
+    } else {
+        config.threads
+    })
 }
 
 /// Las transferencias de los bloques que dejaron de ser canónicos, desde
@@ -321,12 +499,21 @@ impl Drop for QuanticRuntime {
 fn mine_once(
     storage: &RocksDbStorage,
     chain_id: &str,
-    config: &QuanticMiningConfig,
+    address: &QuanticAddress,
+    threads: usize,
     transactions: Vec<QuanticTransaction>,
     stop: &AtomicBool,
-) -> Result<Option<Block>, String> {
+) -> Result<Option<(Block, u64)>, String> {
     let timestamp = now_secs();
-    let (mut block, _) = miner::build_template(storage, chain_id, &config.address, proving_key(), transactions, timestamp)?;
+    let (mut block, validated) = miner::build_template(storage, chain_id, address, proving_key(), transactions, timestamp)?;
+    // El génesis de una red con premine le paga al equipo, no al minero.
+    let pays_the_premine = block.header.block_height == super::GENESIS_HEIGHT
+        && network_for_chain(chain_id).is_some_and(|network| super::consensus_params(network).premine.is_some());
+    let reward = if pays_the_premine {
+        0
+    } else {
+        validated.minted.saturating_add(validated.fees)
+    };
     // La misma regla con la que el nodo acepta el bloque: el objetivo del hijo
     // del padre de la plantilla.
     let parent = storage
@@ -334,8 +521,8 @@ fn mine_once(
         .map_err(|e| format!("{e:?}"))?
         .unwrap_or_else(|| crate::state::chain::genesis_parent_for(chain_id));
     let difficulty = super::compact_target_for_child(storage, chain_id, &parent).map_err(|e| e.to_string())?;
-    match miner::solve_pow_parallel(chain_id, &mut block, difficulty, config.threads, TEMPLATE_LIFETIME, stop)? {
-        miner::PowOutcome::Solved => Ok(Some(block)),
+    match miner::solve_pow_parallel(chain_id, &mut block, difficulty, threads, TEMPLATE_LIFETIME, stop)? {
+        miner::PowOutcome::Solved => Ok(Some((block, reward))),
         miner::PowOutcome::Interrupted => Ok(None),
     }
 }
@@ -355,5 +542,24 @@ mod tests {
         assert!(!gossip_budget_allows(&par, 64, minuto), "nueve envios de 64 acciones por minuto");
         assert!(gossip_budget_allows(&otro, 64, minuto), "cada par tiene el suyo");
         assert!(gossip_budget_allows(&par, 64, minuto + 1), "al minuto siguiente, de nuevo");
+    }
+
+    #[test]
+    fn the_hot_control_decides_whether_and_how_hard_to_mine() {
+        use crate::api::LocalMiningControlSnapshot as Control;
+        let spending = zoka_quantic::QuanticSpendingKey::from_root(&[7u8; 32], zoka_quantic::Network::Regtest, 0).unwrap();
+        let config = QuanticMiningConfig {
+            address: spending.full_viewing_key().address(),
+            threads: 3,
+            interval: Duration::ZERO,
+            min_peers: 0,
+            start_enabled: false,
+        };
+        let control = |enabled, threads| Control { enabled, threads, updated_at: 1 };
+        assert_eq!(wanted_threads(&config, &control(false, 0)), None, "--no-mine: espera /mining/start");
+        assert_eq!(wanted_threads(&config, &control(false, 8)), None, "/mining/stop");
+        assert_eq!(wanted_threads(&config, &control(true, 0)), Some(3), "los hilos del arranque");
+        assert_eq!(wanted_threads(&config, &control(true, 2)), Some(2), "los que pidió /mining/start");
+        assert_eq!(wanted_threads(&config, &control(true, 500)), Some(64), "con tope");
     }
 }
