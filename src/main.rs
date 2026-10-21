@@ -800,6 +800,7 @@ fn network_config_path_from_env(network: NetworkProfile) -> Option<PathBuf> {
     // la testnet retirada no se lee: apuntaria a un manifiesto de otra cadena.
     let network_specific = match network {
         NetworkProfile::Zenith => "ZOKA_MAINNET_NETWORK_CONFIG",
+        NetworkProfile::QuanticMainnet => "ZOKA_QUANTIC_MAINNET_NETWORK_CONFIG",
         NetworkProfile::QuanticTestnet => "ZOKA_QUANTIC_TESTNET_NETWORK_CONFIG",
         NetworkProfile::QuanticRegtest => "ZOKA_QUANTIC_REGTEST_NETWORK_CONFIG",
     };
@@ -896,6 +897,8 @@ fn load_mainnet_network_config(path: &Path) -> Result<MainnetNetworkConfig, Stri
 /// loader still prefers a real file on disk if it exists (for operators
 /// pointing at a custom config) and falls back to the embedded copy otherwise.
 const EMBEDDED_MAINNET_NETWORK_CONFIG: &str = include_str!("../docs/mainnet-network.v1.json");
+const EMBEDDED_QUANTIC_MAINNET_NETWORK_CONFIG: &str =
+    include_str!("../docs/quantic-mainnet-network.v1.json");
 const EMBEDDED_QUANTIC_TESTNET_NETWORK_CONFIG: &str =
     include_str!("../docs/quantic-testnet-network.v1.json");
 const EMBEDDED_QUANTIC_REGTEST_NETWORK_CONFIG: &str =
@@ -904,6 +907,7 @@ const EMBEDDED_QUANTIC_REGTEST_NETWORK_CONFIG: &str =
 fn embedded_network_config_for(network: NetworkProfile) -> &'static str {
     match network {
         NetworkProfile::Zenith => EMBEDDED_MAINNET_NETWORK_CONFIG,
+        NetworkProfile::QuanticMainnet => EMBEDDED_QUANTIC_MAINNET_NETWORK_CONFIG,
         NetworkProfile::QuanticTestnet => EMBEDDED_QUANTIC_TESTNET_NETWORK_CONFIG,
         NetworkProfile::QuanticRegtest => EMBEDDED_QUANTIC_REGTEST_NETWORK_CONFIG,
     }
@@ -2380,6 +2384,9 @@ const DEFAULT_CHAIN_DB_PATH: &str = ".zoka/mainnet/blockchain.db";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NetworkProfile {
     Zenith,
+    /// Zoka Quantic, la red principal: Ironwood y X-Wing desde el bloque 1.
+    /// Arranca recién cuando su génesis está fijo en el binario.
+    QuanticMainnet,
     /// Zoka Quantic: su testnet nueva, con Ironwood y X-Wing desde el bloque
     /// 1 (etapa 5). Solo en builds con la feature `quantic`.
     QuanticTestnet,
@@ -2402,10 +2409,11 @@ impl NetworkProfile {
             // ZSilent, los scripts de mineria y este mismo binario cuando se
             // relanza a si mismo.
             "testnet" | "zenith" | "mainnet" => Ok(Self::Zenith),
+            "quantic-mainnet" | "quantic" => Self::quantic(Self::QuanticMainnet),
             "quantic-testnet" => Self::quantic(Self::QuanticTestnet),
             "quantic-regtest" => Self::quantic(Self::QuanticRegtest),
             other => Err(format!(
-                "invalid --network '{other}'; expected testnet (Zenith), quantic-testnet or quantic-regtest. 'mainnet' is still accepted as Zenith's former name"
+                "invalid --network '{other}'; expected testnet (Zenith), quantic-mainnet, quantic-testnet or quantic-regtest. 'mainnet' is still accepted as Zenith's former name"
             )),
         }
     }
@@ -2424,13 +2432,14 @@ impl NetworkProfile {
     }
 
     fn is_quantic(self) -> bool {
-        matches!(self, Self::QuanticTestnet | Self::QuanticRegtest)
+        matches!(self, Self::QuanticMainnet | Self::QuanticTestnet | Self::QuanticRegtest)
     }
 
     /// El protocolo que anuncia el nodo; los manifiestos tienen que coincidir.
     fn protocol_id(self) -> &'static str {
         match self {
             Self::Zenith => PROTOCOL_FREEZE_ID,
+            Self::QuanticMainnet => zoka::network::p2p::QUANTIC_MAINNET_PROTOCOL_ID,
             Self::QuanticTestnet => zoka::network::p2p::QUANTIC_TESTNET_PROTOCOL_ID,
             Self::QuanticRegtest => zoka::network::p2p::QUANTIC_REGTEST_PROTOCOL_ID,
         }
@@ -2441,6 +2450,7 @@ impl NetworkProfile {
     fn default_p2p_port(self) -> u16 {
         match self {
             Self::Zenith => 28080,
+            Self::QuanticMainnet => 28380,
             Self::QuanticTestnet => 28180,
             Self::QuanticRegtest => 28280,
         }
@@ -2450,6 +2460,7 @@ impl NetworkProfile {
     fn topic_prefix(self) -> Option<&'static str> {
         match self {
             Self::Zenith => None,
+            Self::QuanticMainnet => Some(zoka::network::p2p::QUANTIC_MAINNET_TOPIC_PREFIX),
             Self::QuanticTestnet => Some(zoka::network::p2p::QUANTIC_TESTNET_TOPIC_PREFIX),
             Self::QuanticRegtest => Some(zoka::network::p2p::QUANTIC_REGTEST_TOPIC_PREFIX),
         }
@@ -2458,6 +2469,7 @@ impl NetworkProfile {
     fn from_chain_id(chain_id: &str) -> Result<Self, String> {
         match chain_id {
             MAINNET_CHAIN_ID => Ok(Self::Zenith),
+            economics::QUANTIC_MAINNET_CHAIN_ID => Self::quantic(Self::QuanticMainnet),
             economics::QUANTIC_TESTNET_CHAIN_ID => Self::quantic(Self::QuanticTestnet),
             economics::QUANTIC_REGTEST_CHAIN_ID => Self::quantic(Self::QuanticRegtest),
             TESTNET_CHAIN_ID => Err(format!(
@@ -2472,6 +2484,7 @@ impl NetworkProfile {
     fn chain_id(self) -> &'static str {
         match self {
             Self::Zenith => MAINNET_CHAIN_ID,
+            Self::QuanticMainnet => economics::QUANTIC_MAINNET_CHAIN_ID,
             Self::QuanticTestnet => economics::QUANTIC_TESTNET_CHAIN_ID,
             Self::QuanticRegtest => economics::QUANTIC_REGTEST_CHAIN_ID,
         }
@@ -2480,6 +2493,7 @@ impl NetworkProfile {
     fn default_db_path(self) -> &'static str {
         match self {
             Self::Zenith => DEFAULT_CHAIN_DB_PATH,
+            Self::QuanticMainnet => ".zoka/quantic-mainnet/blockchain.db",
             Self::QuanticTestnet => ".zoka/quantic-testnet/blockchain.db",
             Self::QuanticRegtest => ".zoka/quantic-regtest/blockchain.db",
         }
@@ -2488,6 +2502,7 @@ impl NetworkProfile {
     fn local_dir(self) -> &'static str {
         match self {
             Self::Zenith => ".zoka/mainnet",
+            Self::QuanticMainnet => ".zoka/quantic-mainnet",
             Self::QuanticTestnet => ".zoka/quantic-testnet",
             Self::QuanticRegtest => ".zoka/quantic-regtest",
         }
@@ -2496,6 +2511,7 @@ impl NetworkProfile {
     fn default_genesis_path(self) -> &'static str {
         match self {
             Self::Zenith => "docs/genesis.mainnet.v1.json",
+            Self::QuanticMainnet => "docs/genesis.quantic-mainnet.v1.json",
             Self::QuanticTestnet => "docs/genesis.quantic-testnet.v1.json",
             Self::QuanticRegtest => "docs/genesis.quantic-regtest.v1.json",
         }
@@ -2504,6 +2520,7 @@ impl NetworkProfile {
     fn default_network_config_path(self) -> &'static str {
         match self {
             Self::Zenith => "docs/mainnet-network.v1.json",
+            Self::QuanticMainnet => "docs/quantic-mainnet-network.v1.json",
             Self::QuanticTestnet => "docs/quantic-testnet-network.v1.json",
             Self::QuanticRegtest => "docs/quantic-regtest-network.v1.json",
         }
@@ -2512,6 +2529,7 @@ impl NetworkProfile {
     fn network_config_schema(self) -> &'static str {
         match self {
             Self::Zenith => "zoka-mainnet-network-v1",
+            Self::QuanticMainnet => "zoka-quantic-mainnet-network-v1",
             Self::QuanticTestnet => "zoka-quantic-testnet-network-v1",
             Self::QuanticRegtest => "zoka-quantic-regtest-network-v1",
         }
@@ -2520,6 +2538,7 @@ impl NetworkProfile {
     fn mining_mode(self) -> &'static str {
         match self {
             Self::Zenith => MAINNET_MINING_MODE,
+            Self::QuanticMainnet => QUANTIC_MINING_MODE,
             Self::QuanticTestnet => QUANTIC_MINING_MODE,
             Self::QuanticRegtest => QUANTIC_MINING_MODE,
         }
@@ -2531,6 +2550,7 @@ impl NetworkProfile {
     fn label(self) -> &'static str {
         match self {
             Self::Zenith => "mainnet",
+            Self::QuanticMainnet => "quantic-mainnet",
             Self::QuanticTestnet => "quantic-testnet",
             Self::QuanticRegtest => "quantic-regtest",
         }
@@ -2539,6 +2559,7 @@ impl NetworkProfile {
     fn display_name(self) -> &'static str {
         match self {
             Self::Zenith => economics::ZENITH_DISPLAY_NAME,
+            Self::QuanticMainnet => "Zoka Quantic",
             Self::QuanticTestnet => "Zoka Quantic testnet (Ironwood)",
             Self::QuanticRegtest => "Zoka Quantic regtest",
         }
@@ -2547,6 +2568,7 @@ impl NetworkProfile {
     fn role(self) -> &'static str {
         match self {
             Self::Zenith => economics::ZENITH_NETWORK_ROLE,
+            Self::QuanticMainnet => "mainnet",
             Self::QuanticTestnet => "testnet",
             Self::QuanticRegtest => "regtest",
         }
@@ -14891,13 +14913,13 @@ fn cmd_quantic_wallet(args: &[String]) -> Result<(), String> {
 
 #[cfg(feature = "quantic")]
 fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
-    const USAGE: &str = "usage: zoka quantic-wallet <new|restore|address|list|balance|history|send|import-regtest-team> --network quantic-regtest|quantic-testnet [--name <wallet>] [--password <p> | --password-env <VAR> | --password-stdin] [restore: --phrase-env <VAR> or the phrase on stdin] [send: --to <address> --amount <ZKA> [--memo <text>]] [--rpc <url>] [--json]";
+    const USAGE: &str = "usage: zoka quantic-wallet <new|restore|address|list|balance|history|send|import-regtest-team> --network quantic-mainnet|quantic-testnet|quantic-regtest [--name <wallet>] [--password <p> | --password-env <VAR> | --password-stdin] [restore: --phrase-env <VAR> or the phrase on stdin] [send: --to <address> --amount <ZKA> [--memo <text>]] [--rpc <url>] [--json]";
     let Some((action, rest)) = args.split_first() else {
         return Err(USAGE.to_string());
     };
     let network = NetworkProfile::from_args(rest)?;
     if !network.is_quantic() {
-        return Err("quantic-wallet needs --network quantic-testnet or quantic-regtest".to_string());
+        return Err("quantic-wallet needs --network quantic-mainnet, quantic-testnet or quantic-regtest".to_string());
     }
     let quantic_network = zoka::quantic::network_for_chain(network.chain_id())
         .ok_or_else(|| "unknown Quantic network".to_string())?;
@@ -15121,8 +15143,8 @@ fn cmd_quantic_genesis(args: &[String]) -> Result<(), String> {
         .stack_size(64 * 1024 * 1024)
         .spawn(move || -> Result<(), String> {
             let network = NetworkProfile::from_args(&args)?;
-            if network != NetworkProfile::QuanticTestnet {
-                return Err("quantic-genesis is for --network quantic-testnet (mainnet comes in stage 8)".to_string());
+            if !matches!(network, NetworkProfile::QuanticTestnet | NetworkProfile::QuanticMainnet) {
+                return Err("quantic-genesis is for --network quantic-testnet or quantic-mainnet".to_string());
             }
             let chain_id = network.chain_id();
             let quantic_network = zoka::quantic::network_for_chain(chain_id).ok_or("unknown network")?;
@@ -19518,11 +19540,49 @@ mod tests {
         use super::NetworkProfile;
         let ports = [
             NetworkProfile::Zenith.default_p2p_port(),
+            NetworkProfile::QuanticMainnet.default_p2p_port(),
             NetworkProfile::QuanticTestnet.default_p2p_port(),
             NetworkProfile::QuanticRegtest.default_p2p_port(),
         ];
         assert_eq!(ports[0], 28080);
-        assert!(ports[0] != ports[1] && ports[1] != ports[2] && ports[0] != ports[2]);
+        let distinct: std::collections::HashSet<_> = ports.iter().collect();
+        assert_eq!(distinct.len(), ports.len(), "{ports:?}");
+    }
+
+    #[cfg(feature = "quantic")]
+    #[test]
+    fn quantic_mainnet_is_its_own_network_with_its_own_manifest() {
+        use super::NetworkProfile;
+        let all = [
+            NetworkProfile::Zenith,
+            NetworkProfile::QuanticMainnet,
+            NetworkProfile::QuanticTestnet,
+            NetworkProfile::QuanticRegtest,
+        ];
+        for name in ["quantic-mainnet", "quantic", "Quantic-Mainnet"] {
+            assert_eq!(NetworkProfile::from_name(name).unwrap(), NetworkProfile::QuanticMainnet, "{name}");
+        }
+        let mainnet = NetworkProfile::QuanticMainnet;
+        assert!(mainnet.is_quantic());
+        assert_eq!(mainnet.chain_id(), zoka::economics::QUANTIC_MAINNET_CHAIN_ID);
+        assert_eq!(NetworkProfile::from_chain_id(mainnet.chain_id()).unwrap(), mainnet);
+        // Nada se comparte entre redes: protocolo, tópicos, carpetas y manifiestos.
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a.protocol_id(), b.protocol_id());
+                assert_ne!(a.topic_prefix(), b.topic_prefix());
+                assert_ne!(a.local_dir(), b.local_dir());
+                assert_ne!(a.default_network_config_path(), b.default_network_config_path());
+                assert_ne!(a.label(), b.label());
+            }
+        }
+        // El manifiesto embebido es el de la mainnet de Quantic y se lee.
+        let manifest = super::parse_network_config_for(super::embedded_network_config_for(mainnet), mainnet)
+            .expect("the embedded Quantic mainnet manifest parses");
+        assert_eq!(manifest.chain_id, zoka::economics::QUANTIC_MAINNET_CHAIN_ID);
+        assert_eq!(manifest.protocol_freeze_id, mainnet.protocol_id());
+        // Sin génesis fijo no hay bloque embebido que importar.
+        assert!(zoka::quantic::embedded_genesis_block(zoka::quantic::protocol::Network::Mainnet).is_none());
     }
 
     #[test]

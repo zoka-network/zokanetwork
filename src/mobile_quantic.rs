@@ -44,6 +44,8 @@ fn network_named(name: &str) -> Result<Network, String> {
     match name.trim() {
         "quantic-testnet" => Ok(Network::Testnet),
         "quantic-regtest" => Ok(Network::Regtest),
+        // La mainnet existe recién cuando su génesis está fijo en el binario.
+        "quantic-mainnet" if crate::quantic::fixed_genesis(Network::Mainnet).is_some() => Ok(Network::Mainnet),
         "quantic-mainnet" => Err("Zoka Quantic mainnet has not launched".to_string()),
         other => Err(format!("unknown Quantic network '{other}'")),
     }

@@ -1,0 +1,25 @@
+{
+  "schema": "zoka-quantic-mainnet-network-v1",
+  "status": "pre-genesis",
+  "chain_id": "zoka-quantic-v1",
+  "protocol_freeze_id": "/zoka-quantic/1.0.0",
+  "transport_policy": {
+    "anonymous_transport_preferred": false,
+    "clearnet_requires_explicit_operator_choice": false,
+    "supported": [
+      "tcp"
+    ]
+  },
+  "seed_nodes": [],
+  "public_rpc": [],
+  "desktop": {
+    "local_rpc_url": "http://127.0.0.1:3300"
+  },
+  "snapshot_signers": [],
+  "notes": [
+    "Zoka Quantic mainnet: Ironwood (Halo 2, no trusted setup) with X-Wing note encryption from its first block.",
+    "Pre-genesis: there is no genesis block and no seed yet. Nothing mines until the genesis is compiled into the binary.",
+    "It never mixes with Zenith or with the Quantic testnet: it announces its own protocol id and uses its own gossip topics.",
+    "Its nodes listen on P2P port 28380 by default (Zenith 28080, Quantic testnet 28180, regtest 28280)."
+  ]
+}

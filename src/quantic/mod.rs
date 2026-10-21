@@ -407,9 +407,11 @@ fn roots_of(block: &QuanticBlock, tree: &NoteCommitmentTree) -> QuanticRoots {
 /// cada nodo nuevo arranca con él sin depender de pares.
 pub fn embedded_genesis_block(network: Network) -> Option<Block> {
     const TESTNET: &str = include_str!("../../docs/quantic-testnet-genesis.v1.json");
+    const MAINNET: &str = include_str!("../../docs/quantic-mainnet-genesis.v1.json");
     let raw = match network {
         Network::Testnet => TESTNET,
-        Network::Mainnet | Network::Regtest => return None,
+        Network::Mainnet => MAINNET,
+        Network::Regtest => return None,
     };
     let block: Block = serde_json::from_str(raw).ok()?;
     let expected = fixed_genesis(network)?;
@@ -462,7 +464,7 @@ pub fn target_for_child(
     if network == Network::Regtest {
         return Ok(difficulty::target_for_bits(crate::economics::QUANTIC_REGTEST_DIFFICULTY_BITS));
     }
-    let initial = difficulty::target_for_bits(difficulty::TESTNET_INITIAL_DIFFICULTY_BITS);
+    let initial = difficulty::target_for_bits(difficulty::initial_difficulty_bits(network));
     if parent.header.block_height < GENESIS_HEIGHT {
         return Ok(initial);
     }
@@ -748,7 +750,7 @@ pub fn build_genesis(
     let storage = RocksDbStorage::new(dir.to_str().ok_or("temp path")?).map_err(|e| format!("{e:?}"))?;
     let parent = crate::state::chain::genesis_parent_for(chain_id);
     let (mut block, _) = assemble_block_with(&storage, &params, &parent, &coinbase, &[], timestamp).map_err(|e| e.to_string())?;
-    let initial = difficulty::to_compact(&difficulty::target_for_bits(difficulty::TESTNET_INITIAL_DIFFICULTY_BITS));
+    let initial = difficulty::to_compact(&difficulty::target_for_bits(difficulty::initial_difficulty_bits(network)));
     solve_pow(chain_id, &mut block, initial)?;
     drop(storage);
     let _ = std::fs::remove_dir_all(&dir);

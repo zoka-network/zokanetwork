@@ -197,9 +197,11 @@ fn protocol_freeze_enforce_from_env() -> bool {
 /// Zoka Quantic (etapa 5): cada red de Quantic anuncia su propio protocolo y
 /// usa sus propios tópicos. Un nodo de Zenith desconecta a uno de Quantic en
 /// el saludo inicial (y al revés), así que las redes nunca se mezclan.
+pub const QUANTIC_MAINNET_PROTOCOL_ID: &str = "/zoka-quantic/1.0.0";
 pub const QUANTIC_TESTNET_PROTOCOL_ID: &str = "/zoka-quantic-testnet/0.1.0";
 pub const QUANTIC_REGTEST_PROTOCOL_ID: &str = "/zoka-quantic-regtest/0.1.0";
 /// Lo que reemplaza a `zoka` en los nombres de los tópicos de cada red.
+pub const QUANTIC_MAINNET_TOPIC_PREFIX: &str = "zoka-quantic";
 pub const QUANTIC_TESTNET_TOPIC_PREFIX: &str = "zoka-quantic-testnet";
 pub const QUANTIC_REGTEST_TOPIC_PREFIX: &str = "zoka-quantic-regtest";
 /// Una transferencia de Quantic de 64 acciones pesa unos 270 KB; en hex, el doble.
@@ -210,6 +212,7 @@ const QUANTIC_TX_HEX_MAX: usize = 2 * 300 * 1024;
 /// nodo (la wallet del teléfono). Zenith no tiene: es la red por omisión.
 pub fn quantic_network_protocol(name: &str) -> Option<(&'static str, &'static str)> {
     match name {
+        "quantic-mainnet" => Some((QUANTIC_MAINNET_PROTOCOL_ID, QUANTIC_MAINNET_TOPIC_PREFIX)),
         "quantic-testnet" => Some((QUANTIC_TESTNET_PROTOCOL_ID, QUANTIC_TESTNET_TOPIC_PREFIX)),
         "quantic-regtest" => Some((QUANTIC_REGTEST_PROTOCOL_ID, QUANTIC_REGTEST_TOPIC_PREFIX)),
         _ => None,

@@ -30,6 +30,18 @@ pub const MIN_DIFFICULTY_BITS: u32 = 12;
 /// Dificultad del génesis y de los primeros bloques de la testnet. La PC sola
 /// mina Zenith a 16–18 bits; ASERT la lleva a 120 s en pocas horas.
 pub const TESTNET_INITIAL_DIFFICULTY_BITS: u32 = 14;
+/// La de la mainnet: un poco por encima, porque arranca con más mineros que la
+/// PC sola. Si es poca, ASERT la sube en horas; si es mucha, la baja.
+pub const MAINNET_INITIAL_DIFFICULTY_BITS: u32 = 16;
+
+/// La dificultad del génesis y de sus primeros hijos en cada red pública.
+pub fn initial_difficulty_bits(network: zoka_quantic::Network) -> u32 {
+    match network {
+        zoka_quantic::Network::Mainnet => MAINNET_INITIAL_DIFFICULTY_BITS,
+        zoka_quantic::Network::Testnet => TESTNET_INITIAL_DIFFICULTY_BITS,
+        zoka_quantic::Network::Regtest => economics::QUANTIC_REGTEST_DIFFICULTY_BITS,
+    }
+}
 
 /// El objetivo de `bits` bits de ceros: 2^(256 − bits) − 1.
 pub fn target_for_bits(bits: u32) -> BigUint {

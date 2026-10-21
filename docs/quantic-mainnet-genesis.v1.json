@@ -1,0 +1,1 @@
+{"status": "pre-genesis", "note": "Zoka Quantic mainnet has no genesis yet. zoka quantic-genesis --network quantic-mainnet writes it here; its hash and premine address then go into economics::QUANTIC_MAINNET_GENESIS."}

@@ -1716,7 +1716,13 @@ mod tests {
             ))
         );
         assert!(red_pedida(Some("quantic-regtest")).unwrap().is_some());
-        assert!(red_pedida(Some("quantic-mainnet")).is_err(), "no existe todavia");
+        assert_eq!(
+            red_pedida(Some("quantic-mainnet")).unwrap(),
+            Some((
+                crate::network::p2p::QUANTIC_MAINNET_PROTOCOL_ID,
+                crate::network::p2p::QUANTIC_MAINNET_TOPIC_PREFIX
+            ))
+        );
         assert!(red_pedida(Some("mainnet")).is_err());
         // Nadie fija Quantic en las pruebas: el proceso sigue en Zenith.
         assert!(es_la_red_activa(None));
