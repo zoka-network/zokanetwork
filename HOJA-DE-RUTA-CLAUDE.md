@@ -17,6 +17,18 @@ commit `77d5cda3` (`quantic-cadena-completa`). En ZSilent (`quantic-solo`, commi
 Zenith le ganaba. El setup de Groth16 (12 MB) sigue en el instalador a propósito:
 si quedara algún camino sin cubrir, verifica en vez de colgarse.
 
+La prueba de humo del release (`scratchpad/interop/humo-release.sh`: nodo de
+Quantic sin setup al lado, cuerpo de Zenith a `/private/tx`) encontró lo que las
+unitarias no veían: `StateManager::chain_id()` devolvía siempre Zenith, así que la
+API de un nodo de Quantic no sabía su red (la guarda no se activaba, `/blocks/0`
+era el padre de Zenith y `POST /sync/block`, prendido en la plantilla de los
+nodos RPC públicos, aplicaba reglas de Zenith). Arreglado en `c985304b`, junto con
+la consola de minería de Quantic (decía `mining=off` y `0 block(s)` mientras
+minaba). El binario 3.0.0 de release está en `target/release` y los comandos de
+los dos pasos del usuario están probados con él en una carpeta temporal.
+`scratchpad/interop/ensayo-testnet.sh` (paso 5) ya incluye el checkpoint híbrido
+con una clave de ensayo.
+
 **21/10: dos redes, Zenith retirada.** Pedido del usuario ("no quiero que
 se mezclen las redes"): solo existen **Zoka Quantic Testnet** y **Zoka Quantic
 Mainnet**, las dos desde cero; nada de Zenith pasa a Quantic. La testnet arranca
