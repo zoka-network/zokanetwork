@@ -44,6 +44,15 @@ Qué es postcuántico hoy y qué no:
 **Pasos del usuario, en la PC** (con el `zoka.exe` nuevo: hasta que se instale,
 `C:\Users\mderramus\ZOKA\target\release\zoka.exe`):
 
+Los dos pasos juntos, con la contraseña oculta y las partes públicas en el
+Escritorio, los hace un script (probado entero en una carpeta temporal):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\Users\mderramus\ZOKA\scripts\crear-wallet-equipo-testnet.ps1
+```
+
+A mano, uno por uno:
+
 1. Wallet del equipo de la testnet (recibe el premine de prueba). La contraseña
    se pide dos veces sin mostrarla y llega al comando por una variable de
    entorno que se borra al terminar. `--password-stdin` no sirve escrito a mano:
