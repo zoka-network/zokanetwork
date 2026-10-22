@@ -3,7 +3,7 @@
 Para retomar el trabajo, leer primero
 [HOJA-DE-RUTA-CLAUDE.md](HOJA-DE-RUTA-CLAUDE.md), en esta misma raíz.
 
-Contiene el estado al 21 de octubre de 2026, decisiones del usuario, commits,
+Contiene el estado al 22 de octubre de 2026, decisiones del usuario, commits,
 pruebas realizadas, limitaciones y el orden de implementación pendiente.
 
 Desde el 21/10/2026 hay **dos redes, las dos desde cero: Zoka Quantic Testnet y

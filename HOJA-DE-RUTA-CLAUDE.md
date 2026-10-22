@@ -1,11 +1,23 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
-Actualizada: **21 de octubre de 2026**, Argentina (Claude).
+Actualizada: **22 de octubre de 2026**, Argentina (Claude).
 Proyecto: `C:\Users\mderramus\ZOKA`.
 
 ## Punto de partida
 
-**21/10, lo último: dos redes, Zenith retirada.** Pedido del usuario ("no quiero que
+**22/10: un nodo de Quantic nunca llega a Groth16.** Preparando el instalador
+apareció que, en release y sin el setup de Groth16, verificar cualquier prueba de
+Zenith es un `panic!` (`build_setup_bundle`). En un nodo de Quantic había cinco
+caminos que llegaban ahí a pedido de un par: un bloque con cuerpos privados desde la
+altura 25.570 (la política de Zenith corría antes que la forma de Quantic), el
+encabezado de un bloque ya conocido con cuerpos inventados, el gossip de Zenith,
+`/private/tx` y la cola de privadas bajada por RPC. Cerrados con pruebas en el
+commit `77d5cda3` (`quantic-cadena-completa`). En ZSilent (`quantic-solo`, commit
+`97fca30`) el seed sale del manifiesto: el `-Dzsilent.bootstrapMultiaddr` de
+Zenith le ganaba. El setup de Groth16 (12 MB) sigue en el instalador a propósito:
+si quedara algún camino sin cubrir, verifica en vez de colgarse.
+
+**21/10: dos redes, Zenith retirada.** Pedido del usuario ("no quiero que
 se mezclen las redes"): solo existen **Zoka Quantic Testnet** y **Zoka Quantic
 Mainnet**, las dos desde cero; nada de Zenith pasa a Quantic. La testnet arranca
 **ya** con el protocolo de hoy y se reinicia desde cero con el pool postcuántico;
