@@ -1,9 +1,33 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
-Actualizada: **17 de octubre de 2026**, Argentina (Claude).
+Actualizada: **21 de octubre de 2026**, Argentina (Claude).
 Proyecto: `C:\Users\mderramus\ZOKA`.
 
 ## Punto de partida
+
+**21/10, lo último: dos redes, Zenith retirada.** Pedido del usuario ("no quiero que
+se mezclen las redes"): solo existen **Zoka Quantic Testnet** y **Zoka Quantic
+Mainnet**, las dos desde cero; nada de Zenith pasa a Quantic. La testnet arranca
+**ya** con el protocolo de hoy y se reinicia desde cero con el pool postcuántico;
+la mainnet sale solo con el protocolo completo. Hecho y commiteado (nada pusheado,
+publicado ni instalado):
+
+- **Nodo 3.0.0** (commit `c0b6c300`): en una build con `quantic`, la red por omisión
+  es quantic-testnet, "testnet"/"mainnet" nombran a las de Quantic, `--network
+  zenith` y los comandos de Zenith responden qué usar; `zoka help` solo Quantic;
+  Zenith se muestra como retirada. Suites completas en verde (987+89+2+3 y 929+86+2).
+- **TLS híbrido X25519MLKEM768 en iroh** (`src/network/pq_tls.rs`, commit
+  `01001969`), solo en procesos de Quantic.
+- **Web y papers 2.1** (`zokaweb`, rama `whitepaper-ironwood`, commit `a75ebfd`):
+  dos redes, Zenith como historia, sección 4.8 del pool; el estado de la testnet
+  sale de `TESTNET_LIVE` en `src/components/zoka/network.ts` (ponerlo en `true` al
+  lanzar).
+- **Falta para lanzar la testnet:** los dos pasos del usuario de
+  [LANZAMIENTO-quantic.md](docs/LANZAMIENTO-quantic.md) (wallet `equipo` y
+  `checkpoint-keygen --network quantic-testnet`; la dirección se lee con
+  `quantic-wallet address`, las públicas vienen en la salida del keygen). Después:
+  `scratchpad/lanzar_testnet.py` (génesis + economics.rs), compilar, ensayo local
+  con un segundo nodo, instalador de ZSilent 3.0.
 
 **21/10: decisiones del usuario.** Prioridad: terminar la cadena Zoka Quantic
 completa (arquitectura) para lanzar testnet y mainnet, y después ZSilent; ZKAPriv
