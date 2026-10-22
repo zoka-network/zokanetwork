@@ -1,6 +1,6 @@
 # Lanzamiento de Zoka Quantic: testnet y mainnet
 
-21/10/2026. Qué hace falta, en orden, para abrir cada red. Las claves privadas y
+21/10/2026 (revisado el 22/10). Qué hace falta, en orden, para abrir cada red. Las claves privadas y
 las frases **nunca** van a este repositorio ni a ningún documento: solo sus
 partes públicas.
 
@@ -69,10 +69,28 @@ Qué es postcuántico hoy y qué no:
 4. Fijar en `src/economics.rs`: `QUANTIC_TESTNET_GENESIS` (hash del bloque y
    dirección), y las dos públicas de la autoridad en `CHECKPOINT_AUTHORITY_KEYS`
    y `CHECKPOINT_AUTHORITY_MLDSA_KEYS` para `zoka-quantic-testnet-v1`.
-5. Compilar con `--features randomx,quantic`, correr las pruebas y un ensayo
-   local: un segundo nodo importa el génesis embebido, sincroniza, recibe un
-   checkpoint híbrido y la wallet del equipo ve el premine.
-6. Armar el instalador de ZSilent 3.0 con ese binario.
+5. Compilar los dos binarios (`zoka` y `zokahd` tienen que decir 3.0.x), correr
+   las pruebas y un ensayo local: un segundo nodo importa el génesis embebido,
+   sincroniza, recibe un checkpoint híbrido (firmado con una clave de ensayo,
+   nunca con la real) y la wallet del equipo ve el premine.
+
+   ```text
+   cargo build --release --features randomx,quantic --bins
+   ```
+
+6. Armar el instalador de ZSilent 3.0 con ese binario, desde la raíz del nodo.
+   Primero la revisión, después el paquete. La carpeta de Tor va explícita: la
+   que el script usa por omisión (`windows-x86_64`) es la 15.0.24 y el script
+   exige la 15.0.25 (Tor 0.4.9.14).
+
+   ```text
+   powershell -ExecutionPolicy Bypass -File .\zsilent-core\scripts\prepare-release.ps1 -TorBundleDir .\third_party\tor\windows-x86_64-0.4.9.14
+   powershell -ExecutionPolicy Bypass -File .\zsilent-core\scripts\prepare-release.ps1 -TorBundleDir .\third_party\tor\windows-x86_64-0.4.9.14 -Package
+   ```
+
+   El setup de Groth16 de Zenith (12 MB) sigue en el instalador a propósito: un
+   nodo de Quantic no lo usa, pero si quedara algún camino de Zenith sin cubrir,
+   con el setup verifica en vez de colgarse.
 
 **Pasos del usuario, otra vez:**
 
