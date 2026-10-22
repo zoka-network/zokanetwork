@@ -5,6 +5,19 @@ Proyecto: `C:\Users\mderramus\ZOKA`.
 
 ## Punto de partida
 
+**22/10, lo último: la testnet de Quantic tiene génesis.** Bloque 1
+`1d204e8116f53d74302db20b943b288d141681a9be463f65a43861dd47c2d242` (11:16 UTC),
+premine de prueba a la wallet `equipo` del usuario (la creó con
+`scripts/crear-wallet-equipo-testnet.ps1`), autoridad híbrida de la testnet
+compilada; commit `2fe98fe3`. Suite con `quantic` 990+90+2+3 y ensayo de dos nodos
+con el binario final. **Instalador:** `zsilent-core/build/release/3.0.0/ZSilent
+Core-3.0.0.msi`, SHA-256 `5f9847093916787d403ba3f1fcaa2de6a55ecdcee5d992b08d1469fdadc97174`,
+con ese mismo `zoka.exe` (`3d1a5ae7…`) y el manifiesto activo con la semilla; actualiza
+la 2.1 en el lugar (mismo UpgradeCode). Sin publicar ni pushear. Falta: que el
+usuario lo instale (doble clic), que la PC arranque minando, comprobar la onion con
+un segundo nodo, push y publicación con su aprobación, y `TESTNET_LIVE=true` en la
+web.
+
 **22/10: un nodo de Quantic nunca llega a Groth16.** Preparando el instalador
 apareció que, en release y sin el setup de Groth16, verificar cualquier prueba de
 Zenith es un `panic!` (`build_setup_bundle`). En un nodo de Quantic había cinco
