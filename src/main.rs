@@ -15159,6 +15159,43 @@ fn chain_contains_checkpoint(
     }
 }
 
+/// La dirección corta de una completa (`docs/QUANTIC-DIRECCIONES-CORTAS.md`).
+#[cfg(feature = "quantic")]
+fn short_address_of(address: &str, network: zoka::quantic::protocol::Network) -> Result<String, String> {
+    zoka::quantic::protocol::QuanticAddress::decode_for(address.trim(), network)
+        .map(|full| full.short().encode())
+        .map_err(|e| e.to_string())
+}
+
+/// El destinatario de un envío: una dirección completa tal cual, o una corta
+/// resuelta en el directorio del nodo. La completa que devuelve el nodo se
+/// comprueba contra el resumen de la corta: un nodo puede no tenerla, pero no
+/// cambiarla.
+#[cfg(feature = "quantic")]
+fn resolve_recipient(
+    text: &str,
+    network: zoka::quantic::protocol::Network,
+    rpc: &dyn Fn() -> Result<String, String>,
+) -> Result<zoka::quantic::protocol::QuanticAddress, String> {
+    use zoka::quantic::protocol::address::Recipient;
+    match Recipient::decode_for(text.trim(), network).map_err(|e| e.to_string())? {
+        Recipient::Full(full) => Ok(full),
+        Recipient::Short(short) => {
+            let reply = rpc_http_get_json(&rpc()?, &format!("/quantic/address/{}", short.encode()), 15).map_err(|e| {
+                format!("the node could not resolve that short address ({e}); ask for the full address")
+            })?;
+            let address = reply["address"]
+                .as_str()
+                .ok_or_else(|| format!("unexpected /quantic/address reply: {reply}"))?;
+            let full = zoka::quantic::protocol::QuanticAddress::decode_for(address, network).map_err(|e| e.to_string())?;
+            if !short.matches(&full) {
+                return Err("the node answered an address that does not match the short address".to_string());
+            }
+            Ok(full)
+        }
+    }
+}
+
 /// La contraseña de `--password` o `--password-env`, sin tocar stdin: elegir
 /// la wallet no puede consumir lo que después lee el comando.
 #[cfg(feature = "quantic")]
@@ -15222,7 +15259,7 @@ fn cmd_quantic_wallet(args: &[String]) -> Result<(), String> {
 
 #[cfg(feature = "quantic")]
 fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
-    const USAGE: &str = "usage: zoka quantic-wallet <new|generate-phrase|restore|address|list|balance|history|estimate-fee|send|show-phrase|change-password|backup|import-backup|import-regtest-team> --network quantic-mainnet|quantic-testnet|quantic-regtest [--name <wallet> | --address <its address>] [--password <p> | --password-env <VAR> | --password-stdin] [history: --limit <n>] [restore: --phrase-env <VAR> or the phrase on stdin] [estimate-fee: --amount <ZKA>] [send: --to <address> --amount <ZKA> [--memo <text>]] [change-password: --new-password-env <VAR>] [backup: --out <file>] [import-backup: --file <file>] [--rpc <url>] [--json]";
+    const USAGE: &str = "usage: zoka quantic-wallet <new|generate-phrase|restore|address|publish-address|list|balance|history|estimate-fee|send|show-phrase|change-password|backup|import-backup|import-regtest-team> --network quantic-mainnet|quantic-testnet|quantic-regtest [--name <wallet> | --address <its address>] [--password <p> | --password-env <VAR> | --password-stdin] [history: --limit <n>] [restore: --phrase-env <VAR> or the phrase on stdin] [estimate-fee: --amount <ZKA>] [address: --short] [send: --to <full or short address> --amount <ZKA> [--memo <text>]] [change-password: --new-password-env <VAR>] [backup: --out <file>] [import-backup: --file <file>] [--rpc <url>] [--json]";
     let Some((action, rest)) = args.split_first() else {
         return Err(USAGE.to_string());
     };
@@ -15322,10 +15359,38 @@ fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
         }
         "address" => {
             let address = zoka::quantic::wallet_file::address(&dir, &name)?;
+            let short = short_address_of(&address, quantic_network)?;
             if json {
-                println!("{}", serde_json::json!({ "name": name, "address": address }));
+                println!(
+                    "{}",
+                    serde_json::json!({ "name": name, "address": address, "short_address": short })
+                );
+            } else if has_flag(rest, "--short") {
+                println!("{short}");
             } else {
                 println!("{address}");
+            }
+            Ok(())
+        }
+        // La dirección completa al directorio del nodo, para que le paguen con
+        // la corta. Pública: no pide contraseña. El sello se busca acá.
+        "publish-address" => {
+            let address = zoka::quantic::wallet_file::address(&dir, &name)?;
+            let full = zoka::quantic::protocol::QuanticAddress::decode_for(&address, quantic_network)
+                .map_err(|e| format!("wallet '{name}': {e}"))?;
+            let record = zoka::quantic::directory::AddressRecord::new(&full);
+            let reply = rpc_http_post_json(
+                &rpc()?,
+                "/quantic/address",
+                &serde_json::json!({ "address": record.address, "stamp": record.stamp }),
+                60,
+            )?;
+            let short = full.short().encode();
+            if json {
+                println!("{}", serde_json::json!({ "name": name, "short_address": short, "node": reply }));
+            } else {
+                println!("Published. Short address of '{name}':");
+                println!("{short}");
             }
             Ok(())
         }
@@ -15350,7 +15415,13 @@ fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
                         let unlocked = password.as_deref().is_some_and(|password| {
                             zoka::quantic::wallet_file::open(&dir, name, quantic_network, password).is_ok()
                         });
-                        serde_json::json!({ "name": name, "address": address, "unlocked": unlocked })
+                        let short = short_address_of(address, quantic_network).unwrap_or_default();
+                        serde_json::json!({
+                            "name": name,
+                            "address": address,
+                            "short_address": short,
+                            "unlocked": unlocked,
+                        })
                     })
                     .collect();
                 println!("{}", serde_json::json!({ "network": network.label(), "wallets": names, "details": details }));
@@ -15541,11 +15612,8 @@ fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
         }
         "send" => {
             let password = required_password_value(rest)?;
-            let to = zoka::quantic::protocol::QuanticAddress::decode_for(
-                required_option_value(rest, "--to")?.trim(),
-                quantic_network,
-            )
-            .map_err(|e| format!("--to: {e}"))?;
+            let to = resolve_recipient(&required_option_value(rest, "--to")?, quantic_network, &rpc)
+                .map_err(|e| format!("--to: {e}"))?;
             let amount = economics::parse_zka_amount(&required_option_value(rest, "--amount")?)?;
             if amount == 0 {
                 return Err("--amount must be positive".to_string());
