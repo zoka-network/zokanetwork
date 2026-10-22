@@ -15,21 +15,33 @@ pub const MAINNET_CHAIN_ID: &str = "zoka-mainnet-zenith-v1";
 /// eleccion historica del algoritmo de PoW la nombra; el CLI ya no la abre.
 pub const TESTNET_CHAIN_ID: &str = "zoka-testnet-v1";
 
-// Zenith (`MAINNET_CHAIN_ID`) es la testnet de Zoka Quantic desde octubre de
-// 2026. El chain id no se renombra (de el sale el hash del genesis) y la
-// etiqueta "mainnet" sigue siendo el identificador que guardan las bases y que
-// pasan los clientes viejos. Lo que se le muestra a la gente sale de aca.
-pub const ZENITH_NETWORK_ROLE: &str = "testnet";
-pub const ZENITH_DISPLAY_NAME: &str = "Zoka Quantic testnet";
+// Zenith (`MAINNET_CHAIN_ID`) se retiró el 21/10/2026: Zoka tiene dos redes,
+// Zoka Quantic Testnet y Zoka Quantic Mainnet, las dos desde cero, y ninguna
+// hereda nada de Zenith. El chain id no se renombra (de él sale el hash del
+// génesis); lo que se muestra dice que ya no corre.
+pub const ZENITH_NETWORK_ROLE: &str = "retired";
+pub const ZENITH_DISPLAY_NAME: &str = "Zenith (retired)";
 
-/// Rol publico de una cadena conocida ("testnet" para Zenith).
+/// Rol público de una cadena conocida.
 pub fn network_role_for_chain(chain_id: &str) -> Option<&'static str> {
-    (chain_id == MAINNET_CHAIN_ID).then_some(ZENITH_NETWORK_ROLE)
+    match chain_id {
+        MAINNET_CHAIN_ID => Some(ZENITH_NETWORK_ROLE),
+        QUANTIC_TESTNET_CHAIN_ID => Some("testnet"),
+        QUANTIC_MAINNET_CHAIN_ID => Some("mainnet"),
+        QUANTIC_REGTEST_CHAIN_ID => Some("regtest"),
+        _ => None,
+    }
 }
 
-/// Nombre para personas de una cadena conocida ("Zoka Quantic testnet").
+/// Nombre para personas de una cadena conocida.
 pub fn network_display_name_for_chain(chain_id: &str) -> Option<&'static str> {
-    (chain_id == MAINNET_CHAIN_ID).then_some(ZENITH_DISPLAY_NAME)
+    match chain_id {
+        MAINNET_CHAIN_ID => Some(ZENITH_DISPLAY_NAME),
+        QUANTIC_TESTNET_CHAIN_ID => Some("Zoka Quantic Testnet"),
+        QUANTIC_MAINNET_CHAIN_ID => Some("Zoka Quantic Mainnet"),
+        QUANTIC_REGTEST_CHAIN_ID => Some("Zoka Quantic Regtest (local)"),
+        _ => None,
+    }
 }
 
 /// Emergency mainnet checkpoint used by the 1.4.x hotfix rollout. Nodes that
@@ -799,16 +811,17 @@ mod tests {
         }
     }
 
+    // Dos redes, las de Quantic; Zenith no se presenta como ninguna de ellas.
     #[test]
-    fn zenith_is_presented_as_testnet_without_renaming_the_chain() {
+    fn the_two_networks_are_quantic_and_zenith_is_shown_as_retired() {
         assert_eq!(MAINNET_CHAIN_ID, "zoka-mainnet-zenith-v1");
-        assert_eq!(network_role_for_chain(MAINNET_CHAIN_ID), Some("testnet"));
-        assert_eq!(
-            network_display_name_for_chain(MAINNET_CHAIN_ID),
-            Some("Zoka Quantic testnet")
-        );
+        assert_eq!(network_role_for_chain(MAINNET_CHAIN_ID), Some("retired"));
+        assert_eq!(network_display_name_for_chain(MAINNET_CHAIN_ID), Some("Zenith (retired)"));
+        assert_eq!(network_role_for_chain(QUANTIC_TESTNET_CHAIN_ID), Some("testnet"));
+        assert_eq!(network_display_name_for_chain(QUANTIC_TESTNET_CHAIN_ID), Some("Zoka Quantic Testnet"));
+        assert_eq!(network_role_for_chain(QUANTIC_MAINNET_CHAIN_ID), Some("mainnet"));
+        assert_eq!(network_display_name_for_chain(QUANTIC_MAINNET_CHAIN_ID), Some("Zoka Quantic Mainnet"));
         assert_eq!(network_role_for_chain(TESTNET_CHAIN_ID), None);
-        assert_eq!(network_role_for_chain("zoka-quantic-v1"), None);
     }
 
     #[test]

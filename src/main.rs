@@ -30,6 +30,43 @@ use zoka::storage::RocksDbStorage;
 use zoka::wallet::storage::{PrivateWalletMetadata, WalletStorage};
 use zoka::zk::groth16_backend::PRIVATE_TX_MAX_INPUTS;
 
+/// La ayuda de una build de Quantic: solo lo que sirve en sus dos redes.
+#[cfg(feature = "quantic")]
+fn print_quantic_usage() {
+    println!();
+    println!("{}", dashboard_title("ZOKA Quantic", ANSI_CYAN));
+    println!("{}", dashboard_divider());
+    println!(
+        "  {}",
+        paint(
+            "Two networks: quantic-testnet (default, test coins) and quantic-mainnet. Zenith was retired on 2026-10-21.",
+            ANSI_DIM
+        )
+    );
+    println!("{}", dashboard_divider());
+    println!("{}", dashboard_section("Wallet (zoka quantic-wallet <action> --network quantic-testnet)", ANSI_GREEN));
+    println!("  new --name <wallet> --password-stdin            a new wallet (24-word phrase, shown once)");
+    println!("  generate-phrase | restore --name <w> --phrase-env <VAR> --password-stdin");
+    println!("  list [--password-stdin] | address --name <w>");
+    println!("  balance | history [--limit n] --name <w> --password-stdin");
+    println!("  estimate-fee --amount <ZKA> | send --to <address> --amount <ZKA> [--memo <text>] --name <w> --password-stdin");
+    println!("  show-phrase | change-password --new-password-env <VAR> | backup --out <file> | import-backup --file <file>");
+    println!("  (pick the wallet with --name or --address; add --json for machine output; --rpc <url> for another node)");
+    println!("{}", dashboard_section("Node", ANSI_GREEN));
+    println!("  zoka fullnode --network quantic-testnet [--quantic-mine-to <address>] [--threads n] [--no-mine]");
+    println!("               [--seed <multiaddr>] [--listen <multiaddr>] [--tor-proxy host:port] [--tor-only]");
+    println!("  zoka mine-status --network quantic-testnet [--json]");
+    println!("  zoka node-status | height | block-info | chain-stats   [--network quantic-testnet]");
+    println!("{}", dashboard_section("Network team", ANSI_GREEN));
+    println!("  zoka checkpoint-keygen --network quantic-testnet     the authority key (both halves, stays on this PC)");
+    println!("  zoka quantic-genesis --network quantic-testnet --premine-to <address> --out <file>");
+    println!("  zoka checkpoint-status | checkpoint-sign | snapshot-info | snapshot-export | iroh-id");
+    println!("  zoka version");
+    println!();
+}
+
+// Zenith: no se llama en una build de Quantic (Zenith se retiró el 21/10/2026).
+#[cfg_attr(feature = "quantic", allow(dead_code))]
 fn print_usage() {
     println!();
     println!("{}", dashboard_title("ZOKA private console", ANSI_CYAN));
@@ -1816,6 +1853,8 @@ fn interactive_status_menu() -> Result<bool, String> {
     }
 }
 
+// Zenith: no se llama en una build de Quantic (Zenith se retiró el 21/10/2026).
+#[cfg_attr(feature = "quantic", allow(dead_code))]
 async fn run_interactive_menu() -> Result<(), String> {
     loop {
         print_main_dashboard_screen();
@@ -2356,6 +2395,9 @@ const FEE_MARKET_STEP_ATOMS: u64 = economics::ATOMS_PER_ZKA / 10_000;
 const MAINNET_CHAIN_ID: &str = economics::MAINNET_CHAIN_ID;
 const TESTNET_CHAIN_ID: &str = economics::TESTNET_CHAIN_ID;
 const MAINNET_MINING_MODE: &str = "pow-mainnet";
+/// Lo que contesta el nodo si alguien todavía pide Zenith.
+#[cfg(feature = "quantic")]
+const ZENITH_RETIRED: &str = "Zenith was retired on 2026-10-21. Zoka has two networks: quantic-testnet and quantic-mainnet. Zenith runs only on releases before 3.0.";
 /// Quantic mina con su propio camino (`zoka::quantic::miner`); el modo solo se
 /// muestra.
 const QUANTIC_MINING_MODE: &str = "pow-quantic";
@@ -2399,21 +2441,40 @@ impl NetworkProfile {
     fn from_args(args: &[String]) -> Result<Self, String> {
         let raw = option_value(args, "--network")
             .or_else(|| std::env::var("ZOKA_NETWORK").ok())
-            .unwrap_or_else(|| "testnet".to_string());
+            .unwrap_or_else(|| Self::DEFAULT_NAME.to_string());
         Self::from_name(&raw)
     }
 
+    /// Desde el 21/10/2026 Zoka tiene dos redes, las de Zoka Quantic, y Zenith
+    /// se retiró (decisión del usuario: que las redes no se mezclen). Una build
+    /// sin `quantic` no puede seguir ninguna de las dos y queda como la de
+    /// Zenith, para las pruebas de su código.
+    #[cfg(feature = "quantic")]
+    const DEFAULT_NAME: &'static str = "quantic-testnet";
+    #[cfg(not(feature = "quantic"))]
+    const DEFAULT_NAME: &'static str = "testnet";
+
     fn from_name(raw: &str) -> Result<Self, String> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            // "mainnet" es el nombre anterior de Zenith: lo siguen pasando
-            // ZSilent, los scripts de mineria y este mismo binario cuando se
-            // relanza a si mismo.
+            // La testnet y la mainnet son las de Quantic: no hay otra red.
+            #[cfg(feature = "quantic")]
+            "testnet" | "quantic-testnet" => Ok(Self::QuanticTestnet),
+            #[cfg(feature = "quantic")]
+            "mainnet" | "quantic-mainnet" | "quantic" => Ok(Self::QuanticMainnet),
+            #[cfg(feature = "quantic")]
+            "zenith" => Err(ZENITH_RETIRED.to_string()),
+            // "mainnet" es el nombre anterior de Zenith: lo pasaban ZSilent 2.x,
+            // los scripts de minería y este mismo binario al relanzarse.
+            #[cfg(not(feature = "quantic"))]
             "testnet" | "zenith" | "mainnet" => Ok(Self::Zenith),
+            #[cfg(not(feature = "quantic"))]
             "quantic-mainnet" | "quantic" => Self::quantic(Self::QuanticMainnet),
+            #[cfg(not(feature = "quantic"))]
             "quantic-testnet" => Self::quantic(Self::QuanticTestnet),
+            // Una red local de pruebas: nunca pública.
             "quantic-regtest" => Self::quantic(Self::QuanticRegtest),
             other => Err(format!(
-                "invalid --network '{other}'; expected testnet (Zenith), quantic-mainnet, quantic-testnet or quantic-regtest. 'mainnet' is still accepted as Zenith's former name"
+                "invalid --network '{other}'; expected quantic-testnet (testnet) or quantic-mainnet (mainnet), or quantic-regtest for a local test network"
             )),
         }
     }
@@ -2559,9 +2620,9 @@ impl NetworkProfile {
     fn display_name(self) -> &'static str {
         match self {
             Self::Zenith => economics::ZENITH_DISPLAY_NAME,
-            Self::QuanticMainnet => "Zoka Quantic",
-            Self::QuanticTestnet => "Zoka Quantic testnet (Ironwood)",
-            Self::QuanticRegtest => "Zoka Quantic regtest",
+            Self::QuanticMainnet => "Zoka Quantic Mainnet",
+            Self::QuanticTestnet => "Zoka Quantic Testnet",
+            Self::QuanticRegtest => "Zoka Quantic Regtest (local)",
         }
     }
 
@@ -13689,6 +13750,8 @@ async fn cmd_fullnode_auto_boxed(args: &[String]) -> Result<(), String> {
     Box::pin(cmd_fullnode_auto(args)).await
 }
 
+// Zenith: no se llama en una build de Quantic (Zenith se retiró el 21/10/2026).
+#[cfg_attr(feature = "quantic", allow(dead_code))]
 async fn run_zokahd_guided_default() -> Result<(), String> {
     println!("{}", dashboard_title("ZOKA Node Autopilot", ANSI_CYAN));
     println!("{}", dashboard_divider());
@@ -18333,6 +18396,33 @@ fn running_as_zokahd() -> bool {
     stem.eq_ignore_ascii_case("zokahd")
 }
 
+/// Los comandos de Zenith: en una build de Quantic no se ejecutan (crearían
+/// wallets o transacciones de Zenith dentro de una red de Quantic).
+#[cfg(feature = "quantic")]
+const ZENITH_ONLY_COMMANDS: &[&str] = &[
+    "create", "restore", "generate-seed", "balance", "receive", "history", "send", "fee", "pending",
+    "zokahd-guided", "sync", "backup", "restore-backup", "wipe", "status", "dashboard",
+    "wallet-create", "wallet-generate-seed", "wallet-restore-from-seed", "wallet-restore-from-backup",
+    "wallet-restore-from-keys", "wallet-import", "wallet-change-passphrase", "wallet-backup", "wallet-wipe",
+    "wallet-list", "wallet-export-secrets", "wallet-balance", "wallet-history", "wallet-receive",
+    "wallet-recovery", "sync-status", "chain-economics-migrate", "private-tx-import", "private-tx-publish",
+    "private-tx-audit", "private-pending-diagnostics", "tx-pending", "estimate-fee", "tx-send", "tx-send-many",
+    "team-status", "team-create", "team-join", "team-leave", "team-start", "team-stop", "mine", "mine-console",
+    "genesis-verify", "mainnet-network-lint", "chain-republish-private-txs", "trusted-setup-init",
+];
+
+#[cfg(feature = "quantic")]
+const QUANTIC_INSTEAD: &str = "Use `zoka quantic-wallet` for wallets, `zoka fullnode --network quantic-testnet` for the node (add --quantic-mine-to <address> to mine), or ZSilent 3.0.";
+
+#[cfg(feature = "quantic")]
+fn print_quantic_start() {
+    println!("zoka {} — Zoka Quantic", env!("CARGO_PKG_VERSION"));
+    println!("Networks: quantic-testnet (default) and quantic-mainnet. Zenith was retired on 2026-10-21.");
+    println!("  zoka quantic-wallet new --network quantic-testnet --name <wallet> --password-stdin");
+    println!("  zoka fullnode --network quantic-testnet [--quantic-mine-to <address>]");
+    println!("  zoka help   (every command)");
+}
+
 async fn run() -> Result<(), String> {
     enable_ansi_console_support();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -18345,6 +18435,14 @@ async fn run() -> Result<(), String> {
             println!("zokahd {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
+        // El piloto automático de zokahd crea una wallet de Zenith y la mina:
+        // en una build de Quantic no hay Zenith a la que llevarlo.
+        #[cfg(feature = "quantic")]
+        if args.is_empty() {
+            print_quantic_start();
+            return Ok(());
+        }
+        #[cfg(not(feature = "quantic"))]
         if args.is_empty() {
             return run_zokahd_guided_default().await;
         }
@@ -18373,18 +18471,31 @@ async fn run() -> Result<(), String> {
         }
     }
 
+    #[cfg(feature = "quantic")]
+    if args.is_empty() {
+        print_quantic_start();
+        return Ok(());
+    }
+    #[cfg(not(feature = "quantic"))]
     if args.is_empty() {
         return run_interactive_menu().await;
     }
 
     let command = &args[0];
     let tail = &args[1..];
+    #[cfg(feature = "quantic")]
+    if ZENITH_ONLY_COMMANDS.contains(&command.as_str()) {
+        return Err(format!("`zoka {command}` belonged to Zenith. {ZENITH_RETIRED} {QUANTIC_INSTEAD}"));
+    }
     match command.as_str() {
         "version" | "--version" | "-V" => {
             println!("zoka {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         "help" | "--help" | "-h" => {
+            #[cfg(feature = "quantic")]
+            print_quantic_usage();
+            #[cfg(not(feature = "quantic"))]
             print_usage();
             Ok(())
         }
@@ -20923,11 +21034,31 @@ mod tests {
         assert!(err.contains("no atomic economics marker"));
     }
 
-    // Zenith paso a ser la testnet. `testnet`, `zenith` y su nombre anterior
-    // `mainnet` abren la misma cadena con las rutas de siempre: un cliente
-    // viejo y uno nuevo tienen que ver las mismas wallets en la misma carpeta.
+    // Desde el 21/10/2026 las dos redes son las de Quantic: "testnet" y
+    // "mainnet" las nombran a ellas, y Zenith no se abre. Una build sin
+    // `quantic` sigue siendo la de Zenith (para las pruebas de su código).
+    #[cfg(feature = "quantic")]
+    #[test]
+    fn the_two_networks_are_quantic_and_zenith_no_longer_opens() {
+        for name in ["testnet", "TESTNET", "quantic-testnet"] {
+            assert_eq!(NetworkProfile::from_name(name).expect(name), NetworkProfile::QuanticTestnet);
+        }
+        for name in ["mainnet", " Mainnet ", "quantic-mainnet", "quantic"] {
+            assert_eq!(NetworkProfile::from_name(name).expect(name), NetworkProfile::QuanticMainnet);
+        }
+        let err = NetworkProfile::from_name("zenith").unwrap_err();
+        assert!(err.contains("retired"), "{err}");
+        assert_eq!(NetworkProfile::QuanticTestnet.display_name(), "Zoka Quantic Testnet");
+        assert_eq!(NetworkProfile::QuanticMainnet.display_name(), "Zoka Quantic Mainnet");
+        if std::env::var_os("ZOKA_NETWORK").is_none() {
+            assert_eq!(NetworkProfile::from_args(&[]).expect("default"), NetworkProfile::QuanticTestnet);
+        }
+    }
+
+    // Zenith conserva sus rutas de siempre (sus datos quedan donde estaban).
     #[test]
     fn every_network_name_opens_zenith_with_its_historical_paths() {
+        #[cfg(not(feature = "quantic"))]
         for name in ["testnet", "TESTNET", "zenith", "mainnet", " Mainnet "] {
             assert_eq!(
                 NetworkProfile::from_name(name).expect(name),
@@ -20949,8 +21080,9 @@ mod tests {
         assert_eq!(zenith.network_config_schema(), "zoka-mainnet-network-v1");
         assert_eq!(zenith.mining_mode(), "pow-mainnet");
         assert_eq!(zenith.label(), "mainnet");
-        assert_eq!(zenith.role(), "testnet");
-        assert_eq!(zenith.display_name(), "Zoka Quantic testnet");
+        assert_eq!(zenith.role(), "retired");
+        assert_eq!(zenith.display_name(), "Zenith (retired)");
+        #[cfg(not(feature = "quantic"))]
         if std::env::var_os("ZOKA_NETWORK").is_none() {
             assert_eq!(NetworkProfile::from_args(&[]).expect("default"), zenith);
         }

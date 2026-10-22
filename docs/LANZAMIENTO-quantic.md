@@ -4,22 +4,45 @@
 las frases **nunca** van a este repositorio ni a ningún documento: solo sus
 partes públicas.
 
-## Lo que ya está (rama `quantic-cadena-completa`)
+**Decisiones del usuario (21/10):**
 
-- Las tres redes de Quantic con perfil propio: mainnet (`zoka-quantic-v1`, P2P
-  28380, API 3300), testnet (`zoka-quantic-testnet-v1`, 28180, 3100) y regtest
-  (28280, 3200). No comparten protocolo, tópicos, carpetas ni manifiesto con
-  Zenith ni entre sí.
-- Transacciones Ironwood + X-Wing, consenso, mempool, minería con RandomX,
-  dificultad ASERT (16 bits de arranque en mainnet, 14 en testnet), wallets
-  livianas por P2P, snapshots que rearman el estado.
-- Autoridad de checkpoints **híbrida obligatoria**: una red de Quantic sin la
-  mitad ML-DSA de la clave no tiene autoridad.
+- **Dos redes, las dos desde cero: Zoka Quantic Testnet y Zoka Quantic
+  Mainnet.** Zenith se retiró: nada de su cadena, sus saldos ni sus direcciones
+  pasa a Quantic, y una build con `quantic` no la abre (`--network zenith` y sus
+  comandos de wallet responden qué usar en su lugar).
+- **La testnet arranca ya**, con el protocolo de hoy, y **se reinicia desde
+  cero** (con direcciones nuevas) cuando esté el pool privado 100 %
+  postcuántico. Sus monedas no valen nada.
+- **La mainnet sale solo con el protocolo completo** (ver
+  [QUANTIC-POOL-POSTCUANTICO.md](QUANTIC-POOL-POSTCUANTICO.md)).
+
+## Lo que ya está
+
+Nodo, rama `quantic-cadena-completa` (versión 3.0.0):
+
+- Las redes de Quantic con perfil propio: mainnet (`zoka-quantic-v1`, P2P
+  28380, API 3300) y testnet (`zoka-quantic-testnet-v1`, 28180, 3100), más
+  regtest (28280, 3200) solo para pruebas locales. No comparten protocolo,
+  tópicos, carpetas ni manifiesto entre sí.
+- Transacciones Ironwood + X-Wing, consenso, mempool, minería con RandomX y
+  control en caliente, dificultad ASERT (16 bits de arranque en mainnet, 14 en
+  testnet), wallets livianas por P2P, snapshots que rearman el estado.
+- Autoridad de checkpoints **híbrida obligatoria** (Ed25519 + ML-DSA-65).
+- TLS híbrido X25519MLKEM768 en las conexiones de iroh.
+- `zoka quantic-wallet` completa (alta, frase, saldo, historial, comisión,
+  envío con memo, contraseña, respaldo).
 - libp2p 0.57, `cargo audit` sin vulnerabilidades conocidas.
+
+ZSilent 3.0, rama `quantic-solo` de `zsilent-core`: solo Quantic, probado contra
+un nodo real.
+
+Qué es postcuántico hoy y qué no:
+[QUANTIC-INVENTARIO-CRIPTOGRAFICO.md](QUANTIC-INVENTARIO-CRIPTOGRAFICO.md).
 
 ## Testnet
 
-**Pasos del usuario, en la PC:**
+**Pasos del usuario, en la PC** (con el `zoka.exe` nuevo: hasta que se instale,
+`C:\Users\mderramus\ZOKA\target\release\zoka.exe`):
 
 1. Wallet del equipo de la testnet (recibe el premine de prueba):
 
@@ -37,8 +60,7 @@ partes públicas.
 
    Quedan en `%APPDATA%\Zoka\.zoka\quantic-testnet\`. Respaldar los dos archivos
    (`checkpoint-authority.key` y `checkpoint-authority-mldsa.key`) fuera de la
-   PC, junto al respaldo de la clave de Zenith. Pasarle a Claude las dos
-   **claves públicas** que imprime.
+   PC. Pasarle a Claude las dos **claves públicas** que imprime.
 
 **Pasos de Claude:**
 
@@ -47,34 +69,36 @@ partes públicas.
 4. Fijar en `src/economics.rs`: `QUANTIC_TESTNET_GENESIS` (hash del bloque y
    dirección), y las dos públicas de la autoridad en `CHECKPOINT_AUTHORITY_KEYS`
    y `CHECKPOINT_AUTHORITY_MLDSA_KEYS` para `zoka-quantic-testnet-v1`.
-5. Compilar con `--features randomx,pq-experimental,quantic`, correr las pruebas y
-   un ensayo local: un segundo nodo importa el génesis embebido, sincroniza,
-   recibe un checkpoint híbrido y la wallet del equipo ve el premine.
-6. ZSilent de Quantic (ver [PROPUESTA-quantic-en-las-apps.md](PROPUESTA-quantic-en-las-apps.md)).
+5. Compilar con `--features randomx,quantic`, correr las pruebas y un ensayo
+   local: un segundo nodo importa el génesis embebido, sincroniza, recibe un
+   checkpoint híbrido y la wallet del equipo ve el premine.
+6. Armar el instalador de ZSilent 3.0 con ese binario.
 
 **Pasos del usuario, otra vez:**
 
-7. Instalar el binario y ZSilent nuevos (con su aprobación explícita, como
+7. Instalar el binario y ZSilent 3.0 (con su aprobación explícita, como
    siempre). La PC arranca el nodo de la testnet minando: es la primera semilla.
-8. Con la dirección onion de la PC (el mismo servicio de ZSilent, con un segundo
-   `HiddenServicePort 28180`), Claude la agrega a `seed_nodes` del manifiesto de
-   la testnet.
+8. Con la dirección onion de la PC (el servicio de ZSilent, en el puerto 28180),
+   Claude la agrega a `seed_nodes` del manifiesto de la testnet.
 9. Pushear y publicar el release.
+
+**Cuando esté el pool postcuántico:** génesis nuevo, testnet nueva desde cero
+(otro chain id), wallets nuevas.
 
 ## Mainnet
 
 Lo mismo con `--network quantic-mainnet`, más:
 
-- **Antes del génesis:** la revisión externa de lo que hizo ZOKA
-  ([REVIEW-zoka-quantic.md](REVIEW-zoka-quantic.md)) y la testnet andando sin
-  problemas un tiempo razonable.
+- **Antes del génesis:** el pool privado 100 % postcuántico terminado, la
+  revisión externa ([REVIEW-zoka-quantic.md](REVIEW-zoka-quantic.md)) y la
+  testnet con ese pool andando sin problemas un tiempo razonable.
 - Una wallet del equipo **nueva y distinta** de la de la testnet, para los
   5.000.000 ZKA del premine. Su frase se guarda con el máximo cuidado: es la
   plata del equipo.
 - Una clave de autoridad **propia de la mainnet**, distinta de la de la testnet.
 - La dificultad inicial (16 bits) se revisa con lo que muestre la testnet.
-- El anuncio (8.4 del plan): por qué este relanzamiento es distinto, el premine
-  y los checkpoints del equipo declarados de frente.
+- El anuncio: por qué este relanzamiento es distinto, el premine y los
+  checkpoints del equipo declarados de frente.
 
 ## Lo que no se puede cambiar después del génesis sin un fork
 

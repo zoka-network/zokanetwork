@@ -1,4 +1,8 @@
-# Running a ZOKA node from the command line (Linux and Windows)
+# Running a Zoka Quantic node from the command line (Linux and Windows)
+
+The commands below are for **Zoka Quantic Testnet**. For the mainnet, once it
+launches, use `--network quantic-mainnet`, its manifest, P2P port 28380 and API
+port 3300. (Zenith, the previous network, was retired on 21 October 2026.)
 
 This is for operators who run the `zoka` binary directly instead of the
 ZSilent desktop app. ZSilent bundles Tor and passes the right flags for you;
@@ -14,12 +18,12 @@ No CLI binaries are published; build from source.
 ```sh
 git clone https://github.com/zoka-network/zokanetwork.git
 cd ZokaNetwork
-cargo build --release --features randomx --bins
+cargo build --release --features randomx,quantic --bins
 ```
 
 The binaries land in `target/release/` (`zoka`, `zoka.exe` on Windows).
 
-You also need the network manifest, `docs/mainnet-network.v1.json`, which is
+You also need the network manifest, `docs/quantic-testnet-network.v1.json`, which is
 in the repository you just cloned.
 
 ## 2. Set up Tor
@@ -34,7 +38,7 @@ Install Tor from your distribution, then add to `/etc/tor/torrc`:
 ```
 SocksPort 9050
 HiddenServiceDir /var/lib/tor/zoka/
-HiddenServicePort 28080 127.0.0.1:28080
+HiddenServicePort 28180 127.0.0.1:28180
 ```
 
 ```sh
@@ -49,7 +53,7 @@ Download the Tor Expert Bundle, then create a `torrc` next to `tor.exe`:
 ```
 SocksPort 9050
 HiddenServiceDir C:\Users\<you>\zoka-tor\hs
-HiddenServicePort 28080 127.0.0.1:28080
+HiddenServicePort 28180 127.0.0.1:28180
 ```
 
 ```powershell
@@ -68,28 +72,26 @@ Linux:
 
 ```sh
 ./target/release/zoka fullnode \
-  --network mainnet \
-  --network-config docs/mainnet-network.v1.json \
+  --network quantic-testnet \
+  --network-config docs/quantic-testnet-network.v1.json \
   --tor-proxy 127.0.0.1:9050 \
   --tor-only \
-  --external-addr /onion3/<your-onion-without-.onion>:28080 \
+  --external-addr /onion3/<your-onion-without-.onion>:28180 \
   --serve-iroh-snapshot \
-  --no-mine \
-  --password "<your-wallet-password>"
+  --no-mine
 ```
 
 Windows (PowerShell — note the backtick continuation):
 
 ```powershell
 .\target\release\zoka.exe fullnode `
-  --network mainnet `
-  --network-config docs\mainnet-network.v1.json `
+  --network quantic-testnet `
+  --network-config docs\quantic-testnet-network.v1.json `
   --tor-proxy 127.0.0.1:9050 `
   --tor-only `
-  --external-addr /onion3/<your-onion-without-.onion>:28080 `
+  --external-addr /onion3/<your-onion-without-.onion>:28180 `
   --serve-iroh-snapshot `
-  --no-mine `
-  --password "<your-wallet-password>"
+  --no-mine
 ```
 
 What the flags do:
@@ -100,22 +102,26 @@ What the flags do:
 | `--tor-only` | refuse every non-onion destination, so nothing leaks to clearnet |
 | `--external-addr` | the address you advertise so peers can dial *you* |
 | `--serve-iroh-snapshot` | serve your chain to nodes that need to bootstrap. Costs upload bandwidth; it is what lets newcomers start without a central seed |
-| `--no-mine` | node only. Drop it and add `--address <your-zka1-address>` to mine |
+| `--no-mine` | node only. Drop it and add `--quantic-mine-to <your-zqtest1-address>` to mine |
 
 To mine, replace `--no-mine` with:
 
 ```sh
-  --address <your-zka1-address> --min-mine-peers 1
+  --quantic-mine-to <your-zqtest1-address> --min-mine-peers 1
 ```
+
+The node never needs your wallet password: it mines to a public address, and
+wallets are opened by `zoka quantic-wallet`.
 
 ## 4. Check it worked
 
 The node exposes a local API. `ZOKA_API_BIND` sets the port (default comes from
-the manifest's `desktop.local_rpc_url`, `127.0.0.1:3000`).
+the manifest's `desktop.local_rpc_url`, `127.0.0.1:3100` on the testnet).
 
 ```sh
-curl -s http://127.0.0.1:3000/sync/status
-curl -s http://127.0.0.1:3000/peers
+curl -s http://127.0.0.1:3100/sync/status
+curl -s http://127.0.0.1:3100/peers
+curl -s http://127.0.0.1:3100/quantic/info
 ```
 
 You want `"status":"caught_up"` and a non-zero `tor` count under
@@ -132,5 +138,5 @@ normal and not an error.
   invalid or side-branch chain.
 - **Running two nodes against the same data directory will corrupt it.** Use a
   separate `ZOKA_HOME` for each instance.
-- The canonical chain is anchored at block 3127 (see the README). A node whose
-  block 3127 differs is on a side branch and its blocks are rejected.
+- The chain starts at the genesis compiled into the binary; signed checkpoints
+  from the network authority (Ed25519 + ML-DSA-65) anchor it after that.
