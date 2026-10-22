@@ -5,18 +5,28 @@ Proyecto: `C:\Users\mderramus\ZOKA`.
 
 ## Punto de partida
 
-**22/10, lo último: la testnet de Quantic tiene génesis.** Bloque 1
-`1d204e8116f53d74302db20b943b288d141681a9be463f65a43861dd47c2d242` (11:16 UTC),
-premine de prueba a la wallet `equipo` del usuario (la creó con
-`scripts/crear-wallet-equipo-testnet.ps1`), autoridad híbrida de la testnet
-compilada; commit `2fe98fe3`. Suite con `quantic` 990+90+2+3 y ensayo de dos nodos
-con el binario final. **Instalador:** `zsilent-core/build/release/3.0.0/ZSilent
-Core-3.0.0.msi`, SHA-256 `5f9847093916787d403ba3f1fcaa2de6a55ecdcee5d992b08d1469fdadc97174`,
-con ese mismo `zoka.exe` (`3d1a5ae7…`) y el manifiesto activo con la semilla; actualiza
-la 2.1 en el lugar (mismo UpgradeCode). Sin publicar ni pushear. Falta: que el
-usuario lo instale (doble clic), que la PC arranque minando, comprobar la onion con
-un segundo nodo, push y publicación con su aprobación, y `TESTNET_LIVE=true` en la
-web.
+**22/10, lo último: la Zoka Quantic Testnet está andando en la PC.** Génesis
+`1d204e8116f53d74302db20b943b288d141681a9be463f65a43861dd47c2d242` (11:16 UTC,
+commit `2fe98fe3`), premine de prueba a la wallet del equipo. **ZSilent 3.0.1**
+instalado en la PC (lo pidió el usuario; `msiexec /passive`, código 0; `zoka`
+3.0.1 `3bb4ae04…`), minando a `zsilent-2` con Tor y anunciando su onion
+(`d5pk3…:28180`): bloque 2 a las 15:32. Paso 8 hecho: un nodo de prueba que solo
+podía entrar por la onion sincronizó la cadena. La wallet del equipo es
+`zsilent-2` (restaurada con las 24 palabras); la `equipo` original no abría con
+la contraseña que recordaba el usuario y quedó apartada como
+`equipo.json.olvidada-20261022` (mismas claves). La 3.0.0 no arrancaba el nodo con
+Tor: ZSilent busca `--external-addr` en `zoka --help` y la ayuda de Quantic no lo
+nombraba. **3.0.1** (commits `6baf31ed` nodo y `fbdac36` ZSilent): ese flag en la
+ayuda, `--address` elige la wallet que abre con la contraseña, el tablero de Zenith
+no corre en Quantic (escribía un error por segundo), el diagnóstico va a la carpeta
+de la red y a cada nodo solo le llegan los pares manuales de su puerto. Suite
+990+92+2+3. MSI `zsilent-core/build/release/3.0.1/`, SHA-256
+`8b8facc01ab0c571fd19d0e1f2ae18305c43d26ab779b545a5def82a0004bd71`. **Sin pushear
+ni publicar**: falta, con aprobación del usuario, el push, el release y
+`TESTNET_LIVE=true` en la web. Pool de minería: ZSilent 3.0 lo sacó (era protocolo
+de Zenith); recomendación dada: minería individual por ahora y más adelante un
+pool sin custodio estilo P2Pool (el consenso ya admite coinbase de hasta 64
+salidas, así que no hace falta fork). Decisión del usuario pendiente.
 
 **22/10: un nodo de Quantic nunca llega a Groth16.** Preparando el instalador
 apareció que, en release y sin el setup de Groth16, verificar cualquier prueba de
