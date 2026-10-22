@@ -9,6 +9,8 @@ pub(crate) const ROOT_SEED: &[u8; 16] = b"ZokaQuanticSeed_";
 pub(crate) const XWING_SEED: &[u8; 16] = b"ZokaQ_XWingSeed_";
 /// Address checksum (prefix and payload).
 pub(crate) const ADDRESS_CHECKSUM: &[u8; 16] = b"ZokaQ_AddrCheck_";
+/// Full address (prefix and payload) -> the digest a short address carries.
+pub(crate) const SHORT_ADDRESS: &[u8; 16] = b"ZokaQ_ShortAddr_";
 /// Note seed -> X-Wing encapsulation randomness.
 pub(crate) const KEM_SEED: &[u8; 16] = b"ZokaQ_KemEncSeed";
 /// X-Wing shared secret -> note encryption key.
@@ -56,6 +58,7 @@ mod tests {
             ROOT_SEED,
             XWING_SEED,
             ADDRESS_CHECKSUM,
+            SHORT_ADDRESS,
             KEM_SEED,
             NOTE_KEY,
             OUT_KEY,

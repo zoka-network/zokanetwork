@@ -24,7 +24,7 @@ pub mod tx;
 pub mod verify;
 pub mod wallet;
 
-pub use address::{AddressError, QuanticAddress};
+pub use address::{AddressError, QuanticAddress, QuanticShortAddress, Recipient};
 pub use keys::{KeyError, QuanticFullViewingKey, QuanticSpendingKey};
 pub use network::Network;
 
