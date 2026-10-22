@@ -30,6 +30,17 @@ use zoka::storage::RocksDbStorage;
 use zoka::wallet::storage::{PrivateWalletMetadata, WalletStorage};
 use zoka::zk::groth16_backend::PRIVATE_TX_MAX_INPUTS;
 
+/// Las líneas de `fullnode` de la ayuda de Quantic. ZSilent lee `zoka --help`
+/// y busca ahí `--tor-proxy`, `--tor-only` y `--external-addr` antes de lanzar
+/// el nodo: si falta uno, no lo arranca. Pasó con la 3.0.0, que no nombraba
+/// `--external-addr`, y ZSilent se negaba a arrancar con la onion.
+#[cfg(feature = "quantic")]
+const QUANTIC_FULLNODE_USAGE: [&str; 3] = [
+    "  zoka fullnode --network quantic-testnet [--quantic-mine-to <address>] [--threads n] [--no-mine]",
+    "               [--seed <multiaddr>] [--listen <multiaddr>] [--tor-proxy host:port] [--tor-only]",
+    "               [--external-addr <multiaddr>] [--network-config <file>] [--serve-iroh-snapshot]",
+];
+
 /// La ayuda de una build de Quantic: solo lo que sirve en sus dos redes.
 #[cfg(feature = "quantic")]
 fn print_quantic_usage() {
@@ -53,8 +64,9 @@ fn print_quantic_usage() {
     println!("  show-phrase | change-password --new-password-env <VAR> | backup --out <file> | import-backup --file <file>");
     println!("  (pick the wallet with --name or --address; add --json for machine output; --rpc <url> for another node)");
     println!("{}", dashboard_section("Node", ANSI_GREEN));
-    println!("  zoka fullnode --network quantic-testnet [--quantic-mine-to <address>] [--threads n] [--no-mine]");
-    println!("               [--seed <multiaddr>] [--listen <multiaddr>] [--tor-proxy host:port] [--tor-only]");
+    for line in QUANTIC_FULLNODE_USAGE {
+        println!("{line}");
+    }
     println!("  zoka mine-status --network quantic-testnet [--json]");
     println!("  zoka node-status | height | block-info | chain-stats   [--network quantic-testnet]");
     println!("{}", dashboard_section("Network team", ANSI_GREEN));
@@ -3076,7 +3088,13 @@ const MINING_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 fn mining_log(message: &str) {
     eprintln!("{}", paint(&format!("mining: {message}"), ANSI_DIM));
-    let path = PathBuf::from(NetworkProfile::Zenith.local_dir()).join("mining_diagnostic.log");
+    // En la carpeta de la red de este proceso. Iba siempre a la de Zenith,
+    // también desde un nodo de Quantic.
+    let network = zoka::api::global_startup_status()
+        .chain_id()
+        .and_then(|chain_id| NetworkProfile::from_chain_id(&chain_id).ok())
+        .unwrap_or(NetworkProfile::Zenith);
+    let path = PathBuf::from(network.local_dir()).join("mining_diagnostic.log");
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -6086,6 +6104,12 @@ fn draw_fullnode_runtime_screen(
     session_mined_rewards: u64,
     last_event: &str,
 ) -> Result<(), String> {
+    // Este tablero es de Zenith: lee una wallet de Zenith, que en Quantic no
+    // existe, y en cada refresco escribía el error en el diagnóstico (uno por
+    // segundo con ZSilent). ZSilent toma el estado de Quantic de la API.
+    if network.is_quantic() {
+        return Ok(());
+    }
     let wallet_snapshot = match load_wallet_runtime_snapshot_for_dashboard(
         wallet_storage,
         wallet_selector,
@@ -15123,6 +15147,44 @@ fn chain_contains_checkpoint(
     }
 }
 
+/// La contraseña de `--password` o `--password-env`, sin tocar stdin: elegir
+/// la wallet no puede consumir lo que después lee el comando.
+#[cfg(feature = "quantic")]
+fn password_without_stdin(args: &[String]) -> Option<zeroize::Zeroizing<String>> {
+    option_value(args, "--password")
+        .or_else(|| option_value(args, "--wallet-password"))
+        .or_else(|| {
+            option_value(args, "--password-env")
+                .or_else(|| option_value(args, "--wallet-password-env"))
+                .and_then(|var_name| std::env::var(var_name).ok())
+        })
+        .map(zeroize::Zeroizing::new)
+}
+
+/// Entre varias wallets con la misma dirección (la misma frase restaurada dos
+/// veces, cada una con su contraseña), la que abre con la contraseña dada. Si
+/// ninguna abre, o no hay contraseña, la primera, como antes. Pasó el 22/10:
+/// ZSilent elige por dirección y la primera era una copia con otra contraseña.
+#[cfg(feature = "quantic")]
+fn pick_wallet_for_address(
+    dir: &Path,
+    network: zoka::quantic::protocol::Network,
+    candidates: Vec<String>,
+    password: Option<zeroize::Zeroizing<String>>,
+) -> Option<String> {
+    if candidates.len() > 1 {
+        if let Some(password) = password.as_deref() {
+            if let Some(name) = candidates
+                .iter()
+                .find(|name| zoka::quantic::wallet_file::open(dir, name, network, password).is_ok())
+            {
+                return Some(name.clone());
+            }
+        }
+    }
+    candidates.into_iter().next()
+}
+
 /// `zoka quantic-wallet <acción> --network quantic-regtest|quantic-testnet`:
 /// la wallet de Zoka Quantic de línea de comandos. Habla con el nodo por su API
 /// (`--rpc`, o la del manifiesto) y se sincroniza con bloques compactos que
@@ -15163,11 +15225,15 @@ fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
     // la tiene, en lugar de `--name`.
     let name = match (option_value(rest, "--name"), option_value(rest, "--address")) {
         (Some(name), _) => name,
-        (None, Some(address)) => zoka::quantic::wallet_file::list_with_addresses(&dir)
-            .into_iter()
-            .find(|(_, own)| own == address.trim())
-            .map(|(name, _)| name)
-            .ok_or_else(|| "no Zoka Quantic wallet here has that address".to_string())?,
+        (None, Some(address)) => {
+            let candidates = zoka::quantic::wallet_file::list_with_addresses(&dir)
+                .into_iter()
+                .filter(|(_, own)| own == address.trim())
+                .map(|(name, _)| name)
+                .collect();
+            pick_wallet_for_address(&dir, quantic_network, candidates, password_without_stdin(rest))
+                .ok_or_else(|| "no Zoka Quantic wallet here has that address".to_string())?
+        }
         (None, None) => "default".to_string(),
     };
     let json = has_flag(rest, "--json");
@@ -20067,6 +20133,45 @@ mod tests {
     // la misma onion y la misma identidad de iroh que tenía en Zenith (ZSilent
     // usa una sola clave para cada una), en el puerto P2P de la testnet. Sin
     // eso, quien instale ZSilent 3.0 arranca sin ningún par.
+    // La misma frase restaurada dos veces con contraseñas distintas (pasó el
+    // 22/10 con la wallet del equipo): por dirección se elige la que abre.
+    #[cfg(feature = "quantic")]
+    #[test]
+    fn a_repeated_address_picks_the_wallet_that_opens_with_the_password() {
+        use zoka::quantic::protocol::Network;
+        use zoka::quantic::wallet_file;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (phrase, address) =
+            wallet_file::create(dir.path(), "equipo", Network::Regtest, "olvidada").expect("create");
+        let again = wallet_file::restore(dir.path(), "zsilent-2", Network::Regtest, phrase.as_str(), "nueva")
+            .expect("restore");
+        assert_eq!(again, address);
+        let both = vec!["equipo".to_string(), "zsilent-2".to_string()];
+        let pick = |password: Option<&str>| {
+            super::pick_wallet_for_address(
+                dir.path(),
+                Network::Regtest,
+                both.clone(),
+                password.map(|p| zeroize::Zeroizing::new(p.to_string())),
+            )
+        };
+        assert_eq!(pick(Some("nueva")).as_deref(), Some("zsilent-2"));
+        assert_eq!(pick(Some("olvidada")).as_deref(), Some("equipo"));
+        assert_eq!(pick(Some("otra")).as_deref(), Some("equipo"));
+        assert_eq!(pick(None).as_deref(), Some("equipo"));
+    }
+
+    // ZSilent decide si puede lanzar el nodo leyendo `zoka --help`: con un flag
+    // de menos en la ayuda, la 3.0.0 no arrancaba el nodo con la onion.
+    #[cfg(feature = "quantic")]
+    #[test]
+    fn the_quantic_help_names_the_flags_zsilent_checks_before_starting_the_node() {
+        let help = super::QUANTIC_FULLNODE_USAGE.join("\n");
+        for flag in ["--tor-proxy", "--tor-only", "--external-addr"] {
+            assert!(help.contains(flag), "{flag}");
+        }
+    }
+
     #[cfg(feature = "quantic")]
     #[test]
     fn the_quantic_testnet_manifest_carries_its_first_seed() {
