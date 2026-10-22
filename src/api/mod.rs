@@ -532,6 +532,14 @@ impl StartupStatusState {
             .store(ApiRateLimiter::now_secs(), Ordering::Relaxed);
     }
 
+    /// La cadena que eligió este proceso al arrancar, si ya la eligió.
+    pub fn chain_id(&self) -> Option<String> {
+        self.chain_id
+            .read()
+            .map(|chain_id| chain_id.clone())
+            .unwrap_or(None)
+    }
+
     pub fn mark_ready(&self, detail: Option<String>) {
         self.ready.store(1, Ordering::Relaxed);
         self.set_phase("ready", detail);
@@ -3095,7 +3103,8 @@ async fn get_block_by_height(
     Path(height): Path<u64>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if height == 0 {
-        let block = crate::state::chain::genesis_parent_for(crate::economics::MAINNET_CHAIN_ID);
+        let chain_id = app_state.state_manager.chain_id().await;
+        let block = crate::state::chain::genesis_parent_for(&chain_id);
         return Ok(Json(block_metadata_json(&block, None)));
     }
 
@@ -3128,7 +3137,8 @@ async fn get_raw_block_by_height(
     Path(height): Path<u64>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if height == 0 {
-        let block = crate::state::chain::genesis_parent_for(crate::economics::MAINNET_CHAIN_ID);
+        let chain_id = app_state.state_manager.chain_id().await;
+        let block = crate::state::chain::genesis_parent_for(&chain_id);
         return raw_block_json(&block, None).map(Json).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -3185,7 +3195,8 @@ async fn get_raw_blocks_range(
 
     let mut blocks = Vec::new();
     if from == 0 {
-        let genesis = crate::state::chain::genesis_parent_for(crate::economics::MAINNET_CHAIN_ID);
+        let chain_id = app_state.state_manager.chain_id().await;
+        let genesis = crate::state::chain::genesis_parent_for(&chain_id);
         blocks.push(raw_block_json(&genesis, None).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -4017,8 +4028,8 @@ async fn get_blocks_range(
         Ok(blocks) => {
             let mut block_values = Vec::new();
             if from == 0 {
-                let genesis =
-                    crate::state::chain::genesis_parent_for(crate::economics::MAINNET_CHAIN_ID);
+                let chain_id = app_state.state_manager.chain_id().await;
+                let genesis = crate::state::chain::genesis_parent_for(&chain_id);
                 block_values.push(serde_json::json!({
                     "hash": genesis.header.hash,
                     "height": genesis.header.block_height,
@@ -5602,9 +5613,11 @@ async fn post_block_submit(
     };
 
     let storage = app_state.state_manager.raw_storage();
-    let chain_id = crate::economics::MAINNET_CHAIN_ID;
+    // La red del nodo: con Zenith fijo, un nodo de Quantic con este endpoint
+    // prendido aplicaba los bloques recibidos con las reglas de Zenith.
+    let chain_id = app_state.state_manager.chain_id().await;
 
-    match try_apply_synced_block_payload(&storage, chain_id, &response) {
+    match try_apply_synced_block_payload(&storage, &chain_id, &response) {
         SyncOutcome::Applied(_) => {
             tracing::info!(
                 "post_block_submit: applied block h={} hash={}",

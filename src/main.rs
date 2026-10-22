@@ -3115,6 +3115,40 @@ fn mining_progress_log(progress: &MiningProgressSnapshot) {
     ));
 }
 
+/// La línea de estado de la consola en Zoka Quantic: el minero es el de
+/// `quantic::runtime`. La wallet de Zenith no existe ahí, y el nodo solo tiene
+/// la dirección de `--quantic-mine-to`, no sus claves: no hay saldo que
+/// mostrar. Con los números de Zenith decía `mining=off` y `0 block(s)`
+/// mientras minaba, con un error de dirección `zka1` en rojo.
+#[cfg(feature = "quantic")]
+fn print_quantic_console_status(height: u64, peers: usize, last_event: &str) {
+    let status = zoka::quantic::runtime::mining_status();
+    // Una dirección de Quantic tiene unos 1.700 caracteres.
+    let address = status.address.as_deref().unwrap_or("—");
+    let shown = match (address.get(..14), address.get(address.len().saturating_sub(8)..)) {
+        (Some(head), Some(tail)) if address.len() > 24 => format!("{head}…{tail}"),
+        _ => address.to_string(),
+    };
+    print_mining_console_status(
+        &shown,
+        height,
+        peers,
+        status.configured && status.enabled,
+        status.hashrate_hps,
+        None,
+        None,
+        status.blocks_mined,
+        status.rewards_atoms,
+        last_event,
+    );
+}
+
+/// Sin la feature `quantic` el nodo no sigue cadenas de Quantic.
+#[cfg(not(feature = "quantic"))]
+fn print_quantic_console_status(height: u64, peers: usize, last_event: &str) {
+    print_mining_console_status("—", height, peers, false, 0, None, None, 0, 0, last_event);
+}
+
 /// One compact, colored, scrolling status line for the mining console. No
 /// screen clear: it appends to the terminal like a log so it coexists with
 /// the streaming `mining: progress …` lines instead of wiping them.
@@ -13505,34 +13539,42 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             if now_console >= next_console_status_at
                 || session_mined_blocks != last_console_session_blocks
             {
-                // Reuses the dashboard's own 30s-TTL wallet snapshot cache, so
-                // this doesn't re-run the (Argon2-backed) wallet decrypt on
-                // every console tick -- same fix as the earlier CPU-pegging
-                // dashboard bug, just shared rather than re-triggered here.
-                let wallet_snapshot_result = load_wallet_runtime_snapshot_for_dashboard(
-                    &storage,
-                    &wallet_address,
-                    password.as_deref(),
-                    network,
-                );
-                let wallet_balance = wallet_snapshot_result
-                    .as_ref()
-                    .ok()
-                    .map(|snapshot| snapshot.total_balance);
-                let wallet_balance_error =
-                    wallet_snapshot_result.as_ref().err().map(String::as_str);
-                print_mining_console_status(
-                    &wallet_address,
-                    runtime_chain_height,
-                    node.connected_peer_count(),
-                    runtime_mining_enabled || mining_active,
-                    runtime_mining_state.estimated_hashrate_hps,
-                    wallet_balance,
-                    wallet_balance_error,
-                    session_mined_blocks,
-                    session_mined_rewards,
-                    &last_event,
-                );
+                if network.is_quantic() {
+                    print_quantic_console_status(
+                        runtime_chain_height,
+                        node.connected_peer_count(),
+                        &last_event,
+                    );
+                } else {
+                    // Reuses the dashboard's own 30s-TTL wallet snapshot cache, so
+                    // this doesn't re-run the (Argon2-backed) wallet decrypt on
+                    // every console tick -- same fix as the earlier CPU-pegging
+                    // dashboard bug, just shared rather than re-triggered here.
+                    let wallet_snapshot_result = load_wallet_runtime_snapshot_for_dashboard(
+                        &storage,
+                        &wallet_address,
+                        password.as_deref(),
+                        network,
+                    );
+                    let wallet_balance = wallet_snapshot_result
+                        .as_ref()
+                        .ok()
+                        .map(|snapshot| snapshot.total_balance);
+                    let wallet_balance_error =
+                        wallet_snapshot_result.as_ref().err().map(String::as_str);
+                    print_mining_console_status(
+                        &wallet_address,
+                        runtime_chain_height,
+                        node.connected_peer_count(),
+                        runtime_mining_enabled || mining_active,
+                        runtime_mining_state.estimated_hashrate_hps,
+                        wallet_balance,
+                        wallet_balance_error,
+                        session_mined_blocks,
+                        session_mined_rewards,
+                        &last_event,
+                    );
+                }
                 next_console_status_at = now_console + Duration::from_secs(6);
                 last_console_session_blocks = session_mined_blocks;
             }

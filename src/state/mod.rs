@@ -275,9 +275,14 @@ impl StateManager {
         Arc::clone(&self.storage)
     }
 
-    /// Returns the chain ID this node is running on.
+    /// Returns the chain ID this node is running on: the one it chose at
+    /// startup (`StartupStatusState::set_chain_context`). Zenith while none
+    /// was chosen, as before there was more than one network. Fixed to Zenith,
+    /// a Zoka Quantic node answered its API as if it were a Zenith node.
     pub async fn chain_id(&self) -> String {
-        crate::economics::MAINNET_CHAIN_ID.to_string()
+        crate::api::global_startup_status()
+            .chain_id()
+            .unwrap_or_else(|| crate::economics::MAINNET_CHAIN_ID.to_string())
     }
 
     fn load_state_snapshot_from_storage(storage: &RocksDbStorage) -> Result<State, StateError> {
