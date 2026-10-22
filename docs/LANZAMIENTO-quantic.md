@@ -65,14 +65,29 @@ Qué es postcuántico hoy y qué no:
 **Pasos de Claude:**
 
 3. Génesis: `zoka quantic-genesis --network quantic-testnet --premine-to <dirección>
-   --out docs/quantic-testnet-genesis.v1.json` (RandomX a 14 bits).
+   --out docs/quantic-testnet-genesis.v1.json` (RandomX a 14 bits). Lleva la
+   hora en que se crea y la dificultad ASERT se ancla ahí: si hasta el primer
+   bloque minado pasan horas, los primeros salen al piso de 12 bits hasta
+   alcanzar el horario de 120 s. En la testnet no rompe nada; en la mainnet el
+   génesis se crea justo antes de lanzar.
 4. Fijar en `src/economics.rs`: `QUANTIC_TESTNET_GENESIS` (hash del bloque y
    dirección), y las dos públicas de la autoridad en `CHECKPOINT_AUTHORITY_KEYS`
-   y `CHECKPOINT_AUTHORITY_MLDSA_KEYS` para `zoka-quantic-testnet-v1`.
+   y `CHECKPOINT_AUTHORITY_MLDSA_KEYS` para `zoka-quantic-testnet-v1`; el
+   manifiesto de la testnet pasa de `pre-genesis` a `active`. Los pasos 3 y 4
+   los hace `python scripts/lanzar-testnet-quantic.py <zoka.exe> <dirección>
+   <pública Ed25519> <pública ML-DSA>` (solo datos públicos; revisa todo antes
+   de escribir).
 5. Compilar los dos binarios (`zoka` y `zokahd` tienen que decir 3.0.x), correr
    las pruebas y un ensayo local: un segundo nodo importa el génesis embebido,
-   sincroniza, recibe un checkpoint híbrido (firmado con una clave de ensayo,
-   nunca con la real) y la wallet del equipo ve el premine.
+   sincroniza y recibe un checkpoint híbrido (firmado con una clave de ensayo,
+   nunca con la real). La wallet real del equipo la revisa el usuario en ZSilent.
+
+   **Ensayo general del 22/10, con wallet y autoridad descartables:** pasaron
+   los pasos 3 a 5 completos. El nodo importó el génesis del binario y minó
+   encima (la dificultad bajó de 14 a 13 bits por los 20 minutos entre génesis y
+   primer bloque), un segundo nodo lo siguió con el suministro exacto (premine +
+   12 ZKA por bloque), la wallet "equipo" vio los 5.000.000 ZKA gastables desde
+   el primer bloque y el checkpoint híbrido (versión 2, con ML-DSA) pasó.
 
    ```text
    cargo build --release --features randomx,quantic --bins
@@ -96,8 +111,14 @@ Qué es postcuántico hoy y qué no:
 
 7. Instalar el binario y ZSilent 3.0 (con su aprobación explícita, como
    siempre). La PC arranca el nodo de la testnet minando: es la primera semilla.
-8. Con la dirección onion de la PC (el servicio de ZSilent, en el puerto 28180),
-   Claude la agrega a `seed_nodes` del manifiesto de la testnet.
+8. La semilla ya está en el manifiesto (22/10): ZSilent usa una sola clave de
+   servicio onion y una sola identidad de iroh para todas las redes, así que la
+   PC publica la misma onion que tenía en Zenith
+   (`d5pk3nhesk5wlvz4f5unbhcozxgtj7u6mhagauyprjrxndzpwbaoeiid`), ahora en el
+   puerto 28180, y el mismo EndpointId de iroh (`ca7721e2…`). El manifiesto viaja
+   embebido en el binario y dentro del instalador, así que el instalador que se
+   publique ya la lleva. Falta comprobar, con la PC andando, que un segundo nodo
+   la alcanza por la onion.
 9. Pushear y publicar el release.
 
 **Cuando esté el pool postcuántico:** génesis nuevo, testnet nueva desde cero

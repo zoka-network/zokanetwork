@@ -26,8 +26,19 @@ nodos RPC públicos, aplicaba reglas de Zenith). Arreglado en `c985304b`, junto 
 la consola de minería de Quantic (decía `mining=off` y `0 block(s)` mientras
 minaba). El binario 3.0.0 de release está en `target/release` y los comandos de
 los dos pasos del usuario están probados con él en una carpeta temporal.
-`scratchpad/interop/ensayo-testnet.sh` (paso 5) ya incluye el checkpoint híbrido
-con una clave de ensayo.
+
+La semilla de la testnet ya está en el manifiesto (`fb9b732d`): ZSilent usa una
+sola onion y una sola identidad de iroh para todas las redes, así que la PC
+publica la misma onion que en Zenith (`d5pk3…`) en el puerto 28180 y el mismo
+EndpointId (`ca7721e2…`); el instalador que se publique ya la lleva. **Ensayo
+general de los pasos 3 a 5 con wallet y autoridad descartables: pasó entero**
+(génesis embebido importado, segundo nodo con suministro exacto, la wallet
+"equipo" ve los 5.000.000 ZKA, checkpoint híbrido aceptado). El guion de los
+pasos 3 y 4 quedó en el repo: `scripts/lanzar-testnet-quantic.py`. Los ensayos
+siguen fuera del repo (matan solo procesos de su carpeta):
+`C:\Users\MDERRA~1\AppData\Local\Temp\claude\c--Users-mderramus-ZOKA\44fbeb6a-61fb-49c2-ae95-13d4b284bb2d\scratchpad\interop\`
+(`ensayo-testnet.sh <carpeta del binario> <hash del génesis>`, con `TEAM_HOME`
+y `TEAM_PASSWORD` solo si la wallet es descartable, y `humo-release.sh`).
 
 **21/10: dos redes, Zenith retirada.** Pedido del usuario ("no quiero que
 se mezclen las redes"): solo existen **Zoka Quantic Testnet** y **Zoka Quantic
@@ -50,8 +61,8 @@ publicado ni instalado):
   [LANZAMIENTO-quantic.md](docs/LANZAMIENTO-quantic.md) (wallet `equipo` y
   `checkpoint-keygen --network quantic-testnet`; la dirección se lee con
   `quantic-wallet address`, las públicas vienen en la salida del keygen). Después:
-  `scratchpad/lanzar_testnet.py` (génesis + economics.rs), compilar, ensayo local
-  con un segundo nodo, instalador de ZSilent 3.0.
+  `scripts/lanzar-testnet-quantic.py` (génesis, economics.rs y manifiesto activo),
+  compilar, ensayo local con un segundo nodo, instalador de ZSilent 3.0.
 
 **21/10: decisiones del usuario.** Prioridad: terminar la cadena Zoka Quantic
 completa (arquitectura) para lanzar testnet y mainnet, y después ZSilent; ZKAPriv
