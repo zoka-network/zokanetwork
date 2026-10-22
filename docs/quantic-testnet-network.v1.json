@@ -10,7 +10,18 @@
       "tcp"
     ]
   },
-  "seed_nodes": [],
+  "seed_nodes": [
+    {
+      "label": "seed1",
+      "operator": "zoka-core",
+      "region": "community",
+      "onion": "/onion3/d5pk3nhesk5wlvz4f5unbhcozxgtj7u6mhagauyprjrxndzpwbaoeiid:28180",
+      "iroh": "ca7721e29d60af28dda8406191f6d7a98e146b95cd456392d0c2d2b996639f99",
+      "role": "seed",
+      "status": "active",
+      "note": "The team's PC, the first node of the testnet. Serverless: reachable over Tor v3 onion (no open port) and over iroh (QUIC + n0 hole-punching) for snapshot and tail-sync. Same onion and iroh identity it had on Zenith, now on the testnet's own port."
+    }
+  ],
   "public_rpc": [],
   "desktop": {
     "local_rpc_url": "http://127.0.0.1:3100"
@@ -18,8 +29,8 @@
   "snapshot_signers": [],
   "notes": [
     "Zoka Quantic testnet: Ironwood (Halo 2, no trusted setup) with X-Wing note encryption from its first block. Test coins with no value.",
-    "Pre-genesis: there is no genesis block and no seed yet. The PC of the team will be the first seed once the genesis is created.",
-    "It never mixes with Zenith: it announces its own protocol id and uses its own gossip topics.",
-    "Its nodes listen on P2P port 28180 by default (Zenith uses 28080), so one machine can run both."
+    "Pre-genesis: there is no genesis block yet. The team's PC will be the first seed once the genesis is created.",
+    "Zoka has two networks, Zoka Quantic Testnet and Zoka Quantic Mainnet. This testnet restarts from zero, with new addresses, when the fully post-quantum private pool is ready.",
+    "It never mixes with other networks: it announces its own protocol id, uses its own gossip topics and listens on P2P port 28180 by default."
   ]
 }

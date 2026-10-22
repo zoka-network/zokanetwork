@@ -20063,6 +20063,29 @@ mod tests {
         assert!(zoka::quantic::embedded_genesis_block(zoka::quantic::protocol::Network::Mainnet).is_none());
     }
 
+    // El manifiesto de la testnet trae su primera semilla, la PC del equipo:
+    // la misma onion y la misma identidad de iroh que tenía en Zenith (ZSilent
+    // usa una sola clave para cada una), en el puerto P2P de la testnet. Sin
+    // eso, quien instale ZSilent 3.0 arranca sin ningún par.
+    #[cfg(feature = "quantic")]
+    #[test]
+    fn the_quantic_testnet_manifest_carries_its_first_seed() {
+        use super::NetworkProfile;
+        let testnet = NetworkProfile::QuanticTestnet;
+        let manifest = super::parse_network_config_for(super::embedded_network_config_for(testnet), testnet)
+            .expect("the embedded Quantic testnet manifest parses");
+        assert_eq!(manifest.chain_id, zoka::economics::QUANTIC_TESTNET_CHAIN_ID);
+        assert_eq!(manifest.protocol_freeze_id, testnet.protocol_id());
+        let seeds = manifest.active_seed_candidates(false);
+        assert_eq!(seeds.len(), 1, "{:?}", seeds.iter().map(|s| &s.address).collect::<Vec<_>>());
+        assert_eq!(seeds[0].transport, "tor");
+        let port = format!(":{}", testnet.default_p2p_port());
+        assert!(seeds[0].address.starts_with("/onion3/") && seeds[0].address.ends_with(&port), "{}", seeds[0].address);
+        let iroh = manifest.iroh_snapshot_seed_ids();
+        assert_eq!(iroh.len(), 1);
+        assert_eq!(iroh[0].len(), 64);
+    }
+
     #[test]
     fn the_prefetch_window_stops_at_the_local_head() {
         // El paseo esta a cuatro bloques de engancharse: no inventar alturas
