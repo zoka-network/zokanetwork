@@ -12209,6 +12209,10 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     // NAT-friendly counterpart to libp2p gossip: a miner that can only open
     // outbound HTTP pulls pending private txs into its own pool so it can mine
     // them, even when inbound P2P gossip never reaches it.
+    // Zoka Quantic no tiene transacciones privadas de Zenith: las cuatro tareas
+    // de su cola (importar, reenviar, bajar por RPC, completar cuerpos) no
+    // corren. Verificarlas es Groth16, y en un nodo de Quantic eso es un `panic!`.
+    let zenith_private_pool = !network.is_quantic();
     let mut next_private_sidecar_import_at = tokio::time::Instant::now();
     let mut next_private_pull_at = tokio::time::Instant::now();
     // Arranca corrido un intervalo: al levantar el nodo el gossip todavia no
@@ -12980,7 +12984,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         // from the mining loop. ZSilent wallet nodes often run with --no-mine;
         // without this path, private sends can sit forever in
         // pending_private_queue while /private/pending reports zero.
-        if tokio::time::Instant::now() >= next_private_sidecar_import_at {
+        if zenith_private_pool && tokio::time::Instant::now() >= next_private_sidecar_import_at {
             if let (Some(path), Some(storage)) =
                 (db_path.as_deref(), chain_storage_outer.as_deref())
             {
@@ -13002,7 +13006,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         // Reintento de publicacion. Ver `pending_private_tx_bodies_to_regossip`:
         // sin esto, un unico gossip perdido deja la transaccion viva localmente
         // y muerta para la red, y el emisor no se entera nunca.
-        if tokio::time::Instant::now() >= next_private_regossip_at {
+        if zenith_private_pool && tokio::time::Instant::now() >= next_private_regossip_at {
             if let Some(storage) = chain_storage_outer.as_deref() {
                 let bodies =
                     pending_private_tx_bodies_to_regossip(storage, PRIVATE_TX_REGOSSIP_BATCH);
@@ -13050,7 +13054,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         // already drains into the local pending pool — this avoids fighting the
         // miner for the RocksDB write lock. Runs on every node with RPC
         // endpoints; harmless on the droplets (they re-stage what they have).
-        if tokio::time::Instant::now() >= next_private_pull_at {
+        if zenith_private_pool && tokio::time::Instant::now() >= next_private_pull_at {
             if let Some(path) = db_path.as_deref() {
                 let staged = pull_pending_private_txs_from_rpc(path, &rpc_sync_endpoints);
                 if staged > 0 {
@@ -13065,7 +13069,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         // Backfill private transaction bodies for hashes that are already
         // committed in canonical blocks. This repairs peers that synced a
         // block before ever seeing the private tx in their pending pool.
-        if tokio::time::Instant::now() >= next_private_body_pull_at {
+        if zenith_private_pool && tokio::time::Instant::now() >= next_private_body_pull_at {
             if let Some(storage) = chain_storage_outer.as_deref() {
                 let tip = storage.get_chain_height().unwrap_or(0);
                 if tip > 0 {

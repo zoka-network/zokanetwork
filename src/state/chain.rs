@@ -693,6 +693,24 @@ fn index_block_nullifiers(storage: &RocksDbStorage, block: &Block) -> Result<(),
     Ok(())
 }
 
+/// La primera regla sobre el cuerpo, antes de cualquier verificación cara.
+///
+/// En Zoka Quantic un bloque no puede traer nada de Zenith, y eso se mira antes
+/// que todo lo demás: la política de cuerpos privados de Zenith se decide por
+/// alturas de Zenith (desde la 25.570), así que, sin esto, una cadena de
+/// Quantic más alta mandaba los cuerpos privados que trajera un bloque a la
+/// verificación de Groth16. En un nodo de Quantic no está el setup de Groth16:
+/// eso era un `panic!` en el bucle del nodo, a pedido de quien minara el bloque.
+fn validate_body_policy(chain_id: &str, candidate: &Block) -> Result<(), ChainError> {
+    if crate::economics::is_quantic_chain_id(chain_id) {
+        #[cfg(feature = "quantic")]
+        crate::quantic::validate_shape(candidate).map_err(|e| ChainError::InvalidQuanticBlock(e.to_string()))?;
+        return Ok(());
+    }
+    crate::state::sync::validate_private_tx_bundle_policy_for_block(candidate)
+        .map_err(ChainError::InvalidPrivateTxBundle)
+}
+
 #[cfg(feature = "quantic")]
 type QuanticValidation = crate::quantic::ValidatedBlock;
 #[cfg(not(feature = "quantic"))]
@@ -827,8 +845,7 @@ fn apply_block_inner(
         expected_difficulty_bits: effective_expected_difficulty,
     };
     validate_pow_block(candidate, &ctx)?;
-    crate::state::sync::validate_private_tx_bundle_policy_for_block(candidate)
-        .map_err(ChainError::InvalidPrivateTxBundle)?;
+    validate_body_policy(chain_id, candidate)?;
     validate_private_nullifiers(storage, candidate, extends_head)?;
     let quantic = validate_quantic_body(storage, chain_id, candidate, &parent)?;
 
@@ -2505,5 +2522,21 @@ mod tests {
             matches!(err, ChainError::PrivateNullifierDoubleSpend { .. }),
             "expected double-spend rejection, got: {err:?}"
         );
+    }
+
+    // Un bloque de Quantic con cuerpos privados de Zenith se rechaza por su
+    // forma. No llega a la política de bundles de Zenith, que a esta altura
+    // verifica cada cuerpo con Groth16: en un nodo de Quantic, un `panic!`.
+    #[cfg(feature = "quantic")]
+    #[test]
+    fn a_quantic_block_with_zenith_private_bodies_never_reaches_groth16() {
+        let mut block = recovery_fixture_block(25_600, "candidate", "parent", Vec::new());
+        block.private_tx_hashes = vec!["ab".repeat(32)];
+        block.private_tx_bodies = vec![b"{}".to_vec()];
+
+        let err = validate_body_policy(economics::QUANTIC_TESTNET_CHAIN_ID, &block).unwrap_err();
+        assert!(matches!(err, ChainError::InvalidQuanticBlock(_)), "{err:?}");
+        let err = validate_body_policy(economics::MAINNET_CHAIN_ID, &block).unwrap_err();
+        assert!(matches!(err, ChainError::InvalidPrivateTxBundle(_)), "{err:?}");
     }
 }

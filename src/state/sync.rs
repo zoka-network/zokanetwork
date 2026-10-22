@@ -1107,14 +1107,24 @@ fn try_apply_synced_block_payload_inner(
     };
     match applied {
         Ok(head) => {
-            persist_available_private_tx_bodies(storage, &block, &response.private_tx_bodies);
+            persist_available_private_tx_bodies(
+                storage,
+                chain_id,
+                &block,
+                &response.private_tx_bodies,
+            );
             SyncOutcome::Applied(head)
         }
         Err(ChainError::BlockAlreadyKnown(hash)) => {
             // Persist bodies even when block is already known — this lets a
             // node that synced the block header earlier (without bodies)
             // backfill bodies the next time the same block re-circulates.
-            persist_available_private_tx_bodies(storage, &block, &response.private_tx_bodies);
+            persist_available_private_tx_bodies(
+                storage,
+                chain_id,
+                &block,
+                &response.private_tx_bodies,
+            );
             match storage.get_canonical_block_hash_at_height(candidate_height) {
                 Ok(Some(canonical_hash)) if canonical_hash == hash => SyncOutcome::AlreadyKnown {
                     height: candidate_height,
@@ -1541,9 +1551,17 @@ fn persist_attached_private_tx_bodies(storage: &RocksDbStorage, block: &Block, b
 
 fn persist_available_private_tx_bodies(
     storage: &RocksDbStorage,
+    chain_id: &str,
     block: &Block,
     attached_bodies: &[Vec<u8>],
 ) {
+    // Zoka Quantic no tiene cuerpos privados de Zenith. Y este camino corre
+    // también con un bloque ya conocido, sin haber validado su cuerpo: un par
+    // podía mandar el encabezado de un bloque conocido con cuerpos inventados,
+    // y verificarlos era Groth16, que en un nodo de Quantic es un `panic!`.
+    if crate::economics::is_quantic_chain_id(chain_id) {
+        return;
+    }
     persist_available_private_tx_bodies_at(
         storage,
         block,
@@ -1894,6 +1912,46 @@ mod tests {
             .expect_err("strict bundle must reject body drift");
 
         assert!(err.contains("hash does not match body"));
+    }
+
+    // Zoka Quantic no guarda cuerpos privados de Zenith, ni los que llegan con
+    // un bloque ya conocido: ese camino no valida el cuerpo del bloque, y
+    // verificarlos es Groth16, que en un nodo de Quantic es un `panic!`.
+    #[test]
+    fn a_quantic_node_never_stores_zenith_private_bodies() {
+        let mut manager = PrivateWalletManager::new();
+        manager
+            .create_private_wallet("alice")
+            .expect("alice wallet");
+        let bob = manager.create_private_wallet("bob").expect("bob wallet");
+        manager
+            .deposit_to_private_wallet("alice", 30)
+            .expect("fund alice");
+        let tx_hash = manager
+            .send_private_transaction("alice", bob, 10)
+            .expect("build private tx");
+        let tx = manager
+            .get_private_transaction(&tx_hash)
+            .expect("private tx");
+        let body = serde_json::to_vec(&tx).expect("serialize private tx");
+        let block = block_with_private_bundle(vec![tx_hash.clone()], Vec::new());
+        let (storage, _dir) = open_temp_storage();
+
+        persist_available_private_tx_bodies(
+            &storage,
+            economics::QUANTIC_TESTNET_CHAIN_ID,
+            &block,
+            std::slice::from_ref(&body),
+        );
+        assert_eq!(storage.get_private_transaction_bytes(&tx_hash).unwrap(), None);
+
+        persist_available_private_tx_bodies(
+            &storage,
+            economics::MAINNET_CHAIN_ID,
+            &block,
+            std::slice::from_ref(&body),
+        );
+        assert_eq!(storage.get_private_transaction_bytes(&tx_hash).unwrap(), Some(body));
     }
 
     #[test]

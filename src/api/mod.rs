@@ -3715,12 +3715,28 @@ async fn post_private_view_scan_key(
     }))
 }
 
+/// Zoka Quantic no tiene transacciones privadas de Zenith. Sus pruebas son de
+/// Groth16, y en un nodo de Quantic no está el setup: verificarlas o armarlas
+/// es un `panic!`. La ruta responde como lo que es en esta red: inexistente.
+async fn reject_zenith_private_route_on_quantic(
+    app_state: &AppState,
+) -> Result<(), (StatusCode, String)> {
+    if crate::economics::is_quantic_chain_id(&app_state.state_manager.chain_id().await) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Zenith private transactions do not exist on Zoka Quantic; use /quantic/tx".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Archive a canonical private transaction body so future wallet restores can
 /// replay confirmed private history from a public RPC node.
 async fn post_private_tx_body(
     State(app_state): State<Arc<AppState>>,
     Json(tx): Json<PrivateTransaction>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    reject_zenith_private_route_on_quantic(&app_state).await?;
     let hash_owned: String = tx.tx_hash.trim().to_owned();
     let hash = hash_owned.as_str();
     if hash.is_empty()
@@ -4430,6 +4446,7 @@ async fn send_from_seed(
                 .to_string(),
         ));
     }
+    reject_zenith_private_route_on_quantic(&app_state).await?;
 
     // â”€â”€ Validate inputs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if req.amount_atoms == 0 {

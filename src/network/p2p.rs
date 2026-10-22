@@ -242,6 +242,49 @@ pub fn active_protocol_id() -> &'static str {
     NETWORK_PROTOCOL.get().map(|(id, _)| *id).unwrap_or(PROTOCOL_FREEZE_ID)
 }
 
+/// Lo que un proceso de Quantic no deja entrar: los mensajes que solo existen
+/// en Zenith y los cuerpos privados de Zenith pegados a una respuesta de
+/// bloque. Sus pruebas son de Groth16, y en un nodo de Quantic no está el
+/// setup de Groth16: verificarlas es un `panic!` en el bucle del nodo. Se
+/// cortan en la entrada, antes de que nada las mire.
+fn quantic_message_gate(message: &ZokaMessage) -> Result<(), &'static str> {
+    if is_zenith_only_message(message) {
+        return Err("Zenith-only message on a Quantic network");
+    }
+    if let ZokaMessage::BlockResponse(response) = message {
+        if !response.private_tx_bodies.is_empty() {
+            return Err("Zenith private tx bodies on a Quantic network");
+        }
+    }
+    Ok(())
+}
+
+/// Sin comodín a propósito: un mensaje nuevo obliga a decidir de qué red es.
+fn is_zenith_only_message(message: &ZokaMessage) -> bool {
+    match message {
+        ZokaMessage::Transaction(_)
+        | ZokaMessage::PrivateTransaction(_)
+        | ZokaMessage::PrivateTxAnnounce(_)
+        | ZokaMessage::StemPrivateTransaction(_)
+        | ZokaMessage::PrivateMixerBatch(_)
+        | ZokaMessage::Pbft(_)
+        | ZokaMessage::UserRegistry { .. }
+        | ZokaMessage::UserQuery { .. }
+        | ZokaMessage::UserQueryResponse { .. }
+        | ZokaMessage::TeamAdvertise(_)
+        | ZokaMessage::TeamJoin(_)
+        | ZokaMessage::ShareSubmit(_)
+        | ZokaMessage::TurnUpdate(_) => true,
+        ZokaMessage::BlockRequest { .. }
+        | ZokaMessage::BlockResponse(_)
+        | ZokaMessage::BlockAnnounce(_)
+        | ZokaMessage::SyncState(_)
+        | ZokaMessage::Ping(_)
+        | ZokaMessage::SignedCheckpoint(_)
+        | ZokaMessage::QuanticTransaction { .. } => false,
+    }
+}
+
 fn topic_name(zenith_name: &str) -> String {
     match NETWORK_PROTOCOL.get() {
         Some((_, prefix)) => format!("{prefix}/{}", zenith_name.trim_start_matches("zoka/")),
@@ -1535,6 +1578,9 @@ impl Node {
     }
 
     fn validate_inbound_message(&self, message: &ZokaMessage) -> Result<(), &'static str> {
+        if NETWORK_PROTOCOL.get().is_some() {
+            quantic_message_gate(message)?;
+        }
         match message {
             ZokaMessage::PrivateTransaction(tx) => {
                 if !Self::is_private_tx_well_formed(tx) {
@@ -6428,6 +6474,48 @@ mod tests {
         assert!(node
             .validate_inbound_message(&ZokaMessage::PrivateTransaction(tx))
             .is_err());
+    }
+
+    // Un proceso de Quantic descarta en la entrada todo lo de Zenith: sus
+    // pruebas son de Groth16 y ahí no está el setup (verificarlas es un
+    // panic). Lo común y lo de Quantic sigue de largo.
+    #[test]
+    fn a_quantic_process_drops_zenith_messages_before_verifying_them() {
+        for message in [
+            ZokaMessage::PrivateTransaction(sample_private_tx("tx-zenith")),
+            ZokaMessage::UserQuery {
+                username: "alice".to_string(),
+            },
+        ] {
+            assert!(quantic_message_gate(&message).is_err(), "{message:?}");
+        }
+        let response = |private_tx_bodies: Vec<Vec<u8>>| {
+            ZokaMessage::BlockResponse(BlockResponseMessage {
+                block_height: 1,
+                encrypted_block: Vec::new(),
+                block_hash: "h".to_string(),
+                difficulty_bits: None,
+                private_tx_bodies,
+                timestamp: 1,
+            })
+        };
+        assert!(quantic_message_gate(&response(vec![b"{}".to_vec()])).is_err());
+        for message in [
+            response(Vec::new()),
+            ZokaMessage::BlockRequest {
+                block_height: 1,
+                block_hash: None,
+            },
+            ZokaMessage::Ping(PingMessage {
+                nonce: 1,
+                timestamp: 1,
+            }),
+            ZokaMessage::QuanticTransaction {
+                tx_hex: "00".to_string(),
+            },
+        ] {
+            assert!(quantic_message_gate(&message).is_ok(), "{message:?}");
+        }
     }
 
     // Esta prueba describe la configuracion de consenso, donde estas
