@@ -44,23 +44,39 @@ Qué es postcuántico hoy y qué no:
 **Pasos del usuario, en la PC** (con el `zoka.exe` nuevo: hasta que se instale,
 `C:\Users\mderramus\ZOKA\target\release\zoka.exe`):
 
-1. Wallet del equipo de la testnet (recibe el premine de prueba):
+1. Wallet del equipo de la testnet (recibe el premine de prueba). La contraseña
+   se pide dos veces sin mostrarla y llega al comando por una variable de
+   entorno que se borra al terminar. `--password-stdin` no sirve escrito a mano:
+   lee hasta el fin de la entrada (Ctrl+Z y Enter), no hasta el Enter, y lo que
+   se escribe queda a la vista.
 
-   ```text
-   zoka quantic-wallet new --network quantic-testnet --name equipo --password-stdin
+   ```powershell
+   $a = Read-Host "Contraseña nueva" -AsSecureString
+   $b = Read-Host "Repetila" -AsSecureString
+   $pa = [System.Net.NetworkCredential]::new('', $a).Password
+   $pb = [System.Net.NetworkCredential]::new('', $b).Password
+   if ($pa -ceq $pb -and $pa.Length -ge 8) { $env:ZOKA_EQUIPO_PW = $pa; zoka quantic-wallet new --network quantic-testnet --name equipo --password-env ZOKA_EQUIPO_PW; Remove-Item Env:ZOKA_EQUIPO_PW } else { "No coinciden o tiene menos de 8 caracteres: no se creó nada." }
+   Remove-Variable a, b, pa, pb
    ```
 
-   Anotar la frase de 24 palabras en papel, fuera de la PC. Pasarle a Claude la
-   **dirección** (`zqtest1…`), que es pública.
+   Anotar la frase de 24 palabras en papel, fuera de la PC, y limpiar la
+   terminal (`Clear-Host`); esa salida no se comparte. Pasarle a Claude la
+   **dirección** (`zqtest1…`), que es pública:
+
+   ```powershell
+   zoka quantic-wallet address --network quantic-testnet --name equipo | Out-File -Encoding utf8 $env:USERPROFILE\Desktop\testnet-direccion.txt
+   ```
+
 2. Clave de la autoridad de la testnet (las dos mitades):
 
-   ```text
-   zoka checkpoint-keygen --network quantic-testnet
+   ```powershell
+   zoka checkpoint-keygen --network quantic-testnet | Out-File -Encoding utf8 $env:USERPROFILE\Desktop\testnet-autoridad.txt
    ```
 
    Quedan en `%APPDATA%\Zoka\.zoka\quantic-testnet\`. Respaldar los dos archivos
    (`checkpoint-authority.key` y `checkpoint-authority-mldsa.key`) fuera de la
-   PC. Pasarle a Claude las dos **claves públicas** que imprime.
+   PC. El archivo del Escritorio tiene solo las dos **claves públicas** (y dónde
+   quedaron las privadas): ese es el que lee Claude.
 
 **Pasos de Claude:**
 
