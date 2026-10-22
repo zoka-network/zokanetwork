@@ -7498,10 +7498,22 @@ fn choose_best_snapshot_offer(
 /// Pull a snapshot from a peer's iroh endpoint. Runs off the main loop: the
 /// transfer is slow and purely network-bound, and stalling the loop on it
 /// would drop gossip and peer keepalives.
+/// El preset de iroh del nodo: el de n0 y, con `pq-experimental`, TLS híbrido
+/// postcuántico (X25519MLKEM768) cuando el proceso sigue una red de Quantic.
+#[cfg(feature = "pq-experimental")]
+fn iroh_preset() -> zoka::network::pq_tls::NodePreset {
+    zoka::network::pq_tls::NodePreset
+}
+
+#[cfg(not(feature = "pq-experimental"))]
+fn iroh_preset() -> iroh::endpoint::presets::N0 {
+    iroh::endpoint::presets::N0
+}
+
 async fn fetch_peer_snapshot(endpoint_id: iroh::EndpointId) -> Result<(String, Vec<u8>), String> {
     let fetch = zoka::network::iroh_snapshot_transfer::fetch_snapshot(
         endpoint_id.into(),
-        iroh::endpoint::presets::N0,
+        iroh_preset(),
     );
     match tokio::time::timeout(Duration::from_secs(180), fetch).await {
         Ok(Ok(bytes)) => Ok((endpoint_id.to_string(), bytes)),
@@ -19150,7 +19162,7 @@ async fn maybe_bootstrap_from_iroh(
         );
         let fetch = zoka::network::iroh_snapshot_transfer::fetch_snapshot(
             endpoint_id.into(),
-            iroh::endpoint::presets::N0,
+            iroh_preset(),
         );
         let bytes = match tokio::time::timeout(Duration::from_secs(120), fetch).await {
             Ok(Ok(b)) => b,
@@ -19272,7 +19284,7 @@ async fn maybe_iroh_head_sync(
         // Cheap staleness probe first.
         let head_fut = zoka::network::iroh_snapshot_transfer::fetch_head(
             endpoint_id.into(),
-            iroh::endpoint::presets::N0,
+            iroh_preset(),
         );
         let seed_head = match tokio::time::timeout(Duration::from_secs(8), head_fut).await {
             Ok(Ok(h)) => h,
@@ -19285,7 +19297,7 @@ async fn maybe_iroh_head_sync(
         let want = ((seed_head - local_height).min(MAX_BLOCKS_PER_TICK as u64)) as u32;
         let blocks_fut = zoka::network::iroh_snapshot_transfer::fetch_block_range(
             endpoint_id.into(),
-            iroh::endpoint::presets::N0,
+            iroh_preset(),
             local_height + 1,
             want,
         );
@@ -19368,7 +19380,7 @@ async fn maybe_serve_iroh_snapshot(
     let endpoint = match zoka::network::iroh_snapshot_transfer::serve_chain(
         source,
         key,
-        iroh::endpoint::presets::N0,
+        iroh_preset(),
     )
     .await
     {
@@ -19457,7 +19469,7 @@ fn cmd_snapshot_fetch_iroh(args: &[String]) -> Result<(), String> {
         rt.block_on(async move {
             zoka::network::iroh_snapshot_transfer::fetch_snapshot(
                 endpoint_id.into(),
-                iroh::endpoint::presets::N0,
+                iroh_preset(),
             )
             .await
             .map_err(|e| format!("iroh snapshot fetch failed: {e}"))

@@ -53,7 +53,7 @@ mobile = []
 # Apagada por defecto: compilarla no cambia consenso, direcciones ni wallets,
 # y el .so de la wallet movil (que usa `mobile` sin default features) no la
 # arrastra. Solo expone `zoka::pq` para pruebas y trabajo de integracion.
-pq-experimental = ["dep:zoka-pq"]
+pq-experimental = ["dep:zoka-pq", "dep:rustls"]
 # Zoka Quantic (etapa 5): perfil de red `quantic-testnet` con el circuito de
 # Ironwood (crate orchard) y el cifrado de notas X-Wing (crates/zoka-quantic).
 # Arrastra orchard y Halo 2. Implica pq-experimental (firmas hibridas de la
@@ -124,6 +124,9 @@ fs4 = "0.8"
 # Ver la feature `pq-experimental`. Tiene su propio Cargo.lock para compilarse
 # suelta en el telefono; dentro del nodo manda el Cargo.lock de la raiz.
 zoka-pq = { path = "crates/zoka-pq", optional = true }
+# El TLS híbrido postcuántico de iroh (src/network/pq_tls.rs): la misma rustls
+# que ya trae iroh, con el proveedor de ring.
+rustls = { version = "0.23.46", optional = true, default-features = false, features = ["ring", "std"] }
 # Ver la feature `quantic`. Tiene su propio Cargo.lock para compilarse suelta;
 # dentro del nodo manda el Cargo.lock de la raiz.
 zoka-quantic = { path = "crates/zoka-quantic", optional = true }

@@ -31,7 +31,7 @@ daría Shor (ver «Atacante cuántico simulado»).
 | **Compromisos de notas y árbol** | Sinsemilla | dentro de `orchard` | Logaritmo discreto | Abrir un compromiso a otra nota | **Abierto** |
 | Direcciones | Orchard (`pk_d = [ivk]·g_d`) + clave X-Wing | `crates/zoka-quantic/src/address.rs` | Logaritmo discreto en la parte Orchard | Sacar la `ivk` de una dirección; no alcanza para leer notas, que van con X-Wing | Abierto en parte |
 | Transporte P2P | `libp2p-noise` (`snow`, X25519), identidad Ed25519 | `src/network/p2p.rs` | Logaritmo discreto | Descifrar tráfico grabado: qué nodo mandó primero cada tx (metadatos, no fondos). Suplantar un nodo, sin tocar el consenso | **Abierto** |
-| Snapshots por iroh | QUIC (`noq`) con `rustls` + `ring` | iroh | Logaritmo discreto | Igual que arriba; lo que viaja (la cadena) es público y va firmado | Abierto, impacto bajo |
+| Snapshots por iroh | QUIC (`noq`) con `rustls` + `ring` y el grupo híbrido X25519MLKEM768 propio | `src/network/pq_tls.rs` | Redes (ML-KEM) + logaritmo discreto | Nada mientras ML-KEM aguante: el secreto de la sesión lleva las dos mitades | **Cerrado** en las redes de Quantic (Zenith sigue con X25519) |
 | Tor (Arti) | ntor (X25519) | `zkapriv`, ZSilent | Logaritmo discreto | Desanonimizar circuitos grabados | Depende del proyecto Tor |
 
 Lo que solo usa Zenith (`bulletproofs`, `merlin`, `bls12_381`/Groth16,
@@ -64,11 +64,11 @@ pool nuevo antes de la mainnet.
    pruebas y el tiempo en el teléfono de 32 bits, y pasar por auditoría externa.
 2. **Direcciones**: en el pool nuevo, solo hashes y la clave X-Wing; no queda nada
    del que sacar una clave de visión.
-3. **Transporte**: para iroh, el grupo híbrido X25519MLKEM768 como proveedor de
-   `rustls` propio (rustls 0.23 solo lo trae con aws-lc-rs; tenemos `ml-kem` y
-   `x25519-dalek`). iroh 1.3 lo admite: `Endpoint::builder().crypto_provider(...)`
-   recibe el proveedor de `ring` con ese grupo primero en `kx_groups` y X25519
-   detrás, así un nodo viejo sigue conectando con el clásico. Para libp2p no hay Noise postcuántico: evaluar QUIC con el
+3. **Transporte**: iroh ya está cerrado (21/10, `src/network/pq_tls.rs`): el
+   grupo X25519MLKEM768 sobre el proveedor de `ring`, primero en `kx_groups`, con
+   X25519 detrás y la mitad clásica ofrecida aparte, así un par viejo sigue
+   conectando. Probado por QUIC real: con los dos lados híbridos se negocia el
+   grupo híbrido; con un lado clásico, la conexión sigue. Para libp2p no hay Noise postcuántico: evaluar QUIC con el
    mismo proveedor, o un handshake híbrido propio. Identidad de los nodos: al
    final, no toca fondos.
 4. **Tor**: seguir lo que haga el proyecto Tor; no está en nuestras manos.

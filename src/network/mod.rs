@@ -16,6 +16,8 @@ pub mod iroh_snapshot_transfer;
 pub mod message;
 pub mod p2p;
 pub mod peer_store;
+#[cfg(feature = "pq-experimental")]
+pub mod pq_tls;
 pub mod private_tx_request_response;
 pub mod quantic_light_request_response;
 pub mod snapshot_request_response;
