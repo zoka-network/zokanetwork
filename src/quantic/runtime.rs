@@ -32,8 +32,9 @@ pub fn proving_key() -> &'static ProvingKey {
     KEY.get_or_init(zoka_quantic::verify::proving_key)
 }
 
-/// Transferencias que la API ya admitió, para publicarlas desde el bucle.
-static OUTBOUND: OnceLock<mpsc::UnboundedSender<Vec<u8>>> = OnceLock::new();
+/// Lo que la API ya admitió (transferencias, registros del directorio de
+/// direcciones), para publicarlo desde el bucle.
+static OUTBOUND: OnceLock<mpsc::UnboundedSender<ZokaMessage>> = OnceLock::new();
 
 /// Admite una transferencia que llegó por la API y la deja lista para
 /// publicarla. Devuelve su id.
@@ -48,9 +49,21 @@ pub fn submit_from_api(
         .map_err(|_| mempool::MempoolError::Storage("mempool lock poisoned".into()))?
         .insert(storage, chain_id, tx, now_secs())?;
     if let Some(outbound) = OUTBOUND.get() {
-        let _ = outbound.send(bytes.to_vec());
+        let _ = outbound.send(ZokaMessage::QuanticTransaction {
+            tx_hex: hex::encode(bytes),
+        });
     }
     Ok(txid.to_hex())
+}
+
+/// Deja un registro del directorio de direcciones listo para difundirlo.
+pub fn publish_address_record(record: &super::directory::AddressRecord) {
+    if let Some(outbound) = OUTBOUND.get() {
+        let _ = outbound.send(ZokaMessage::QuanticAddressRecord {
+            address: record.address.clone(),
+            stamp: record.stamp,
+        });
+    }
 }
 
 /// Una transferencia que llegó por la red. El gossip ya la reenvió; acá solo
@@ -186,7 +199,7 @@ pub struct QuanticRuntime {
     stop: Arc<AtomicBool>,
     next_mine_at: Instant,
     last_tip: Option<String>,
-    outbound: mpsc::UnboundedReceiver<Vec<u8>>,
+    outbound: mpsc::UnboundedReceiver<ZokaMessage>,
     status: QuanticMiningStatus,
     /// Desde cuándo se busca el bloque que sigue a la punta (para el tiempo de
     /// resolución). `None` mientras no se mina.
@@ -312,12 +325,9 @@ impl QuanticRuntime {
         }
 
         // 1. Lo que entró por la API sale a la red.
-        while let Ok(bytes) = self.outbound.try_recv() {
-            let message = ZokaMessage::QuanticTransaction {
-                tx_hex: hex::encode(&bytes),
-            };
+        while let Ok(message) = self.outbound.try_recv() {
             if let Err(error) = node.publish_message(&message) {
-                outcome.events.push(format!("Quantic transaction not published yet: {error}"));
+                outcome.events.push(format!("Quantic message not published yet: {error}"));
             }
         }
 

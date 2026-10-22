@@ -11,17 +11,26 @@
 //! - `GET /quantic/mining`: el minero de este nodo (encendido, hilos,
 //!   hashrate, bloques propios y cuándo maduran).
 //!
+//! - `POST /quantic/address` con `{"address": "...", "stamp": n}`: publica una
+//!   dirección completa en el directorio de direcciones cortas
+//!   ([`super::directory`]) y sale a la red. Sin `stamp`, el sello lo busca el
+//!   nodo (unos segundos) o usa el que ya tenía guardado.
+//! - `GET /quantic/address/<corta>`: la dirección completa de una corta, si
+//!   este nodo la tiene.
+//!
 //! Info y bloques compactos salen de [`super::light`], lo mismo que reciben
 //! los teléfonos por la red P2P.
 
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
+use zoka_quantic::{QuanticAddress, QuanticShortAddress};
 
+use super::directory::{self, AddressRecord, DirectoryError};
 use super::{light, mempool, runtime, GENESIS_HEIGHT};
 use crate::api::AppState;
 use crate::storage::RocksDbStorage;
@@ -51,6 +60,79 @@ pub fn routes(router: Router<Arc<AppState>>) -> Router<Arc<AppState>> {
         .route("/quantic/blocks", get(get_blocks))
         .route("/quantic/compact", get(get_compact))
         .route("/quantic/mining", get(get_mining))
+        .route("/quantic/address", post(post_address))
+        .route("/quantic/address/:short", get(get_address))
+}
+
+#[derive(Deserialize)]
+struct PublishAddressBody {
+    address: String,
+    /// Sin sello lo busca el nodo, o usa el que ya tenía guardado.
+    stamp: Option<u64>,
+}
+
+fn directory_error(error: DirectoryError) -> ApiError {
+    match error {
+        DirectoryError::Address(_) | DirectoryError::Stamp => (StatusCode::BAD_REQUEST, error.to_string()),
+        DirectoryError::Full => (StatusCode::INSUFFICIENT_STORAGE, error.to_string()),
+        DirectoryError::Storage(_) => internal(error),
+    }
+}
+
+async fn post_address(
+    State(app_state): State<Arc<AppState>>,
+    Json(body): Json<PublishAddressBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let chain_id = chain_id()?;
+    let network = super::network_for_chain(&chain_id).ok_or_else(|| internal("unknown chain"))?;
+    let storage = app_state.state_manager.raw_storage();
+    // Buscar un sello son unos segundos de Argon2: fuera del hilo de la API.
+    let result = tokio::task::spawn_blocking(move || {
+        let full = QuanticAddress::decode_for(body.address.trim(), network).map_err(DirectoryError::Address)?;
+        let record = match body.stamp {
+            Some(stamp) => AddressRecord {
+                address: full.encode(),
+                stamp,
+            },
+            None => match directory::lookup_record(&storage, &full.short())? {
+                Some((_, stored)) => stored,
+                None => AddressRecord::new(&full),
+            },
+        };
+        let (short, new) = directory::store(&storage, network, &record)?;
+        Ok::<_, DirectoryError>((short, new, record))
+    })
+    .await
+    .map_err(internal)?;
+    let (short, new, record) = result.map_err(directory_error)?;
+    // Sale a la red aunque ya estuviera: volver a publicar es como se entera un
+    // nodo que llegó después.
+    runtime::publish_address_record(&record);
+    Ok(Json(serde_json::json!({
+        "short_address": short.encode(),
+        "new": new,
+    })))
+}
+
+async fn get_address(
+    State(app_state): State<Arc<AppState>>,
+    Path(short): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let chain_id = chain_id()?;
+    let network = super::network_for_chain(&chain_id).ok_or_else(|| internal("unknown chain"))?;
+    let short = QuanticShortAddress::decode_for(short.trim(), network)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let storage = app_state.state_manager.raw_storage();
+    match directory::lookup(&storage, &short).map_err(directory_error)? {
+        Some(full) => Ok(Json(serde_json::json!({
+            "short_address": short.encode(),
+            "address": full.encode(),
+        }))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            "this node does not know that short address".to_string(),
+        )),
+    }
 }
 
 /// La dificultad del próximo bloque: el objetivo compacto, sus bits de ceros

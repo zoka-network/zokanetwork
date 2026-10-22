@@ -183,6 +183,9 @@ impl MessageHandler for DefaultMessageHandler {
                 let mut stats = self.stats.write().await;
                 stats.transactions += 1;
             }
+            ZokaMessage::QuanticAddressRecord { address, .. } => {
+                info!("Quantic address record received: {} chars", address.len());
+            }
         }
 
         let mut count = self.processed_count.write().await;

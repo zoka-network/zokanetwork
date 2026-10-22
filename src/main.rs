@@ -8226,6 +8226,18 @@ async fn handle_fullnode_network_message(
         zoka::network::message::ZokaMessage::QuanticTransaction { tx_hex } => {
             zoka::quantic::runtime::accept_network_transaction(storage?, chain_id, tx_hex, source)
         }
+        #[cfg(feature = "quantic")]
+        zoka::network::message::ZokaMessage::QuanticAddressRecord { address, stamp } => {
+            zoka::quantic::directory::accept_network_record(
+                storage?,
+                chain_id,
+                zoka::quantic::directory::AddressRecord {
+                    address: address.clone(),
+                    stamp: *stamp,
+                },
+                source,
+            )
+        }
         zoka::network::message::ZokaMessage::PrivateTransaction(message_tx) => {
             // Persist the gossiped private tx body + mark it pending in
             // local storage so the local miner picks it up at its next

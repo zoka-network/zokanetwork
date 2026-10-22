@@ -83,6 +83,9 @@ pub enum ZokaMessage {
     /// `crates/zoka-quantic`, en hex (unos 22 KB con 2 acciones). Solo circula
     /// en las redes de Quantic, que usan sus propios tópicos.
     QuanticTransaction { tx_hex: String },
+    /// Zoka Quantic: una dirección completa para el directorio de direcciones
+    /// cortas (`quantic::directory`), con su sello de trabajo. Solo en Quantic.
+    QuanticAddressRecord { address: String, stamp: u64 },
     /// Respuesta de consulta (sin exponer metadata sensible)
     UserQueryResponse {
         username: String,
@@ -429,6 +432,7 @@ impl ZokaMessage {
             ZokaMessage::TurnUpdate(message) => message.timestamp,
             ZokaMessage::SignedCheckpoint(_) => 0,
             ZokaMessage::QuanticTransaction { .. } => 0,
+            ZokaMessage::QuanticAddressRecord { .. } => 0,
             ZokaMessage::UserRegistry { .. } => 0,
             ZokaMessage::UserQuery { .. } => 0,
             ZokaMessage::UserQueryResponse { .. } => 0,

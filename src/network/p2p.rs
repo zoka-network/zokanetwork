@@ -206,6 +206,9 @@ pub const QUANTIC_TESTNET_TOPIC_PREFIX: &str = "zoka-quantic-testnet";
 pub const QUANTIC_REGTEST_TOPIC_PREFIX: &str = "zoka-quantic-regtest";
 /// Una transferencia de Quantic de 64 acciones pesa unos 270 KB; en hex, el doble.
 const QUANTIC_TX_HEX_MAX: usize = 2 * 300 * 1024;
+/// El largo máximo de una dirección de Quantic (`MAX_ADDRESS_CHARS` del crate,
+/// que esta build puede no tener).
+const QUANTIC_ADDRESS_MAX_CHARS: usize = 1800;
 
 /// El protocolo y el prefijo de tópicos de una red de Quantic por su nombre
 /// (`quantic-testnet`, `quantic-regtest`), para quien no es el binario del
@@ -281,7 +284,8 @@ fn is_zenith_only_message(message: &ZokaMessage) -> bool {
         | ZokaMessage::SyncState(_)
         | ZokaMessage::Ping(_)
         | ZokaMessage::SignedCheckpoint(_)
-        | ZokaMessage::QuanticTransaction { .. } => false,
+        | ZokaMessage::QuanticTransaction { .. }
+        | ZokaMessage::QuanticAddressRecord { .. } => false,
     }
 }
 
@@ -1716,6 +1720,19 @@ impl Node {
                     || !tx_hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
                 {
                     return Err("malformed quantic transaction");
+                }
+            }
+            ZokaMessage::QuanticAddressRecord { address, .. } => {
+                // La forma; el sello (unos milisegundos de Argon2) lo verifica
+                // el directorio, con presupuesto por par.
+                if NETWORK_PROTOCOL.get().is_none() {
+                    return Err("quantic address record on a non-Quantic network");
+                }
+                if address.is_empty()
+                    || address.len() > QUANTIC_ADDRESS_MAX_CHARS
+                    || !address.is_ascii()
+                {
+                    return Err("malformed quantic address record");
                 }
             }
             ZokaMessage::BlockRequest { .. } | ZokaMessage::Ping(_) => {}
@@ -6512,6 +6529,10 @@ mod tests {
             }),
             ZokaMessage::QuanticTransaction {
                 tx_hex: "00".to_string(),
+            },
+            ZokaMessage::QuanticAddressRecord {
+                address: "zqtest1".to_string(),
+                stamp: 1,
             },
         ] {
             assert!(quantic_message_gate(&message).is_ok(), "{message:?}");

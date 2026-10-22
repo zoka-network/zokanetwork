@@ -33,6 +33,7 @@ pub use zoka_quantic as protocol;
 
 pub mod api;
 pub mod difficulty;
+pub mod directory;
 pub mod light;
 pub mod mempool;
 pub mod miner;
