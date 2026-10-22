@@ -206,6 +206,9 @@ pub struct QuanticRuntime {
     searching_since: Option<Instant>,
     solve_secs_total: f64,
     hash_sample: (Instant, u64),
+    /// Cuándo se vuelven a difundir las direcciones publicadas desde este nodo
+    /// (`directory::local_records`).
+    next_republish_at: Instant,
 }
 
 /// Lo que pasó en una vuelta.
@@ -259,6 +262,8 @@ impl QuanticRuntime {
             searching_since: None,
             solve_secs_total: 0.0,
             hash_sample: (Instant::now(), miner::total_hashes()),
+            // Unos minutos después de arrancar, cuando ya hay pares.
+            next_republish_at: Instant::now() + Duration::from_secs(120),
         })
     }
 
@@ -328,6 +333,25 @@ impl QuanticRuntime {
         while let Ok(message) = self.outbound.try_recv() {
             if let Err(error) = node.publish_message(&message) {
                 outcome.events.push(format!("Quantic message not published yet: {error}"));
+            }
+        }
+        // Las direcciones publicadas desde acá vuelven a salir cada tanto: así
+        // las aprende un nodo que se sumó después (el directorio no se
+        // sincroniza entre nodos).
+        if Instant::now() >= self.next_republish_at {
+            self.next_republish_at = Instant::now() + Duration::from_secs(super::directory::REPUBLISH_EVERY_SECS);
+            if let Some(network) = network_for_chain(&self.chain_id) {
+                let records = super::directory::local_records(storage, network);
+                let total = records.len();
+                for record in records {
+                    let _ = node.publish_message(&ZokaMessage::QuanticAddressRecord {
+                        address: record.address,
+                        stamp: record.stamp,
+                    });
+                }
+                if total > 0 {
+                    outcome.events.push(format!("Address directory: republished {total} own address(es)."));
+                }
             }
         }
 

@@ -36,6 +36,13 @@ pub const GOSSIP_RECORDS_PER_PEER_PER_MINUTE: u32 = 30;
 
 const RECORD_PREFIX: &str = "quantic:addr:";
 const COUNT_KEY: &str = "quantic:addr-count";
+/// Las direcciones que se publicaron desde la API de este nodo: el nodo las
+/// vuelve a difundir al arrancar y cada [`REPUBLISH_EVERY_SECS`], para que se
+/// enteren los nodos que llegaron después.
+const LOCAL_KEY: &str = "quantic:addr-local";
+pub const REPUBLISH_EVERY_SECS: u64 = 6 * 60 * 60;
+/// Tope de direcciones propias que se vuelven a difundir.
+const MAX_LOCAL: usize = 64;
 const STAMP_SALT: &[u8] = b"ZokaQ_AddrStampV1";
 
 /// Una dirección completa con su sello, como viaja y como se guarda.
@@ -197,6 +204,44 @@ pub fn lookup_record(
     Ok(short.matches(&full).then_some((full, record)))
 }
 
+/// Anota `short` entre las publicadas desde este nodo.
+pub fn mark_local(storage: &RocksDbStorage, short: &QuanticShortAddress) -> Result<(), DirectoryError> {
+    let mut local = local_addresses(storage, short.network())?;
+    if local.contains(short) {
+        return Ok(());
+    }
+    local.push(*short);
+    if local.len() > MAX_LOCAL {
+        local.remove(0);
+    }
+    let text: Vec<String> = local.iter().map(|short| short.encode()).collect();
+    let bytes = serde_json::to_vec(&text).map_err(storage_error)?;
+    storage.put_raw(LOCAL_KEY, bytes).map_err(storage_error)
+}
+
+/// Las direcciones publicadas desde este nodo, de la más vieja a la más nueva.
+pub fn local_addresses(storage: &RocksDbStorage, network: Network) -> Result<Vec<QuanticShortAddress>, DirectoryError> {
+    let Some(bytes) = storage.get_raw(LOCAL_KEY).map_err(storage_error)? else {
+        return Ok(Vec::new());
+    };
+    let text: Vec<String> = serde_json::from_slice(&bytes).map_err(storage_error)?;
+    Ok(text
+        .iter()
+        .filter_map(|short| QuanticShortAddress::decode_for(short, network).ok())
+        .collect())
+}
+
+/// Los registros de las direcciones publicadas desde este nodo, para volver a
+/// difundirlos.
+pub fn local_records(storage: &RocksDbStorage, network: Network) -> Vec<AddressRecord> {
+    local_addresses(storage, network)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|short| lookup_record(storage, short).ok().flatten())
+        .map(|(_, record)| record)
+        .collect()
+}
+
 /// Un registro que llegó por la red: con presupuesto por par, porque verificar
 /// el sello lleva unos milisegundos y corre en el bucle del nodo.
 pub fn accept_network_record(
@@ -303,6 +348,22 @@ mod tests {
             .unwrap();
         let borrowed = AddressRecord { address: other.encode(), stamp };
         assert_eq!(store(&storage, Network::Testnet, &borrowed), Err(DirectoryError::Stamp));
+    }
+
+    #[test]
+    fn the_node_remembers_the_addresses_published_through_it() {
+        let (storage, _dir) = storage();
+        let mine = address(Network::Testnet, 7);
+        let theirs = address(Network::Testnet, 8);
+        for full in [&mine, &theirs] {
+            store(&storage, Network::Testnet, &AddressRecord::new(full)).unwrap();
+        }
+        mark_local(&storage, &mine.short()).unwrap();
+        mark_local(&storage, &mine.short()).unwrap();
+        assert_eq!(local_addresses(&storage, Network::Testnet), Ok(vec![mine.short()]));
+        let records = local_records(&storage, Network::Testnet);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].address, mine.encode());
     }
 
     #[test]

@@ -100,6 +100,9 @@ async fn post_address(
             },
         };
         let (short, new) = directory::store(&storage, network, &record)?;
+        // Publicada desde acá: el nodo la vuelve a difundir al arrancar y cada
+        // tanto (ver `directory::REPUBLISH_EVERY_SECS`).
+        directory::mark_local(&storage, &short)?;
         Ok::<_, DirectoryError>((short, new, record))
     })
     .await
