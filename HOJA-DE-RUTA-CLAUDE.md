@@ -23,7 +23,18 @@ queda para más adelante.
 - **Rama `quantic-cadena-completa`:** perfil de mainnet, autoridad híbrida
   obligatoria, nodo con pila grande, y el minero de Quantic con control en caliente
   para ZSilent (`--no-mine` + `/mining/start|stop`, `/quantic/mining`, `/stats`,
-  `mine-status` con datos de Quantic).
+  `mine-status` con datos de Quantic). `quantic-wallet` completa para ZSilent:
+  escaneo guardado y cifrado (`<nombre>.scan`), `generate-phrase`, `list` con
+  desbloqueo, `--address`, `estimate-fee`, `show-phrase`, `change-password`,
+  `backup`/`import-backup`, `history --limit` con hora.
+- **ZSilent 3.0, rama `quantic-solo` de `zsilent-core`** (sobre `wallet-liviana`):
+  solo Quantic (testnet por omisión, prefijo `zqtest1`, P2P 28180 también en el
+  onion), `WalletService` sobre `quantic-wallet`, el nodo sin contraseña y minando
+  a `--quantic-mine-to`, enviar con memo y MAX real, recibir con QR animado,
+  historial con montos, alta de 24 palabras, sin minado en equipo. 72 pruebas y
+  una de punta a punta contra un nodo regtest (`interop/zsilent-wallet.sh`).
+  Para el release: el nodo tiene que salir como 3.0.x (mismo mayor.menor) y
+  compilarse con `--features randomx,quantic` (el script de release lo exige).
 
 **16 y 17/10: desarrollo post-cuántico en modo autónomo** (pedido del usuario:
 "enfocate en el desarrollo post quantic"; "continúa ... cuando no sepas qué hacer
