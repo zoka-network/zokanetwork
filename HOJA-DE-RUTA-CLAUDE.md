@@ -1,9 +1,71 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
-Actualizada: **22 de octubre de 2026**, Argentina (Claude).
+Actualizada: **23 de octubre de 2026**, Argentina (Claude).
 Proyecto: `C:\Users\mderramus\ZOKA`.
 
 ## Punto de partida
+
+**23/10, lo último: génesis nuevo de la testnet, XMRig mina por Stratum y
+ZSilent 3.0.2 armada (sin instalar ni publicar).** Ramas: nodo
+`quantic-direcciones-cortas`, ZSilent `direcciones-cortas`. Nada pusheado.
+
+- **Direcciones cortas** (`ee759eb1`, `d85851b1`, `a9d3c00e`, `405f1c71`): 57
+  caracteres en la testnet (`zqtest1…`), con un QR normal. El nodo tiene un
+  directorio que resuelve la corta a la completa: se publica con
+  `POST /quantic/address` (sello Argon2id) y viaja por gossip. Se paga a una
+  corta con `quantic-wallet send --to <corta>`. Diseño en
+  `docs/QUANTIC-DIRECCIONES-CORTAS.md`.
+- **PoW v2, compatible con XMRig (consenso, `dadb49dd`)**: blob de 76 bytes con
+  la forma del de Monero, nonce de 32 bits en la posición 39, extranonce en los
+  32 bits de arriba del nonce del encabezado, hash comparado en little endian.
+- **Génesis nuevo** `b7d58bf48ea5c2916922f484a138258a35f72b8e3799816ff7011d6c6a0c2aca`
+  (2026-10-23 01:38 UTC, `97d2a528`), con el premine en `zsilent-2` y la misma
+  autoridad (Ed25519 + ML-DSA-65). El del 22/10 (`1d204e81…`) se retiró
+  (`1608c129`). **La PC todavía corre 3.0.1 con el génesis viejo:** antes de
+  instalar la 3.0.2 hay que apartar (renombrar)
+  `%APPDATA%\Zoka\.zoka\quantic-testnet\blockchain.db`, con aprobación del
+  usuario y ZSilent cerrado por él.
+- **Stratum en el nodo** (`--stratum host:puerto`; `acbe6cbe`, `996ca646`):
+  `login` con dirección completa, corta o cualquier otra cosa (cobra la de
+  `--quantic-mine-to`); un login que parece dirección de otra red recibe un
+  error. Tope de 256 conexiones. `GET /quantic/stratum`. **Probado con XMRig
+  6.26.0 oficial** contra una testnet local aislada: 6 aciertos aceptados, 0
+  rechazados, 3 bloques, y la wallet cobró por su corta. Diseño y camino a los
+  pools grandes en `docs/QUANTIC-POOL-DE-MINERIA.md` (`50f7d734`). Lo siguiente
+  sería el RPC `get_block_template`/`submit_block` para el software de pools de
+  Monero. El P2Pool de Monero no sirve tal cual; uno propio, más adelante.
+- **Defender y XMRig:** lo mata por comportamiento (`Trojan:Win64/HashvaultMiner.A`,
+  ThreatID 2147978346), y una exclusión de carpeta no alcanza. Para la prueba,
+  el usuario corrió como administrador un permiso temporal. Quitarlo exige
+  `Remove-MpPreference -ThreatIDDefaultAction_Ids 2147978346
+  -ThreatIDDefaultAction_Actions 6`: sin la acción da el error 0x57, y así le
+  quedó puesto hasta que lo saque él. XMRig se borró. Mientras se tocaba
+  Defender, el clasificador de permisos bloqueó incluso lecturas: elevar o
+  tocar Defender lo hace el usuario.
+- **ZSilent** (`ffe9c8a`, `7095b92`, `b805d49`): se fue todo el minado en equipo
+  de Zenith (pantalla, Ajustes Experimental, estado, RPC, modelos y pruebas), y
+  hay una sección nueva, **Stratum**. Enciende el Stratum del nodo (solo esta PC
+  o también la red local, puerto 3333), reinicia el nodo con `--stratum` y
+  muestra mineros, aciertos y bloques. Arma la línea de XMRig con la corta
+  publicada y avisa del antivirus. 76 pruebas.
+- **Defender y `zoka.exe`:** el 02/07/2026 Defender marcó un `zoka.exe` bajado de
+  GitHub como `PUA:Win32/Caypnamer.A!ml`. Esa detección (274600) está
+  **permitida en la PC**, así que la PC no sirve para probar si un instalador
+  nuevo salta: hay que probarlo en un Windows limpio. Desde la 3.0.2, `zoka.exe`
+  y `zokahd.exe` llevan sus datos de versión (`build.rs`, `3b1d3cea`), y
+  `prepare-release.ps1` no empaqueta un binario sin ellos. Lo que de verdad lo
+  resuelve es la firma de código y avisarle a Microsoft del falso positivo en
+  cada versión: decisión y cuenta del usuario.
+- **3.0.2:** suite con `quantic` 1000+92+2+3 (antes del `build.rs`). MSI
+  `zsilent-core/build/release/3.0.2/ZSilent Core-3.0.2.msi`, SHA-256
+  `aa3f30818544171ef5638a27092b8907434b0ed6faf4d9699bb967bc1fdd7868`. El
+  `zoka.exe` de adentro (`b25eedba…`, v3.0.2) es el compilado; se verificó
+  extrayendo el MSI con `msiexec /a`. El ensayo de la testnet con ese binario
+  (`ensayo-testnet.sh`, autoridad descartable) pasó entero: génesis embebido,
+  segundo nodo con el suministro exacto (5.000.000 + 10 × 12 ZKA) y checkpoint
+  híbrido aceptado.
+- **Pendiente, con aprobación:** instalar la 3.0.2 en la PC, push, release y
+  `TESTNET_LIVE=true` en la web.
 
 **22/10, lo último: la Zoka Quantic Testnet está andando en la PC.** Génesis
 `1d204e8116f53d74302db20b943b288d141681a9be463f65a43861dd47c2d242` (11:16 UTC,
