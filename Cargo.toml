@@ -1,6 +1,6 @@
 ﻿[package]
 name = "zoka"
-version = "3.0.1"
+version = "3.0.2"
 edition = "2021"
 autobins = false
 
@@ -136,6 +136,10 @@ num-bigint = { version = "0.4", optional = true }
 [dev-dependencies]
 proptest = "1.0"
 tempfile = "3"
+
+# Los datos de versión de zoka.exe y zokahd.exe en Windows (ver build.rs).
+[build-dependencies]
+embed-resource = "3.0.12"
 
 # ----------------------------------------------------------------------------
 # Test/dev profile speedups for crypto-heavy crates.
