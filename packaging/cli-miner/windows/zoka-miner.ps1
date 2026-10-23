@@ -161,7 +161,7 @@ switch ($Command) {
     }
     "xmrig-node" {
         Say "Node with a Stratum server for XMRig on port $StratumPort; the node itself does not mine." "Cyan"
-        Say "If ZSilent's Stratum already uses that port, run this with -StratumPort 3334."
+        Say "If another program (for example ZSilent's Stratum) already uses it, pick another with -StratumPort <port>."
         Say "XMRig on this PC:  xmrig -o 127.0.0.1:$StratumPort -u <your address> -p x -a rx/0"
         Say "XMRig on another PC of your network: use this PC's local IP instead of 127.0.0.1."
         Say "Windows may ask whether zoka.exe can accept connections: allow private networks only."

@@ -143,7 +143,7 @@ case "$COMMAND" in
         ;;
     xmrig-node)
         echo "Node with a Stratum server for XMRig on port $STRATUM_PORT; the node itself does not mine."
-        echo "If ZSilent's Stratum already uses that port, run this with --stratum-port 3334."
+        echo "If another program (for example ZSilent's Stratum) already uses it, pick another with --stratum-port <port>."
         echo "XMRig on this machine:  xmrig -o 127.0.0.1:$STRATUM_PORT -u <your address> -p x -a rx/0"
         echo "XMRig on another machine of your network: use this machine's local IP instead of 127.0.0.1."
         start_node --stratum "0.0.0.0:$STRATUM_PORT" --no-mine
