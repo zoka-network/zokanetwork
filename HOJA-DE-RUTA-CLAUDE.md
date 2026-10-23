@@ -64,8 +64,22 @@ ZSilent 3.0.2 armada (sin instalar ni publicar).** Ramas: nodo
   (`ensayo-testnet.sh`, autoridad descartable) pasó entero: génesis embebido,
   segundo nodo con el suministro exacto (5.000.000 + 10 × 12 ZKA) y checkpoint
   híbrido aceptado.
-- **Pendiente, con aprobación:** instalar la 3.0.2 en la PC, push, release y
-  `TESTNET_LIVE=true` en la web.
+- **Instalada en la PC** (lo pidió el usuario; `msiexec /passive`, código 0, a
+  las 11:34) en `%LOCALAPPDATA%\ZSilent Core`, con `zoka.exe` `b25eedba…`
+  v3.0.2. Antes se apartaron, renombrándolos con el sufijo
+  `.genesis-1d204e81-20261023` y sin borrar nada, tres archivos de
+  `%APPDATA%\Zoka\.zoka\quantic-testnet`:
+  - `blockchain.db`, la cadena vieja;
+  - `quantic-wallets\zsilent-2.scan`, el escaneo de la wallet; sin apartarlo,
+    mientras la cadena nueva fuera más baja que la vieja mostraba el saldo viejo
+    como «nodo atrasado»;
+  - `user_mining_state.json`.
+
+  Las wallets, las claves de autoridad, la onion y la identidad de iroh no se
+  tocaron. La dirección corta hay que volver a publicarla: el directorio vivía
+  en la base vieja.
+- **Pendiente, con aprobación:** push, release y `TESTNET_LIVE=true` en la web.
+  Antes de publicar, probar el MSI en un Windows limpio.
 
 **22/10, lo último: la Zoka Quantic Testnet está andando en la PC.** Génesis
 `1d204e8116f53d74302db20b943b288d141681a9be463f65a43861dd47c2d242` (11:16 UTC,
