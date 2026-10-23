@@ -78,6 +78,30 @@ ZSilent 3.0.2 armada (sin instalar ni publicar).** Ramas: nodo
   Las wallets, las claves de autoridad, la onion y la identidad de iroh no se
   tocaron. La dirección corta hay que volver a publicarla: el directorio vivía
   en la base vieja.
+- **3.0.3, instalada en la PC a las 12:40** (lo pidió el usuario; sin apartar
+  nada, misma cadena). MSI `zsilent-core/build/release/3.0.3/`, SHA-256
+  `61f44c568abbd2268a993e570a5b4caeb9afce76e5aa6e938f8c08d301acfe16`; `zoka.exe`
+  `c5d1b4d5…`. Se verificó extrayendo el MSI: el logo nuevo, el código nuevo y el
+  binario. Trae:
+  - **Peerstore propio de cada red de Quantic** (`815f5e67`):
+    `peers-quantic-testnet.json`. El `~/.zoka/peers.json` era uno solo, y el
+    nodo de la testnet marcaba en cada arranque las 17 direcciones de Zenith
+    (puerto 28080) de la 2.1.
+  - **El Stratum dice si arranca o falló** (`eeb2fb2f`, ZSilent `a537054`): se
+    abre al final del arranque del nodo, cerca de un minuto después. La 3.0.2
+    mostraba «NOT LISTENING» en rojo durante ese minuto; ahora dice
+    «STARTING».
+  - **Logo nuevo de Zoka Quantic** (ZSilent `f198355`): la Z con una Q rosa
+    pixelada, desde `Downloads\zokaquantic.jpg`, con
+    `scripts/prepare-brand-assets.ps1`.
+  - **La dirección corta en toda la app** (ZSilent `88fcc1b`,
+    `ZSilentUiState.shownAddress`): Wallet, barra lateral, Mining, Ajustes,
+    Dashboard y login. La completa sigue en Receive, y la tarjeta de Wallet
+    avisa «not published».
+
+  La corta de `zsilent-2` es
+  `zqtest15MnwVgjVzRRABprTurtK7rB2tUw4V7FUyfi66Mt1zJPXuv76Bp`; hay que
+  publicarla desde Receive.
 - **Pendiente, con aprobación:** push, release y `TESTNET_LIVE=true` en la web.
   Antes de publicar, probar el MSI en un Windows limpio.
 
