@@ -120,7 +120,7 @@ fn gossip_budget_allows(source: &libp2p::PeerId, actions: u32, minute: u64) -> b
     true
 }
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -425,6 +425,26 @@ impl QuanticRuntime {
                     self.next_mine_at = Instant::now() + Duration::from_secs(10);
                 }
                 Err(error) => outcome.events.push(format!("Quantic mining task failed: {error}")),
+            }
+        }
+
+        // 3b. Lo que encontraron los mineros del Stratum (XMRig): se aplica y se
+        // publica como un bloque propio.
+        for found in super::stratum::take_found() {
+            let block = found.block;
+            match crate::state::chain::apply_block(storage, &self.chain_id, &block) {
+                Ok(head) => {
+                    let payload = serde_json::to_vec(&block).unwrap_or_default();
+                    let _ = node.publish_block_response(block.header.block_height, block.header.hash.clone(), payload);
+                    let _ = node.publish_block_announce(head.height, head.hash.clone(), head.cumulative_work.to_string(), None);
+                    let _ = node.publish_sync_state(head.height, head.hash.clone());
+                    outcome.events.push(format!(
+                        "Stratum miner found Quantic block {} ({} ZKA atoms).",
+                        head.height, found.reward_atoms
+                    ));
+                    outcome.mined = Some((head.height, head.hash));
+                }
+                Err(error) => outcome.events.push(format!("Block from the Stratum was refused: {error}")),
             }
         }
 

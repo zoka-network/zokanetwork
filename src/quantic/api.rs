@@ -62,6 +62,13 @@ pub fn routes(router: Router<Arc<AppState>>) -> Router<Arc<AppState>> {
         .route("/quantic/mining", get(get_mining))
         .route("/quantic/address", post(post_address))
         .route("/quantic/address/:short", get(get_address))
+        .route("/quantic/stratum", get(get_stratum))
+}
+
+/// El servidor Stratum de este nodo: dónde escucha, mineros y aciertos.
+async fn get_stratum() -> Result<Json<serde_json::Value>, ApiError> {
+    chain_id()?;
+    serde_json::to_value(super::stratum::status()).map(Json).map_err(internal)
 }
 
 #[derive(Deserialize)]

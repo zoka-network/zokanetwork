@@ -38,6 +38,7 @@ pub mod light;
 pub mod mempool;
 pub mod miner;
 pub mod runtime;
+pub mod stratum;
 pub mod wallet_file;
 pub mod wallet_sync;
 

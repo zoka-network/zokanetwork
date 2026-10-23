@@ -12329,6 +12329,34 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     }
     #[cfg(feature = "quantic")]
     let mut quantic_runtime = quantic_runtime_for(args, network, &chain_id, min_mine_peers)?;
+    // Stratum: XMRig mina contra este nodo (`--stratum 127.0.0.1:3333`). Cobra a
+    // la dirección del login del minero, o a la de `--quantic-mine-to`.
+    #[cfg(feature = "quantic")]
+    if let (true, Some(bind), Some(storage)) =
+        (network.is_quantic(), option_value(args, "--stratum"), chain_storage_outer.clone())
+    {
+        let bind: std::net::SocketAddr = bind
+            .trim()
+            .parse()
+            .map_err(|e| format!("--stratum: expected host:port ({e})"))?;
+        let quantic_network = zoka::quantic::network_for_chain(&chain_id)
+            .ok_or_else(|| format!("{chain_id} is not a Quantic chain"))?;
+        let default_address = match option_value(args, "--quantic-mine-to") {
+            Some(text) => Some(
+                zoka::quantic::protocol::QuanticAddress::decode_for(text.trim(), quantic_network)
+                    .map_err(|e| format!("--quantic-mine-to: {e}"))?,
+            ),
+            None => None,
+        };
+        let config = zoka::quantic::stratum::StratumConfig { bind, default_address };
+        let stratum_chain = chain_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = zoka::quantic::stratum::serve(config, storage, stratum_chain).await {
+                tracing::error!(target: "zoka.stratum", "{error}");
+            }
+        });
+        startup_notes.push(format!("Zoka Quantic: Stratum for XMRig (rx/0) on {bind}."));
+    }
     #[cfg(feature = "quantic")]
     if let Some(runtime) = quantic_runtime.as_ref() {
         startup_notes.push(if runtime.starts_enabled() {
