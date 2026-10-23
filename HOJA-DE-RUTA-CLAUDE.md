@@ -102,6 +102,22 @@ ZSilent 3.0.2 armada (sin instalar ni publicar).** Ramas: nodo
   La corta de `zsilent-2` es
   `zqtest15MnwVgjVzRRABprTurtK7rB2tUw4V7FUyfi66Mt1zJPXuv76Bp`; hay que
   publicarla desde Receive.
+- **XMRig en la PC del usuario** (12:54): 6.25.0 oficial, versión gcc, hash
+  verificado contra el `SHA256SUMS` del release. Minó por la red local
+  (`192.168.1.13:3333`) contra ZSilent 3.0.3, con la corta de `zsilent-2`: 7
+  bloques en minutos y 0 aciertos rechazados. Con la dificultad en el piso, cada
+  acierto es un bloque. El usuario había bajado primero la versión arm64, que en
+  su i5-6400 da «No coincide el tipo de máquina».
+- **ZSilent 3.0.4, armada** (`7c51a75`; MSI `zsilent-core/build/release/3.0.4/`,
+  SHA-256 `d357baae3a5e6173fdb7074e85a4dacf748021afa40da05e45303c5d78862059`;
+  nodo 3.0.3 sin cambios). Trae tres decisiones del usuario, anotadas en
+  `docs/QUANTIC-DIRECCIONES-CORTAS.md`:
+  - solo la corta a la vista;
+  - la corta se publica sola («sola y siempre»);
+  - un QR estándar, porque el de puntos redondos les costaba a los teléfonos.
+    `QrCodeReadBackTest` lo vuelve a leer con un lector de QR.
+
+  78 pruebas.
 - **Pendiente, con aprobación:** push, release y `TESTNET_LIVE=true` en la web.
   Antes de publicar, probar el MSI en un Windows limpio.
 

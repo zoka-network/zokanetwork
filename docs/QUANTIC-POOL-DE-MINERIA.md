@@ -87,6 +87,11 @@ prueba:
 - la wallet cobró los 36 ZKA de esos 3 bloques (todavía sin madurar) por su
   dirección corta.
 
+Ese mismo día, en la PC del usuario: XMRig 6.25.0 oficial (versión gcc,
+verificada contra el `SHA256SUMS` del release) minó por la red local contra
+ZSilent 3.0.3, con la dirección corta de la wallet del equipo. Encontró 7
+bloques en minutos, con 0 aciertos rechazados.
+
 Windows Defender cierra XMRig a los pocos segundos de arrancar
 (`Trojan:Win64/HashvaultMiner.A`, ThreatID 2147978346). Le pasa a cualquier
 minero de CPU; no es algo de Zoka. Una exclusión de carpeta no alcanza, porque
