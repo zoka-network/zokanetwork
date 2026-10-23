@@ -1,6 +1,6 @@
 {
   "schema": "zoka-quantic-testnet-network-v1",
-  "status": "pre-genesis",
+  "status": "active",
   "chain_id": "zoka-quantic-testnet-v1",
   "protocol_freeze_id": "/zoka-quantic-testnet/0.1.0",
   "transport_policy": {
@@ -29,7 +29,7 @@
   "snapshot_signers": [],
   "notes": [
     "Zoka Quantic testnet: Ironwood (Halo 2, no trusted setup) with X-Wing note encryption from its first block. Test coins with no value.",
-    "Pre-genesis: there is no genesis block yet. The team's PC will be the first seed once the genesis is created.",
+    "Genesis: block 1 b7d58bf48ea5c2916922f484a138258a35f72b8e3799816ff7011d6c6a0c2aca, created 2026-10-23 01:38 UTC. The team's PC is the first seed.",
     "Zoka has two networks, Zoka Quantic Testnet and Zoka Quantic Mainnet. This testnet restarts from zero, with new addresses, when the fully post-quantum private pool is ready.",
     "It never mixes with other networks: it announces its own protocol id, uses its own gossip topics and listens on P2P port 28180 by default."
   ]
