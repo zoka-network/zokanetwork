@@ -1,8 +1,23 @@
-# Direcciones cortas de Zoka Quantic (borrador de diseño)
+# Direcciones cortas de Zoka Quantic
 
 22/10/2026. Decisión del usuario: **diseñar direcciones cortas**, y con ellas
 volver a un QR normal ("al acortar las direcciones quizás podamos mantener los
-QR"). Es un borrador: nada está construido y ningún parámetro está fijo.
+QR").
+
+**Estado al 23/10/2026:** construido con la opción A (directorio en los nodos):
+formato, directorio, `quantic-wallet` y ZSilent. Ese día el usuario decidió
+además:
+
+- **Solo la corta a la vista** («¿no podemos solo tener la corta?»). La completa
+  sigue existiendo por dentro, porque lleva las claves con las que se cifra el
+  pago, pero ZSilent no la muestra. Si una wallet la pide, se copia desde
+  Ajustes > Wallets (ZSilent 3.0.4).
+- **Publicación automática, «sola y siempre»**: ZSilent publica la corta de cada
+  wallet que el nodo local no conoce, sin botón. Reemplaza al «con permiso
+  explícito al crear la wallet» del plan de abajo; el permiso es esta decisión.
+- **QR estándar**: el de puntos redondos les costaba a los teléfonos. Ahora tiene
+  módulos cuadrados, las esquinas de la norma, 4 módulos de margen, corrección M
+  (33 módulos para una corta) y cada módulo en píxeles enteros.
 
 ## El problema
 
