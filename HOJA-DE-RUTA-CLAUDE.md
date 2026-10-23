@@ -108,7 +108,8 @@ ZSilent 3.0.2 armada (sin instalar ni publicar).** Ramas: nodo
   bloques en minutos y 0 aciertos rechazados. Con la dificultad en el piso, cada
   acierto es un bloque. El usuario había bajado primero la versión arm64, que en
   su i5-6400 da «No coincide el tipo de máquina».
-- **ZSilent 3.0.4, armada** (`7c51a75`; MSI `zsilent-core/build/release/3.0.4/`,
+- **ZSilent 3.0.4, instalada en la PC** (lo pidió el usuario; código 0;
+  `7c51a75`; MSI `zsilent-core/build/release/3.0.4/`,
   SHA-256 `d357baae3a5e6173fdb7074e85a4dacf748021afa40da05e45303c5d78862059`;
   nodo 3.0.3 sin cambios). Trae tres decisiones del usuario, anotadas en
   `docs/QUANTIC-DIRECCIONES-CORTAS.md`:
