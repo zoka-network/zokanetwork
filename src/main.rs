@@ -60,7 +60,7 @@ fn print_quantic_usage() {
     println!("{}", dashboard_section("Wallet (zoka quantic-wallet <action> --network quantic-testnet)", ANSI_GREEN));
     println!("  new --name <wallet> --password-stdin            a new wallet (24-word phrase, shown once)");
     println!("  generate-phrase | restore --name <w> --phrase-env <VAR> --password-stdin");
-    println!("  list [--password-stdin] | address --name <w>");
+    println!("  list [--password-stdin] | address --name <w> [--full]   (the short address unless --full)");
     println!("  balance | history [--limit n] --name <w> --password-stdin");
     println!("  estimate-fee --amount <ZKA> | send --to <address> --amount <ZKA> [--memo <text>] --name <w> --password-stdin");
     println!("  show-phrase | change-password --new-password-env <VAR> | backup --out <file> | import-backup --file <file>");
@@ -10794,6 +10794,32 @@ fn expand_node_config_into_args(args: &[String]) -> Result<Vec<String>, String> 
     Ok(out)
 }
 
+/// La dirección de `--quantic-mine-to`: la completa, o la corta de una wallet de
+/// esta PC, que es la que muestran `quantic-wallet new` y `address` desde el
+/// 23/10/2026. Una corta ajena no sirve: para minar hace falta la completa, y la
+/// de una wallet propia está en su archivo.
+#[cfg(feature = "quantic")]
+fn quantic_mine_to_address(
+    text: &str,
+    quantic_network: zoka::quantic::protocol::Network,
+    wallets_dir: &std::path::Path,
+) -> Result<zoka::quantic::protocol::QuanticAddress, String> {
+    use zoka::quantic::protocol::{QuanticAddress, Recipient};
+    match Recipient::decode_for(text.trim(), quantic_network) {
+        Ok(Recipient::Full(full)) => Ok(full),
+        Ok(Recipient::Short(short)) => zoka::quantic::wallet_file::list_with_addresses(wallets_dir)
+            .into_iter()
+            .filter_map(|(_, address)| QuanticAddress::decode_for(&address, quantic_network).ok())
+            .find(|full| short.matches(full))
+            .ok_or_else(|| {
+                "--quantic-mine-to: that short address is not one of this computer's wallets; \
+                 pass the full one (zoka quantic-wallet address --name <wallet> --full)"
+                    .to_string()
+            }),
+        Err(error) => Err(format!("--quantic-mine-to: {error}")),
+    }
+}
+
 /// El runtime de Quantic del nodo, si el perfil es de Quantic. Con
 /// `--quantic-mine-to <dirección>` también mina (`--quantic-mine-threads` o
 /// `--threads`, `--mine-interval-secs` y `--min-mine-peers` como en Zenith).
@@ -10812,8 +10838,8 @@ fn quantic_runtime_for(
         .ok_or_else(|| format!("{chain_id} is not a Quantic chain"))?;
     let mining = match option_value(args, "--quantic-mine-to") {
         Some(text) => {
-            let address = zoka::quantic::protocol::QuanticAddress::decode_for(text.trim(), quantic_network)
-                .map_err(|e| format!("--quantic-mine-to: {e}"))?;
+            let wallets = zoka::quantic::wallet_file::wallets_dir(network.local_dir());
+            let address = quantic_mine_to_address(&text, quantic_network, &wallets)?;
             let threads = parse_u64_arg(
                 option_value(args, "--quantic-mine-threads").or_else(|| option_value(args, "--threads")),
                 default_mining_threads() as u64,
@@ -12355,11 +12381,9 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             .map_err(|e| format!("--stratum: expected host:port ({e})"))?;
         let quantic_network = zoka::quantic::network_for_chain(&chain_id)
             .ok_or_else(|| format!("{chain_id} is not a Quantic chain"))?;
+        let wallets = zoka::quantic::wallet_file::wallets_dir(network.local_dir());
         let default_address = match option_value(args, "--quantic-mine-to") {
-            Some(text) => Some(
-                zoka::quantic::protocol::QuanticAddress::decode_for(text.trim(), quantic_network)
-                    .map_err(|e| format!("--quantic-mine-to: {e}"))?,
-            ),
+            Some(text) => Some(quantic_mine_to_address(&text, quantic_network, &wallets)?),
             None => None,
         };
         let config = zoka::quantic::stratum::StratumConfig { bind, default_address };
@@ -12372,6 +12396,36 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             }
         });
         startup_notes.push(format!("Zoka Quantic: Stratum for XMRig (rx/0) on {bind}."));
+    }
+    // La dirección a la que mina el nodo va sola a su directorio, como en ZSilent
+    // (decisión del usuario del 23/10/2026: «sola y siempre»): así se le puede
+    // pagar con la corta, que es la que muestran el CLI y ZSilent. El runtime la
+    // vuelve a anunciar a los 2 minutos de arrancar y cada 6 horas. El sello son
+    // unos segundos de Argon2: fuera del arranque.
+    #[cfg(feature = "quantic")]
+    if let (true, Some(text), Some(storage)) =
+        (network.is_quantic(), option_value(args, "--quantic-mine-to"), chain_storage_outer.clone())
+    {
+        let quantic_network = zoka::quantic::network_for_chain(&chain_id)
+            .ok_or_else(|| format!("{chain_id} is not a Quantic chain"))?;
+        let wallets = zoka::quantic::wallet_file::wallets_dir(network.local_dir());
+        let full = quantic_mine_to_address(&text, quantic_network, &wallets)?;
+        tokio::task::spawn_blocking(move || {
+            use zoka::quantic::directory;
+            let result = directory::lookup_record(&storage, &full.short())
+                .and_then(|stored| {
+                    let record = match stored {
+                        Some((_, record)) => record,
+                        None => directory::AddressRecord::new(&full),
+                    };
+                    directory::store(&storage, quantic_network, &record)
+                })
+                .and_then(|(short, _)| directory::mark_local(&storage, &short).map(|()| short));
+            match result {
+                Ok(short) => tracing::info!(target: "zoka.quantic", "mining address published: {}", short.encode()),
+                Err(error) => tracing::warn!(target: "zoka.quantic", "mining address not published: {error}"),
+            }
+        });
     }
     #[cfg(feature = "quantic")]
     if let Some(runtime) = quantic_runtime.as_ref() {
@@ -15357,17 +15411,25 @@ fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
         "new" => {
             let password = required_password_value(rest)?;
             let (phrase, address) = zoka::quantic::wallet_file::create(&dir, &name, quantic_network, &password)?;
+            let short = short_address_of(&address, quantic_network)?;
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({ "name": name, "address": address, "recovery_phrase": phrase.as_str() })
+                    serde_json::json!({
+                        "name": name,
+                        "address": address,
+                        "short_address": short,
+                        "recovery_phrase": phrase.as_str(),
+                    })
                 );
             } else {
+                // Se muestra la corta, la que se comparte (decisión del 23/10/2026).
+                // La completa, con las claves, sale con `address --full`.
                 println!("Zoka Quantic wallet '{name}' created ({}).", network.display_name());
                 println!("Recovery phrase (write it down offline; it is shown only once):");
                 println!("{}", phrase.as_str());
-                println!("Address:");
-                println!("{address}");
+                println!("Address (the one you share):");
+                println!("{short}");
             }
             Ok(())
         }
@@ -15384,11 +15446,12 @@ fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
                 },
             };
             let address = zoka::quantic::wallet_file::restore(&dir, &name, quantic_network, &phrase, &password)?;
+            let short = short_address_of(&address, quantic_network)?;
             if json {
-                println!("{}", serde_json::json!({ "name": name, "address": address }));
+                println!("{}", serde_json::json!({ "name": name, "address": address, "short_address": short }));
             } else {
                 println!("Zoka Quantic wallet '{name}' restored.");
-                println!("{address}");
+                println!("{short}");
             }
             Ok(())
         }
@@ -15409,10 +15472,12 @@ fn cmd_quantic_wallet_inner(args: &[String]) -> Result<(), String> {
                     "{}",
                     serde_json::json!({ "name": name, "address": address, "short_address": short })
                 );
-            } else if has_flag(rest, "--short") {
-                println!("{short}");
-            } else {
+            } else if has_flag(rest, "--full") {
                 println!("{address}");
+            } else {
+                // La corta es la que se comparte; la completa lleva las claves de
+                // cifrado (1.734 caracteres) y solo hace falta con --full.
+                println!("{short}");
             }
             Ok(())
         }
@@ -20294,6 +20359,30 @@ mod tests {
         for flag in ["--tor-proxy", "--tor-only", "--external-addr", "--stratum"] {
             assert!(help.contains(flag), "{flag}");
         }
+    }
+
+    // El CLI muestra la corta desde el 23/10/2026: `--quantic-mine-to` la acepta
+    // si es de una wallet de esta PC (de ahí saca la completa, que es la que
+    // hace falta para minar). Una corta ajena no se puede minar a ciegas.
+    #[cfg(feature = "quantic")]
+    #[test]
+    fn mining_to_the_short_address_of_an_own_wallet_uses_its_full_address() {
+        use zoka::quantic::protocol::{Network, QuanticAddress};
+        let wallets = tempfile::tempdir().unwrap();
+        let (_, address) =
+            zoka::quantic::wallet_file::create(wallets.path(), "minero", Network::Regtest, "clave").unwrap();
+        let full = QuanticAddress::decode_for(&address, Network::Regtest).unwrap();
+        let short = full.short().encode();
+
+        let resolved = super::quantic_mine_to_address(&short, Network::Regtest, wallets.path()).unwrap();
+        assert_eq!(resolved.encode(), full.encode());
+        let direct = super::quantic_mine_to_address(&address, Network::Regtest, wallets.path()).unwrap();
+        assert_eq!(direct.encode(), full.encode());
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        let foreign = super::quantic_mine_to_address(&short, Network::Regtest, elsewhere.path()).unwrap_err();
+        assert!(foreign.contains("not one of this computer's wallets"), "{foreign}");
+        assert!(super::quantic_mine_to_address("not an address", Network::Regtest, wallets.path()).is_err());
     }
 
     // Un nodo de la testnet de Quantic no puede leer los pares de Zenith: los
