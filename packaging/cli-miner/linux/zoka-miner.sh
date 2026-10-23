@@ -17,7 +17,7 @@ API_BIND="127.0.0.1:3180"
 API="http://$API_BIND"
 LISTEN="/ip4/127.0.0.1/tcp/28181"
 TOR_SOCKS="127.0.0.1:19150"
-STRATUM_BIND="0.0.0.0:3333"
+STRATUM_PORT=3333
 
 COMMAND="${1:-help}"
 shift || true
@@ -27,6 +27,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --wallet) WALLET="$2"; shift 2 ;;
         --threads) THREADS="$2"; shift 2 ;;
+        --stratum-port) STRATUM_PORT="$2"; shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -100,7 +101,7 @@ start_node() {
     echo "Press Ctrl+C to stop."
     echo
     ZOKA_API_BIND="$API_BIND" "$ZOKA" fullnode --network "$NETWORK" --quantic-mine-to "$address" \
-        --listen "$LISTEN" --tor-proxy "$TOR_SOCKS" "$@"
+        --listen "$LISTEN" --tor-proxy "$TOR_SOCKS" --min-mine-peers 1 "$@"
 }
 
 # La contraseña viaja a zoka por una variable de entorno de este proceso: nunca
@@ -141,10 +142,11 @@ case "$COMMAND" in
         start_node --threads "$THREADS"
         ;;
     xmrig-node)
-        echo "Node with a Stratum server for XMRig on port 3333; the node itself does not mine."
-        echo "XMRig on this machine:  xmrig -o 127.0.0.1:3333 -u <your address> -p x -a rx/0"
+        echo "Node with a Stratum server for XMRig on port $STRATUM_PORT; the node itself does not mine."
+        echo "If ZSilent's Stratum already uses that port, run this with --stratum-port 3334."
+        echo "XMRig on this machine:  xmrig -o 127.0.0.1:$STRATUM_PORT -u <your address> -p x -a rx/0"
         echo "XMRig on another machine of your network: use this machine's local IP instead of 127.0.0.1."
-        start_node --stratum "$STRATUM_BIND" --no-mine
+        start_node --stratum "0.0.0.0:$STRATUM_PORT" --no-mine
         ;;
     balance)
         node_online || die "The node is not running. Start mining first (./zoka-miner.sh mine), then check the balance from another terminal."
@@ -167,7 +169,8 @@ Zoka Quantic CLI miner (testnet). Commands:
   balance         your balance (with the node running)
   xmrig-node      run the node for XMRig instead of mining
   status          height and your blocks
-Options: --wallet <name> (default: miner). Data lives in ./data next to this script.
+Options: --wallet <name> (default: miner), --threads n, --stratum-port n (default: 3333).
+Data lives in ./data next to this script.
 EOF
         ;;
 esac

@@ -102,6 +102,8 @@ Zoka Quantic uses RandomX (`rx/0`), the same algorithm as Monero, so
 
 1. Run **`start-node-for-xmrig.cmd`** (Windows) or `./zoka-miner.sh xmrig-node`
    (Linux). The node opens a Stratum server on port 3333 and does not mine by itself.
+   If ZSilent's Stratum already uses that port on this computer, pick another one:
+   `zoka-miner.ps1 xmrig-node -StratumPort 3334` or `./zoka-miner.sh xmrig-node --stratum-port 3334`.
 2. Start XMRig with your address:
 
    ```text

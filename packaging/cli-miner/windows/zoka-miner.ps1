@@ -12,7 +12,8 @@ param(
     [ValidateSet("create-wallet", "restore-wallet", "address", "mine", "balance", "xmrig-node", "status", "help")]
     [string]$Command = "help",
     [string]$Wallet = "miner",
-    [int]$Threads = 0
+    [int]$Threads = 0,
+    [int]$StratumPort = 3333
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,7 +25,7 @@ $ApiBind = "127.0.0.1:3180"
 $Api = "http://$ApiBind"
 $Listen = "/ip4/127.0.0.1/tcp/28181"
 $TorSocks = "127.0.0.1:19150"
-$StratumBind = "0.0.0.0:3333"
+$StratumBind = "0.0.0.0:$StratumPort"
 
 $env:ZOKA_HOME = $Data
 New-Item -ItemType Directory -Force -Path $Data | Out-Null
@@ -113,7 +114,7 @@ function Start-Node([string[]]$Extra) {
         Say "Mining rewards go to wallet '$Wallet': $address" "Cyan"
         Say "Press Ctrl+C to stop." "Cyan"
         Say ""
-        & $Zoka fullnode --network $Network --quantic-mine-to $address --listen $Listen --tor-proxy $TorSocks @Extra
+        & $Zoka fullnode --network $Network --quantic-mine-to $address --listen $Listen --tor-proxy $TorSocks --min-mine-peers 1 @Extra
     } finally {
         Stop-Process -Id $tor.Id -Force -ErrorAction SilentlyContinue
         Say "Node and Tor stopped."
@@ -159,8 +160,9 @@ switch ($Command) {
         Start-Node @("--threads", "$Threads")
     }
     "xmrig-node" {
-        Say "Node with a Stratum server for XMRig on port 3333; the node itself does not mine." "Cyan"
-        Say "XMRig on this PC:  xmrig -o 127.0.0.1:3333 -u <your address> -p x -a rx/0"
+        Say "Node with a Stratum server for XMRig on port $StratumPort; the node itself does not mine." "Cyan"
+        Say "If ZSilent's Stratum already uses that port, run this with -StratumPort 3334."
+        Say "XMRig on this PC:  xmrig -o 127.0.0.1:$StratumPort -u <your address> -p x -a rx/0"
         Say "XMRig on another PC of your network: use this PC's local IP instead of 127.0.0.1."
         Say "Windows may ask whether zoka.exe can accept connections: allow private networks only."
         Start-Node @("--stratum", $StratumBind, "--no-mine")
@@ -185,6 +187,7 @@ switch ($Command) {
         Say "  balance         your balance (with the node running)"
         Say "  xmrig-node      run the node for XMRig instead of mining"
         Say "  status          height and your blocks"
-        Say "Options: -Wallet <name> (default: miner). Data lives in .\data next to this script."
+        Say "Options: -Wallet <name> (default: miner), -Threads n, -StratumPort n (default: 3333)."
+        Say "Data lives in .\data next to this script."
     }
 }

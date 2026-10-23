@@ -3155,11 +3155,13 @@ fn mining_progress_log(progress: &MiningProgressSnapshot) {
 #[cfg(feature = "quantic")]
 fn print_quantic_console_status(height: u64, peers: usize, last_event: &str) {
     let status = zoka::quantic::runtime::mining_status();
-    // Una dirección de Quantic tiene unos 1.700 caracteres.
-    let address = status.address.as_deref().unwrap_or("—");
-    let shown = match (address.get(..14), address.get(address.len().saturating_sub(8)..)) {
-        (Some(head), Some(tail)) if address.len() > 24 => format!("{head}…{tail}"),
-        _ => address.to_string(),
+    // La corta, la que se comparte (decisión del 23/10/2026); la completa tiene
+    // unos 1.700 caracteres.
+    let shown = match status.address.as_deref() {
+        Some(full) => zoka::quantic::protocol::QuanticAddress::decode(full)
+            .map(|address| address.short().encode())
+            .unwrap_or_else(|_| full.chars().take(14).collect::<String>() + "…"),
+        None => "—".to_string(),
     };
     print_mining_console_status(
         &shown,
@@ -11027,6 +11029,14 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     // que minar en modo solo-sincronizar seria tirar el trabajo. Se apaga acá
     // en vez de confiar en que el llamador pase tambien --no-mine.
     let auto_mine = !has_flag(args, "--no-mine") && !sync_only;
+    // En Quantic el nodo es siempre «solo sincronizar» para la wallet de Zenith
+    // (`sync_only`), así que `auto_mine` da falso aunque el runtime de Quantic
+    // mine a `--quantic-mine-to`. Para la regla de no minar sin pares cuenta como
+    // que mina: sin esto, un minero de la línea de comandos minaba aislado y sus
+    // bloques no llegaban a nadie (lo de la 1.6.2). ZSilent pasa
+    // `--min-mine-peers 1` a mano, y el nodo de la autoridad no espera pares.
+    let mines_for_peer_rule =
+        auto_mine || (network.is_quantic() && option_value(args, "--quantic-mine-to").is_some());
     let min_mine_peers_arg = option_value(args, "--min-mine-peers");
     let mut min_mine_peers =
         parse_u64_arg(min_mine_peers_arg.clone(), 0, "--min-mine-peers")?.clamp(0, 128) as usize;
@@ -11155,7 +11165,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             println!("Scan private key (hex): {}", export.scan_private_key_hex);
             println!("Spend private key (hex): {}", export.spend_private_key_hex);
         }
-    } else {
+    } else if !network.is_quantic() {
         println!("Sync-only mode: no wallet opened. Blocks download and validate; mining and private scanning stay off until the wallet session starts.");
     }
     let mut startup_notes = vec![
@@ -11726,7 +11736,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 ));
             }
         }
-        if auto_mine && min_mine_peers_arg.is_none() {
+        if mines_for_peer_rule && min_mine_peers_arg.is_none() {
             min_mine_peers = min_mine_peers.max(1);
         }
         let initial_seed_connect_timeout = if allow_isolated_start {
@@ -11786,7 +11796,25 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(network.default_network_config_path()));
-        if config_path.exists() {
+        // Sin --network-config y sin el archivo en la ruta de siempre, vale el
+        // manifiesto que trae el binario (`load_network_config_for` ya cae ahí).
+        // Antes este bloque exigía el archivo: un nodo de la línea de comandos
+        // arrancaba sin ninguna semilla de libp2p y no publicaba sus bloques,
+        // aunque por iroh bajara la cadena (23/10/2026). Un archivo pedido con
+        // --network-config que no existe sigue siendo un error.
+        if network_config_arg.is_some() && !config_path.exists() {
+            return Err(format!(
+                "{} network config file not found: {}",
+                network.display_name(),
+                config_path.display()
+            ));
+        }
+        let config_source = if config_path.exists() {
+            config_path.display().to_string()
+        } else {
+            "the manifest built into this binary".to_string()
+        };
+        {
             let network_config = load_network_config_for(&config_path, network)?;
             configured_seed_nodes = network_config.active_seed_node_count();
             let seed_candidates = network_config.active_seed_candidates(allow_clearnet_seeds);
@@ -11803,13 +11831,13 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                 .iter()
                 .map(|seed| seed.address.clone())
                 .collect();
-            if auto_mine && min_mine_peers_arg.is_none() && !reconnect_seed_peers.is_empty() {
+            if mines_for_peer_rule && min_mine_peers_arg.is_none() && !reconnect_seed_peers.is_empty() {
                 min_mine_peers = min_mine_peers.max(1);
             }
             startup_notes.push(format!(
                 "{} network config loaded from {}: status={}, active_seeds={}, active_rpc={}, snapshot_signers={}, notes={}.",
                 network.display_name(),
-                config_path.display(),
+                config_source,
                 if network_config.status.is_empty() {
                     "unknown"
                 } else {
@@ -11864,18 +11892,6 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
             if let Err(err) = peer_store.save() {
                 startup_notes.push(format!("PeerStore save failed: {err}."));
             }
-        } else if network_config_arg.is_some() {
-            return Err(format!(
-                "{} network config file not found: {}",
-                network.display_name(),
-                config_path.display()
-            ));
-        } else {
-            startup_notes.push(format!(
-                "Default {} network config not found at {}; running standalone until peers connect.",
-                network.display_name(),
-                config_path.display()
-            ));
         }
     } else {
         startup_notes
@@ -20383,6 +20399,18 @@ mod tests {
         let foreign = super::quantic_mine_to_address(&short, Network::Regtest, elsewhere.path()).unwrap_err();
         assert!(foreign.contains("not one of this computer's wallets"), "{foreign}");
         assert!(super::quantic_mine_to_address("not an address", Network::Regtest, wallets.path()).is_err());
+    }
+
+    // Sin --network-config y sin el archivo en la ruta de siempre (un nodo de la
+    // línea de comandos), las semillas salen del manifiesto del binario. Antes
+    // arrancaba sin ninguna semilla de libp2p y sus bloques no salían (23/10/2026).
+    #[test]
+    fn without_a_manifest_file_the_node_uses_the_seeds_built_into_the_binary() {
+        use super::NetworkProfile;
+        let missing = std::path::Path::new("this/manifest/does/not/exist.json");
+        let config = super::load_network_config_for(missing, NetworkProfile::QuanticTestnet)
+            .expect("the embedded Quantic testnet manifest parses");
+        assert!(config.active_seed_node_count() >= 1, "the testnet manifest has no active seed");
     }
 
     // Un nodo de la testnet de Quantic no puede leer los pares de Zenith: los
