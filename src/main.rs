@@ -31,14 +31,16 @@ use zoka::wallet::storage::{PrivateWalletMetadata, WalletStorage};
 use zoka::zk::groth16_backend::PRIVATE_TX_MAX_INPUTS;
 
 /// Las líneas de `fullnode` de la ayuda de Quantic. ZSilent lee `zoka --help`
-/// y busca ahí `--tor-proxy`, `--tor-only` y `--external-addr` antes de lanzar
-/// el nodo: si falta uno, no lo arranca. Pasó con la 3.0.0, que no nombraba
-/// `--external-addr`, y ZSilent se negaba a arrancar con la onion.
+/// y busca ahí `--tor-proxy`, `--tor-only`, `--external-addr` y `--stratum`
+/// antes de lanzar el nodo con ellos: si falta uno, no lo arranca. Pasó con la
+/// 3.0.0, que no nombraba `--external-addr`, y ZSilent se negaba a arrancar con
+/// la onion.
 #[cfg(feature = "quantic")]
-const QUANTIC_FULLNODE_USAGE: [&str; 3] = [
+const QUANTIC_FULLNODE_USAGE: [&str; 4] = [
     "  zoka fullnode --network quantic-testnet [--quantic-mine-to <address>] [--threads n] [--no-mine]",
     "               [--seed <multiaddr>] [--listen <multiaddr>] [--tor-proxy host:port] [--tor-only]",
     "               [--external-addr <multiaddr>] [--network-config <file>] [--serve-iroh-snapshot]",
+    "               [--stratum host:port]   (XMRig and other rx/0 miners mine against this node)",
 ];
 
 /// La ayuda de una build de Quantic: solo lo que sirve en sus dos redes.
@@ -20275,7 +20277,7 @@ mod tests {
     #[test]
     fn the_quantic_help_names_the_flags_zsilent_checks_before_starting_the_node() {
         let help = super::QUANTIC_FULLNODE_USAGE.join("\n");
-        for flag in ["--tor-proxy", "--tor-only", "--external-addr"] {
+        for flag in ["--tor-proxy", "--tor-only", "--external-addr", "--stratum"] {
             assert!(help.contains(flag), "{flag}");
         }
     }

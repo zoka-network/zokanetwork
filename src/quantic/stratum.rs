@@ -48,6 +48,9 @@ pub const MAX_PAYOUT_ADDRESSES: usize = 16;
 const RECENT_JOBS: usize = 8;
 /// Una línea de JSON más larga que esto no es de un minero.
 const MAX_LINE_BYTES: usize = 8 * 1024;
+/// Conexiones a la vez. Abierto a la red local, nadie llena el nodo de
+/// sesiones: la que pasa el tope se cierra al aceptarla.
+pub const MAX_CONNECTIONS: usize = 256;
 
 /// Un bloque que encontró un minero del Stratum, para que lo publique el runtime.
 pub struct FoundBlock {
@@ -228,6 +231,12 @@ impl Hub {
             Ok(Recipient::Short(short)) => super::directory::lookup(&self.storage, &short)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| "this node does not know that short address: publish it first".to_string()),
+            // Parece una dirección de Zoka Quantic pero no es de esta red (o
+            // está mal copiada): cobrarle a la del nodo sería minar para otro
+            // sin que el minero se entere.
+            Err(error) if looks_like_quantic_address(login) => {
+                Err(format!("that is not a {} address: {error}", self.network.address_prefix()))
+            }
             Err(_) => self
                 .default_address
                 .clone()
@@ -282,6 +291,15 @@ impl Hub {
         self.blocks.fetch_add(1, Ordering::Relaxed);
         Ok(true)
     }
+}
+
+/// Empieza como una dirección de alguna red de Zoka Quantic (`zq1`, `zqtest1`,
+/// `zqregtest1`). Un login así que no se decodifica en esta red es un error del
+/// minero, no un nombre de trabajador.
+fn looks_like_quantic_address(login: &str) -> bool {
+    [Network::Mainnet, Network::Testnet, Network::Regtest]
+        .iter()
+        .any(|network| login.starts_with(network.address_prefix()))
 }
 
 /// Lo que muestra `GET /quantic/stratum`.
@@ -346,6 +364,7 @@ pub async fn serve(config: StratumConfig, storage: Arc<RocksDbStorage>, chain_id
     let _ = HUB.set(Arc::clone(&hub));
     tokio::spawn(refresh_templates(Arc::clone(&hub)));
     tracing::info!(target: "zoka.stratum", "Stratum listening on {}", config.bind);
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -355,11 +374,17 @@ pub async fn serve(config: StratumConfig, storage: Arc<RocksDbStorage>, chain_id
                 continue;
             }
         };
+        let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+            tracing::debug!(target: "zoka.stratum", "miner {peer}: too many connections");
+            drop(stream);
+            continue;
+        };
         let hub = Arc::clone(&hub);
         tokio::spawn(async move {
             if let Err(error) = session(hub, stream).await {
                 tracing::debug!(target: "zoka.stratum", "miner {peer}: {error}");
             }
+            drop(slot);
         });
     }
 }
@@ -561,5 +586,17 @@ mod tests {
         hash[24..32].copy_from_slice(&(target64 - 1).to_le_bytes());
         assert!(u64::from_le_bytes(hash[24..32].try_into().unwrap()) < target64);
         assert!(difficulty::hash_meets_target(&hash, &share));
+    }
+
+    // Un login que no es dirección (el nombre de un trabajador) cobra a la del
+    // nodo; uno que empieza como dirección de Quantic y no es de esta red, no.
+    #[test]
+    fn a_login_that_starts_like_an_address_is_never_taken_for_a_worker_name() {
+        for login in ["zq1abc", "zqtest1abc", "zqregtest1abc"] {
+            assert!(looks_like_quantic_address(login), "{login}");
+        }
+        for login in ["x", "worker1", "rig-01", "zka1abc", ""] {
+            assert!(!looks_like_quantic_address(login), "{login}");
+        }
     }
 }
