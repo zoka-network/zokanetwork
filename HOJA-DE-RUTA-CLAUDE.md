@@ -119,6 +119,59 @@ ZSilent 3.0.2 armada (sin instalar ni publicar).** Ramas: nodo
     `QrCodeReadBackTest` lo vuelve a leer con un lector de QR.
 
   78 pruebas.
+- **Minero CLI y web nueva, listos sin publicar** (pedido del usuario: ZSilent
+  como wallet oficial, un minero CLI con guía para GitHub y ZKAPriv «en
+  desarrollo»; las tres secciones del menú al día y sin Zenith).
+  - **Minero CLI 3.0.4** (`packaging/cli-miner/`, se arma con
+    `scripts/build-cli-miner.ps1` y `scripts/build-cli-miner-linux.sh`):
+    - un script por sistema (create-wallet, restore-wallet, address, mine,
+      balance, xmrig-node, status), accesos `.cmd` y guías en inglés y
+      castellano;
+    - en Windows trae Tor 0.4.9.14 con su licencia; en Linux usa el de la
+      distribución;
+    - todo queda en `./data`, con puertos propios: API 3180, P2P 28181 solo
+      local, Tor 19150 y Stratum 3333 (se cambia con -StratumPort o
+      --stratum-port).
+
+    Salida en `target/cli-miner/3.0.4/`:
+    - zip de Windows `9abd1773…158f`;
+    - tar.gz de Linux `edee7995…84ca`;
+    - `SHA256SUMS.txt` y `RELEASE-NOTES.md`.
+  - **Linux sobre Debian 11:** compilado en Debian 13 pedía glibc 2.39 (no
+    arrancaba en Ubuntu 22.04). `scripts/build-linux-bullseye.sh` compila dentro
+    de un Debian 11 aislado en WSL (`/srv/zoka-bullseye`, Rust 1.97.1). El
+    binario pide glibc 2.30 y anda de Ubuntu 20.04 y Debian 11 en adelante.
+    Probado adentro de ese Debian 11 con su Tor 0.4.5.16: bajó la cadena, se
+    conectó a la PC por Tor y abrió el Stratum. El de Windows se probó igual en
+    una carpeta limpia.
+  - **Errores del nodo que encontró esa prueba**, arreglados en `8139bb61`:
+    - sin `--network-config`, el nodo no cargaba ninguna semilla de libp2p
+      (bajaba por iroh, pero quedaba con `peers=0` y no publicaba bloques). Ahora
+      usa el manifiesto del binario;
+    - en Quantic `auto_mine` es siempre falso (`sync_only`), así que un minero
+      CLI **minaba sin pares**, como en la 1.6.2. Ahora `--quantic-mine-to`
+      cuenta como minar para esa regla;
+    - la consola mostraba la dirección completa y el aviso «Sync-only» de Zenith.
+
+    ZSilent no tenía los dos primeros, porque pasa `--network-config` y
+    `--min-mine-peers 1`. Además: el zip de `Compress-Archive` (PS 5.1) usaba
+    barras invertidas, y ahora se arma a mano (`a7f320cf`). Nodo final
+    `zoka.exe` `93d9e9f5…`.
+  - **CLI con la corta** (`cb565d9f`): `new`, `restore` y `address` muestran la
+    corta (`--full` da la completa), `--quantic-mine-to` acepta la corta de una
+    wallet propia, y el nodo publica solo la dirección a la que mina.
+  - **ZSilent 3.0.5** (con el nodo 3.0.4): MSI
+    `zsilent-core/build/release/3.0.5/`, SHA-256
+    `7b14f365ae079c4fbc8e816ef2e4a6504e50b35c332c2dc3620d2af1cb161bab`. Se
+    verificó extrayéndolo. Tiene `RELEASE-NOTES.md`. **No instalada en la PC**,
+    que sigue en la 3.0.4.
+  - **Web** (`zokaweb`, rama `web-quantic-23oct`, `eab109b`):
+    - Download tiene tres tarjetas: ZSilent, el minero CLI y ZKAPriv;
+    - Tech y Docs al día;
+    - Zenith sale de todo lo visible, incluso de `index.html` y del pie;
+    - `TESTNET_LIVE = true` y descargas en los releases de GitHub
+      (`zsilent-core` v3.0.5 y `zokanetwork` v3.0.4): esos tags tienen que
+      existir antes de publicar la web.
 - **Dificultad y hora del génesis (para la mainnet):** ASERT se ancla en la hora
   del génesis. La testnet se creó a las 01:38 UTC y se empezó a minar a las
   14:41 UTC: quedó unos 300 bloques atrás del ritmo (uno cada 120 s), con la
