@@ -524,7 +524,7 @@ fn validate_quantic_pow(block: &Block, ctx: &PowBlockContext<'_>) -> Result<(), 
     if !quantic_hash_meets(&computed, ctx.expected_difficulty_bits) {
         return Err(PowBelowDifficulty {
             needed: ctx.expected_difficulty_bits,
-            actual: pow::leading_zero_bits(&computed),
+            actual: quantic_hash_bits(&computed),
         });
     }
     if block.header.seal.0 != computed {
@@ -545,6 +545,18 @@ fn quantic_hash_meets(hash: &[u8], compact_target: u32) -> bool {
 #[cfg(not(feature = "quantic"))]
 fn quantic_hash_meets(_hash: &[u8], _compact_target: u32) -> bool {
     false
+}
+
+/// Cuánto trabajo tiene un hash de Quantic, para el mensaje de error: los
+/// ceros de arriba leyéndolo little endian, como la regla.
+#[cfg(feature = "quantic")]
+fn quantic_hash_bits(hash: &[u8]) -> u32 {
+    crate::quantic::difficulty::hash_zero_bits(hash)
+}
+
+#[cfg(not(feature = "quantic"))]
+fn quantic_hash_bits(hash: &[u8]) -> u32 {
+    pow::leading_zero_bits(hash)
 }
 
 fn validate_pow(block: &Block, ctx: &PowBlockContext<'_>) -> Result<(), BlockValidationError> {

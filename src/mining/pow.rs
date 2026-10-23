@@ -119,11 +119,32 @@ pub fn build_pow_input(
     input
 }
 
-/// Proof-of-work input of a Zoka Quantic block. Unlike [`build_pow_input`],
-/// which Zenith uses and which leaves the body out (the work only binds the
-/// parent, the miner address, height, time and nonce), this one commits to
-/// `merkle_root` and `state_root`: the work cannot be moved to another body.
-/// A Quantic block has no public miner address to bind instead.
+/// Largo del bloque de trabajo de Quantic: el de Monero, que es lo que espera
+/// XMRig.
+pub const QUANTIC_POW_BLOB_BYTES: usize = 76;
+/// Dónde va el nonce de 32 bits dentro del bloque de trabajo: ahí lo escribe
+/// XMRig (Monero y todo `rx/0` lo tienen en esa posición).
+pub const QUANTIC_POW_NONCE_OFFSET: usize = 39;
+/// Versión del bloque de trabajo (primer byte).
+pub const QUANTIC_POW_BLOB_VERSION: u8 = 0x02;
+
+/// Proof-of-work input of a Zoka Quantic block: a 76-byte blob laid out like
+/// Monero's, so XMRig and Stratum pools can mine it (`docs/QUANTIC-POOL-DE-MINERIA.md`).
+/// Unlike [`build_pow_input`] (Zenith), it commits to `merkle_root` and
+/// `state_root`: the work cannot be moved to another body.
+///
+/// ```text
+///  0       versión 0x02
+///  1..7    hora (u48 LE)
+///  7..39   SHA-256("zoka-quantic-pow-v2-where" ‖ chain_id ‖ prev_hash ‖ altura)
+/// 39..43   nonce (u32 LE): lo que recorre XMRig
+/// 43..75   SHA-256("zoka-quantic-pow-v2-what" ‖ merkle_root ‖ state_root ‖ extranonce)
+/// 75       0x00 (reservado)
+/// ```
+///
+/// `nonce` es el del encabezado (u64): los 32 bits de abajo van a la posición
+/// 39 y los de arriba son el extranonce, que un pool reparte para que cada
+/// minero recorra su propio espacio sin tocar el coinbase.
 pub fn build_quantic_pow_input(
     chain_id: &str,
     prev_hash: &str,
@@ -133,17 +154,55 @@ pub fn build_quantic_pow_input(
     timestamp: u64,
     nonce: u64,
 ) -> Vec<u8> {
-    let mut input = Vec::with_capacity(320);
-    input.extend_from_slice(b"zoka-quantic-pow-v1");
-    for part in [chain_id, prev_hash, merkle_root, state_root] {
-        input.push(0x1f);
-        input.extend_from_slice(part.as_bytes());
-    }
-    input.push(0x1f);
-    input.extend_from_slice(&height.to_le_bytes());
-    input.extend_from_slice(&timestamp.to_le_bytes());
-    input.extend_from_slice(&nonce.to_le_bytes());
-    input
+    let mut blob = quantic_pow_blob_without_nonce(
+        chain_id,
+        prev_hash,
+        merkle_root,
+        state_root,
+        height,
+        timestamp,
+        (nonce >> 32) as u32,
+    );
+    blob[QUANTIC_POW_NONCE_OFFSET..QUANTIC_POW_NONCE_OFFSET + 4].copy_from_slice(&(nonce as u32).to_le_bytes());
+    blob
+}
+
+/// El bloque de trabajo con el nonce en cero: lo que un pool le pasa a XMRig
+/// como `blob` (con su extranonce ya puesto).
+pub fn quantic_pow_blob_without_nonce(
+    chain_id: &str,
+    prev_hash: &str,
+    merkle_root: &str,
+    state_root: &str,
+    height: u64,
+    timestamp: u64,
+    extranonce: u32,
+) -> Vec<u8> {
+    let separated = |label: &[u8], parts: &[&[u8]]| -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(label);
+        for part in parts {
+            hasher.update([0x1f]);
+            hasher.update(part);
+        }
+        hasher.finalize().into()
+    };
+    let height_bytes = height.to_le_bytes();
+    let extranonce_bytes = extranonce.to_le_bytes();
+    let place = separated(
+        b"zoka-quantic-pow-v2-where",
+        &[chain_id.as_bytes(), prev_hash.as_bytes(), &height_bytes],
+    );
+    let body = separated(
+        b"zoka-quantic-pow-v2-what",
+        &[merkle_root.as_bytes(), state_root.as_bytes(), &extranonce_bytes],
+    );
+    let mut blob = vec![0u8; QUANTIC_POW_BLOB_BYTES];
+    blob[0] = QUANTIC_POW_BLOB_VERSION;
+    blob[1..7].copy_from_slice(&timestamp.to_le_bytes()[..6]);
+    blob[7..39].copy_from_slice(&place);
+    blob[43..75].copy_from_slice(&body);
+    blob
 }
 
 /// Builds a backend for `(chain_id, height)`, picking the algorithm declared
@@ -631,6 +690,56 @@ mod randomx_backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn quantic_blob(nonce: u64) -> Vec<u8> {
+        build_quantic_pow_input("zoka-quantic-testnet-v1", "aa", "bb", "cc", 7, 1_792_667_777, nonce)
+    }
+
+    // XMRig recorre 4 bytes en la posición 39 de un bloque de 76: es lo único
+    // que cambia entre un intento y otro. El extranonce del pool cambia solo el
+    // resumen del cuerpo, y nada más.
+    #[test]
+    fn the_quantic_blob_has_the_nonce_where_xmrig_writes_it() {
+        let base = quantic_blob(0);
+        assert_eq!(base.len(), QUANTIC_POW_BLOB_BYTES);
+        assert_eq!(base[0], QUANTIC_POW_BLOB_VERSION);
+        assert_eq!(&base[1..7], &1_792_667_777u64.to_le_bytes()[..6]);
+        assert_eq!(&base[QUANTIC_POW_NONCE_OFFSET..QUANTIC_POW_NONCE_OFFSET + 4], &[0u8; 4]);
+        let with_nonce = quantic_blob(0x0102_0304);
+        assert_eq!(&with_nonce[39..43], &[4, 3, 2, 1]);
+        let changed: Vec<usize> = (0..76).filter(|i| base[*i] != with_nonce[*i]).collect();
+        assert!(changed.iter().all(|i| (39..43).contains(i)), "{changed:?}");
+        let other_extranonce = quantic_blob(1u64 << 32);
+        let changed: Vec<usize> = (0..76).filter(|i| base[*i] != other_extranonce[*i]).collect();
+        assert!(!changed.is_empty() && changed.iter().all(|i| (43..75).contains(i)), "{changed:?}");
+        assert_eq!(
+            quantic_pow_blob_without_nonce("zoka-quantic-testnet-v1", "aa", "bb", "cc", 7, 1_792_667_777, 0),
+            base
+        );
+    }
+
+    #[test]
+    fn every_header_field_reaches_the_quantic_blob() {
+        let base = build_quantic_pow_input("c", "p", "m", "s", 7, 9, 5);
+        for other in [
+            build_quantic_pow_input("c2", "p", "m", "s", 7, 9, 5),
+            build_quantic_pow_input("c", "p2", "m", "s", 7, 9, 5),
+            build_quantic_pow_input("c", "p", "m2", "s", 7, 9, 5),
+            build_quantic_pow_input("c", "p", "m", "s2", 7, 9, 5),
+            build_quantic_pow_input("c", "p", "m", "s", 8, 9, 5),
+            build_quantic_pow_input("c", "p", "m", "s", 7, 10, 5),
+        ] {
+            assert_ne!(base, other);
+        }
+    }
+
+    /// El formato es consenso: cambiarlo es un fork.
+    #[test]
+    fn the_quantic_blob_format_does_not_change() {
+        assert_eq!(hex::encode(quantic_blob(0x0102_0304_0506_0708)), QUANTIC_BLOB_VECTOR);
+    }
+
+    const QUANTIC_BLOB_VECTOR: &str = "0281f0d96a0000b9a6c33285d5a2026576feed594b66aa6d8b86d993f831a7411ec4ed29367aa80807060511f5c82756c73ca82b2a07d11e1ac5a02a0aa4a9f142bf9a08967ff0c748878d00";
 
     #[test]
     fn epoch_seed_rotates_every_epoch() {

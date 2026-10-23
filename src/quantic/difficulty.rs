@@ -97,9 +97,25 @@ pub fn from_compact(compact: u32) -> BigUint {
     }
 }
 
-/// Si `hash` (big endian) cumple el objetivo.
+/// Si `hash` cumple el objetivo, leído como un número **little endian**, igual
+/// que Monero: así el filtro de XMRig (los 8 bytes de arriba del hash contra
+/// el objetivo del pool) coincide con la regla de la red.
 pub fn hash_meets_target(hash: &[u8], target: &BigUint) -> bool {
-    hash.len() == 32 && BigUint::from_bytes_be(hash) <= *target
+    hash.len() == 32 && BigUint::from_bytes_le(hash) <= *target
+}
+
+/// Bits en cero de arriba de `hash` leído little endian (para mostrar cuánto
+/// trabajo tiene un hash; la regla es [`hash_meets_target`]).
+pub fn hash_zero_bits(hash: &[u8]) -> u32 {
+    let mut bits = 0;
+    for byte in hash.iter().rev() {
+        if *byte == 0 {
+            bits += 8;
+        } else {
+            return bits + byte.leading_zeros();
+        }
+    }
+    bits
 }
 
 /// Trabajo esperado de un bloque con ese objetivo: 2^256 / (objetivo + 1),
@@ -164,14 +180,23 @@ mod tests {
         }
     }
 
+    // Como Monero: el hash es un número little endian, así que los ceros que
+    // cuentan son los del final (lo que mira XMRig: los bytes 24..32).
     #[test]
-    fn a_hash_meets_a_target_as_a_big_endian_number() {
+    fn a_hash_meets_a_target_as_a_little_endian_number() {
         let target = target_for_bits(12);
-        let mut hash = [0u8; 32];
-        hash[1] = 0x0f; // 12 bits de ceros
+        let mut hash = [0xffu8; 32];
+        hash[31] = 0x00;
+        hash[30] = 0x0f; // 12 bits de ceros arriba
         assert!(hash_meets_target(&hash, &target));
-        hash[1] = 0x10; // 11 bits de ceros
+        assert_eq!(hash_zero_bits(&hash), 12);
+        hash[30] = 0x10; // 11 bits de ceros
         assert!(!hash_meets_target(&hash, &target));
+        assert_eq!(hash_zero_bits(&hash), 11);
+        // Los ceros al principio no cuentan.
+        let mut leading = [0u8; 32];
+        leading[31] = 0xff;
+        assert!(!hash_meets_target(&leading, &target));
         assert!(!hash_meets_target(&[0u8; 31], &target));
     }
 
