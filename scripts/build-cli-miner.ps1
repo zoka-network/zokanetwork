@@ -77,7 +77,18 @@ $lines = Get-ChildItem -LiteralPath $pkg -Recurse -File | Sort-Object FullName |
 
 $zip = Join-Path $outRoot "$name.zip"
 if (Test-Path -LiteralPath $zip) { throw "$zip already exists." }
-Compress-Archive -LiteralPath $pkg -DestinationPath $zip
+# A mano y no con Compress-Archive: el de Windows PowerShell 5.1 guarda las rutas
+# con barras invertidas, fuera del formato zip, y otros programas lo extraen mal.
+Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+$archive = [System.IO.Compression.ZipFile]::Open($zip, [System.IO.Compression.ZipArchiveMode]::Create)
+try {
+    Get-ChildItem -LiteralPath $pkg -Recurse -File | Sort-Object FullName | ForEach-Object {
+        $entry = "$name/" + ($_.FullName.Substring($pkg.Length + 1) -replace '\\', '/')
+        [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $_.FullName, $entry, [System.IO.Compression.CompressionLevel]::Optimal)
+    }
+} finally {
+    $archive.Dispose()
+}
 $zipHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
 Add-Content -LiteralPath (Join-Path $outRoot "SHA256SUMS.txt") -Value ("{0}  {1}.zip" -f $zipHash, $name)
 
