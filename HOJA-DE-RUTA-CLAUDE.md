@@ -119,6 +119,12 @@ ZSilent 3.0.2 armada (sin instalar ni publicar).** Ramas: nodo
     `QrCodeReadBackTest` lo vuelve a leer con un lector de QR.
 
   78 pruebas.
+- **Dificultad y hora del génesis (para la mainnet):** ASERT se ancla en la hora
+  del génesis. La testnet se creó a las 01:38 UTC y se empezó a minar a las
+  14:41 UTC: quedó unos 300 bloques atrás del ritmo (uno cada 120 s), con la
+  dificultad en el piso hasta alcanzarlo (con XMRig, cada acierto era un bloque).
+  Para la mainnet: crear el génesis justo al lanzar, o anclar ASERT en el primer
+  bloque minado. Eso es consenso: hay que decidirlo antes del génesis.
 - **Pendiente, con aprobación:** push, release y `TESTNET_LIVE=true` en la web.
   Antes de publicar, probar el MSI en un Windows limpio.
 
