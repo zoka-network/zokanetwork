@@ -12364,8 +12364,10 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
         };
         let config = zoka::quantic::stratum::StratumConfig { bind, default_address };
         let stratum_chain = chain_id.clone();
+        zoka::quantic::stratum::mark_configured(bind);
         tokio::spawn(async move {
             if let Err(error) = zoka::quantic::stratum::serve(config, storage, stratum_chain).await {
+                zoka::quantic::stratum::mark_failed(&error);
                 tracing::error!(target: "zoka.stratum", "{error}");
             }
         });

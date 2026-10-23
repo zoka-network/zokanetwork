@@ -305,7 +305,13 @@ fn looks_like_quantic_address(login: &str) -> bool {
 /// Lo que muestra `GET /quantic/stratum`.
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct StratumStatus {
+    /// Dónde se le pidió escuchar (`--stratum`). Con esto y sin `listening`
+    /// ni `error`, el Stratum está arrancando: se abre al final del arranque
+    /// del nodo, cerca de un minuto después.
+    pub configured: Option<String>,
     pub listening: Option<String>,
+    /// Por qué no se pudo abrir, si falló.
+    pub error: Option<String>,
     pub miners: usize,
     pub accepted_shares: u64,
     pub rejected_shares: u64,
@@ -313,18 +319,34 @@ pub struct StratumStatus {
 }
 
 static HUB: OnceLock<Arc<Hub>> = OnceLock::new();
+static CONFIGURED: OnceLock<String> = OnceLock::new();
+static FAILED: OnceLock<String> = OnceLock::new();
+
+/// El nodo arrancó con `--stratum`. Se marca antes de lanzar el servidor, para
+/// que la API distinga «arrancando» de «sin Stratum».
+pub fn mark_configured(bind: SocketAddr) {
+    let _ = CONFIGURED.set(bind.to_string());
+}
+
+/// El servidor no pudo arrancar: la API lo dice en vez de quedar «arrancando».
+pub fn mark_failed(error: &str) {
+    let _ = FAILED.set(error.to_string());
+}
 
 pub fn status() -> StratumStatus {
-    let Some(hub) = HUB.get() else {
-        return StratumStatus::default();
-    };
-    StratumStatus {
+    let mut status = StratumStatus {
+        configured: CONFIGURED.get().cloned(),
         listening: LISTENING.get().cloned(),
-        miners: hub.miners.lock().map(|miners| miners.values().sum()).unwrap_or(0),
-        accepted_shares: hub.accepted.load(Ordering::Relaxed),
-        rejected_shares: hub.rejected.load(Ordering::Relaxed),
-        blocks_found: hub.blocks.load(Ordering::Relaxed),
+        error: FAILED.get().cloned(),
+        ..StratumStatus::default()
+    };
+    if let Some(hub) = HUB.get() {
+        status.miners = hub.miners.lock().map(|miners| miners.values().sum()).unwrap_or(0);
+        status.accepted_shares = hub.accepted.load(Ordering::Relaxed);
+        status.rejected_shares = hub.rejected.load(Ordering::Relaxed);
+        status.blocks_found = hub.blocks.load(Ordering::Relaxed);
     }
+    status
 }
 
 static LISTENING: OnceLock<String> = OnceLock::new();
