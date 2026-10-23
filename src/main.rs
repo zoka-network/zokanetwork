@@ -2531,6 +2531,18 @@ impl NetworkProfile {
         }
     }
 
+    /// El peerstore de esta red: Zenith, el de siempre; cada red de Quantic, el
+    /// suyo (ver `quantic_peer_store_path`).
+    fn peer_store_path(self) -> std::path::PathBuf {
+        use zoka::network::peer_store::{default_peer_store_path, quantic_peer_store_path};
+        match self {
+            Self::Zenith => default_peer_store_path(),
+            Self::QuanticMainnet => quantic_peer_store_path("quantic-mainnet"),
+            Self::QuanticTestnet => quantic_peer_store_path("quantic-testnet"),
+            Self::QuanticRegtest => quantic_peer_store_path("quantic-regtest"),
+        }
+    }
+
     /// Lo que reemplaza a `zoka` en los nombres de los tópicos.
     fn topic_prefix(self) -> Option<&'static str> {
         match self {
@@ -11594,7 +11606,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
     // establish only one PeerId connection.
     let mut configured_seed_nodes = manual_seed_peers.len();
     let mut rpc_sync_endpoints = Vec::<String>::new();
-    let peer_store_path = zoka::network::peer_store::default_peer_store_path();
+    let peer_store_path = network.peer_store_path();
     let mut peer_store =
         match zoka::network::peer_store::PeerStore::load_or_default(peer_store_path.clone()) {
             Ok(store) => {
@@ -20279,6 +20291,21 @@ mod tests {
         let help = super::QUANTIC_FULLNODE_USAGE.join("\n");
         for flag in ["--tor-proxy", "--tor-only", "--external-addr", "--stratum"] {
             assert!(help.contains(flag), "{flag}");
+        }
+    }
+
+    // Un nodo de la testnet de Quantic no puede leer los pares de Zenith: los
+    // marcaba en cada arranque (23/10/2026).
+    #[test]
+    fn a_quantic_node_never_reads_the_zenith_peer_store() {
+        use super::NetworkProfile;
+        let zenith = NetworkProfile::Zenith.peer_store_path();
+        for quantic in [
+            NetworkProfile::QuanticTestnet,
+            NetworkProfile::QuanticMainnet,
+            NetworkProfile::QuanticRegtest,
+        ] {
+            assert_ne!(quantic.peer_store_path().file_name(), zenith.file_name(), "{quantic:?}");
         }
     }
 

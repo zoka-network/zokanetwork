@@ -291,7 +291,30 @@ impl PeerStore {
     }
 }
 
+/// El peerstore de Zenith, el de siempre (`peers.json`).
 pub fn default_peer_store_path() -> PathBuf {
+    peer_store_path_named(&peer_store_file_name(None))
+}
+
+/// El peerstore de una red de Zoka Quantic (`quantic-testnet`, …): uno propio
+/// por red. Compartían `peers.json` con Zenith, y un nodo de la testnet de
+/// Quantic marcaba en cada arranque las onions de Zenith del puerto 28080
+/// (23/10/2026): las redes no se mezclan ni en a quién se llama.
+pub fn quantic_peer_store_path(network_name: &str) -> PathBuf {
+    peer_store_path_named(&peer_store_file_name(Some(network_name)))
+}
+
+/// `peers.json` para Zenith, `peers-<red>.json` para una red de Quantic.
+pub fn peer_store_file_name(quantic_network: Option<&str>) -> String {
+    match quantic_network {
+        Some(network) => format!("peers-{network}.json"),
+        None => "peers.json".to_string(),
+    }
+}
+
+/// `ZOKA_PEER_STORE` manda (un archivo elegido a mano, para cualquier red);
+/// si no, el archivo va en `ZOKA_HOME` o en `~/.zoka`.
+fn peer_store_path_named(file_name: &str) -> PathBuf {
     if let Ok(path) = std::env::var("ZOKA_PEER_STORE") {
         let path = path.trim();
         if !path.is_empty() {
@@ -301,18 +324,28 @@ pub fn default_peer_store_path() -> PathBuf {
     if let Ok(home) = std::env::var("ZOKA_HOME") {
         let home = home.trim();
         if !home.is_empty() {
-            return PathBuf::from(home).join("peers.json");
+            return PathBuf::from(home).join(file_name);
         }
     }
     home::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".zoka")
-        .join("peers.json")
+        .join(file_name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_quantic_network_has_its_own_peer_store_apart_from_zenith() {
+        assert_eq!(peer_store_file_name(None), "peers.json");
+        assert_eq!(peer_store_file_name(Some("quantic-testnet")), "peers-quantic-testnet.json");
+        assert_ne!(
+            peer_store_file_name(Some("quantic-testnet")),
+            peer_store_file_name(Some("quantic-mainnet"))
+        );
+    }
 
     #[test]
     fn dial_addrs_filters_out_stale_private_entries() {
