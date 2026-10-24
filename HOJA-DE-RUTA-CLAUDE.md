@@ -172,6 +172,19 @@ ZSilent 3.0.2 armada (sin instalar ni publicar).** Ramas: nodo
     - `TESTNET_LIVE = true` y descargas en los releases de GitHub
       (`zsilent-core` v3.0.5 y `zokanetwork` v3.0.4): esos tags tienen que
       existir antes de publicar la web.
+- **PUBLICADO el 24/10/2026** (el usuario: «ocupate del resto solo»):
+  - **ZSilent 3.0.5 instalada en la PC**, con el nodo `93d9e9f5…`.
+  - **Código:** `main` de los tres repos (nodo `96a35324`, ZSilent `38baed0`, web
+    `7105778`) y las etiquetas `v3.0.4` y `v3.0.5`, en GitHub y GitLab. GitLab
+    necesita `GIT_SSH_COMMAND="ssh -i ~/.ssh/gitlab_zoka -o IdentitiesOnly=yes"`.
+  - **Releases en GitHub** (con `gh`, cuenta zoka-network):
+    - `zoka-network/zokanetwork` v3.0.4, con los dos paquetes del minero CLI;
+    - `zoka-network/zsilent-core` v3.0.5, con `ZSilent-Core-3.0.5.msi` (con
+      guion: GitHub cambia los espacios por puntos).
+
+    Bajados desde GitHub, los hashes coinciden.
+  - **Web publicada** en zoka.network (Cloudflare Pages, proyecto `zokaweb`). Se
+    verificó en vivo: textos nuevos, enlaces y whitepaper 2.2.
 - **Dificultad y hora del génesis (para la mainnet):** ASERT se ancla en la hora
   del génesis. La testnet se creó a las 01:38 UTC y se empezó a minar a las
   14:41 UTC: quedó unos 300 bloques atrás del ritmo (uno cada 120 s), con la
