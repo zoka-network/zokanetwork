@@ -1,7 +1,41 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
-Actualizada: **24 de octubre de 2026**, Argentina (continuación web por Codex).
+Actualizada: **24 de octubre de 2026**, Argentina (web y revisión de Quantic por Codex).
 Proyecto: `C:\Users\mderramus\ZOKA`.
+
+## 24/10: revisión del desarrollo postcuántico y XMRig
+
+Pedido del usuario: revisar qué queda del desarrollo de Quantic teniendo en
+cuenta lo construido por Claude, la versión 3.0.5 y el uso de XMRig.
+Informe actual: [docs/REVISION-quantic-2026-10-24.md](docs/REVISION-quantic-2026-10-24.md).
+
+- **Versiones comprobadas:** ZSilent 3.0.5 incluye el nodo 3.0.4. Coinciden
+  Cargo.toml, notas del MSI y metadatos del ejecutable instalado. CLI: 3.0.4.
+- **Ya implementado:** X-Wing en las notas, firmas híbridas de checkpoints y
+  snapshots, TLS híbrido preferido en iroh (con compatibilidad clásica),
+  cadena/testnet Quantic, ZSilent y PoW/Stratum compatible con XMRig.
+- **Pendiente principal:** el pool STARK de transferencias. El ejecutable
+  `crates/zoka-pq-pool` mide permutaciones Poseidon2; todavía no tiene las
+  restricciones de una transferencia ni está integrado al consenso. El gasto
+  actual usa Ironwood/Orchard, Halo 2 y firmas de curva.
+- **Orden:** arquitectura de pruebas/agregación, transferencia completa,
+  integración al nodo y wallets, rendimiento y pruebas adversariales,
+  nueva testnet y revisión externa antes de mainnet.
+- **Otros pendientes:** transporte libp2p clásico, interfaz Android,
+  RPC para pools externos y prueba de xmrig-proxy; P2Pool propio es posterior.
+  Revisar el ancla de ASERT y propagación/tamaños antes de mainnet.
+- **Detalle verificado de snapshots:** las firmas híbridas existen, pero el
+  bootstrap iroh solo exige firma con `--iroh-require-signed-snapshot`; por
+  omisión confía en la identidad iroh del seed y revalida los bloques. El
+  manifiesto de testnet tiene `snapshot_signers: []`. Falta cerrar esta política
+  para una autenticación postcuántica obligatoria de la sincronización.
+- **Validación de esta revisión:** 82 pruebas pasadas (14 primitivas, 40
+  biblioteca Quantic, 26 nodo y 2 de extremo a extremo). Benchmark STARK: 199,6
+  KiB, 205,7 ms de prueba y 14,5 ms de verificación; son permutaciones aisladas,
+  no una transferencia completa. No se ejecutó minería nueva ni un teléfono.
+- Las listas antiguas de abajo conservan tareas ya terminadas. Para saber qué
+  falta, usar el informe de esta revisión y comprobar el código; no contar
+  casillas abiertas como porcentaje de avance.
 
 ## 24/10: corrección de identidad confirmada por el usuario
 
