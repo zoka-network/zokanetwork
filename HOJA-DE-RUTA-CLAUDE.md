@@ -3,6 +3,30 @@
 Actualizada: **24 de octubre de 2026**, Argentina (continuación web por Codex).
 Proyecto: `C:\Users\mderramus\ZOKA`.
 
+## 24/10: corrección de identidad confirmada por el usuario
+
+La marca correcta es **ZOKA QUANTIC**, no Zoka Network. El usuario aclaró que
+la idea central es una blockchain con **conocimiento cero y privacidad por
+defecto, con implementación postcuántica**. Esta aclaración sustituye la
+identidad descrita en la entrada anterior del plan web, conservada abajo
+como historial.
+
+Publicado en **https://zoka.network**: portada «Zero knowledge by default»,
+marca, navegación, pie, metadatos, Tech y papers coherentes. Se explica la
+criptografía postcuántica ya implementada (cifrado de notas X-Wing y firmas
+híbridas de snapshots/checkpoints), manteniendo explícito que Halo 2 sigue
+siendo clásico y el nuevo pool totalmente postcuántico está en desarrollo.
+Redes: **Zoka Quantic Testnet** y **Zoka Quantic Mainnet**.
+
+Whitepaper y litepaper **2.4**, regenerados conservando sus URLs. Código web
+`0805a5c`, en `main` de GitHub y GitLab. Cloudflare Pages de producción:
+`https://2d2c13ab.zokaweb.pages.dev`.
+
+Validado: TypeScript, 7 pruebas, lint sin errores (7 avisos preexistentes),
+build, portada en 320/390/1440 px y primeras páginas de ambos PDFs. En la web
+pública se comprobaron marca, mensaje, Tech, papers y enlace a ZokaScan;
+JS, CSS y PDFs coinciden por SHA-256 con el build local. Sin errores JS.
+
 ## 24/10: terminado el plan web `ethereal-booping-wall`
 
 El usuario pidió retomar el trabajo web que Claude dejó en el plan
