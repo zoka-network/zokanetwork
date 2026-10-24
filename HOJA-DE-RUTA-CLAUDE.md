@@ -1,7 +1,42 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
-Actualizada: **23 de octubre de 2026**, Argentina (Claude).
+Actualizada: **24 de octubre de 2026**, Argentina (continuación web por Codex).
 Proyecto: `C:\Users\mderramus\ZOKA`.
+
+## 24/10: terminado el plan web `ethereal-booping-wall`
+
+El usuario pidió retomar el trabajo web que Claude dejó en el plan
+`ethereal-booping-wall.md`. Implementado y publicado en **https://zoka.network**:
+
+- Marca **Zoka Network**, privacidad de punta a punta como mensaje principal,
+  Zenith como base del proyecto, Quantic Testnet en vivo y Zoka Mainnet
+  «coming soon», sin cambiar IDs ni reglas del nodo.
+- `Downloads/pcquantic.mp4` reemplaza el globo: copia H.264 de 1.804.417 bytes,
+  sin pista de audio, con poster, pausa y respeto por movimiento reducido.
+  El original no se modificó.
+- Home: descarga directa de ZSilent 3.0.5 y enlace a **https://zokascan.cc**.
+  El usuario confirmó esa URL y que el explorador se reparará después; la web
+  avisa que está temporalmente fuera de servicio. No se tocó el explorador.
+- Download contiene las tres opciones (ZSilent, CLI, Android en desarrollo),
+  con enlaces a sus guías. Docs tiene **12 guías** y los papers. Las URLs
+  `/#docs/cli-miner`, etc., soportan compartir, recargar, atrás y adelante.
+- Tech explica las capas de privacidad, Halo 2/Ironwood, X-Wing, direcciones,
+  libp2p/Gossipsub/Kademlia, Tor, iroh, minería y checkpoints, con límites y
+  estado real de implementación.
+- Whitepaper y litepaper **2.3**, 17 y 5 páginas, regenerados y revisados;
+  se conservaron las URLs de PDF existentes. Fuentes tipográficas locales,
+  con sus licencias: sin solicitudes a Google Fonts al cargar el sitio.
+
+**Código:** `zokaweb` commit `4e7f90c`, en `main` de GitHub y GitLab;
+rama de trabajo conservada `web-privacidad-24oct`. **Cloudflare Pages:**
+despliegue de producción `https://99a2b7f6.zokaweb.pages.dev`.
+
+**Validación:** 7 pruebas Vitest; TypeScript de app y configuración; lint sin
+errores (7 avisos Fast Refresh preexistentes); build de producción. Navegador
+en 320, 390, 768 y 1440 px: 12 guías, historial, foco, video y movimiento
+reducido; sin errores JS ni peticiones externas. Descargas GitHub HTTP 200.
+Tras publicar, HTML, JS, CSS, video, poster, fuentes y PDFs en zoka.network
+coinciden con el build local; comprobado también en navegador público.
 
 ## Punto de partida
 
