@@ -3,11 +3,45 @@
 Actualizada: **28 de octubre de 2026**, Argentina (núcleo STARK local verificado; testnet v2 minada con XMRig en local; red pública v2 probada por los relays de n0).
 Proyecto: `C:\Users\mderramus\ZOKA`.
 
+## 28/10, noche (3): checkpoints de la PC en el nodo STARK (Claude, rama `quantic-v2-checkpoints`)
+
+Tercer punto del orden acordado (decisión 3 del usuario). Rama sobre
+`quantic-v2-red-publica`, **sin pushear**.
+
+- **Claves:** la testnet v2 usa las mismas claves de autoridad que la v1 (la
+  misma PC, y cada firma lleva el chain id). El usuario no tiene que crear
+  nada. Si prefiere claves propias para la v2, es una línea en `economics.rs`
+  más `zoka checkpoint-keygen`.
+- **Nodo:** `serve --authority DIR`. `DIR` es la carpeta de la red de la v1
+  donde están `checkpoint-authority.key` y `checkpoint-authority-mldsa.key`.
+  Se firma con las reglas de la v1: cada 30 bloques, 6 por debajo de la punta,
+  con algún par en sesión y ninguno adelante.
+- **Red y API:**
+  - `HEAD` informa la altura del checkpoint, y cada sesión trae o entrega el
+    más nuevo antes de mover bloques;
+  - `GET`/`POST /checkpoint`;
+  - `checkpoint-sign` para corregir a mano;
+  - cuarentena de la minería mientras la cadena contradice el checkpoint.
+- **Validado:** 30 pruebas, la suite de 256 y tres procesos reales con claves
+  descartables de `zoka checkpoint-keygen`:
+  - la autoridad sola no firmó;
+  - con un par firmó el 4;
+  - un nodo con una cadena propia de 30 pasó a la de 11 de la autoridad;
+  - una firma a mano llegó a los tres;
+  - una falsificada dio 422.
+
+  Carpetas en `target/v2-checkpoint-2026-10-28/` (la `run2` es la buena; la
+  primera se cortó por un error del guion de prueba).
+- **Lanzamiento:** ZSilent v2 tiene que arrancar el nodo de la PC con
+  `--authority` apuntando a esa carpeta.
+- **Sigue:** direcciones cortas v2, ZSilent v2 y el génesis.
+
 ## 28/10, noche (2): red pública v2 (Claude, rama `quantic-v2-red-publica`)
 
 Segundo punto del orden acordado. La rama `quantic-v2-formato-final` quedó
 pusheada a GitHub y GitLab con el OK del usuario (`92a2de9e`, verificada con
-`ls-remote`). La nueva, sobre ella, **sin pushear**:
+`ls-remote`). La nueva, sobre ella, también quedó pusheada con su OK
+(`b503f158`, verificada en los dos remotos):
 
 - **Arreglo de TLS que también toca a la v1** (`610cf464`): el proveedor de
   rustls que exigía solo X25519MLKEM768 también lo usan el HTTPS de los relays

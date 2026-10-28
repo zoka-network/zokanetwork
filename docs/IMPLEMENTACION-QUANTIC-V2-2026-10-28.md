@@ -230,6 +230,21 @@ Falta:
 - un relay propio para la mainnet;
 - defensa contra quien ocupa las sesiones entrantes con muchos nodos reales.
 
+## Checkpoints de la autoridad (28/10, rama `quantic-v2-checkpoints`)
+
+La PC sigue como nodo autoritario en la v2. La testnet v2 usa las claves de
+autoridad de la v1, y las firmas híbridas son obligatorias.
+- `HEAD` informa la altura del checkpoint, y cada sesión trae o entrega el más
+  nuevo antes de mover bloques.
+- `serve --authority DIR` firma con las reglas de la v1.
+- `checkpoint-sign` firma a mano, y la API agrega `GET`/`POST /checkpoint`.
+- No se arman plantillas sobre una rama que contradice el checkpoint.
+
+Validado con 30 pruebas de red y autoridad, la suite de 256 y tres procesos
+reales. Un nodo que minó solo 30 bloques pasó a la cadena de 11 de la
+autoridad, y una firma a mano llegó a los tres. Detalle en
+[CHECKPOINTS-AUTORITATIVOS.md](CHECKPOINTS-AUTORITATIVOS.md).
+
 La misma frase aplicada a esquemas diferentes no migra las notas ni los saldos.
 No se publicó un instalador, no se activó un génesis público nuevo y no se
 sustituyeron los JNI existentes como parte de este trabajo.

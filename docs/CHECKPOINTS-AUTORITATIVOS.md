@@ -169,6 +169,49 @@ ensayo. Binario de `e142e349`. Resultado:
    dejó de minar (cuarentena), entró en modo de recuperación y en menos de dos
    minutos tenía en el 16 el bloque firmado, bajando la rama de A.
 
+## Testnet v2 (STARK, 28/10/2026)
+
+Decisión del usuario (28/10): la PC sigue siendo el nodo autoritario en la
+testnet v2, que reemplaza a la v1. Rama `quantic-v2-checkpoints`.
+
+- **Claves:** la testnet v2 (`zoka-quantic-testnet-v2`) tiene compiladas las
+  mismas dos mitades que la v1 de Quantic. Cada firma lleva el chain id, así
+  que un checkpoint de una cadena no sirve en la otra, y la PC no necesita
+  claves nuevas. La versión 2 (híbrida) es la única que se acepta.
+- **Modo autoridad:** `quantic-pq-node serve --authority DIR`. `DIR` es la
+  carpeta con `checkpoint-authority.key` y `checkpoint-authority-mldsa.key`, la
+  de la red de la v1. Si alguna de las dos no es la compilada, el nodo no
+  arranca, en vez de firmar algo que nadie aceptaría. Las reglas de firma son
+  las de la v1: cada 30 bloques, el bloque 6 por debajo de la punta, con algún
+  par en sesión (entrante o saliente) y ningún par saliente que informe una
+  punta más alta. Si su cadena no contiene el último checkpoint aceptado, no
+  firma.
+- **Distribución:** `HEAD` informa la altura del último checkpoint aceptado.
+  Cada sesión, antes de mover bloques, trae el del otro lado si es más nuevo
+  (`CHECKPOINT`) o le entrega el propio (`SUBMIT_CHECKPOINT`). Así el pull que
+  sigue ya queda atado al checkpoint. `sync` también lo trae. Cada nodo lo
+  verifica contra las claves compiladas antes de guardarlo. Un checkpoint
+  rechazado no se vuelve a pedir en esa sesión.
+- **API:** `GET /checkpoint` y `POST /checkpoint`. `/status` muestra el vigente
+  y si la cadena canónica lo contiene (`followed`).
+- **Cuarentena:** no se arma una plantilla de minería (API, Stratum ni minero
+  interno) sobre una rama que contradice un checkpoint aceptado. El error dice
+  `mining paused`. Se mina de nuevo cuando el nodo se reorganiza.
+- **Corregir a mano:**
+  `quantic-pq-node checkpoint-sign --authority DIR --network testnet --height H
+  --hash <hash> --out cp.json` firma solo con las claves compiladas y verifica
+  el resultado antes de imprimirlo. Se entrega con
+  `Invoke-RestMethod -Method Post -ContentType application/json -InFile cp.json
+  http://127.0.0.1:9140/checkpoint` y los nodos se lo pasan entre sí.
+- **Probado** con tres procesos reales y claves descartables de
+  `zoka checkpoint-keygen`:
+  - la autoridad, sola durante 25 s, no firmó nada;
+  - con un seguidor conectado firmó el 4;
+  - un nodo que había minado solo una cadena de 30 bloques aceptó el
+    checkpoint y pasó a la de 11 de la autoridad;
+  - un checkpoint firmado a mano y entregado al seguidor llegó a los tres;
+  - uno falsificado se rechazó (422).
+
 ## Pendiente
 
 - Crear la mitad ML-DSA de la clave de Zenith (la crea el usuario en la PC) y
@@ -176,4 +219,6 @@ ensayo. Binario de `e142e349`. Resultado:
 - **Mientras un par anuncia una punta más alta, la autoridad no firma** (figura
   sincronizando). Es lo correcto si esa punta es real; un par que mienta su
   altura puede frenar las firmas nuevas, no las viejas (el vigente se reenvía
-  igual). Revisar antes de Quantic.
+  igual). Revisar antes de Quantic. En la v2 pasa lo mismo: un par saliente que
+  informa una punta más alta, aunque sea de una rama que el checkpoint ya
+  descarta, frena las firmas mientras dure la sesión.

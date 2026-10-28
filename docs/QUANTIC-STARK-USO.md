@@ -232,6 +232,22 @@ de quien venga. Un atacante con muchos nodos reales puede ocupar lugares en la
 tabla o las sesiones entrantes de una semilla; los pares fijos siguen
 conectados igual.
 
+## Checkpoints de la autoridad
+
+La PC del equipo firma checkpoints («en la altura H el bloque canónico es este
+hash»). Los nodos no siguen ninguna rama que contradiga el último aceptado,
+aunque tenga más trabajo. La testnet v2 trae compiladas las claves de la
+autoridad. En la regtest no hay ninguna: una red local de prueba las define con
+`ZOKA_CHECKPOINT_AUTHORITY_PUBKEY` y `ZOKA_CHECKPOINT_AUTHORITY_MLDSA_PUBKEY`.
+Detalle en [CHECKPOINTS-AUTORITATIVOS.md](CHECKPOINTS-AUTORITATIVOS.md).
+
+- `serve --authority DIR` convierte al nodo en la autoridad. `DIR` tiene las
+  dos mitades de la clave, que tienen que ser las compiladas.
+- Cada sesión intercambia el checkpoint más nuevo antes de mover bloques.
+- Mientras la cadena local contradice el checkpoint, la API, el Stratum y el
+  minero interno no arman plantillas (`mining paused`).
+- `checkpoint-sign` firma uno a mano. Se entrega con `POST /checkpoint`.
+
 ## Sincronizar una copia para la wallet y enviar
 
 RocksDB abre una base por proceso. Mientras A o B estén activos, use otra base
@@ -376,11 +392,13 @@ para exponer directamente a Internet.
 
 | Operación | Solicitud | Resultado |
 | --- | --- | --- |
-| Estado | `GET /status` | Cadena, altura, hash, emisión, cantidad de notas y mempool, algoritmo, límites, estado del Stratum y pares (salientes, entrantes, conocidos, pendientes, relay) |
+| Estado | `GET /status` | Cadena, altura, hash, emisión, cantidad de notas y mempool, algoritmo, límites, estado del Stratum, pares (salientes, entrantes, conocidos, pendientes, relay) y checkpoint vigente (altura, hash y si la cadena lo contiene) |
 | Bloque canónico | `GET /blocks/ALTURA` | JSON del bloque; 404 si no existe |
 | Admitir pago | `POST /transactions`, `application/octet-stream` | Transacción v2 binaria; 202 con txid si se acepta |
 | Plantilla de minería | `GET /mining/template?address=DIRECCION` | Bloque candidato, blob, target, seed y posición del nonce |
 | Admitir bloque | `POST /blocks`, `application/json` | Valida y almacena el bloque; conserva ramas válidas según fork choice |
+| Checkpoint vigente | `GET /checkpoint` | El último checkpoint aceptado, o `null` |
+| Admitir checkpoint | `POST /checkpoint`, `application/json` | Lo verifica contra las claves de la autoridad y lo guarda si es el más nuevo; 422 si la firma o la altura no sirven |
 
 Ejemplos con el nodo A activo:
 
