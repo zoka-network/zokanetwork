@@ -15,6 +15,8 @@ pub const MAX_SUPPLY: u64 = 23_000_000 * ATOMS;
 pub const ANCHOR_WINDOW: usize = 100;
 pub const MAX_BLOCK_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_BLOCK_TRANSACTIONS: usize = 16;
+/// One short of a full depth-32 tree, so a frontier always has its root.
+pub const MAX_NOTES: u64 = (1 << DEPTH) - 1;
 pub fn subsidy(height: u32) -> u64 {
     match height {
         1 => PREMINE,
@@ -62,7 +64,7 @@ impl NoteTree {
     }
     pub fn append(&mut self, note: Digest) -> Result<u32, Error> {
         let _ = note.fields()?;
-        if self.count >= 1u64 << DEPTH {
+        if self.count >= MAX_NOTES {
             return Err(Error::Ledger("note tree full"));
         }
         let index = self.count as u32;
@@ -103,6 +105,247 @@ impl NoteTree {
     }
 }
 
+/// Coinbase rewards join the note tree this many blocks after their block.
+pub fn maturity(network: u8) -> u32 {
+    if network == 3 {
+        2
+    } else {
+        60
+    }
+}
+
+/// An incremental note tree: the left nodes that still wait for a right
+/// sibling, one per set bit of `count`. Enough to append and compute the root
+/// of the full tree, so a node keeps this per block instead of every note.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Frontier {
+    count: u64,
+    ommers: Vec<Option<Digest>>,
+}
+impl Default for Frontier {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            ommers: vec![None; DEPTH],
+        }
+    }
+}
+impl Frontier {
+    pub fn len(&self) -> u64 {
+        self.count
+    }
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+    pub fn append(&mut self, network: u8, leaf: Digest) -> Result<(), Error> {
+        let _ = leaf.fields()?;
+        if self.count >= MAX_NOTES || self.ommers.len() != DEPTH {
+            return Err(Error::Ledger("note tree full"));
+        }
+        let mut node = leaf;
+        for level in 0..DEPTH {
+            if (self.count >> level) & 1 == 0 {
+                self.ommers[level] = Some(node);
+                break;
+            }
+            let left = self.ommers[level]
+                .take()
+                .ok_or(Error::Ledger("corrupt frontier"))?;
+            node = crypto::parent(network, level, left, node)?;
+        }
+        self.count += 1;
+        Ok(())
+    }
+    /// The same root as a [`NoteTree`] holding the same notes.
+    pub fn root(&self, network: u8) -> Result<Digest, Error> {
+        let mut empty = Digest::ZERO;
+        let mut acc: Option<Digest> = None;
+        for (level, ommer) in self.ommers.iter().enumerate() {
+            acc = match (ommer, acc) {
+                (Some(left), right) => Some(crypto::parent(
+                    network,
+                    level,
+                    *left,
+                    right.unwrap_or(empty),
+                )?),
+                (None, Some(left)) => Some(crypto::parent(network, level, left, empty)?),
+                (None, None) => None,
+            };
+            empty = crypto::parent(network, level, empty, empty)?;
+        }
+        Ok(acc.unwrap_or(empty))
+    }
+}
+
+/// What the ledger rules read and change. [`Ledger`] keeps everything in
+/// memory (wallets need every note for their paths); a node keeps a compact
+/// state per block and looks the rest up. Both run the same [`apply`].
+pub trait LedgerState {
+    fn network(&self) -> u8;
+    fn height(&self) -> u32;
+    fn issued(&self) -> u64;
+    fn notes(&self) -> u64;
+    fn contains_anchor(&self, root: &Digest) -> bool;
+    fn is_spent(&self, nullifier: &Digest) -> Result<bool, Error>;
+    /// How many coinbase notes join the tree at `height`.
+    fn matured_count(&self, height: u32) -> usize;
+    fn take_matured(&mut self, height: u32) -> Vec<Digest>;
+    /// Called only once every rule of the block holds.
+    fn append(&mut self, note: Digest) -> Result<(), Error>;
+    fn defer(&mut self, matures_at: u32, notes: Vec<Digest>);
+    fn spend(&mut self, nullifiers: BTreeSet<Digest>);
+    /// Closes the block; its final root becomes an anchor.
+    fn close(&mut self, height: u32, issued: u64) -> Result<(), Error>;
+}
+
+pub fn check_transfer<S: LedgerState + ?Sized>(state: &S, tx: &Transaction) -> Result<(), Error> {
+    let s = &tx.statement;
+    if s.minted != 0 || s.nullifiers.is_empty() {
+        return Err(Error::Ledger("expected a transfer"));
+    }
+    if !state.contains_anchor(&s.anchor) {
+        return Err(Error::Ledger("unknown or expired anchor"));
+    }
+    for nf in &s.nullifiers {
+        if state.is_spent(nf)? {
+            return Err(Error::Ledger("spent nullifier"));
+        }
+    }
+    if s.fee < conventional_fee(s.nullifiers.len(), s.commitments.len()) {
+        return Err(Error::Ledger("fee"));
+    }
+    tx.verify(
+        state.network(),
+        state
+            .height()
+            .checked_add(1)
+            .ok_or(Error::Ledger("height overflow"))?,
+    )
+}
+
+/// Validation precedes all mutations. Invalid blocks leave state unchanged.
+pub fn apply<S: LedgerState + ?Sized>(
+    state: &mut S,
+    coinbase: &Transaction,
+    transfers: &[Transaction],
+) -> Result<(), Error> {
+    let height = state
+        .height()
+        .checked_add(1)
+        .ok_or(Error::Ledger("height overflow"))?;
+    if transfers.len() > MAX_BLOCK_TRANSACTIONS {
+        return Err(Error::Ledger("too many transactions"));
+    }
+    let bytes = transfers
+        .iter()
+        .chain(std::iter::once(coinbase))
+        .try_fold(0usize, |sum, tx| {
+            Ok::<_, Error>(sum.saturating_add(tx.encode()?.len()))
+        })?;
+    if bytes > MAX_BLOCK_BYTES {
+        return Err(Error::Ledger("block byte limit"));
+    }
+    let mut nullifiers = BTreeSet::new();
+    let mut fees = 0u64;
+    for tx in transfers {
+        check_transfer(state, tx)?;
+        fees = fees
+            .checked_add(tx.statement.fee)
+            .ok_or(Error::Ledger("fee overflow"))?;
+        for nf in &tx.statement.nullifiers {
+            if !nullifiers.insert(*nf) {
+                return Err(Error::DuplicateNullifier);
+            }
+        }
+    }
+    let reward = subsidy(height)
+        .checked_add(fees)
+        .ok_or(Error::Ledger("reward overflow"))?;
+    if coinbase.statement.minted != reward || !coinbase.statement.nullifiers.is_empty() {
+        return Err(Error::Ledger("coinbase reward"));
+    }
+    coinbase.verify(state.network(), height)?;
+    if height == 1 && !transfers.is_empty() {
+        return Err(Error::Ledger("genesis transfers"));
+    }
+    let issued = state
+        .issued()
+        .checked_add(subsidy(height))
+        .filter(|v| *v <= MAX_SUPPLY)
+        .ok_or(Error::Ledger("supply"))?;
+    height
+        .checked_add(maturity(state.network()))
+        .ok_or(Error::Ledger("maturity overflow"))?;
+    let inserts = state.matured_count(height)
+        + transfers
+            .iter()
+            .map(|t| t.statement.commitments.len())
+            .sum::<usize>()
+        + if height == 1 {
+            coinbase.statement.commitments.len()
+        } else {
+            0
+        };
+    if state.notes() + inserts as u64 > MAX_NOTES {
+        return Err(Error::Ledger("note tree full"));
+    }
+    commit(state, height, issued, coinbase, transfers, nullifiers)
+}
+
+/// Re-applies an already validated block (a node's own canonical chain)
+/// without verifying its proofs again: how a wallet rebuilds the full tree.
+pub fn replay<S: LedgerState + ?Sized>(
+    state: &mut S,
+    coinbase: &Transaction,
+    transfers: &[Transaction],
+) -> Result<(), Error> {
+    let height = state
+        .height()
+        .checked_add(1)
+        .ok_or(Error::Ledger("height overflow"))?;
+    let issued = state
+        .issued()
+        .checked_add(subsidy(height))
+        .ok_or(Error::Ledger("supply"))?;
+    let nullifiers = transfers
+        .iter()
+        .flat_map(|tx| tx.statement.nullifiers.iter().copied())
+        .collect();
+    commit(state, height, issued, coinbase, transfers, nullifiers)
+}
+
+// Every digest was checked by validation. Matured digests came from earlier
+// verified coinbases; capacity was checked, so these appends cannot fail.
+fn commit<S: LedgerState + ?Sized>(
+    state: &mut S,
+    height: u32,
+    issued: u64,
+    coinbase: &Transaction,
+    transfers: &[Transaction],
+    nullifiers: BTreeSet<Digest>,
+) -> Result<(), Error> {
+    for note in state.take_matured(height) {
+        state.append(note)?;
+    }
+    if height == 1 {
+        for note in &coinbase.statement.commitments {
+            state.append(*note)?;
+        }
+    } else {
+        let at = height
+            .checked_add(maturity(state.network()))
+            .ok_or(Error::Ledger("maturity overflow"))?;
+        state.defer(at, coinbase.statement.commitments.clone());
+    }
+    for tx in transfers {
+        for note in &tx.statement.commitments {
+            state.append(*note)?;
+        }
+    }
+    state.spend(nullifiers);
+    state.close(height, issued)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Ledger {
     pub network: u8,
@@ -112,7 +355,6 @@ pub struct Ledger {
     pub spent: BTreeSet<Digest>,
     anchors: VecDeque<Digest>,
     pending: BTreeMap<u32, Vec<Digest>>,
-    maturity: u32,
 }
 impl Ledger {
     pub fn new(network: u8) -> Result<Self, Error> {
@@ -125,122 +367,56 @@ impl Ledger {
             spent: BTreeSet::new(),
             anchors: VecDeque::new(),
             pending: BTreeMap::new(),
-            maturity: if network == 3 { 2 } else { 60 },
         })
     }
     pub fn contains_anchor(&self, root: &Digest) -> bool {
         self.anchors.contains(root)
     }
     pub fn check_transfer(&self, tx: &Transaction) -> Result<(), Error> {
-        let s = &tx.statement;
-        if s.minted != 0 || s.nullifiers.is_empty() {
-            return Err(Error::Ledger("expected a transfer"));
-        }
-        if !self.contains_anchor(&s.anchor) {
-            return Err(Error::Ledger("unknown or expired anchor"));
-        }
-        if s.nullifiers.iter().any(|nf| self.spent.contains(nf)) {
-            return Err(Error::Ledger("spent nullifier"));
-        }
-        if s.fee < conventional_fee(s.nullifiers.len(), s.commitments.len()) {
-            return Err(Error::Ledger("fee"));
-        }
-        tx.verify(
-            self.network,
-            self.height
-                .checked_add(1)
-                .ok_or(Error::Ledger("height overflow"))?,
-        )
+        check_transfer(self, tx)
     }
-
-    /// Validation precedes all mutations. Invalid blocks leave state unchanged.
-    pub fn apply(
-        &mut self,
-        coinbase: &Transaction,
-        transfers: &[Transaction],
-    ) -> Result<(), Error> {
-        let height = self
-            .height
-            .checked_add(1)
-            .ok_or(Error::Ledger("height overflow"))?;
-        if transfers.len() > MAX_BLOCK_TRANSACTIONS {
-            return Err(Error::Ledger("too many transactions"));
-        }
-        let bytes = transfers
-            .iter()
-            .chain(std::iter::once(coinbase))
-            .try_fold(0usize, |sum, tx| {
-                Ok::<_, Error>(sum.saturating_add(tx.encode()?.len()))
-            })?;
-        if bytes > MAX_BLOCK_BYTES {
-            return Err(Error::Ledger("block byte limit"));
-        }
-        let mut nullifiers = BTreeSet::new();
-        let mut fees = 0u64;
-        for tx in transfers {
-            self.check_transfer(tx)?;
-            fees = fees
-                .checked_add(tx.statement.fee)
-                .ok_or(Error::Ledger("fee overflow"))?;
-            for nf in &tx.statement.nullifiers {
-                if !nullifiers.insert(*nf) {
-                    return Err(Error::DuplicateNullifier);
-                }
-            }
-        }
-        let reward = subsidy(height)
-            .checked_add(fees)
-            .ok_or(Error::Ledger("reward overflow"))?;
-        if coinbase.statement.minted != reward || !coinbase.statement.nullifiers.is_empty() {
-            return Err(Error::Ledger("coinbase reward"));
-        }
-        coinbase.verify(self.network, height)?;
-        if height == 1 && !transfers.is_empty() {
-            return Err(Error::Ledger("genesis transfers"));
-        }
-        let issued = self
-            .issued
-            .checked_add(subsidy(height))
-            .filter(|v| *v <= MAX_SUPPLY)
-            .ok_or(Error::Ledger("supply"))?;
-        let maturity_height = height
-            .checked_add(self.maturity)
-            .ok_or(Error::Ledger("maturity overflow"))?;
-        let matured = self.pending.get(&height).map_or(0, Vec::len);
-        let inserts = matured
-            + transfers
-                .iter()
-                .map(|t| t.statement.commitments.len())
-                .sum::<usize>()
-            + if height == 1 {
-                coinbase.statement.commitments.len()
-            } else {
-                0
-            };
-        if self.tree.len() + inserts as u64 > 1u64 << DEPTH {
-            return Err(Error::Ledger("note tree full"));
-        }
-        // Every digest was checked by proof validation above. Matured digests
-        // came from earlier verified coinbases; these appends cannot fail.
-        if let Some(notes) = self.pending.remove(&height) {
-            for note in notes {
-                self.tree.append(note)?;
-            }
-        }
-        if height == 1 {
-            for note in &coinbase.statement.commitments {
-                self.tree.append(*note)?;
-            }
-        } else {
-            self.pending
-                .insert(maturity_height, coinbase.statement.commitments.clone());
-        }
-        for tx in transfers {
-            for note in &tx.statement.commitments {
-                self.tree.append(*note)?;
-            }
-        }
+    pub fn apply(&mut self, coinbase: &Transaction, transfers: &[Transaction]) -> Result<(), Error> {
+        apply(self, coinbase, transfers)
+    }
+    pub fn replay(&mut self, coinbase: &Transaction, transfers: &[Transaction]) -> Result<(), Error> {
+        replay(self, coinbase, transfers)
+    }
+}
+impl LedgerState for Ledger {
+    fn network(&self) -> u8 {
+        self.network
+    }
+    fn height(&self) -> u32 {
+        self.height
+    }
+    fn issued(&self) -> u64 {
+        self.issued
+    }
+    fn notes(&self) -> u64 {
+        self.tree.len()
+    }
+    fn contains_anchor(&self, root: &Digest) -> bool {
+        self.anchors.contains(root)
+    }
+    fn is_spent(&self, nullifier: &Digest) -> Result<bool, Error> {
+        Ok(self.spent.contains(nullifier))
+    }
+    fn matured_count(&self, height: u32) -> usize {
+        self.pending.get(&height).map_or(0, Vec::len)
+    }
+    fn take_matured(&mut self, height: u32) -> Vec<Digest> {
+        self.pending.remove(&height).unwrap_or_default()
+    }
+    fn append(&mut self, note: Digest) -> Result<(), Error> {
+        self.tree.append(note).map(|_| ())
+    }
+    fn defer(&mut self, matures_at: u32, notes: Vec<Digest>) {
+        self.pending.insert(matures_at, notes);
+    }
+    fn spend(&mut self, nullifiers: BTreeSet<Digest>) {
         self.spent.extend(nullifiers);
+    }
+    fn close(&mut self, height: u32, issued: u64) -> Result<(), Error> {
         self.issued = issued;
         self.height = height;
         self.anchors.push_back(self.tree.root());
@@ -270,6 +446,23 @@ mod tests {
         assert_ne!(
             path.root(3, tree.commitment(3).unwrap()).unwrap(),
             tree.root()
+        );
+    }
+    #[test]
+    fn a_frontier_has_the_root_of_the_full_tree() {
+        let mut tree = NoteTree::new(3).unwrap();
+        let mut frontier = Frontier::default();
+        assert_eq!(frontier.root(3).unwrap(), tree.root());
+        for i in 0..70u32 {
+            let leaf = Digest([i + 7; 16]);
+            tree.append(leaf).unwrap();
+            frontier.append(3, leaf).unwrap();
+            assert_eq!(frontier.root(3).unwrap(), tree.root(), "{} notes", i + 1);
+        }
+        assert_eq!(frontier.len(), 70);
+        assert_ne!(
+            Frontier::default().root(2).unwrap(),
+            Frontier::default().root(3).unwrap()
         );
     }
     #[test]

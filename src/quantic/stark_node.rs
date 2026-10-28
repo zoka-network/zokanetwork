@@ -195,7 +195,7 @@ pub(crate) fn import_mined_locked(state: &NodeState, block: &Block) -> Result<bo
     }
     let current = tip(state)?;
     if previous.header.hash != current.header.hash {
-        let ledger = stark::state_after(&state.storage, state.profile, &current)?;
+        let ledger = stark::branch(&state.storage, state.profile, &current)?;
         state
             .mempool
             .lock()
@@ -884,7 +884,7 @@ mod tests {
         // This payment's anchor is absent from the peer's current canonical
         // ledger. It becomes usable there only after adopting our complete fork.
         let payment_id = with_state(&local, move |state| {
-            let ledger = stark::state_after(&state.storage, state.profile, &tip(state)?)?;
+            let ledger = stark::full_ledger(&state.storage, state.profile, &tip(state)?)?;
             let reward = stark::decode(&genesis)?.remove(0);
             let (note, _) = alice
                 .receive(reward.statement.commitments[0], &reward.envelopes[0])

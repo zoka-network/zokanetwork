@@ -294,7 +294,7 @@ impl Chain {
             blocks.push(block);
         }
         let parent = blocks.last().expect("height > 0").clone();
-        let ledger = stark::state_after(&self.storage, stark::Profile::REGTEST, &parent)?;
+        let ledger = stark::full_ledger(&self.storage, stark::Profile::REGTEST, &parent)?;
         let inserted = commitment_order(&blocks)?;
         if inserted.len() as u64 != ledger.tree.len() {
             return Err("el orden de las notas no coincide con el árbol guardado".into());
@@ -380,7 +380,7 @@ fn validate_existing_v2(storage: &RocksDbStorage) -> Result<(), String> {
     )
     .map_err(|e| format!("génesis v2 inválido: {e}"))?;
     stark::validate(storage, stark::Profile::REGTEST, &genesis, &parent)?;
-    stark::state_after(storage, stark::Profile::REGTEST, &genesis)?;
+    stark::branch(storage, stark::Profile::REGTEST, &genesis)?;
     let hash = storage.get_last_block_hash().map_err(|e| e.to_string())?;
     let tip = storage
         .get_canonical_block_by_height(height)
@@ -389,7 +389,7 @@ fn validate_existing_v2(storage: &RocksDbStorage) -> Result<(), String> {
     if tip.header.hash != hash {
         return Err("la punta de la base existente no coincide con el índice".into());
     }
-    stark::state_after(storage, stark::Profile::REGTEST, &tip)?;
+    stark::branch(storage, stark::Profile::REGTEST, &tip)?;
     Ok(())
 }
 

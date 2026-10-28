@@ -367,7 +367,7 @@ fn handle_request(state: &NodeState, tag: u8, body: &[u8]) -> Result<Vec<u8>, St
         SUBMIT_TX => {
             let tx = Transaction::decode(body).map_err(err)?;
             let txid = tx.txid();
-            let ledger = stark::state_after(&state.storage, state.profile, &tip(state)?)?;
+            let ledger = stark::branch(&state.storage, state.profile, &tip(state)?)?;
             state
                 .mempool
                 .lock()
@@ -396,7 +396,7 @@ fn import_block_locked(state: &NodeState, block: &Block) -> Result<bool, String>
     };
     let current = tip(state)?;
     if current.header.hash != previous {
-        let ledger = stark::state_after(&state.storage, state.profile, &current)?;
+        let ledger = stark::branch(&state.storage, state.profile, &current)?;
         state
             .mempool
             .lock()
@@ -800,7 +800,7 @@ mod tests {
         let payment = with_state(&local, move |state| {
             let alice = Account::from_seed(&[31; 32], 3, 0).map_err(err)?;
             let bob = Account::from_seed(&[32; 32], 3, 0).map_err(err)?;
-            let ledger = stark::state_after(&state.storage, state.profile, &for_payment)?;
+            let ledger = stark::full_ledger(&state.storage, state.profile, &for_payment)?;
             let cb = stark::decode(&for_payment)?.remove(0);
             let (note, _) = alice
                 .receive(cb.statement.commitments[0], &cb.envelopes[0])

@@ -65,7 +65,7 @@ impl NodeState {
             .and_then(|marker| Profile::for_chain(&marker))
             .ok_or("STARK API requires a database marked with a STARK v2 chain id")?;
         let parent = current_tip(profile, &storage).map_err(|e| e.message)?;
-        stark::state_after(&storage, profile, &parent)?;
+        stark::branch(&storage, profile, &parent)?;
         Ok(Self {
             profile,
             storage,
@@ -294,11 +294,12 @@ async fn status(
     blocking(permit, move || {
         let _gate = state.gate.lock().map_err(|_| ApiError::internal("node gate poisoned"))?;
         let tip = current_tip(state.profile, &state.storage)?;
-        let ledger = stark::state_after(&state.storage, state.profile, &tip).map_err(ApiError::internal)?;
+        let branch = stark::branch(&state.storage, state.profile, &tip).map_err(ApiError::internal)?;
+        let ledger = branch.state();
         let count = state.mempool.lock().map_err(|_| ApiError::internal("mempool poisoned"))?.len();
         json_response(StatusCode::OK, &serde_json::json!({
             "chain_id":state.profile.chain_id,"pool_version":2,"height":ledger.height,"hash":tip.header.hash,
-            "issued_atoms":ledger.issued,"notes":ledger.tree.len(),"mempool_transactions":count,
+            "issued_atoms":ledger.issued,"notes":ledger.notes,"mempool_transactions":count,
             "pow_algorithm":state.profile.pow_algorithm(),"xmrig_compatible":state.profile.xmrig_compatible(),
             "max_transaction_bytes":MAX_TRANSACTION_BYTES,"max_block_request_bytes":MAX_BLOCK_REQUEST_BYTES,
             "stratum":super::stratum::status(),
@@ -341,7 +342,7 @@ async fn submit_transaction(
             .lock()
             .map_err(|_| ApiError::internal("node gate poisoned"))?;
         let tip = current_tip(state.profile, &state.storage)?;
-        let ledger = stark::state_after(&state.storage, state.profile, &tip).map_err(ApiError::internal)?;
+        let ledger = stark::branch(&state.storage, state.profile, &tip).map_err(ApiError::internal)?;
         state
             .mempool
             .lock()
@@ -456,7 +457,7 @@ async fn submit_block(
         };
         let tip = current_tip(state.profile, &state.storage)?;
         if tip.header.hash != old_tip.header.hash {
-            let ledger = stark::state_after(&state.storage, state.profile, &tip).map_err(ApiError::internal)?;
+            let ledger = stark::branch(&state.storage, state.profile, &tip).map_err(ApiError::internal)?;
             state.mempool.lock().map_err(|_| ApiError::internal("mempool poisoned"))?.revalidate(&ledger);
         }
         let canonical = state.storage.get_canonical_block_by_height(block.header.block_height)
@@ -732,7 +733,7 @@ mod tests {
         let storage = state.storage.clone();
         let recipient = bob.address();
         let payment = tokio::task::spawn_blocking(move || {
-            let ledger = stark::state_after(&storage, Profile::REGTEST, &genesis).unwrap();
+            let ledger = stark::full_ledger(&storage, Profile::REGTEST, &genesis).unwrap();
             let reward = stark::decode(&genesis).unwrap().remove(0);
             let (note, _) = alice
                 .receive(reward.statement.commitments[0], &reward.envelopes[0])

@@ -243,7 +243,7 @@ struct Scan {
 }
 fn scan(db: &RocksDbStorage, profile: Profile, account: &Account) -> Result<Scan, String> {
     let parent = tip(db, profile)?;
-    let state = stark::state_after(db, profile, &parent)?;
+    let state = stark::full_ledger(db, profile, &parent)?;
     let mut positions = BTreeMap::new();
     for index in 0..state.tree.len() {
         let index = u32::try_from(index).map_err(error)?;
@@ -613,10 +613,11 @@ One atom = 0.000001 ZKA. No public chain or wallet path is selected automaticall
         "status" => {
             let (db, profile) = open_db(&path(args, "--db")?, network_option(args)?)?;
             let parent = tip(&db, profile)?;
-            let state = stark::state_after(&db, profile, &parent)?;
+            let branch = stark::branch(&db, profile, &parent)?;
+            let state = branch.state();
             println!(
                 "{}",
-                serde_json::json!({"chain_id":profile.chain_id,"height":state.height,"hash":parent.header.hash,"issued_atoms":state.issued,"notes":state.tree.len()})
+                serde_json::json!({"chain_id":profile.chain_id,"height":state.height,"hash":parent.header.hash,"issued_atoms":state.issued,"notes":state.notes})
             );
         }
         _ => {
