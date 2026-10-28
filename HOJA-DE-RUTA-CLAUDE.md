@@ -1,15 +1,63 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
-Actualizada: **28 de octubre de 2026**, Argentina (núcleo STARK local verificado; testnet v2 minada con XMRig en local).
+Actualizada: **28 de octubre de 2026**, Argentina (núcleo STARK local verificado; testnet v2 minada con XMRig en local; red pública v2 probada por los relays de n0).
 Proyecto: `C:\Users\mderramus\ZOKA`.
+
+## 28/10, noche (2): red pública v2 (Claude, rama `quantic-v2-red-publica`)
+
+Segundo punto del orden acordado. La rama `quantic-v2-formato-final` quedó
+pusheada a GitHub y GitLab con el OK del usuario (`92a2de9e`, verificada con
+`ls-remote`). La nueva, sobre ella, **sin pushear**:
+
+- **Arreglo de TLS que también toca a la v1** (`610cf464`): el proveedor de
+  rustls que exigía solo X25519MLKEM768 también lo usan el HTTPS de los relays
+  y pkarr de iroh, y los relays de n0 cortaban con `HandshakeFailure`. Un nodo
+  con `--relay N0` nunca quedaba en línea, y lo mismo pasaba con el
+  `NodePreset` de la v1 en Quantic. Ahora se ofrece el híbrido primero y un
+  hook `after_handshake` cierra toda conexión de iroh que no lo negoció.
+  Dependencia nueva `noq-proto` 1.3 (ya estaba en el lock).
+- **Red pública** (`f367e385`):
+  - descriptor v3 que fija la huella de 32 bytes de la clave ML-DSA;
+  - manifiesto `docs/quantic-testnet-v2-network.v1.json` embebido (pre-génesis,
+    sin semillas);
+  - peticiones `PEERS`/`ANNOUNCE`: cada nodo se anuncia solo a sí mismo, y antes
+    de compartir un par lo llama y lo autentica;
+  - tabla de pares acotada y guardada en la base;
+  - relay N0 por omisión en la testnet;
+  - `quantic-pq-node identity`, que imprime la entrada de semilla;
+  - `sync` y `broadcast` usan las semillas;
+  - `/status` informa los pares.
+- **Validado:**
+  - 19 pruebas de red, 238 de `quantic::`, `state::chain`, `economics` y
+    `network::`, y `cargo check` sin features y con `quantic`;
+  - tres procesos reales en loopback: C conocía solo a B (vía manifiesto),
+    encontró a A y siguió su cadena;
+  - dos procesos por los relays reales de n0: la semilla fijada solo por
+    EndpointId y huella, A en línea en 1 s, y B siguió a A.
+
+  Carpetas de prueba en `target/v2-red-2026-10-28/` (la `n0` es la corrida que
+  falló antes del arreglo).
+- **Para el lanzamiento:**
+  1. el usuario crea la identidad de la PC con `quantic-pq-node identity
+     --network testnet`;
+  2. su `seed_entry` pasa al manifiesto, que es consenso de red, no de cadena;
+  3. el binario se vuelve a compilar.
+- **Queda abierto:**
+  - no hay Tor: QUIC va sobre UDP, así que haría falta otro transporte (TCP);
+  - las semillas no tienen un modo solo de presentación de pares: con muchos
+    nodos se llenan;
+  - para la mainnet hace falta un relay propio;
+  - un atacante con muchos nodos reales puede ocupar las 64 sesiones entrantes.
+- **Sigue:** checkpoints de la PC en el nodo STARK, direcciones cortas v2,
+  ZSilent v2 y el génesis.
 
 ## 28/10, noche: formato final de la v2 (Claude, rama `quantic-v2-formato-final`)
 
 Primer punto del orden acordado («estado por diferencias»). Al revisarlo
 aparecieron otros dos problemas de formato, también de consenso, y se
 resolvieron juntos antes del génesis v2. Especificación en
-[QUANTIC-V2-FORMATO.md](docs/QUANTIC-V2-FORMATO.md). Sin pushear (la
-aprobación de push fue para las dos ramas anteriores).
+[QUANTIC-V2-FORMATO.md](docs/QUANTIC-V2-FORMATO.md). Pusheada el 28/10 con el
+OK del usuario.
 
 - **Faerie Gold** (seguridad): `rho` lo elegía el emisor y dos notas podían
   compartir nullifier. Ahora `rho` sale del primer nullifier (AIR) o de la

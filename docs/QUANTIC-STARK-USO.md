@@ -146,8 +146,9 @@ intentarlo después de cada intervalo indicado, en segundos. Sin esa opción,
 el nodo valida y distribuye datos pero no mina. Ctrl+C inicia el cierre.
 
 El descriptor `node-a.peer.json` es público: contiene chain ID, identidad iroh,
-direcciones de conexión y clave pública ML-DSA-65 del servidor. Compártalo por
-un canal autenticado; el cliente confía en la clave fijada allí. No comparta el
+direcciones de conexión y la huella (blake3, 32 bytes) de la clave pública
+ML-DSA-65 del servidor, que manda la clave completa al conectarse. Compártalo
+por un canal autenticado; el cliente confía en la clave fijada allí. No comparta el
 archivo `node-a.identity.json`. En un reinicio, use otro nombre para
 `--descriptor-out`, porque el comando no sobrescribe archivos, y distribuya el
 descriptor nuevo: el puerto de transporte puede cambiar.
@@ -159,27 +160,77 @@ En otra terminal, cargue `ZOKA_PQ_PASSWORD` para la identidad del nodo B y ejecu
 ```
 
 El nodo B sincroniza desde A, comparte bloques y retransmite las transacciones
-de su mempool. Se pueden indicar hasta ocho opciones `--peer`; los ciclos de
+de su mempool. Se pueden indicar hasta ocho opciones `--peer`, que con las
+semillas del manifiesto son los pares fijos; los ciclos de
 sincronización trabajan en lotes de hasta 64 bloques y se repiten cada cinco
 segundos. La búsqueda de ancestro común permite procesar ramas divergentes;
 cada bloque recibido pasa por la validación local y la selección de cadena por
 trabajo acumulado. Un bloque válido de una rama todavía menos pesada puede
 quedar almacenado sin cambiar la punta canónica.
 
-Por defecto se usa transporte directo sin relays. El descriptor incluye
+En la regtest el transporte es directo, sin relays: el descriptor incluye
 sockets loopback para que los dos nodos del ejemplo funcionen en la misma PC.
-Para conectar equipos distintos se necesitan direcciones alcanzables, o la
-opción explícita `--relay=N0` tanto al servir como al conectar. Con N0 el nodo
+En la testnet v2 el valor por omisión es `--relay N0` (relays y búsqueda de
+direcciones de n0), así que ningún nodo necesita abrir puertos;
+`--relay none` lo apaga y `--relay N0` lo prende en la regtest. Con N0 el nodo
 espera que el relay esté disponible antes de publicar su descriptor. Eso usa
-infraestructura pública de transporte; la cadena sigue siendo regtest y el
-relay no proporciona anonimato.
+infraestructura pública de transporte y no proporciona anonimato.
 
-Las conexiones exigen intercambio TLS híbrido postcuántico. Además, el
+Las conexiones entre nodos exigen intercambio TLS híbrido postcuántico
+(X25519MLKEM768): iroh cierra, apenas termina el handshake, toda conexión que
+negoció otro grupo. El HTTPS que el mismo endpoint usa con los relays y con
+pkarr puede negociar un grupo clásico, porque los relays públicos no ofrecen el
+híbrido; por el relay viaja QUIC ya cifrado de punta a punta. Además, el
 servidor firma con ML-DSA-65 un mensaje ligado al exporter de esa conexión TLS,
 al protocolo, a la cadena y a las identidades de ambos extremos. El cliente
 comprueba la clave fijada en el descriptor. La identidad Ed25519 de iroh por
 sí sola no es la garantía postcuántica de este protocolo. El ALPN separado es
 `/zoka/quantic-stark/2`.
+
+## Semillas e intercambio de pares
+
+Un nodo nuevo empieza por los pares fijos: sus `--peer` y las semillas del
+manifiesto de la cadena. El de la testnet v2,
+[quantic-testnet-v2-network.v1.json](quantic-testnet-v2-network.v1.json), viaja
+dentro del binario; la regtest no tiene. `--seeds none` no usa ninguno y
+`--seeds ARCHIVO` usa otro manifiesto con el mismo formato. Una semilla se fija
+por su EndpointId de iroh y por la huella de su clave ML-DSA; con relays, n0
+encuentra el resto. Para obtener esos dos datos de una identidad:
+
+```powershell
+& $Zoka quantic-pq-node identity --identity .\stark-lab\node-a.identity.json
+```
+
+Imprime la entrada `seed_entry` lista para el manifiesto (crea la identidad si
+el archivo no existe; no imprime nada secreto). Sin `--peer`, `sync` y
+`broadcast` prueban las semillas en orden.
+
+Después el nodo aprende pares de sus pares:
+
+- Al abrir una sesión se anuncia a sí mismo (`--announce no` lo evita). El que
+  recibe el anuncio exige que el endpoint anunciado sea el de esa conexión.
+- Cada diez minutos pide `PEERS`. La respuesta trae hasta 16 pares que el que
+  responde llamó y autenticó en el último día, o pares fijos con sesión
+  abierta; un par que acaba de fallar no se comparte.
+- Un par anunciado o recibido queda pendiente hasta que este nodo lo llama, se
+  autentica con su clave y sirve la misma cadena. Recién entonces entra en la
+  tabla y se comparte.
+- Con relays se guardan solo los EndpointId de los pares aprendidos, sin
+  direcciones: un anuncio no puede hacer que el nodo llame a un tercero.
+
+La tabla guarda hasta 256 pares conocidos y 64 pendientes, se escribe en la base
+cada cinco minutos y al cerrar, y sobrevive a los reinicios. A un par que falla
+se lo vuelve a intentar con espera creciente (de 2 minutos a 6 horas); después
+de 8 fallas seguidas y una semana sin responder, se lo olvida. A los pares fijos
+se los vuelve a llamar siempre, con espera de 5 segundos a 5 minutos. Todas las
+llamadas salen del endpoint del propio nodo: sesión con cada par fijo, hasta 8
+con pares aprendidos y una comprobación de un pendiente cada 10 segundos. Cada
+nodo acepta hasta 64 sesiones entrantes.
+
+Nada de esto vuelve confiable a un par: cada bloque se valida localmente, venga
+de quien venga. Un atacante con muchos nodos reales puede ocupar lugares en la
+tabla o las sesiones entrantes de una semilla; los pares fijos siguen
+conectados igual.
 
 ## Sincronizar una copia para la wallet y enviar
 
@@ -325,7 +376,7 @@ para exponer directamente a Internet.
 
 | Operación | Solicitud | Resultado |
 | --- | --- | --- |
-| Estado | `GET /status` | Cadena, altura, hash, emisión, cantidad de notas y mempool, algoritmo, límites y estado del Stratum |
+| Estado | `GET /status` | Cadena, altura, hash, emisión, cantidad de notas y mempool, algoritmo, límites, estado del Stratum y pares (salientes, entrantes, conocidos, pendientes, relay) |
 | Bloque canónico | `GET /blocks/ALTURA` | JSON del bloque; 404 si no existe |
 | Admitir pago | `POST /transactions`, `application/octet-stream` | Transacción v2 binaria; 202 con txid si se acepta |
 | Plantilla de minería | `GET /mining/template?address=DIRECCION` | Bloque candidato, blob, target, seed y posición del nonce |
@@ -367,7 +418,7 @@ rendimiento ni de memoria constante por debajo de esos tamaños.
 | Comisión, emisión de coinbase y efectos públicos de la transacción | Públicos y ligados a la prueba |
 | Número de entradas y salidas, tamaños, txid y sobres cifrados | Públicos |
 | Alturas, tiempos, prueba de trabajo y cabeceras | Públicos |
-| IP, identidad del peer y patrones de conexión/transmisión | No los oculta la STARK ni el relay; permiten observación y posibles correlaciones |
+| IP, identidad del peer y patrones de conexión/transmisión | No los oculta la STARK ni el relay. El operador del relay y el DNS de pkarr (n0) ven IP y EndpointId; los pares, su EndpointId y lo que piden |
 
 El cifrado de notas usa X-Wing, combinación de ML-KEM-768 y X25519, junto con
 ChaCha20-Poly1305. La propiedad de fondos, pertenencia y conservación de saldo
@@ -410,8 +461,13 @@ cuánticas, conocimiento cero de la composición completa ni seguridad de toda
 la aplicación. Tampoco ampliar la salida de un hash aumenta automáticamente
 su resistencia interna.
 
+La red pública depende hoy de los relays y del DNS de n0. No hay transporte por
+Tor (QUIC va sobre UDP y Tor solo lleva TCP), ni un modo en el que las semillas
+sirvan solo para presentar pares: con muchos nodos, cada semilla se llenaría de
+sesiones fijas. Para la mainnet hace falta un relay propio.
+
 Se puede implementar y probar hoy el protocolo y sus rechazos sin disponer de
 una máquina cuántica. Lo implementado aquí no equivale a una auditoría externa
 ni a una certificación de resistencia cuántica. La cadena, las wallets y el
 transporte v2 descritos funcionan en cadenas locales: la regtest y la testnet v2
-antes de que el lanzamiento le fije el génesis.
+antes de que el lanzamiento le fije el génesis y su primera semilla.

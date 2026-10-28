@@ -129,7 +129,7 @@ de pruebas de varios megabytes se validaron para una red pública sostenida.
 
 | Área | Límite concreto del código actual |
 | --- | --- |
-| Perfiles públicos v2 | Desde la continuación de abajo existe el perfil `zoka-quantic-testnet-v2` (RandomX, ASERT, `zqtest2`). Falta el génesis fijo (decisión de lanzamiento), semillas y manifiesto, y revisar la selección de envío por altura para dificultad variable |
+| Perfiles públicos v2 | Desde la continuación de abajo existe el perfil `zoka-quantic-testnet-v2` (RandomX, ASERT, `zqtest2`), con manifiesto, intercambio de pares y relays (sección final). Falta el génesis fijo y la primera semilla (decisiones de lanzamiento), y revisar la selección de envío por altura para dificultad variable |
 | XMRig | Hecho en local: Stratum sobre plantillas STARK, probado con XMRig 6.25.0 real (ver abajo). Falta el RPC `get_block_template`/`submit_block` para software de pools y probarlo con varios mineros y xmrig-proxy |
 | ZSilent | `WalletService`, `NodeController` y la configuración siguen los comandos, prefijos y contratos v1. Falta conectar el flujo v2 y sus modelos de saldo/historial |
 | Android | `mobile_quantic`, JNI y las pantallas no están conectados al pool STARK. Compilar para ARM no sustituye esa integración ni la medición de memoria en dispositivos |
@@ -190,6 +190,45 @@ Validado: 14 pruebas del pool y 105 del nodo en release; pago por CLI de punta
 a punta (saldo, emisión y rechazo del doble gasto); XMRig 6.25.0 real, 25
 aciertos aceptados y 0 rechazados, 5 bloques canónicos, base de 119 KB para 5
 bloques (antes 7,4 MB para 4).
+
+## Red pública (28/10, rama `quantic-v2-red-publica`)
+
+- **TLS:** la exigencia de X25519MLKEM768 pasó del proveedor de rustls a un hook
+  `after_handshake` de iroh. El proveedor también sirve al HTTPS de relays y
+  pkarr, y los relays de n0 rechazaban un ClientHello solo híbrido
+  (`HandshakeFailure`). Así, un nodo con relays nunca quedaba en línea, y pasaba
+  lo mismo en la v1 de Quantic. Las conexiones entre nodos siguen siendo solo
+  híbridas, en los dos sentidos.
+- **Descriptor v3:** fija la huella blake3 de 32 bytes de la clave ML-DSA-65.
+  Una semilla del manifiesto es su EndpointId y esa huella.
+- **Manifiesto** `docs/quantic-testnet-v2-network.v1.json`, embebido en el
+  binario. Está en pre-génesis y sin semillas.
+- **Intercambio:**
+  - `ANNOUNCE` solo acepta el endpoint de la propia conexión;
+  - `PEERS` devuelve hasta 16 pares que el nodo llamó y autenticó en el último
+    día, o pares fijos con sesión, con una respuesta por conexión y minuto;
+  - cada par aprendido se llama y se autentica antes de entrar en la tabla;
+  - con relays se guardan solo los EndpointId.
+- **Nodo:**
+  - sesiones fijas con `--peer` y las semillas;
+  - hasta 8 sesiones con pares aprendidos;
+  - tabla de 256 conocidos y 64 pendientes, guardada en la base;
+  - 64 sesiones entrantes;
+  - relay N0 por omisión en la testnet.
+
+Validado:
+- 19 pruebas de red y 238 de `quantic::`, `state::chain`, `economics` y
+  `network::`, en release;
+- tres procesos en loopback: el nodo que conocía un solo par encontró al
+  tercero y siguió su cadena;
+- dos procesos por los relays reales de n0, con la semilla fijada solo por id y
+  huella.
+
+Falta:
+- Tor (haría falta un transporte TCP);
+- un modo de semilla que solo presente pares;
+- un relay propio para la mainnet;
+- defensa contra quien ocupa las sesiones entrantes con muchos nodos reales.
 
 La misma frase aplicada a esquemas diferentes no migra las notas ni los saldos.
 No se publicó un instalador, no se activó un génesis público nuevo y no se
