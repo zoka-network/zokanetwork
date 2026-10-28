@@ -743,6 +743,7 @@ impl Default for WalletStorage {
 const ENCRYPTION_MAGIC: &[u8] = b"ZOKAENC1";
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
+const AUTH_TAG_LEN: usize = 16;
 
 fn derive_encryption_key(password: &str, salt: &[u8]) -> Result<[u8; 32], BlockError> {
     let mut key = [0u8; 32];
@@ -827,9 +828,14 @@ pub(crate) fn decrypt_data(encrypted: &[u8], password: &str) -> Result<Vec<u8>, 
         ));
     }
 
-    if encrypted.len() >= ENCRYPTION_MAGIC.len() + SALT_LEN + NONCE_LEN
-        && &encrypted[..ENCRYPTION_MAGIC.len()] == ENCRYPTION_MAGIC
-    {
+    if encrypted.starts_with(ENCRYPTION_MAGIC) {
+        // A modern-format marker must never downgrade to unauthenticated XOR,
+        // even when corruption leaves only part of the header or GCM tag.
+        if encrypted.len() < ENCRYPTION_MAGIC.len() + SALT_LEN + NONCE_LEN + AUTH_TAG_LEN {
+            return Err(BlockError::TransactionValidationFailed(
+                "truncated authenticated encryption payload".to_string(),
+            ));
+        }
         let salt_start = ENCRYPTION_MAGIC.len();
         let nonce_start = salt_start + SALT_LEN;
         let data_start = nonce_start + NONCE_LEN;
@@ -994,6 +1000,29 @@ mod tests {
         let legacy = xor_legacy(data, password).expect("legacy");
         let decrypted = decrypt_data(&legacy, password).expect("decrypt fallback");
         assert_eq!(decrypted, data);
+    }
+
+    #[test]
+    fn test_truncated_modern_payload_never_falls_back_to_legacy_xor() {
+        let encrypted = encrypt_data(&[7; 32], "right-password").expect("encrypt seed");
+        let minimum = ENCRYPTION_MAGIC.len() + SALT_LEN + NONCE_LEN + AUTH_TAG_LEN;
+        for len in ENCRYPTION_MAGIC.len()..minimum {
+            let truncated = &encrypted[..len];
+            for password in ["right-password", "wrong-password"] {
+                let error = decrypt_data(truncated, password)
+                    .expect_err("modern-format truncation must not decrypt as legacy XOR");
+                assert!(error
+                    .to_string()
+                    .contains("truncated authenticated encryption"));
+            }
+        }
+        // With the old decoder, 32 bytes passed through XOR and looked exactly
+        // like a seed to a caller. Cover authenticated bodies missing tag bytes
+        // too, including a structurally complete header with no valid tag.
+        for len in [minimum, encrypted.len() - 1] {
+            assert!(decrypt_data(&encrypted[..len], "right-password").is_err());
+        }
+        assert_eq!(decrypt_data(&encrypted, "right-password").unwrap(), [7; 32]);
     }
 
     #[test]

@@ -1,12 +1,39 @@
-# Pool privado postcuántico de Zoka Quantic (borrador de diseño)
+# Pool privado postcuántico de ZOKA QUANTIC
+
+## Estado de la implementación: 28/10/2026
+
+Ya existe una implementación STARK v2 en
+[zoka-pq-pool](../crates/zoka-pq-pool/src/lib.rs), integrada con consenso,
+persistencia, wallet, minería, API y transporte de un nodo en la cadena separada
+`zoka-quantic-regtest-v2`. La [guía de uso](QUANTIC-STARK-USO.md) documenta el
+build con `--features quantic-pq`, dos nodos, sincronización, pagos y los límites
+actuales. El regtest usa PoW CPU; no es el protocolo `rx/0` de XMRig ni una
+migración de la red pública o de wallets Orchard.
+
+La [revisión asistida del código STARK](REVISION-STARK-CODIGO-2026-10-25.md)
+describe las restricciones verificadas, las correcciones y las hipótesis de
+seguridad. Es una revisión de implementación, no una auditoría externa ni una
+certificación postcuántica. Los bits del estimador son una cota bajo su modelo
+clásico; no deben publicarse como bits de seguridad cuántica. La
+[revisión de Quantic del 24/10](REVISION-quantic-2026-10-24.md) aporta el contexto
+anterior, pero no sustituye la evaluación de la ruta STARK v2.
+
+El texto que sigue conserva el diseño y las mediciones históricas del 21/10.
+Sus candidatos, parámetros y decisiones eran propuestas de esa fecha. En
+particular, los aproximadamente 200 KB medían permutaciones aisladas, no una
+transferencia completa; la implementación actual no agrega recursivamente las
+pruebas del bloque y admite hasta 32 MiB de transacciones binarias por bloque.
+Para comportamiento y comandos vigentes, prevalecen la guía de uso y el código.
+
+## Diseño y medidas históricos: 21/10/2026
 
 21/10/2026. Paso 3 del plan (ver
 [QUANTIC-INVENTARIO-CRIPTOGRAFICO.md](QUANTIC-INVENTARIO-CRIPTOGRAFICO.md)).
 Decisión del usuario del 21/10: **la mainnet espera a este pool**. La testnet
 puede salir antes con Orchard.
 
-Es un borrador: nada de esto está construido y ningún parámetro está fijo. El
-primer paso es un prototipo que mida lo que acá se estima.
+En esa fecha era un borrador sin parámetros fijados. Se proponía construir un
+prototipo para medir las estimaciones siguientes; véase arriba el estado actual.
 
 ## Objetivo
 

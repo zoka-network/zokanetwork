@@ -16,9 +16,10 @@
 //! secreto:  secreto ML-KEM (32)                      ‖ secreto X25519 (32)
 //! ```
 //!
-//! El cliente manda además la mitad X25519 sola (`hybrid_component`): un par
-//! que no conoce el grupo híbrido elige X25519 sin otra vuelta, y la conexión
-//! sigue andando.
+//! El proveedor de compatibilidad ofrece también X25519 solo. El preset de
+//! Quantic usa `RequiredPostQuantumTls`: no ofrece esa mitad ni permite volver
+//! a un grupo clásico. TLS conserva la identidad Ed25519 de iroh; la firma
+//! híbrida de snapshots se verifica aparte y no depende de esa identidad.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -157,6 +158,57 @@ pub fn provider() -> CryptoProvider {
     provider
 }
 
+/// A Quantic peer must never silently negotiate only the classical half.
+/// Keep the compatibility provider above for explicit legacy tools/tests.
+#[derive(Debug)]
+struct RequiredHybridGroup;
+
+impl SupportedKxGroup for RequiredHybridGroup {
+    fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, Error> {
+        Ok(Box::new(RequiredHybridExchange(X25519_MLKEM768.start()?)))
+    }
+
+    fn start_and_complete(&self, share: &[u8]) -> Result<CompletedKeyExchange, Error> {
+        X25519_MLKEM768.start_and_complete(share)
+    }
+
+    fn ffdhe_group(&self) -> Option<FfdheGroup<'static>> { None }
+    fn name(&self) -> NamedGroup { NamedGroup::X25519MLKEM768 }
+    fn usable_for_version(&self, version: ProtocolVersion) -> bool {
+        version == ProtocolVersion::TLSv1_3
+    }
+}
+
+struct RequiredHybridExchange(Box<dyn ActiveKeyExchange>);
+
+impl ActiveKeyExchange for RequiredHybridExchange {
+    fn complete(self: Box<Self>, share: &[u8]) -> Result<SharedSecret, Error> {
+        self.0.complete(share)
+    }
+    fn pub_key(&self) -> &[u8] { self.0.pub_key() }
+    fn ffdhe_group(&self) -> Option<FfdheGroup<'static>> { None }
+    fn group(&self) -> NamedGroup { NamedGroup::X25519MLKEM768 }
+    fn complete_hybrid_component(self: Box<Self>, _share: &[u8]) -> Result<SharedSecret, Error> {
+        Err(INVALID_KEY_SHARE)
+    }
+    // No classical component is offered, even in the first ClientHello.
+}
+
+pub fn required_hybrid_provider() -> CryptoProvider {
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider.kx_groups = vec![&RequiredHybridGroup];
+    provider
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RequiredPostQuantumTls<P>(pub P);
+
+impl<P: Preset> Preset for RequiredPostQuantumTls<P> {
+    fn apply(self, builder: Builder) -> Builder {
+        self.0.apply(builder).crypto_provider(Arc::new(required_hybrid_provider()))
+    }
+}
+
 /// Un preset de iroh con el TLS híbrido encima de `inner`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PostQuantumTls<P>(pub P);
@@ -176,7 +228,7 @@ pub struct NodePreset;
 impl Preset for NodePreset {
     fn apply(self, builder: Builder) -> Builder {
         if crate::network::p2p::network_protocol_is_set() {
-            PostQuantumTls(presets::N0).apply(builder)
+            RequiredPostQuantumTls(presets::N0).apply(builder)
         } else {
             presets::N0.apply(builder)
         }
@@ -186,6 +238,37 @@ impl Preset for NodePreset {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn required_provider_cannot_offer_a_classical_downgrade() {
+        let provider = required_hybrid_provider();
+        assert_eq!(provider.kx_groups.len(), 1);
+        let exchange = provider.kx_groups[0].start().unwrap();
+        assert_eq!(exchange.group(), NamedGroup::X25519MLKEM768);
+        assert!(exchange.hybrid_component().is_none());
+        assert!(exchange.complete_hybrid_component(&[1; 32]).is_err());
+    }
+
+    #[tokio::test]
+    async fn required_iroh_tls_accepts_hybrid_and_rejects_classical_peers() {
+        use crate::network::iroh_snapshot_transfer::{fetch_snapshot, serve_snapshot};
+        use std::time::Duration;
+        let payload = vec![42; 4096];
+        let strict = || RequiredPostQuantumTls(presets::Minimal);
+        let server = serve_snapshot(Arc::new(payload.clone()), strict()).await.unwrap();
+        assert_eq!(fetch_snapshot(server.addr(), strict()).await.unwrap(), payload);
+        let rejected = tokio::time::timeout(
+            Duration::from_secs(10), fetch_snapshot(server.addr(), presets::Minimal)
+        ).await;
+        assert!(rejected.is_err() || rejected.unwrap().is_err());
+        server.close().await;
+        let classical = serve_snapshot(Arc::new(payload), presets::Minimal).await.unwrap();
+        let rejected = tokio::time::timeout(
+            Duration::from_secs(10), fetch_snapshot(classical.addr(), strict())
+        ).await;
+        assert!(rejected.is_err() || rejected.unwrap().is_err());
+        classical.close().await;
+    }
 
     #[test]
     fn both_sides_agree_on_a_secret_made_of_both_halves() {

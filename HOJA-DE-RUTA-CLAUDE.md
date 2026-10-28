@@ -1,7 +1,92 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
-Actualizada: **24 de octubre de 2026**, Argentina (web y revisión de Quantic por Codex).
+Actualizada: **28 de octubre de 2026**, Argentina (núcleo STARK local verificado; integración en curso).
 Proyecto: `C:\Users\mderramus\ZOKA`.
+
+## 28/10: implementación del pool privado STARK (validación local completada)
+
+El usuario autorizó complementar el desarrollo de Claude e implementar la
+blockchain privada con refuerzo postcuántico. Rama de trabajo:
+`quantic-protocolo-postcuantico`. No se migraron la testnet pública ni wallets
+instaladas. El código nuevo usa `quantic-pq` y la cadena local separada
+`zoka-quantic-regtest-v2`.
+
+- `crates/zoka-pq-pool` ahora contiene una transferencia real: propietario
+  derivado mediante hash, notas y árbol Poseidon2, nullifiers, montos de 64
+  bits, balance dentro del AIR, pruebas STARK con ocultamiento, cifrado X-Wing,
+  direcciones v2 y ledger con emisión, comisiones y maduración. El antiguo
+  benchmark de permutaciones continúa siendo solo un benchmark.
+- `src/quantic/stark.rs` integra este formato en el validador real del nodo,
+  PoW, RocksDB y reorganizaciones. La primera prueba completa pasó (22,5 s).
+  Tiene mempool acotado. El estado completo por bloque aún es una limitación
+  de escalabilidad; no presentarlo como almacenamiento listo para mainnet.
+- CLI `quantic-pq`: wallet cifrada/restauración, escaneo, reservas, transferencias
+  por archivo, minado e importación/exportación de bloques. Se conserva el
+  flujo anterior `pq-regtest` (send mina automáticamente); son schemas de
+  wallet distintos. Se endureció ese flujo contra XOR, notas duplicadas y DB
+  de otra red. Sus nuevas regresiones pasaron en la corrida final.
+- `stark_api.rs`, `stark_net.rs` y `stark_node.rs` están implementados y
+  conectados al comando `quantic-pq-node`. API loopback, transporte iroh con
+  TLS híbrido obligatorio y autenticación ML-DSA fijada por descriptor y
+  ligada al exporter TLS; sincronización de forks por lotes, retransmisión de
+  pagos, minero y copias locales para la wallet. Comparten límites de trabajo
+  y bloqueo de estado; la cancelación no libera un verificador todavía activo.
+  Guía: [QUANTIC-STARK-USO.md](docs/QUANTIC-STARK-USO.md).
+- TLS iroh de Quantic exige intercambio híbrido. Snapshots/importaciones
+  exigen firmas híbridas de claves confiables; la autoridad compilada sirve
+  como fallback cuando el manifiesto no lista firmantes. Servir bloques
+  sigue disponible sin clave de autoridad. El protocolo v2 añade autenticación
+  ML-DSA al servidor; la identidad iroh subyacente sigue siendo Ed25519.
+- La revisión del transporte corrigió un estancamiento al enviar forks largos
+  con pagos pendientes. También se corrigió `wallet/storage.rs`: un archivo
+  que comienza con `ZOKAENC1` pero está truncado ya no cae al descifrado XOR.
+  Los formatos antiguos sin ese encabezado conservan su compatibilidad.
+- Medidas verificadas: prueba 1→2 de 1.868.731 bytes (~6,4 s); forma máxima
+  8→8 de 8.341.990 bytes (87,15 s mientras había otras compilaciones).
+  Pasaron las pruebas del circuito, inflación con hashes recalculados,
+  ciphertexts, doble gasto, maduración y rechazo de bytes sobrantes. El
+  estimador clásico arroja 128 bits bajo una hipótesis explícita de hash;
+  no acredita 128 bits cuánticos ni reemplaza revisión externa.
+- `cargo check --offline --manifest-path crates/zoka-pq-pool/Cargo.toml --lib`
+  pasó para `armv7-linux-androideabi` y `aarch64-linux-android`. No se midió
+  todavía el prover en un teléfono ni se sustituyeron los JNI existentes.
+- Informe de revisión asistida:
+  [REVISION-STARK-CODIGO-2026-10-25.md](docs/REVISION-STARK-CODIGO-2026-10-25.md).
+  No es auditoría externa ni certificación de resistencia cuántica.
+- El 28/10 pasaron 10 pruebas del pool (99,83 s), 48 de Quantic incluidas
+  API/transporte/nodo/CLI y compatibilidad anterior (354,66 s), 42 de TLS,
+  snapshots y almacenamiento de wallets (27,55 s), 15 del CLI de snapshots
+  (0,12 s) y 3 de configuración de red. Pasaron también `cargo check --offline
+  --features quantic-pq --tests`, `cargo check --offline --lib` sin la feature,
+  y la compilación release de `zoka` con `quantic-pq`.
+- La prueba posterior con dos procesos reales detectó un fallo específico de
+  Windows al enviar: bloquear el archivo de wallet impedía leerlo por otro
+  handle del mismo proceso. Se corrigió a un sidecar `.stark-lock` persistente
+  con ruta canónica y se añadió regresión. Pasaron las cuatro pruebas del CLI
+  de wallet (10,83 s), el rebuild y el envío real de 1 ZKA entre dos nodos:
+  ambos llegaron a altura 3 y el receptor vio 1.000.000 átomos disponibles.
+  Las bases conservan el mismo hash al reabrirse por sus rutas absolutas.
+  Los procesos temporales quedaron detenidos. Junto con la regresión de rutas
+  descrita abajo, son 120 pruebas distintas.
+- La comprobación posterior detectó que `main` cambiaba siempre a la carpeta
+  general de Zoka, también para las rutas explícitas v2. Se corrigió para que
+  estos comandos conserven el directorio del invocador y omitan la migración
+  automática y lectura de configuración pública. Pasaron su regresión, el
+  rebuild final y la repetición con dos procesos y rutas relativas: pago de
+  1 ZKA, altura 3 y mismo hash al reabrir ambas bases. No hubo pérdida de la
+  cadena original. La prueba de
+  rutas anterior creó dos bases vacías bajo la carpeta general de Zoka, en
+  `target/quantic-validation-2026-10-28/smoke-a9e03ac149664bb0bbbc59aba52daf7e`;
+  su eliminación fue rechazada por la revisión automática ("blocked by policy")
+  y se conservaron. No reintentar con otra vía ni tocar las bases del usuario.
+- La testnet existente y XMRig siguen en el protocolo v1. Regtest v2 usa el
+  PoW CPU de pruebas; esas pruebas no validan RandomX/XMRig v2 ni la GUI móvil.
+- Informe del código y sus comprobaciones:
+  [IMPLEMENTACION-QUANTIC-V2-2026-10-28.md](docs/IMPLEMENTACION-QUANTIC-V2-2026-10-28.md).
+
+Esta entrada sustituye el estado de implementación de la revisión del 24/10
+que figura abajo. No afirmar que el proyecto está completo ni que mainnet está
+habilitada basándose solamente en estas pruebas locales.
 
 ## 24/10: revisión del desarrollo postcuántico y XMRig
 

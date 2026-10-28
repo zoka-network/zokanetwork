@@ -439,6 +439,8 @@ pub const QUANTIC_MAINNET_CHAIN_ID: &str = "zoka-quantic-v1";
 pub const QUANTIC_TESTNET_CHAIN_ID: &str = "zoka-quantic-testnet-v1";
 /// Redes locales de prueba de Quantic: prueba de trabajo liviana.
 pub const QUANTIC_REGTEST_CHAIN_ID: &str = "zoka-quantic-regtest-v1";
+/// Separate chain identity: v1 peers must never follow a STARK test chain.
+pub const QUANTIC_PQ_REGTEST_CHAIN_ID: &str = "zoka-quantic-regtest-v2";
 
 /// El génesis de una red pública de Quantic: el hash de su bloque 1 y la
 /// dirección que recibe el premine. Fijo en el binario, como el de Bitcoin:
@@ -468,6 +470,7 @@ pub fn is_quantic_chain_id(chain_id: &str) -> bool {
     chain_id == QUANTIC_MAINNET_CHAIN_ID
         || chain_id == QUANTIC_TESTNET_CHAIN_ID
         || chain_id == QUANTIC_REGTEST_CHAIN_ID
+        || chain_id == QUANTIC_PQ_REGTEST_CHAIN_ID
 }
 
 /// Las cadenas públicas usan RandomX: Zenith y las dos de Quantic.

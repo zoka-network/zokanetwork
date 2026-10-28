@@ -65,6 +65,22 @@ fn print_quantic_usage() {
     println!("  estimate-fee --amount <ZKA> | send --to <address> --amount <ZKA> [--memo <text>] --name <w> --password-stdin");
     println!("  show-phrase | change-password --new-password-env <VAR> | backup --out <file> | import-backup --file <file>");
     println!("  (pick the wallet with --name or --address; add --json for machine output; --rpc <url> for another node)");
+    #[cfg(feature = "quantic-pq")]
+    {
+        println!(
+            "{}",
+            dashboard_section(
+                "Red local postcuántica (zoka-quantic-regtest-v2, no es la testnet)",
+                ANSI_GREEN
+            )
+        );
+        println!("  zoka pq-regtest new --dir <carpeta> --name <wallet> --password-env <VAR>");
+        println!("  zoka pq-regtest address --dir <carpeta> --name <wallet>");
+        println!("  zoka pq-regtest balance|mine --dir <carpeta> --name <wallet> --password-env <VAR>");
+        println!("  zoka pq-regtest send --dir <carpeta> --name <wallet> --password-env <VAR> --to <zqregtest2...> --amount <átomos>");
+        println!("  zoka quantic-pq help     wallet, send and block import/export with explicit file paths");
+        println!("  zoka quantic-pq-node help     authenticated v2 regtest node, sync and broadcast");
+    }
     println!("{}", dashboard_section("Node", ANSI_GREEN));
     for line in QUANTIC_FULLNODE_USAGE {
         println!("{line}");
@@ -649,6 +665,15 @@ fn looks_like_placeholder(value: &str) -> bool {
         || lowered.contains("rpceu111")
 }
 
+fn valid_snapshot_signer(chain_id: &str, signer: &str) -> bool {
+    #[cfg(feature = "pq-experimental")]
+    if zoka::hybrid_signature::HybridVerifyingKey::from_hex(signer).is_ok() {
+        return true;
+    }
+    !economics::is_quantic_chain_id(chain_id)
+        && hex::decode(signer.trim()).map(|bytes| bytes.len() == 32).unwrap_or(false)
+}
+
 fn lint_mainnet_network_config(
     path: &Path,
     allow_placeholders: bool,
@@ -703,7 +728,7 @@ fn lint_mainnet_network_config(
         }
     }
 
-    if config.snapshot_signers.is_empty() {
+    if zoka::snapshot::trusted_signers_for_chain(&config.chain_id, &config.snapshot_signers).is_empty() {
         let msg = "no snapshot signer public keys configured".to_string();
         if release_ready_status {
             errors.push(msg);
@@ -712,16 +737,13 @@ fn lint_mainnet_network_config(
         }
     }
     for signer in &config.snapshot_signers {
-        if hex::decode(signer)
-            .map(|bytes| bytes.len() != 32)
-            .unwrap_or(true)
-        {
+        if !valid_snapshot_signer(&config.chain_id, signer) {
             errors.push(format!(
-                "snapshot signer '{}' is not a 32-byte hex public key",
+                "snapshot signer '{}' is invalid (Quantic requires a hybrid Ed25519 + ML-DSA-65 public key)",
                 signer
             ));
         }
-        if looks_like_placeholder(signer) {
+        if signer.len() == 64 && looks_like_placeholder(signer) {
             errors.push(format!(
                 "snapshot signer '{}' looks like a placeholder",
                 signer
@@ -7661,18 +7683,14 @@ async fn fetch_peer_snapshot(endpoint_id: iroh::EndpointId) -> Result<(String, V
 
 /// Import a snapshot that came from an arbitrary peer.
 ///
-/// Deliberately does *not* require a trusted signature, unlike the
-/// manifest-seed bootstrap path. That path uses the signature to authorize a
-/// specific operator-run seed; here the whole point is that *any* peer can be
-/// the source, so authorization can't come from an allowlist. Safety comes
-/// from `import_into_storage` replaying every block through the full consensus
-/// apply path — proof of work, difficulty, and the canonical 3127 checkpoint —
-/// so a hostile peer cannot introduce an invalid or side-branch chain. The
-/// worst it can do is waste our bandwidth.
+/// Any peer may deliver a snapshot. Quantic requires a trusted hybrid
+/// signature on its contents regardless of the peer identity; every block is
+/// then replayed through consensus.
 fn import_peer_snapshot_bytes(
     storage: &Arc<RocksDbStorage>,
     chain_id: &str,
     bytes: &[u8],
+    trusted_signers: &[String],
 ) -> Result<u64, String> {
     let snapshot = zoka::snapshot::deserialize(bytes).map_err(|e| format!("parse failed: {e}"))?;
     if snapshot.header.chain_id != chain_id {
@@ -7680,6 +7698,15 @@ fn import_peer_snapshot_bytes(
             "snapshot is for chain {}, not {chain_id}",
             snapshot.header.chain_id
         ));
+    }
+    if economics::is_quantic_chain_id(chain_id) {
+        zoka::snapshot::verify_against_trusted_signers(&snapshot, chain_id, trusted_signers)
+            .map_err(|e| format!("snapshot authentication failed: {e}"))?;
+    } else {
+        zoka::snapshot::verify(&snapshot, &zoka::snapshot::VerifyOptions {
+            expected_chain_id: chain_id, require_signature: false,
+            expected_pubkey: None, expected_hybrid_pubkey: None, require_hybrid: false,
+        }).map_err(|e| format!("snapshot verification failed: {e}"))?;
     }
     zoka::snapshot::import_into_storage(storage, chain_id, &snapshot)
         .map_err(|e| format!("import rejected by consensus: {e}"))
@@ -7698,6 +7725,12 @@ fn live_chain_manifest(
     iroh_endpoint_id: &str,
 ) -> Result<zoka::network::snapshot_request_response::SnapshotManifest, String> {
     use zoka::network::snapshot_request_response::SnapshotManifest;
+
+    if economics::is_quantic_chain_id(chain_id)
+        && !IROH_SIGNED_SNAPSHOT_AVAILABLE.load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err("this endpoint serves blocks but has no signed snapshot".into());
+    }
 
     let head_height = storage
         .get_chain_height()
@@ -11314,7 +11347,7 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     .map(PathBuf::from)
                     .unwrap_or_else(|| PathBuf::from(network.default_network_config_path()));
                 let trusted_signers = load_network_config_for(&config_path, network)
-                    .map(|cfg| cfg.snapshot_signers)
+                    .map(|cfg| zoka::snapshot::trusted_signers_for_chain(&chain_id, &cfg.snapshot_signers))
                     .unwrap_or_default();
                 if trusted_signers.is_empty() {
                     startup_notes.push(format!(
@@ -13097,7 +13130,10 @@ async fn cmd_fullnode_auto(args: &[String]) -> Result<(), String> {
                     if let Some(handle) = peer_snapshot_fetch.take() {
                         match handle.await {
                             Ok(Ok((source, bytes))) => {
-                                match import_peer_snapshot_bytes(storage, &chain_id, &bytes) {
+                                let trusted_signers = load_network_config_for(&iroh_bootstrap_config_path, network)
+                                    .map(|cfg| zoka::snapshot::trusted_signers_for_chain(&chain_id, &cfg.snapshot_signers))
+                                    .unwrap_or_default();
+                                match import_peer_snapshot_bytes(storage, &chain_id, &bytes, &trusted_signers) {
                                     Ok(applied) => {
                                         last_event = format!(
                                             "Peer snapshot from {source}: imported {applied} block(s); now at height {}.",
@@ -18805,6 +18841,10 @@ async fn run() -> Result<(), String> {
         return Err(format!("`zoka {command}` belonged to Zenith. {ZENITH_RETIRED} {QUANTIC_INSTEAD}"));
     }
     match command.as_str() {
+        #[cfg(feature = "quantic-pq")]
+        "quantic-pq" => zoka::quantic::stark_cli::run(tail),
+        #[cfg(feature = "quantic-pq")]
+        "quantic-pq-node" => zoka::quantic::stark_node::run(tail).await,
         "version" | "--version" | "-V" => {
             println!("zoka {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -18900,6 +18940,8 @@ async fn run() -> Result<(), String> {
         "quantic-wallet" => cmd_quantic_wallet(tail),
         #[cfg(feature = "quantic")]
         "quantic-genesis" => cmd_quantic_genesis(tail),
+        #[cfg(feature = "quantic-pq")]
+        "pq-regtest" => zoka::quantic::pq_local::command(tail),
         "checkpoint-status" => cmd_checkpoint_status(tail),
         "private-pending-diagnostics" => cmd_private_pending_diagnostics(tail),
         "tx-pending" => cmd_pending_transfers(tail),
@@ -19221,15 +19263,137 @@ fn cmd_release_keygen(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Apply the same trust policy to manual imports and automatic bootstrap.
+fn verify_cli_snapshot(
+    snapshot: &zoka::snapshot::ChainSnapshotV1,
+    network: NetworkProfile,
+    require_signature: bool,
+    signer: Option<&str>,
+    args: &[String],
+) -> Result<String, String> {
+    let chain_id = network.chain_id();
+    let configured = if let Some(key) = signer {
+        vec![key.to_owned()]
+    } else if network.is_quantic() {
+        let explicit_path = option_value(args, "--network-config");
+        let path = explicit_path.as_deref().unwrap_or(network.default_network_config_path());
+        if explicit_path.is_some() && !Path::new(path).is_file() {
+            return Err(format!("snapshot network config '{path}' does not exist"));
+        }
+        load_network_config_for(Path::new(path), network)?.snapshot_signers
+    } else { Vec::new() };
+    if network.is_quantic() || !configured.is_empty() {
+        let signers = zoka::snapshot::trusted_signers_for_chain(chain_id, &configured);
+        return zoka::snapshot::verify_against_trusted_signers(snapshot, chain_id, &signers)
+            .map_err(|e| format!("snapshot verify failed: {e}"));
+    }
+    zoka::snapshot::verify(snapshot, &zoka::snapshot::VerifyOptions {
+        expected_chain_id: chain_id, require_signature,
+        expected_pubkey: None, expected_hybrid_pubkey: None, require_hybrid: false,
+    }).map_err(|e| format!("snapshot verify failed: {e}"))
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SnapshotFileCommand {
+    Info,
+    Export,
+    Import,
+}
+
+/// Separate the one file path from validated options before any file/DB access.
+/// Return only options to the existing helpers, so a path after `--` can never
+/// be interpreted as a flag. Normalize `--name=value` and the signer alias too.
+fn parse_snapshot_file_args(
+    args: &[String],
+    command: SnapshotFileCommand,
+) -> Result<(String, Vec<String>), String> {
+    let (name, values, flags): (&str, &[&str], &[&str]) = match command {
+        SnapshotFileCommand::Info => (
+            "snapshot-info",
+            &[
+                "--network",
+                "--network-config",
+                "--signer-key",
+                "--public-key",
+            ],
+            &["--json", "--require-signature"],
+        ),
+        SnapshotFileCommand::Export => (
+            "snapshot-export",
+            &[
+                "--network",
+                "--network-config",
+                "--db",
+                "--sign-key-hex",
+                "--mldsa-key-file",
+            ],
+            &[],
+        ),
+        SnapshotFileCommand::Import => (
+            "snapshot-import",
+            &[
+                "--network",
+                "--network-config",
+                "--db",
+                "--signer-key",
+                "--public-key",
+            ],
+            &["--require-signature"],
+        ),
+    };
+    let mut path = None;
+    let mut options = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut positional_only = false;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if !positional_only && arg == "--" {
+            positional_only = true;
+            continue;
+        }
+        if !positional_only && arg.starts_with('-') {
+            let (option, inline_value) = match arg.split_once('=') {
+                Some((option, value)) => (option, Some(value)),
+                None => (arg.as_str(), None),
+            };
+            let takes_value = values.contains(&option);
+            if !takes_value && !flags.contains(&option) {
+                return Err(format!("{name}: unknown option {option}"));
+            }
+            let canonical = if option == "--public-key" {
+                "--signer-key"
+            } else {
+                option
+            };
+            if !seen.insert(canonical) {
+                return Err(format!("{name}: duplicate option {canonical}"));
+            }
+            options.push(canonical.to_owned());
+            if takes_value {
+                let value = inline_value
+                    .or_else(|| args.next().map(String::as_str))
+                    .filter(|value| !value.is_empty() && !value.starts_with("--"))
+                    .ok_or_else(|| format!("{name}: missing value for {option}"))?;
+                options.push(value.to_owned());
+            } else if inline_value.is_some() {
+                return Err(format!("{name}: {option} does not take a value"));
+            }
+        } else {
+            if arg.is_empty() {
+                return Err(format!("{name}: snapshot path cannot be empty"));
+            }
+            if path.replace(arg.clone()).is_some() {
+                return Err(format!("{name}: expected exactly one snapshot path"));
+            }
+        }
+    }
+    let path = path.ok_or_else(|| format!("{name}: missing snapshot path"))?;
+    Ok((path, options))
+}
+
 fn cmd_snapshot_info(args: &[String]) -> Result<(), String> {
-    let in_path = args
-        .iter()
-        .find(|arg| !arg.starts_with("--"))
-        .cloned()
-        .ok_or_else(|| {
-            "missing argument: pass the snapshot path (e.g. zoka snapshot-info ./mainnet.snapshot.json)"
-                .to_string()
-        })?;
+    let (in_path, options) = parse_snapshot_file_args(args, SnapshotFileCommand::Info)?;
+    let args = options.as_slice();
     let as_json = has_flag(args, "--json");
     let require_signature = has_flag(args, "--require-signature");
     let pubkey_hex =
@@ -19240,34 +19404,8 @@ fn cmd_snapshot_info(args: &[String]) -> Result<(), String> {
     let snapshot =
         zoka::snapshot::deserialize(&bytes).map_err(|e| format!("snapshot parse failed: {e}"))?;
 
-    let pubkey_array;
-    let pubkey_ref: Option<&[u8; 32]> = match pubkey_hex {
-        Some(hex_key) => {
-            let decoded = hex::decode(hex_key.trim())
-                .map_err(|e| format!("snapshot signer key must be 32-byte hex: {e}"))?;
-            if decoded.len() != 32 {
-                return Err(format!(
-                    "snapshot signer key must decode to 32 bytes (got {})",
-                    decoded.len()
-                ));
-            }
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&decoded);
-            pubkey_array = key;
-            Some(&pubkey_array)
-        }
-        None => None,
-    };
-
-    let opts = zoka::snapshot::VerifyOptions {
-        expected_chain_id: MAINNET_CHAIN_ID,
-        require_signature: require_signature || pubkey_ref.is_some(),
-        expected_pubkey: pubkey_ref,
-        expected_hybrid_pubkey: None,
-        require_hybrid: false,
-    };
-    let digest = zoka::snapshot::verify(&snapshot, &opts)
-        .map_err(|e| format!("snapshot verify failed: {e}"))?;
+    let network = NetworkProfile::from_args(args)?;
+    let digest = verify_cli_snapshot(&snapshot, network, require_signature, pubkey_hex.as_deref(), args)?;
 
     if as_json {
         println!(
@@ -19324,22 +19462,17 @@ fn cmd_snapshot_info(args: &[String]) -> Result<(), String> {
 /// metadata into a `zoka-snapshot-v1` JSON, optionally signs it with
 /// ed25519, writes the result to disk, and prints the SHA-256 digest.
 fn cmd_snapshot_export(args: &[String]) -> Result<(), String> {
-    let out_path = args
-        .iter()
-        .find(|arg| !arg.starts_with("--"))
-        .cloned()
-        .ok_or_else(|| {
-            "missing argument: pass the output path (e.g. zoka snapshot-export ./mainnet.snapshot.json)"
-                .to_string()
-        })?;
+    let (out_path, options) = parse_snapshot_file_args(args, SnapshotFileCommand::Export)?;
+    let args = options.as_slice();
+    let network = NetworkProfile::from_args(args)?;
     let db_path_owned = option_value(args, "--db");
-    let db_path = db_path_owned.as_deref().unwrap_or(".zoka/blockchain.db");
+    let db_path = db_path_owned.as_deref().unwrap_or(network.default_db_path());
     let sign_key_hex = option_value(args, "--sign-key-hex");
 
     let storage = RocksDbStorage::new(db_path)
         .map_err(|e| format!("failed to open chain db '{db_path}': {e}"))?;
 
-    let mut snapshot = zoka::snapshot::export_from_storage(&storage, MAINNET_CHAIN_ID, now_secs())
+    let mut snapshot = zoka::snapshot::export_from_storage(&storage, network.chain_id(), now_secs())
         .map_err(|e| format!("snapshot export failed: {e}"))?;
 
     if let Some(hex_key) = sign_key_hex {
@@ -19378,6 +19511,10 @@ fn cmd_snapshot_export(args: &[String]) -> Result<(), String> {
         return Err("--mldsa-key-file is the second half of --sign-key-hex; pass both".to_string());
     }
 
+    if network.is_quantic() {
+        // Public Quantic snapshots must carry the pinned hybrid authority.
+        verify_cli_snapshot(&snapshot, network, true, None, args)?;
+    }
     let bytes = zoka::snapshot::serialize(&snapshot)
         .map_err(|e| format!("snapshot serialization failed: {e}"))?;
     let digest = zoka::snapshot::compute_digest(&snapshot)
@@ -19428,16 +19565,11 @@ fn cmd_snapshot_export(args: &[String]) -> Result<(), String> {
 /// re-checked. Idempotent: blocks the local chain already has are
 /// skipped.
 fn cmd_snapshot_import(args: &[String]) -> Result<(), String> {
-    let in_path = args
-        .iter()
-        .find(|arg| !arg.starts_with("--"))
-        .cloned()
-        .ok_or_else(|| {
-            "missing argument: pass the snapshot path (e.g. zoka snapshot-import ./mainnet.snapshot.json)"
-                .to_string()
-        })?;
+    let (in_path, options) = parse_snapshot_file_args(args, SnapshotFileCommand::Import)?;
+    let args = options.as_slice();
+    let network = NetworkProfile::from_args(args)?;
     let db_path_owned = option_value(args, "--db");
-    let db_path = db_path_owned.as_deref().unwrap_or(".zoka/blockchain.db");
+    let db_path = db_path_owned.as_deref().unwrap_or(network.default_db_path());
     let require_signature = has_flag(args, "--require-signature");
     let pubkey_hex =
         option_value(args, "--signer-key").or_else(|| option_value(args, "--public-key"));
@@ -19447,41 +19579,14 @@ fn cmd_snapshot_import(args: &[String]) -> Result<(), String> {
     let snapshot =
         zoka::snapshot::deserialize(&bytes).map_err(|e| format!("snapshot parse failed: {e}"))?;
 
-    let pubkey_array;
-    let pubkey_ref: Option<&[u8; 32]> = match pubkey_hex {
-        Some(hex_key) => {
-            let decoded = hex::decode(hex_key.trim())
-                .map_err(|e| format!("snapshot signer key must be 32-byte hex: {e}"))?;
-            if decoded.len() != 32 {
-                return Err(format!(
-                    "snapshot signer key must decode to 32 bytes (got {})",
-                    decoded.len()
-                ));
-            }
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&decoded);
-            pubkey_array = key;
-            Some(&pubkey_array)
-        }
-        None => None,
-    };
-
-    let opts = zoka::snapshot::VerifyOptions {
-        expected_chain_id: MAINNET_CHAIN_ID,
-        require_signature: require_signature || pubkey_ref.is_some(),
-        expected_pubkey: pubkey_ref,
-        expected_hybrid_pubkey: None,
-        require_hybrid: false,
-    };
-    let digest = zoka::snapshot::verify(&snapshot, &opts)
-        .map_err(|e| format!("snapshot verify failed: {e}"))?;
+    let digest = verify_cli_snapshot(&snapshot, network, require_signature, pubkey_hex.as_deref(), args)?;
 
     let storage = Arc::new(
         RocksDbStorage::new(db_path)
             .map_err(|e| format!("failed to open chain db '{db_path}': {e}"))?,
     );
 
-    let applied = zoka::snapshot::import_into_storage(&storage, MAINNET_CHAIN_ID, &snapshot)
+    let applied = zoka::snapshot::import_into_storage(&storage, network.chain_id(), &snapshot)
         .map_err(|e| format!("snapshot import failed: {e}"))?;
 
     println!("Snapshot:           {in_path}");
@@ -19500,16 +19605,45 @@ fn cmd_snapshot_import(args: &[String]) -> Result<(), String> {
 }
 
 /// Export the current chain as serialized snapshot bytes plus its head height.
+fn can_export_snapshot(
+    chain_id: &str,
+    signer: Option<&zoka::checkpoint_authority::CheckpointSigner>,
+) -> bool {
+    if !economics::is_quantic_chain_id(chain_id) {
+        return true;
+    }
+    #[cfg(feature = "pq-experimental")]
+    { signer.and_then(|s| s.hybrid.as_ref()).is_some() }
+    #[cfg(not(feature = "pq-experimental"))]
+    { let _ = signer; false }
+}
+
 fn export_snapshot_bytes(
     storage: &RocksDbStorage,
     chain_id: &str,
+    signer: Option<&zoka::checkpoint_authority::CheckpointSigner>,
 ) -> Result<(Vec<u8>, u64), String> {
+    if !can_export_snapshot(chain_id, signer) {
+        return Err("Quantic snapshot serving requires the pinned hybrid authority key".into());
+    }
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let snapshot = zoka::snapshot::export_from_storage(storage, chain_id, timestamp)
+    let mut snapshot = zoka::snapshot::export_from_storage(storage, chain_id, timestamp)
         .map_err(|e| format!("export failed: {e}"))?;
+    #[cfg(feature = "pq-experimental")]
+    let signed_hybrid = if let Some(key) = signer.and_then(|s| s.hybrid.as_ref()) {
+        zoka::snapshot::sign_hybrid(&mut snapshot, key).map_err(|e| e.to_string())?;
+        true
+    } else { false };
+    #[cfg(not(feature = "pq-experimental"))]
+    let signed_hybrid = false;
+    if !signed_hybrid {
+        if let Some(key) = signer {
+            zoka::snapshot::sign(&mut snapshot, &key.ed25519.to_bytes()).map_err(|e| e.to_string())?;
+        }
+    }
     let height = snapshot.header.head_height;
     let bytes =
         zoka::snapshot::serialize(&snapshot).map_err(|e| format!("serialize failed: {e}"))?;
@@ -19565,14 +19699,10 @@ async fn maybe_bootstrap_from_iroh(
     if seed_ids.is_empty() {
         return;
     }
-    // The iroh EndpointId in the trusted manifest is itself the authorization:
-    // to serve from EndpointId X you must hold X's secret key, so a
-    // manifest-listed id cryptographically authenticates the source (the same
-    // trust the snapshot signature provides). We therefore don't also require
-    // the snapshot's own signature on this path -- and the import re-validates
-    // every block against consensus from genesis regardless. Opt in to extra
-    // signature enforcement with --iroh-require-signed-snapshot.
-    let require_signature = require_signed_snapshot;
+    // Quantic authenticates the snapshot independently of the classical iroh
+    // identity. Every imported block is still checked against consensus.
+    let require_signature = zoka::snapshot::bootstrap_requires_signature(chain_id, require_signed_snapshot);
+    let trusted_signers = zoka::snapshot::trusted_signers_for_chain(chain_id, &config.snapshot_signers);
     for id_str in &seed_ids {
         let endpoint_id: iroh::EndpointId = match id_str.parse() {
             Ok(id) => id,
@@ -19617,7 +19747,7 @@ async fn maybe_bootstrap_from_iroh(
             }
         };
         if require_signature
-            && !snapshot_signed_by_trusted(&snapshot, chain_id, &config.snapshot_signers)
+            && !snapshot_signed_by_trusted(&snapshot, chain_id, &trusted_signers)
         {
             println!("iroh bootstrap: snapshot rejected (not signed by a trusted snapshot_signer). Falling back to IBD.");
             continue;
@@ -19647,6 +19777,11 @@ struct StorageChainServe {
     storage: Arc<RocksDbStorage>,
     snapshot: zoka::network::iroh_snapshot_transfer::SnapshotProvider,
 }
+
+// A peer without authority keys can serve validated individual blocks, but
+// must not advertise an unavailable or unsigned Quantic snapshot.
+static IROH_SIGNED_SNAPSHOT_AVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 impl zoka::network::iroh_snapshot_transfer::ChainServe for StorageChainServe {
     fn head_height(&self) -> u64 {
@@ -19779,6 +19914,13 @@ async fn maybe_serve_iroh_snapshot(
         tracing::warn!(target: "zoka.iroh", "iroh snapshot seed skipped: no chain DB configured");
         return None;
     };
+    let mut signing_notes = Vec::new();
+    let signer = NetworkProfile::from_chain_id(chain_id).ok().and_then(|network| {
+        load_checkpoint_authority(network.local_dir(), chain_id, &mut signing_notes)
+    });
+    for note in signing_notes {
+        tracing::info!(target: "zoka.iroh", "{note}");
+    }
     let key_path = zoka_home().join("iroh_key");
     let key = match zoka::network::iroh_snapshot_transfer::load_or_generate_secret_key(&key_path) {
         Ok(k) => k,
@@ -19787,13 +19929,17 @@ async fn maybe_serve_iroh_snapshot(
             return None;
         }
     };
-    let (bytes, height) = match export_snapshot_bytes(storage, chain_id) {
+    let (bytes, height) = match export_snapshot_bytes(storage, chain_id, signer.as_ref()) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(target: "zoka.iroh", error = %e, "iroh snapshot seed disabled");
-            return None;
+            tracing::info!(target: "zoka.iroh", error = %e, "iroh serving head and blocks without a snapshot");
+            (Vec::new(), storage.get_chain_height().unwrap_or(0))
         }
     };
+    IROH_SIGNED_SNAPSHOT_AVAILABLE.store(
+        !bytes.is_empty() && economics::is_quantic_chain_id(chain_id),
+        std::sync::atomic::Ordering::Release,
+    );
     let provider = zoka::network::iroh_snapshot_transfer::provider_from_arc(Arc::new(bytes));
     // Serve the live chain (not just a static snapshot blob): the same endpoint
     // now answers head-height probes and incremental block-range pulls, so a
@@ -19819,9 +19965,13 @@ async fn maybe_serve_iroh_snapshot(
         }
     };
     println!(
-        "iroh snapshot seed live at height {height}; EndpointId = {} (advertise this in the manifest 'iroh' field)",
+        "iroh chain endpoint live at height {height}; EndpointId = {} (advertise this in the manifest 'iroh' field)",
         endpoint.id()
     );
+
+    if !can_export_snapshot(chain_id, signer.as_ref()) {
+        return Some(endpoint);
+    }
 
     // Refresh the served snapshot as the chain grows so late-joining nodes
     // don't have to IBD a long tail. Runs for the endpoint's lifetime.
@@ -19831,9 +19981,13 @@ async fn maybe_serve_iroh_snapshot(
         const REEXPORT_INTERVAL: Duration = Duration::from_secs(300);
         loop {
             tokio::time::sleep(REEXPORT_INTERVAL).await;
-            match export_snapshot_bytes(&storage_bg, &chain_id_bg) {
+            match export_snapshot_bytes(&storage_bg, &chain_id_bg, signer.as_ref()) {
                 Ok((bytes, new_height)) => {
                     zoka::network::iroh_snapshot_transfer::update_provider(&provider, bytes);
+                    IROH_SIGNED_SNAPSHOT_AVAILABLE.store(
+                        economics::is_quantic_chain_id(&chain_id_bg),
+                        std::sync::atomic::Ordering::Release,
+                    );
                     tracing::debug!(target: "zoka.iroh", height = new_height, "iroh snapshot refreshed");
                 }
                 Err(e) => {
@@ -19874,8 +20028,9 @@ fn cmd_snapshot_fetch_iroh(args: &[String]) -> Result<(), String> {
         "missing --iroh-id <endpoint-id> (the seed's iroh EndpointId from the network manifest)"
             .to_string()
     })?;
+    let network = NetworkProfile::from_args(args)?;
     let db_path_owned = option_value(args, "--db");
-    let db_path = db_path_owned.as_deref().unwrap_or(".zoka/blockchain.db");
+    let db_path = db_path_owned.as_deref().unwrap_or(network.default_db_path());
     let require_signature = has_flag(args, "--require-signature");
     let pubkey_hex =
         option_value(args, "--signer-key").or_else(|| option_value(args, "--public-key"));
@@ -19895,6 +20050,13 @@ fn cmd_snapshot_fetch_iroh(args: &[String]) -> Result<(), String> {
             .build()
             .map_err(|e| format!("failed to start runtime for iroh fetch: {e}"))?;
         rt.block_on(async move {
+            #[cfg(feature = "pq-experimental")]
+            if network.is_quantic() {
+                return zoka::network::iroh_snapshot_transfer::fetch_snapshot(
+                    endpoint_id.into(),
+                    zoka::network::pq_tls::RequiredPostQuantumTls(iroh::endpoint::presets::N0),
+                ).await.map_err(|e| format!("iroh snapshot fetch failed: {e}"));
+            }
             zoka::network::iroh_snapshot_transfer::fetch_snapshot(
                 endpoint_id.into(),
                 iroh_preset(),
@@ -19910,40 +20072,13 @@ fn cmd_snapshot_fetch_iroh(args: &[String]) -> Result<(), String> {
     let snapshot =
         zoka::snapshot::deserialize(&bytes).map_err(|e| format!("snapshot parse failed: {e}"))?;
 
-    let pubkey_array;
-    let pubkey_ref: Option<&[u8; 32]> = match pubkey_hex {
-        Some(hex_key) => {
-            let decoded = hex::decode(hex_key.trim())
-                .map_err(|e| format!("snapshot signer key must be 32-byte hex: {e}"))?;
-            if decoded.len() != 32 {
-                return Err(format!(
-                    "snapshot signer key must decode to 32 bytes (got {})",
-                    decoded.len()
-                ));
-            }
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&decoded);
-            pubkey_array = key;
-            Some(&pubkey_array)
-        }
-        None => None,
-    };
-
-    let opts = zoka::snapshot::VerifyOptions {
-        expected_chain_id: MAINNET_CHAIN_ID,
-        require_signature: require_signature || pubkey_ref.is_some(),
-        expected_pubkey: pubkey_ref,
-        expected_hybrid_pubkey: None,
-        require_hybrid: false,
-    };
-    let digest = zoka::snapshot::verify(&snapshot, &opts)
-        .map_err(|e| format!("snapshot verify failed: {e}"))?;
+    let digest = verify_cli_snapshot(&snapshot, network, require_signature, pubkey_hex.as_deref(), args)?;
 
     let storage = Arc::new(
         RocksDbStorage::new(db_path)
             .map_err(|e| format!("failed to open chain db '{db_path}': {e}"))?,
     );
-    let applied = zoka::snapshot::import_into_storage(&storage, MAINNET_CHAIN_ID, &snapshot)
+    let applied = zoka::snapshot::import_into_storage(&storage, network.chain_id(), &snapshot)
         .map_err(|e| format!("snapshot import failed: {e}"))?;
 
     println!("SHA-256 digest:     {digest}");
@@ -20044,7 +20179,20 @@ fn main() {
     }
 }
 
+/// These enabled commands take explicit paths, relative to the caller. They
+/// must not initialize/migrate the shared home or read the public node config.
+fn command_uses_invocation_directory(command: Option<&str>) -> bool {
+    cfg!(feature = "quantic-pq")
+        && matches!(
+            command,
+            Some("quantic-pq" | "quantic-pq-node" | "pq-regtest")
+        )
+}
+
 async fn async_main() {
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let preserve_invocation_directory =
+        command_uses_invocation_directory(raw_args.first().map(String::as_str));
     // The fluid streaming console is the default (see cmd_fullnode_auto), so
     // keep the tracing log stream (p2p gossip INFO, etc.) from drowning it: if
     // the operator didn't pick a level explicitly, default to warn. Only the
@@ -20055,22 +20203,24 @@ async fn async_main() {
     // would normally expand the config file into args it's too late to change
     // the subscriber's level. An explicit RUST_LOG always wins either way.
     if std::env::var_os("RUST_LOG").is_none() {
-        let raw_args: Vec<String> = std::env::args().skip(1).collect();
         let dashboard_opt_out = raw_args.iter().any(|a| a == "--dashboard")
             || std::env::var("ZOKA_DASHBOARD").as_deref() == Ok("1")
-            || find_node_config_path(&raw_args)
-                .ok()
-                .flatten()
-                .and_then(|path| fs::read_to_string(path).ok())
-                .and_then(|raw| serde_json::from_str::<NodeConfigFile>(&raw).ok())
-                .and_then(|cfg| cfg.mining_console)
-                == Some(false);
+            || (!preserve_invocation_directory
+                && find_node_config_path(&raw_args)
+                    .ok()
+                    .flatten()
+                    .and_then(|path| fs::read_to_string(path).ok())
+                    .and_then(|raw| serde_json::from_str::<NodeConfigFile>(&raw).ok())
+                    .and_then(|cfg| cfg.mining_console)
+                    == Some(false));
         if !dashboard_opt_out {
             std::env::set_var("RUST_LOG", "warn");
         }
     }
     let _ = tracing_subscriber::fmt::try_init();
-    setup_zoka_home();
+    if !preserve_invocation_directory {
+        setup_zoka_home();
+    }
     if let Err(err) = run().await {
         eprintln!("{err}");
         std::process::exit(1);
@@ -20078,9 +20228,9 @@ async fn async_main() {
 }
 
 /// Resolve the canonical Zoka data directory (shared by CLI and ZSilent) and
-/// change the process working directory into it before any subcommand runs.
-/// All existing relative paths like ".zoka/mainnet" then resolve against the
-/// single shared home, regardless of where the binary was launched from.
+/// change the process working directory into it for the existing commands.
+/// Their relative paths like ".zoka/mainnet" resolve against the single shared
+/// home. The explicit-path PQ commands bypass this setup and its migration.
 fn setup_zoka_home() {
     let home = zoka_home();
     if fs::create_dir_all(&home).is_err() {
@@ -22385,6 +22535,282 @@ mod tests {
         assert_eq!(report.active_seed_count, 3);
         assert_eq!(report.active_seed_candidates_without_clearnet, 3);
         assert_eq!(report.snapshot_signer_count, 1);
+    }
+
+    #[test]
+    fn startup_directory_policy_preserves_only_enabled_pq_commands() {
+        for command in ["quantic-pq", "quantic-pq-node", "pq-regtest"] {
+            assert_eq!(
+                command_uses_invocation_directory(Some(command)),
+                cfg!(feature = "quantic-pq"),
+                "explicit paths stay relative to the caller only when {command} is enabled"
+            );
+        }
+        for command in [
+            None,
+            Some("fullnode"),
+            Some("quantic-wallet"),
+            Some("quantic-genesis"),
+            Some("snapshot-import"),
+            Some("help"),
+            Some("--version"),
+            Some("quantic-pq-node-extra"),
+            Some("QUANTIC-PQ"),
+        ] {
+            assert!(
+                !command_uses_invocation_directory(command),
+                "existing startup defaults must remain unchanged for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_file_args_accept_network_before_or_after_the_path() {
+        for command in [
+            SnapshotFileCommand::Info,
+            SnapshotFileCommand::Export,
+            SnapshotFileCommand::Import,
+        ] {
+            for raw in [
+                vec!["--network", "quantic-testnet", "chain.snap"],
+                vec!["chain.snap", "--network", "quantic-testnet"],
+                vec!["--network=quantic-testnet", "chain.snap"],
+            ] {
+                let args: Vec<_> = raw.into_iter().map(str::to_owned).collect();
+                let (path, options) = parse_snapshot_file_args(&args, command).unwrap();
+                assert_eq!(path, "chain.snap");
+                assert_eq!(
+                    option_value(&options, "--network").as_deref(),
+                    Some("quantic-testnet")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_file_args_accept_db_before_or_after_the_path() {
+        for command in [SnapshotFileCommand::Export, SnapshotFileCommand::Import] {
+            for raw in [
+                vec![
+                    "--db",
+                    r"C:\local data\chain.db",
+                    "chain.snap",
+                    "--network",
+                    "quantic-testnet",
+                ],
+                vec![
+                    "--network",
+                    "quantic-testnet",
+                    "chain.snap",
+                    "--db",
+                    r"C:\local data\chain.db",
+                ],
+                vec![
+                    "--db=C:\\local data\\chain.db",
+                    "--network=quantic-testnet",
+                    "chain.snap",
+                ],
+            ] {
+                let args: Vec<_> = raw.into_iter().map(str::to_owned).collect();
+                let (path, options) = parse_snapshot_file_args(&args, command).unwrap();
+                assert_eq!(path, "chain.snap");
+                assert_eq!(
+                    option_value(&options, "--db").as_deref(),
+                    Some(r"C:\local data\chain.db")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_file_args_preserve_paths_flags_and_signer_alias() {
+        let args: Vec<_> = [
+            "--json",
+            "--public-key=trusted-key",
+            "--network-config",
+            "config with spaces.json",
+            r"C:\snapshots\a=b snapshot.snap",
+            "--require-signature",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let (path, options) = parse_snapshot_file_args(&args, SnapshotFileCommand::Info).unwrap();
+        assert_eq!(path, r"C:\snapshots\a=b snapshot.snap");
+        assert!(has_flag(&options, "--json"));
+        assert!(has_flag(&options, "--require-signature"));
+        assert_eq!(
+            option_value(&options, "--signer-key").as_deref(),
+            Some("trusted-key")
+        );
+        assert_eq!(
+            option_value(&options, "--network-config").as_deref(),
+            Some("config with spaces.json")
+        );
+
+        let (path, options) =
+            parse_snapshot_file_args(&["--".into(), "--json".into()], SnapshotFileCommand::Info)
+                .unwrap();
+        assert_eq!(path, "--json");
+        assert!(
+            !has_flag(&options, "--json"),
+            "a literal path must not become an option"
+        );
+
+        let args: Vec<_> = [
+            "--sign-key-hex",
+            "key",
+            "--mldsa-key-file",
+            "seed",
+            "out.snap",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let (path, options) = parse_snapshot_file_args(&args, SnapshotFileCommand::Export).unwrap();
+        assert_eq!(path, "out.snap");
+        assert_eq!(
+            option_value(&options, "--mldsa-key-file").as_deref(),
+            Some("seed")
+        );
+    }
+
+    #[test]
+    fn snapshot_file_args_reject_unknown_duplicate_missing_and_extra_arguments() {
+        for raw in [
+            vec![],
+            vec![""],
+            vec!["first.snap", "second.snap"],
+            vec!["--unknown", "chain.snap"],
+            vec!["--network", "quantic-testnet"],
+            vec!["chain.snap", "--network"],
+            vec!["chain.snap", "--network="],
+            vec!["chain.snap", "--network", "--json"],
+            vec![
+                "chain.snap",
+                "--network",
+                "quantic-testnet",
+                "--network=quantic-mainnet",
+            ],
+            vec!["chain.snap", "--json", "--json"],
+            vec!["chain.snap", "--json=false"],
+            vec![
+                "chain.snap",
+                "--signer-key",
+                "first",
+                "--public-key",
+                "second",
+            ],
+            vec!["chain.snap", "--db", "db"],
+        ] {
+            let args: Vec<_> = raw.into_iter().map(str::to_owned).collect();
+            assert!(
+                parse_snapshot_file_args(&args, SnapshotFileCommand::Info).is_err(),
+                "{args:?}"
+            );
+        }
+        for command in [SnapshotFileCommand::Export, SnapshotFileCommand::Import] {
+            for raw in [
+                vec!["chain.snap", "--db"],
+                vec!["--db", "first", "chain.snap", "--db=second"],
+                vec!["chain.snap", "--json"],
+            ] {
+                let args: Vec<_> = raw.into_iter().map(str::to_owned).collect();
+                assert!(
+                    parse_snapshot_file_args(&args, command).is_err(),
+                    "{args:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_file_args_reject_errors_before_export_creates_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("new-db");
+        let output = directory.path().join("out.snap");
+        let args = vec![
+            "--db".into(),
+            database.to_string_lossy().into_owned(),
+            output.to_string_lossy().into_owned(),
+            "--unknown".into(),
+        ];
+        assert!(cmd_snapshot_export(&args)
+            .unwrap_err()
+            .contains("unknown option"));
+        assert!(!database.exists());
+        assert!(!output.exists());
+    }
+
+    #[test]
+    #[cfg(feature = "pq-experimental")]
+    fn snapshot_policy_accepts_hybrid_keys_without_classical_downgrade() {
+        let key = zoka::hybrid_signature::HybridSigningKey::from_parts(
+            ed25519_dalek::SigningKey::from_bytes(&[61; 32]), &[62; 32],
+        ).unwrap();
+        let public = key.verifying_key().to_hex();
+        let classical = hex::encode(key.ed25519().verifying_key().to_bytes());
+        assert!(valid_snapshot_signer(economics::QUANTIC_TESTNET_CHAIN_ID, &public));
+        assert!(!valid_snapshot_signer(economics::QUANTIC_TESTNET_CHAIN_ID, &classical));
+        assert!(valid_snapshot_signer(economics::MAINNET_CHAIN_ID, &classical));
+        let mut bad_version = public;
+        bad_version.replace_range(..2, "ff");
+        assert!(!valid_snapshot_signer(economics::QUANTIC_TESTNET_CHAIN_ID, &bad_version));
+    }
+
+    #[test]
+    #[cfg(feature = "pq-experimental")]
+    fn peer_snapshot_authentication_precedes_import_and_rejects_classical_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Arc::new(RocksDbStorage::new(directory.path()).unwrap());
+        let chain = economics::QUANTIC_TESTNET_CHAIN_ID;
+        let key = zoka::hybrid_signature::HybridSigningKey::from_parts(
+            ed25519_dalek::SigningKey::from_bytes(&[63; 32]), &[64; 32],
+        ).unwrap();
+        let trusted = vec![key.verifying_key().to_hex()];
+        let mut snapshot = zoka::snapshot::export_from_storage(&storage, chain, 1).unwrap();
+        let bytes = zoka::snapshot::serialize(&snapshot).unwrap();
+        assert!(import_peer_snapshot_bytes(&storage, chain, &bytes, &trusted).is_err());
+        zoka::snapshot::sign(&mut snapshot, &key.ed25519().to_bytes()).unwrap();
+        let bytes = zoka::snapshot::serialize(&snapshot).unwrap();
+        assert!(import_peer_snapshot_bytes(&storage, chain, &bytes, &trusted).is_err());
+        zoka::snapshot::sign_hybrid(&mut snapshot, &key).unwrap();
+        let bytes = zoka::snapshot::serialize(&snapshot).unwrap();
+        assert!(import_peer_snapshot_bytes(&storage, chain, &bytes, &[]).is_err());
+        assert_eq!(import_peer_snapshot_bytes(&storage, chain, &bytes, &trusted).unwrap(), 0);
+        assert_eq!(storage.get_chain_height().unwrap(), 0);
+    }
+
+    #[test]
+    fn block_serving_remains_available_without_a_snapshot_signer() {
+        use zoka::network::iroh_snapshot_transfer::ChainServe;
+        let directory = tempfile::tempdir().unwrap();
+        let source = StorageChainServe {
+            storage: Arc::new(RocksDbStorage::new(directory.path()).unwrap()),
+            snapshot: zoka::network::iroh_snapshot_transfer::provider_from_arc(Arc::new(Vec::new())),
+        };
+        assert!(!can_export_snapshot(economics::QUANTIC_TESTNET_CHAIN_ID, None));
+        assert!(can_export_snapshot(economics::MAINNET_CHAIN_ID, None));
+        assert_eq!(source.head_height(), 0);
+        assert!(source.snapshot_bytes().is_empty());
+        assert!(source.block_bytes(1).is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "pq-experimental")]
+    fn snapshot_export_preserves_both_signature_halves() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = RocksDbStorage::new(directory.path()).unwrap();
+        let classical = ed25519_dalek::SigningKey::from_bytes(&[65; 32]);
+        let hybrid = zoka::hybrid_signature::HybridSigningKey::from_parts(classical.clone(), &[66; 32]).unwrap();
+        let public = hybrid.verifying_key().to_hex();
+        let signer = zoka::checkpoint_authority::CheckpointSigner {
+            ed25519: classical, hybrid: Some(hybrid), legacy_v1: true,
+        };
+        let chain = economics::MAINNET_CHAIN_ID;
+        let (bytes, _) = export_snapshot_bytes(&storage, chain, Some(&signer)).unwrap();
+        let snapshot = zoka::snapshot::deserialize(&bytes).unwrap();
+        zoka::snapshot::verify_against_trusted_signers(&snapshot, chain, &[public]).unwrap();
     }
 
     #[test]

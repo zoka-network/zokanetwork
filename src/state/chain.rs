@@ -712,7 +712,11 @@ fn validate_body_policy(chain_id: &str, candidate: &Block) -> Result<(), ChainEr
 }
 
 #[cfg(feature = "quantic")]
-type QuanticValidation = crate::quantic::ValidatedBlock;
+enum QuanticValidation {
+    Orchard(crate::quantic::ValidatedBlock),
+    #[cfg(feature = "quantic-pq")]
+    Stark(crate::quantic::stark::Validated),
+}
 #[cfg(not(feature = "quantic"))]
 type QuanticValidation = ();
 
@@ -730,8 +734,16 @@ fn validate_quantic_body(
     }
     #[cfg(feature = "quantic")]
     {
+        if chain_id == crate::economics::QUANTIC_PQ_REGTEST_CHAIN_ID {
+            #[cfg(feature = "quantic-pq")]
+            return crate::quantic::stark::validate(storage, candidate, parent)
+                .map(|v| Some(QuanticValidation::Stark(v)))
+                .map_err(ChainError::InvalidQuanticBlock);
+            #[cfg(not(feature = "quantic-pq"))]
+            return Err(ChainError::InvalidQuanticBlock("STARK chain requires quantic-pq".into()));
+        }
         crate::quantic::validate_block(storage, chain_id, candidate, parent)
-            .map(Some)
+            .map(|v| Some(QuanticValidation::Orchard(v)))
             .map_err(|e| ChainError::InvalidQuanticBlock(e.to_string()))
     }
     #[cfg(not(feature = "quantic"))]
@@ -755,7 +767,11 @@ fn quantic_block_work(_compact_target: u32) -> u128 {
 
 #[cfg(feature = "quantic")]
 fn quantic_minted(validated: &QuanticValidation) -> u64 {
-    validated.minted
+    match validated {
+        QuanticValidation::Orchard(v) => v.minted,
+        #[cfg(feature = "quantic-pq")]
+        QuanticValidation::Stark(v) => v.minted(),
+    }
 }
 
 #[cfg(not(feature = "quantic"))]
@@ -769,8 +785,13 @@ fn store_quantic_state(
     candidate: &Block,
     validated: &QuanticValidation,
 ) -> Result<(), ChainError> {
-    crate::quantic::store_block_state(storage, candidate, validated)
-        .map_err(|e| ChainError::Storage(e.to_string()))
+    match validated {
+        QuanticValidation::Orchard(v) => crate::quantic::store_block_state(storage, candidate, v)
+            .map_err(|e| ChainError::Storage(e.to_string())),
+        #[cfg(feature = "quantic-pq")]
+        QuanticValidation::Stark(v) => crate::quantic::stark::store(storage, candidate, v)
+            .map_err(ChainError::Storage),
+    }
 }
 
 #[cfg(not(feature = "quantic"))]

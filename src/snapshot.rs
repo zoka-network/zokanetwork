@@ -385,7 +385,7 @@ pub fn verify(
     let digest = compute_digest(snapshot)?;
 
     let signature_hex = snapshot.signature_hex.as_ref();
-    if opts.require_signature && signature_hex.is_none() {
+    if (opts.require_signature || opts.expected_pubkey.is_some()) && signature_hex.is_none() {
         return Err(SnapshotError::SignatureRequired);
     }
     let hybrid = snapshot.mldsa_signature_hex.is_some() || snapshot.signer_mldsa_pubkey_hex.is_some();
@@ -501,6 +501,10 @@ pub fn verify_against_trusted_signers(
         .iter()
         .filter(|key| key.len() * 2 == HYBRID_SIGNER_HEX_LEN)
         .collect();
+    // A manifest containing only a classical key must not downgrade Quantic.
+    if economics::is_quantic_chain_id(chain_id) && hybrid.is_empty() {
+        return Err(SnapshotError::HybridSignatureRequired);
+    }
     let mut last_error = SnapshotError::NoTrustedSigner;
     if !hybrid.is_empty() {
         for key in hybrid {
@@ -533,6 +537,25 @@ pub fn verify_against_trusted_signers(
         }
     }
     Err(last_error)
+}
+
+/// Explicit manifest signers take precedence. Quantic otherwise uses its pinned
+/// hybrid checkpoint authority, never an unauthenticated peer identity.
+pub fn trusted_signers_for_chain(chain_id: &str, configured: &[String]) -> Vec<String> {
+    if !configured.is_empty() || !economics::is_quantic_chain_id(chain_id) {
+        return configured.to_vec();
+    }
+    #[cfg(feature = "pq-experimental")]
+    if let Some(keys) = crate::checkpoint_authority::authority_keys_for_chain(chain_id) {
+        if let Some(mldsa) = keys.mldsa {
+            return vec![crate::hybrid_signature::HybridVerifyingKey::from_parts(keys.ed25519, mldsa).to_hex()];
+        }
+    }
+    Vec::new()
+}
+
+pub fn bootstrap_requires_signature(chain_id: &str, explicitly_requested: bool) -> bool {
+    explicitly_requested || economics::is_quantic_chain_id(chain_id)
 }
 
 /// Replay every block in `snapshot` through `state::chain::apply_block`,
@@ -936,6 +959,9 @@ mod tests {
             require_hybrid: false,
         };
         verify(&snap, &opts).expect("unsigned ok");
+        let expected = SigningKey::from_bytes(&[19; 32]).verifying_key().to_bytes();
+        let pinned = VerifyOptions { expected_pubkey: Some(&expected), ..opts };
+        assert!(matches!(verify(&snap, &pinned), Err(SnapshotError::SignatureRequired)));
     }
 
     #[test]
@@ -1163,5 +1189,18 @@ mod tests {
         let snap = export_from_storage(&storage, chain_id, 1).expect("export");
         let json = String::from_utf8(serialize(&snap).unwrap()).unwrap();
         assert!(!json.contains("mldsa"), "no new field when there is no hybrid signature");
+    }
+
+    #[test]
+    fn quantic_bootstrap_never_relies_on_classical_identity_alone() {
+        for chain in [economics::QUANTIC_TESTNET_CHAIN_ID, economics::QUANTIC_MAINNET_CHAIN_ID, economics::QUANTIC_REGTEST_CHAIN_ID] {
+            assert!(bootstrap_requires_signature(chain, false));
+            assert!(bootstrap_requires_signature(chain, true));
+            let (storage, _dir) = build_chain_with_blocks("zoka-test-net", 1);
+            let snapshot = export_from_storage(&storage, "zoka-test-net", 1).unwrap();
+            assert!(matches!(verify_against_trusted_signers(&snapshot, chain, &[]), Err(SnapshotError::HybridSignatureRequired)));
+            assert!(matches!(verify_against_trusted_signers(&snapshot, chain, &["00".repeat(32)]), Err(SnapshotError::HybridSignatureRequired)));
+        }
+        assert!(!bootstrap_requires_signature("zoka-test-net", false));
     }
 }

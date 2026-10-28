@@ -41,6 +41,18 @@ pub mod runtime;
 pub mod stratum;
 pub mod wallet_file;
 pub mod wallet_sync;
+#[cfg(feature = "quantic-pq")]
+pub mod pq_local;
+#[cfg(feature = "quantic-pq")]
+pub mod stark;
+#[cfg(feature = "quantic-pq")]
+pub mod stark_cli;
+#[cfg(feature = "quantic-pq")]
+pub mod stark_api;
+#[cfg(feature = "quantic-pq")]
+pub mod stark_net;
+#[cfg(feature = "quantic-pq")]
+pub mod stark_node;
 
 /// El nodo numera desde 1 (la altura 0 es el génesis sintético de cada
 /// cadena), así que el génesis de Quantic, con el premine, es el bloque 1.
@@ -88,6 +100,9 @@ fn storage_error(error: impl std::fmt::Debug) -> QuanticBlockError {
 }
 
 pub fn network_for_chain(chain_id: &str) -> Option<Network> {
+    if chain_id == crate::economics::QUANTIC_PQ_REGTEST_CHAIN_ID {
+        return Some(Network::Regtest);
+    }
     Network::ALL.into_iter().find(|n| n.chain_id() == chain_id)
 }
 
