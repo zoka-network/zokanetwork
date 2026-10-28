@@ -2,10 +2,9 @@
 //! `rx/0`), with templates built from the STARK node's state and found blocks
 //! imported through the same gate as API, peers and the built-in miner.
 //!
-//! Each payout address costs a coinbase STARK proof per template (seconds and
-//! hundreds of MiB), so this backend allows fewer addresses and refreshes less
-//! often than the Ironwood one, and proves only while holding a `work` permit.
-use std::time::Duration;
+//! A coinbase carries no proof, so a template is cheap: the ledger rules plus
+//! the re-verification of the mempool transfers it includes, done while
+//! holding a `work` permit. Limits and refresh are the Ironwood ones.
 
 use super::{
     stark::{
@@ -16,11 +15,6 @@ use super::{
     stratum::{looks_like_quantic_address, Backend},
 };
 use crate::{storage::RocksDbStorage, types::Block};
-
-/// At most this many payout addresses get templates at the same time.
-pub const MAX_PAYOUT_ADDRESSES: usize = 4;
-/// A template is rebuilt when the tip changes or after this long.
-pub const TEMPLATE_REFRESH: Duration = Duration::from_secs(60);
 
 /// `zq2`, `zqtest2`, `zqregtest2`: a v2 address of some network.
 fn looks_like_v2_address(login: &str) -> bool {
@@ -143,19 +137,11 @@ impl Backend for StarkBackend {
             Err(reason) => eprintln!("STARK stratum block rejected: {reason}"),
         }
     }
-
-    fn template_refresh(&self) -> Duration {
-        TEMPLATE_REFRESH
-    }
-
-    fn max_payout_addresses(&self) -> usize {
-        MAX_PAYOUT_ADDRESSES
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use serde_json::{json, Value};
     use tokio::{
