@@ -3,6 +3,28 @@
 Actualizada: **28 de octubre de 2026**, Argentina (núcleo STARK local verificado; testnet v2 minada con XMRig en local).
 Proyecto: `C:\Users\mderramus\ZOKA`.
 
+## 28/10, noche: formato final de la v2 (Claude, rama `quantic-v2-formato-final`)
+
+Primer punto del orden acordado («estado por diferencias»). Al revisarlo
+aparecieron otros dos problemas de formato, también de consenso, y se
+resolvieron juntos antes del génesis v2. Especificación en
+[QUANTIC-V2-FORMATO.md](docs/QUANTIC-V2-FORMATO.md). Sin pushear (la
+aprobación de push fue para las dos ramas anteriores).
+
+- **Faerie Gold** (seguridad): `rho` lo elegía el emisor y dos notas podían
+  compartir nullifier. Ahora `rho` sale del primer nullifier (AIR) o de la
+  altura del coinbase; `rcm` oculta. `b9399b83`.
+- **Coinbase sin prueba:** de ~947 KB a menos de 4 KB por bloque. `b9399b83`.
+- **Estado compacto:** registro de cientos de bytes por bloque y `state_root`
+  de tamaño constante; ramas laterales validadas con el índice canónico de
+  nullifiers. `9f49e743`.
+- Validado: 14 + 105 pruebas en release, pago por CLI de punta a punta y XMRig
+  real (25/0 aciertos, 5 bloques, base de 119 KB contra 7,4 MB).
+- **Sigue**, en el orden acordado: red pública v2 (semillas, manifiesto,
+  descubrimiento de pares y Tor/relay), checkpoints de la PC en el nodo STARK,
+  direcciones cortas v2, ZSilent v2 y después el génesis. Queda abierto el
+  tamaño de las pruebas de pago (1,9 MB).
+
 ## 28/10, tarde: testnet v2 con RandomX y XMRig (Claude, rama `quantic-stark-xmrig`)
 
 El usuario pidió continuar lo que Codex dejó a medio hacer. Codex había
@@ -29,9 +51,15 @@ nada pusheado ni instalado:
   y uso en [QUANTIC-STARK-USO.md](docs/QUANTIC-STARK-USO.md).
 - Defender no cortó XMRig en estas corridas: el permiso del ThreatID 2147978346
   que puso el usuario el 23/10 parece seguir activo (lo quita él).
-- **Decisiones del usuario antes de lanzar la testnet v2**: el génesis (wallet
-  del equipo v2 y fecha; recordar el ancla de ASERT en la hora del génesis) y
-  si se reemplaza ya la testnet v1.
+- **Decisiones del usuario (28/10, respuesta «sí» a las cuatro):**
+  1. la testnet v2 **reemplaza** a la v1 apenas esté lista (no conviven);
+  2. el génesis v2 se crea cuando estén la base de estado y la red pública
+     (la wallet del equipo v2 la crea él en ese momento; recordar el ancla de
+     ASERT en la hora del génesis);
+  3. **la PC sigue como nodo autoritario** en la v2: hay que llevar los
+     checkpoints firmados al nodo STARK;
+  4. push de `quantic-protocolo-postcuantico` y `quantic-stark-xmrig` a GitHub
+     y GitLab: **hecho** (`ed6304d5` y `2b95fb53`, verificados con `ls-remote`).
 - **Falta**, en este orden sugerido: almacenamiento por diferencias en vez de
   copiar el ledger entero por bloque (cambia `state_root`: es consenso y hay
   que hacerlo antes del génesis), ZSilent sobre el flujo v2, semillas y

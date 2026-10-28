@@ -133,7 +133,7 @@ de pruebas de varios megabytes se validaron para una red pública sostenida.
 | XMRig | Hecho en local: Stratum sobre plantillas STARK, probado con XMRig 6.25.0 real (ver abajo). Falta el RPC `get_block_template`/`submit_block` para software de pools y probarlo con varios mineros y xmrig-proxy |
 | ZSilent | `WalletService`, `NodeController` y la configuración siguen los comandos, prefijos y contratos v1. Falta conectar el flujo v2 y sus modelos de saldo/historial |
 | Android | `mobile_quantic`, JNI y las pantallas no están conectados al pool STARK. Compilar para ARM no sustituye esa integración ni la medición de memoria en dispositivos |
-| Almacenamiento y revisión | La representación por copias completas necesita reemplazo para escalar; faltan pruebas prolongadas, fuzzing y revisión criptográfica independiente |
+| Almacenamiento y revisión | Desde el formato final (abajo) el estado por bloque es compacto. Faltan reducir el tamaño de las pruebas, guardar los bloques en binario, pruebas prolongadas, fuzzing y revisión criptográfica independiente |
 
 ## Continuación del 28/10: testnet v2 con RandomX y XMRig
 
@@ -169,6 +169,27 @@ formato privado»).
   bloque), 4 bloques canónicos, un trabajo por altura y sin reconexiones; la
   wallet ve 5.000.000 ZKA disponibles y 36 inmaduros. Unos 685 H/s con 2 hilos.
   Las corridas 2 a 4 son las que mostraron las fallas.
+
+## Formato final antes del génesis (28/10, rama `quantic-v2-formato-final`)
+
+Tres cambios de consenso, especificados en
+[QUANTIC-V2-FORMATO.md](QUANTIC-V2-FORMATO.md):
+
+- **`rho` único por nota.** Quien enviaba elegía `rho` al azar y el circuito no
+  lo ataba: dos notas con el mismo `rho` compartían nullifier («Faerie Gold»).
+  Ahora sale del primer nullifier de la transferencia (forzado por el AIR) o de
+  la altura del coinbase, y `rcm` da el ocultamiento.
+- **Coinbase sin prueba STARK:** publica su valor y `H(owner ‖ rcm)`; el nodo
+  recalcula el compromiso. De ~947 KB a menos de 4 KB por bloque.
+- **Estado compacto:** `state_root` compromete altura, emisión, raíz y tamaño
+  del árbol y un acumulador de nullifiers; por bloque se guarda un registro de
+  cientos de bytes, y las ramas se validan con esos registros y el índice
+  canónico de nullifiers. La wallet reconstruye el árbol con `replay`.
+
+Validado: 14 pruebas del pool y 105 del nodo en release; pago por CLI de punta
+a punta (saldo, emisión y rechazo del doble gasto); XMRig 6.25.0 real, 25
+aciertos aceptados y 0 rechazados, 5 bloques canónicos, base de 119 KB para 5
+bloques (antes 7,4 MB para 4).
 
 La misma frase aplicada a esquemas diferentes no migra las notas ni los saldos.
 No se publicó un instalador, no se activó un génesis público nuevo y no se

@@ -265,11 +265,12 @@ xmrig.exe -o 127.0.0.1:3333 -u $Minera -p x -a rx/0
   resuelve una plantilla hasta el final con un hilo y es para la regtest.
   `--stratum` en la regtest también es un error: XMRig calcula RandomX y la
   regtest usa otra prueba de trabajo.
-- Cada dirección de cobro necesita su plantilla, y cada plantilla, una prueba
-  STARK del coinbase (segundos de CPU y cientos de MiB). Por eso el nodo
-  atiende hasta 4 direcciones a la vez y rehace cada plantilla al cambiar la
-  punta o cada 60 segundos, y la arma con uno de los dos permisos de trabajo
-  criptográfico que comparte con la API y la red.
+- Cada dirección de cobro necesita su plantilla. El coinbase no lleva prueba
+  ([formato](QUANTIC-V2-FORMATO.md)), así que una plantilla cuesta las reglas
+  del ledger y volver a verificar las transferencias del mempool que incluye.
+  El nodo atiende hasta 16 direcciones a la vez, rehace cada plantilla al
+  cambiar la punta o cada 30 segundos y la arma con uno de los dos permisos de
+  trabajo criptográfico que comparte con la API y la red.
 - Los aciertos son 16 veces más fáciles que un bloque; el nodo recalcula el
   hash de cada uno y rechaza los que no coinciden, los repetidos y los de
   trabajos viejos. Al encontrar un bloque imprime una línea
@@ -282,13 +283,12 @@ xmrig.exe -o 127.0.0.1:3333 -u $Minera -p x -a rx/0
   a que termine; después cada uno se responde en milisegundos.
 
 Probado el 28/10 con XMRig 6.25.0 oficial (2 hilos, sin huge pages, unos
-685 H/s) contra un nodo de la testnet v2 local y aislado: 20 aciertos
-aceptados y ninguno rechazado, respondidos en 5 ms (unos 240 ms los que eran
-bloque, por la verificación STARK), y 4 bloques canónicos que pagaron a la
-wallet del login. Cada plantilla nueva salió unos 2 segundos después del
-bloque anterior. Con la dificultad en el piso, un acierto que llega en esos
-segundos puede ser otro bloque de la misma altura: queda guardado como rama
-lateral (`"canonical":false`).
+685 H/s) contra un nodo de la testnet v2 local y aislado, con el formato
+final: 25 aciertos aceptados y ninguno rechazado, respondidos en 5 a 15 ms, y
+5 bloques canónicos que pagaron a la wallet del login. Cada trabajo nuevo salió
+en menos de un segundo después del bloque anterior. Con la dificultad en el
+piso, un acierto que llega en ese intervalo puede ser otro bloque de la misma
+altura: queda guardado como rama lateral (`"canonical":false`).
 
 El Stratum escucha en la dirección que se le pida. Abrirlo a la red local
 (`0.0.0.0:3333`) es decisión de quien corre el nodo: cualquiera que llegue al
@@ -389,14 +389,17 @@ el campo cifrado.
 
 ## Alcance y límites actuales
 
-El adaptador guarda una **copia completa del estado del ledger por bloque
-validado** en RocksDB y compromete esa codificación en `state_root`. Incluye
-árbol de notas, nullifiers gastados, anclas y recompensas pendientes. Esto
-permite recuperar y validar ramas, pero el almacenamiento crece con las copias
-sucesivas del estado; no es una representación compactada apta para asumir
-crecimiento constante por bloque. La wallet vuelve a escanear bloques
-canónicos sin podar para encontrar sus notas. Las pruebas se transportan por
-transacción, sin agregación recursiva de todo el bloque.
+El nodo guarda por bloque un **registro compacto** (unos cientos de bytes) y
+`state_root` compromete un estado de tamaño constante: altura, emisión, raíz y
+tamaño del árbol de notas y un acumulador de los nullifiers gastados. Las
+ramas laterales se validan con esos registros y el índice canónico de
+nullifiers. Detalle en [QUANTIC-V2-FORMATO.md](QUANTIC-V2-FORMATO.md). Las
+bases creadas antes de ese formato no se pueden abrir: hay que usar una nueva.
+
+La wallet reconstruye el árbol completo recorriendo los bloques canónicos (sin
+podar) cada vez que calcula saldo o arma un pago; eso crece con la cadena. Las
+pruebas se transportan por transacción, unos 1,9 MB por pago, sin agregación
+recursiva de todo el bloque.
 
 La configuración de STARK y el estimador de Plonky3 se documentan en la
 [revisión del código](REVISION-STARK-CODIGO-2026-10-25.md). Los bits de seguridad
