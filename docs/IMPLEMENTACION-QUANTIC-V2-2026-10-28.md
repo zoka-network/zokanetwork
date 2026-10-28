@@ -129,11 +129,46 @@ de pruebas de varios megabytes se validaron para una red pública sostenida.
 
 | Área | Límite concreto del código actual |
 | --- | --- |
-| Perfiles públicos v2 | Los adaptadores fijan red 3 y cadena regtest. Requieren reglas de activación, génesis fijo y perfiles/manifiestos; la selección de envío por altura debe cambiar para dificultad variable |
-| XMRig | Regtest v2 usa PoW CPU. El Stratum existente construye coinbase y trabajos del pool Orchard. Falta integrar trabajos STARK, direcciones v2, RandomX/ASERT y comprobar shares, extranonce y bloques de XMRig |
+| Perfiles públicos v2 | Desde la continuación de abajo existe el perfil `zoka-quantic-testnet-v2` (RandomX, ASERT, `zqtest2`). Falta el génesis fijo (decisión de lanzamiento), semillas y manifiesto, y revisar la selección de envío por altura para dificultad variable |
+| XMRig | Hecho en local: Stratum sobre plantillas STARK, probado con XMRig 6.25.0 real (ver abajo). Falta el RPC `get_block_template`/`submit_block` para software de pools y probarlo con varios mineros y xmrig-proxy |
 | ZSilent | `WalletService`, `NodeController` y la configuración siguen los comandos, prefijos y contratos v1. Falta conectar el flujo v2 y sus modelos de saldo/historial |
 | Android | `mobile_quantic`, JNI y las pantallas no están conectados al pool STARK. Compilar para ARM no sustituye esa integración ni la medición de memoria en dispositivos |
 | Almacenamiento y revisión | La representación por copias completas necesita reemplazo para escalar; faltan pruebas prolongadas, fuzzing y revisión criptográfica independiente |
+
+## Continuación del 28/10: testnet v2 con RandomX y XMRig
+
+Rama `quantic-stark-xmrig`, sobre `quantic-protocolo-postcuantico`. Retoma el
+paso que había quedado anunciado («conectar la minería de XMRig al nuevo
+formato privado»).
+
+- **Perfiles** (`stark::Profile`): regtest v2 (red 3, PoW CPU, dificultad fija)
+  y testnet v2 (`zoka-quantic-testnet-v2`, red 2, RandomX y la ASERT de la v1).
+  El perfil sale de la marca de la base y viaja en `NodeState`. Wallets,
+  identidades de nodo y descriptores guardan su cadena y se rechazan en otra;
+  el mensaje que el servidor firma con ML-DSA incluye la cadena.
+  `--network regtest|testnet` (regtest por omisión, como antes). La testnet v2
+  no entra en `network_for_chain`: hereda solo la dificultad, para que nunca
+  le llegue el génesis embebido de la v1. Su génesis es
+  `QUANTIC_PQ_TESTNET_GENESIS = None` hasta el lanzamiento.
+- **Stratum**: el servidor de la v1 pasó a tener un `Backend` (login → dirección
+  de cobro, plantilla, bloque encontrado). El de Ironwood conserva su
+  comportamiento; `stark_stratum.rs` arma plantillas STARK con un permiso de
+  trabajo, hasta 4 direcciones y refresco cada 60 s, e importa los bloques por
+  el mismo candado que API, red y minero. `quantic-pq-node serve --stratum`.
+  En la testnet `--mine-to` solo paga logins que no son direcciones.
+- **Fallas del Stratum compartido que destapó XMRig real** (también afectaban a
+  la v1, aunque ahí no se veían): con la cadena vacía la punta guardada es `"0"`
+  y cada plantilla se daba por vieja, una prueba por segundo; mientras una
+  sesión esperaba la respuesta de un acierto se acumulaban avisos y XMRig
+  recibía el mismo trabajo dos veces y se reconectaba; y el verificador
+  RandomX recién se armaba con el primer acierto (unos 37 s de espera).
+  Arreglados, con una regresión que falla sin el primer arreglo.
+- **XMRig 6.25.0 real** contra un nodo de testnet v2 local y aislado, wallet
+  descartable, en `target/stark-xmrig-2026-10-28/xmrig-run5`: 20 aciertos
+  aceptados y ninguno rechazado, respuestas de 5 ms (unos 240 ms los que eran
+  bloque), 4 bloques canónicos, un trabajo por altura y sin reconexiones; la
+  wallet ve 5.000.000 ZKA disponibles y 36 inmaduros. Unos 685 H/s con 2 hilos.
+  Las corridas 2 a 4 son las que mostraron las fallas.
 
 La misma frase aplicada a esquemas diferentes no migra las notas ni los saldos.
 No se publicó un instalador, no se activó un génesis público nuevo y no se

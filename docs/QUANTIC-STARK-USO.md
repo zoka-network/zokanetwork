@@ -1,7 +1,8 @@
 # ZOKA QUANTIC STARK v2: uso local
 
 Actualizado el 28 de octubre de 2026. Esta guía corresponde a la implementación
-de la cadena **`zoka-quantic-regtest-v2`**, activada con la feature `quantic-pq`.
+de las cadenas **`zoka-quantic-regtest-v2`** y **`zoka-quantic-testnet-v2`**,
+activadas con la feature `quantic-pq`.
 Incluye transferencias privadas con STARK, wallet cifrada, consenso y persistencia,
 nodo con transporte autenticado, sincronización y API local. Es una cadena de
 pruebas separada: estos comandos no despliegan una mainnet ni convierten la
@@ -9,8 +10,9 @@ testnet Orchard existente.
 
 Las opciones se contrastaron con [stark_cli.rs](../src/quantic/stark_cli.rs),
 [stark_node.rs](../src/quantic/stark_node.rs),
-[stark_api.rs](../src/quantic/stark_api.rs) y
-[stark_net.rs](../src/quantic/stark_net.rs). La
+[stark_api.rs](../src/quantic/stark_api.rs),
+[stark_net.rs](../src/quantic/stark_net.rs) y
+[stark_stratum.rs](../src/quantic/stark_stratum.rs). La
 [revisión del pool STARK](REVISION-STARK-CODIGO-2026-10-25.md) explica las
 hipótesis criptográficas y los límites de la evidencia. Esta guía no constituye
 un informe de ejecución de las nuevas pruebas de API o transporte.
@@ -33,11 +35,25 @@ Para un binario dedicado al regtest se puede compilar con
 `--no-default-features --features quantic-pq`; esto no elimina los requisitos
 nativos de RocksDB.
 
-La minería de **esta cadena v2 usa la prueba de trabajo CPU de regtest**,
-independientemente de que el binario incluya RandomX. No es `rx/0`, no expone
-Stratum para este protocolo y no se puede conectar XMRig a sus plantillas.
-La API informa `xmrig_compatible: false`. El soporte RandomX/XMRig de otras
-cadenas del proyecto no convierte este regtest en una de ellas.
+### Dos cadenas v2
+
+| `--network` | Cadena | Prueba de trabajo | Direcciones | Minería |
+| --- | --- | --- | --- | --- |
+| `regtest` (por omisión) | `zoka-quantic-regtest-v2` | CPU de pruebas (SHA3), dificultad fija | `zqregtest2…` | Minero interno (`--mine-to`) o `quantic-pq mine` |
+| `testnet` | `zoka-quantic-testnet-v2` | RandomX (`rx/0`) con la ASERT de la testnet v1 | `zqtest2…` | XMRig por el Stratum del nodo (`--stratum`) |
+
+La testnet v2 es la que reemplazará a la v1 cuando se lance. **Todavía no tiene
+génesis fijo** (`QUANTIC_PQ_TESTNET_GENESIS` en `economics.rs` vale `None`):
+hasta que el lanzamiento lo fije en el binario, quien mina el bloque 1 arma su
+propia cadena local con esas reglas y se lleva el premine de esa cadena. No hay
+semillas ni manifiesto público de la v2. La API y `serve` informan
+`xmrig_compatible` según la cadena.
+
+Una base, una wallet y una identidad de nodo guardan su cadena y nunca se
+abren como otra. `--network` elige la cadena de una base **nueva**; una base
+existente conserva la suya, y pedir otra con `--network` es un error. La
+wallet de un envío decide su cadena. Un descriptor de par nombra la cadena que
+sirve, y esa cadena forma parte del mensaje que firma el servidor con ML-DSA.
 
 Los ejemplos siguientes son PowerShell. Cada terminal debe estar en la raíz
 del repositorio y definir `$Zoka` como arriba. En Linux se usa el mismo conjunto
@@ -87,10 +103,15 @@ segunda, la frase. No incluya la frase en argumentos ni en el historial.
 
 Las wallets usan el esquema `zoka-quantic-stark-wallet-v2`; las identidades de
 nodo usan `zoka-quantic-stark-node-identity-v2`. Son archivos diferentes. Las
-direcciones completas aceptadas por este CLI comienzan por `zqregtest2` y
-contienen las claves públicas necesarias para cifrar. Una versión abreviada de
-la dirección no sirve como destinatario. La biblioteca también define los
-prefijos v2 `zq2` y `zqtest2`, pero estos comandos solo operan en regtest.
+direcciones completas comienzan por `zqregtest2` (regtest) o `zqtest2`
+(testnet) y contienen las claves públicas necesarias para cifrar. Una versión
+abreviada de la dirección no sirve como destinatario. El prefijo `zq2` de la
+mainnet existe en la biblioteca, pero ningún comando abre esa cadena. Para una
+wallet de la testnet:
+
+```powershell
+& $Zoka quantic-pq wallet-create --network testnet --wallet .\stark-lab\minera.wallet.json
+```
 
 **No existe migración de saldo ni de wallet v1 a v2 mediante estos comandos.**
 La misma frase aplicada a otro esquema no implica la misma cuenta. No cambie
@@ -215,6 +236,68 @@ ya exportado**: ese pago todavía puede entrar en un bloque hasta caducar o
 hasta que una de sus entradas sea gastada. Sincronice antes de decidir volver
 a gastar fondos reservados.
 
+## Minar la testnet v2 con XMRig
+
+En la testnet v2 el nodo no mina solo: abre un Stratum y XMRig (o cualquier
+minero `rx/0` que hable el protocolo de pools de Monero) mina sus plantillas.
+El protocolo es el mismo de la testnet v1 (blob de 76 bytes, nonce de 32 bits
+en la posición 39 y extranonce propio por conexión); cambian la plantilla, que
+lleva el coinbase con su prueba STARK, y el bloque encontrado, que entra por la
+misma validación que uno recibido.
+
+```powershell
+$Minera = (& $Zoka quantic-pq address --wallet .\stark-lab\minera.wallet.json).Trim()
+& $Zoka quantic-pq-node serve --network testnet --db .\stark-lab\testnet-a --identity .\stark-lab\testnet-a.identity.json --api 127.0.0.1:9140 --descriptor-out .\stark-lab\testnet-a.peer.json --stratum 127.0.0.1:3333
+```
+
+En otra terminal:
+
+```powershell
+xmrig.exe -o 127.0.0.1:3333 -u $Minera -p x -a rx/0
+```
+
+- El login de XMRig (`-u`) es la **dirección v2 completa** de la wallet que
+  cobra. Una dirección de otra red, una de la v1 (`zqtest1…`) o una corta se
+  rechazan con un error, para no minar para otro sin saberlo. Con
+  `--mine-to DIRECCION` en `serve`, un login que no es una dirección (el
+  nombre de un equipo) cobra a esa.
+- `--mine-to` sin `--stratum` es un error en la testnet: el minero interno
+  resuelve una plantilla hasta el final con un hilo y es para la regtest.
+  `--stratum` en la regtest también es un error: XMRig calcula RandomX y la
+  regtest usa otra prueba de trabajo.
+- Cada dirección de cobro necesita su plantilla, y cada plantilla, una prueba
+  STARK del coinbase (segundos de CPU y cientos de MiB). Por eso el nodo
+  atiende hasta 4 direcciones a la vez y rehace cada plantilla al cambiar la
+  punta o cada 60 segundos, y la arma con uno de los dos permisos de trabajo
+  criptográfico que comparte con la API y la red.
+- Los aciertos son 16 veces más fáciles que un bloque; el nodo recalcula el
+  hash de cada uno y rechaza los que no coinciden, los repetidos y los de
+  trabajos viejos. Al encontrar un bloque imprime una línea
+  `{"stratum_block":…}` y lo importa; los pares lo reciben en su ciclo.
+- `GET /status` incluye `stratum`: dirección, mineros conectados, aciertos
+  aceptados y rechazados y bloques encontrados.
+- Al abrir el Stratum el nodo arma su verificador de RandomX: el dataset de
+  2 GB, uno por proceso y época, que también valida los bloques. En la PC de
+  pruebas (i5-6400) tarda unos 37 segundos. Un acierto que llega antes espera
+  a que termine; después cada uno se responde en milisegundos.
+
+Probado el 28/10 con XMRig 6.25.0 oficial (2 hilos, sin huge pages, unos
+685 H/s) contra un nodo de la testnet v2 local y aislado: 20 aciertos
+aceptados y ninguno rechazado, respondidos en 5 ms (unos 240 ms los que eran
+bloque, por la verificación STARK), y 4 bloques canónicos que pagaron a la
+wallet del login. Cada plantilla nueva salió unos 2 segundos después del
+bloque anterior. Con la dificultad en el piso, un acierto que llega en esos
+segundos puede ser otro bloque de la misma altura: queda guardado como rama
+lateral (`"canonical":false`).
+
+El Stratum escucha en la dirección que se le pida. Abrirlo a la red local
+(`0.0.0.0:3333`) es decisión de quien corre el nodo: cualquiera que llegue al
+puerto puede pedir plantillas.
+
+Windows Defender detecta XMRig como `Trojan:Win64/HashvaultMiner.A` y lo cierra
+a los pocos segundos; una exclusión de carpeta no alcanza. Ver
+[QUANTIC-POOL-DE-MINERIA.md](QUANTIC-POOL-DE-MINERIA.md).
+
 ## Minería e intercambio de bloques sin un nodo activo
 
 Con la base indicada cerrada en otros procesos se puede incluir un pago
@@ -242,7 +325,7 @@ para exponer directamente a Internet.
 
 | Operación | Solicitud | Resultado |
 | --- | --- | --- |
-| Estado | `GET /status` | Cadena, altura, hash, emisión, cantidad de notas y mempool, algoritmo y límites |
+| Estado | `GET /status` | Cadena, altura, hash, emisión, cantidad de notas y mempool, algoritmo, límites y estado del Stratum |
 | Bloque canónico | `GET /blocks/ALTURA` | JSON del bloque; 404 si no existe |
 | Admitir pago | `POST /transactions`, `application/octet-stream` | Transacción v2 binaria; 202 con txid si se acepta |
 | Plantilla de minería | `GET /mining/template?address=DIRECCION` | Bloque candidato, blob, target, seed y posición del nonce |
@@ -327,4 +410,5 @@ su resistencia interna.
 Se puede implementar y probar hoy el protocolo y sus rechazos sin disponer de
 una máquina cuántica. Lo implementado aquí no equivale a una auditoría externa
 ni a una certificación de resistencia cuántica. La cadena, las wallets y el
-transporte v2 descritos están delimitados al regtest local de esta implementación.
+transporte v2 descritos funcionan en cadenas locales: la regtest y la testnet v2
+antes de que el lanzamiento le fije el génesis.

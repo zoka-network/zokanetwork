@@ -1,7 +1,41 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
-Actualizada: **28 de octubre de 2026**, Argentina (núcleo STARK local verificado; integración en curso).
+Actualizada: **28 de octubre de 2026**, Argentina (núcleo STARK local verificado; testnet v2 minada con XMRig en local).
 Proyecto: `C:\Users\mderramus\ZOKA`.
+
+## 28/10, tarde: testnet v2 con RandomX y XMRig (Claude, rama `quantic-stark-xmrig`)
+
+El usuario pidió continuar lo que Codex dejó a medio hacer. Codex había
+commiteado el núcleo STARK (`ed6304d5`) y anunciado como siguiente paso
+«conectar la minería de XMRig al nuevo formato privado»; no llegó a escribirlo.
+Hecho, en la rama `quantic-stark-xmrig` (sobre `quantic-protocolo-postcuantico`),
+nada pusheado ni instalado:
+
+- **Perfiles STARK**: además de la regtest v2 existe `zoka-quantic-testnet-v2`
+  (RandomX, la ASERT de la v1, direcciones `zqtest2`). `--network
+  regtest|testnet` en `quantic-pq` y `quantic-pq-node` (regtest por omisión).
+  Base, wallet, identidad y descriptor guardan su cadena. **Sin génesis fijo**
+  (`QUANTIC_PQ_TESTNET_GENESIS = None`): fijarlo es la decisión de lanzamiento.
+- **Stratum para XMRig** sobre plantillas STARK: `quantic-pq-node serve
+  --network testnet --stratum HOST:PUERTO`. El login es la dirección v2
+  completa. El Stratum de la v1 quedó con un `Backend` y sin cambios de uso.
+- **Probado con XMRig 6.25.0 real** (el de `Downloads`), nodo local aislado,
+  wallet descartable: 20 aciertos aceptados, 0 rechazados, 4 bloques. Las
+  corridas anteriores destaparon tres fallas del Stratum compartido (también
+  de la v1), arregladas: plantillas rehechas sin parar con la cadena vacía,
+  trabajo repetido que hacía reconectar a XMRig y 37 s de espera del primer
+  acierto. Detalle en
+  [IMPLEMENTACION-QUANTIC-V2-2026-10-28.md](docs/IMPLEMENTACION-QUANTIC-V2-2026-10-28.md)
+  y uso en [QUANTIC-STARK-USO.md](docs/QUANTIC-STARK-USO.md).
+- Defender no cortó XMRig en estas corridas: el permiso del ThreatID 2147978346
+  que puso el usuario el 23/10 parece seguir activo (lo quita él).
+- **Decisiones del usuario antes de lanzar la testnet v2**: el génesis (wallet
+  del equipo v2 y fecha; recordar el ancla de ASERT en la hora del génesis) y
+  si se reemplaza ya la testnet v1.
+- **Falta**, en este orden sugerido: almacenamiento por diferencias en vez de
+  copiar el ledger entero por bloque (cambia `state_root`: es consenso y hay
+  que hacerlo antes del génesis), ZSilent sobre el flujo v2, semillas y
+  manifiesto de la v2, RPC para pools, y Android.
 
 ## 28/10: implementación del pool privado STARK (validación local completada)
 
