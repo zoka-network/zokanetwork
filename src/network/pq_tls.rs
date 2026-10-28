@@ -17,15 +17,22 @@
 //! ```
 //!
 //! El proveedor de compatibilidad ofrece también X25519 solo. El preset de
-//! Quantic usa `RequiredPostQuantumTls`: no ofrece esa mitad ni permite volver
-//! a un grupo clásico. TLS conserva la identidad Ed25519 de iroh; la firma
-//! híbrida de snapshots se verifica aparte y no depende de esa identidad.
+//! Quantic usa `RequiredPostQuantumTls`: toda conexión de iroh (entrante o
+//! saliente) que no negoció el grupo híbrido se cierra apenas termina el
+//! handshake. El mismo proveedor de rustls sirve al HTTPS del endpoint (relays
+//! y pkarr), y los relays públicos de n0 no ofrecen el grupo híbrido: un
+//! ClientHello solo con él recibe `HandshakeFailure` y el nodo nunca queda en
+//! línea. Por eso el proveedor ofrece los clásicos detrás y la exigencia va en
+//! el hook, conexión por conexión. Lo que viaja por el relay ya es QUIC cifrado
+//! de punta a punta, y pkarr publica direcciones firmadas que son públicas.
+//! TLS conserva la identidad Ed25519 de iroh; la firma híbrida de snapshots se
+//! verifica aparte y no depende de esa identidad.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use iroh::endpoint::presets::{self, Preset};
-use iroh::endpoint::Builder;
+use iroh::endpoint::{AfterHandshakeOutcome, Builder, Connection, EndpointHooks, VarInt};
 use rustls::crypto::{ActiveKeyExchange, CompletedKeyExchange, CryptoProvider, SharedSecret, SupportedKxGroup};
 use rustls::ffdhe_groups::FfdheGroup;
 use rustls::{Error, NamedGroup, PeerMisbehaved, ProtocolVersion};
@@ -194,18 +201,61 @@ impl ActiveKeyExchange for RequiredHybridExchange {
     // No classical component is offered, even in the first ClientHello.
 }
 
+/// Hybrid only, for TLS that talks exclusively to Zoka peers. An iroh endpoint
+/// cannot use it: its relay and pkarr HTTPS clients share the provider (see
+/// the module docs and `RequireHybridHandshake`).
 pub fn required_hybrid_provider() -> CryptoProvider {
     let mut provider = rustls::crypto::ring::default_provider();
     provider.kx_groups = vec![&RequiredHybridGroup];
     provider
 }
 
+/// El grupo que negoció el handshake TLS de una conexión de iroh.
+pub fn negotiated_group(conn: &Connection) -> Option<NamedGroup> {
+    conn.handshake_data()?
+        .downcast::<noq_proto::crypto::rustls::HandshakeData>()
+        .ok()?
+        .negotiated_key_exchange_group
+}
+
+/// Cierra toda conexión de iroh, entrante o saliente, que no negoció
+/// X25519MLKEM768. No toca el HTTPS del endpoint (relays, pkarr).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RequireHybridHandshake;
+
+/// Código de cierre QUIC de una conexión sin intercambio híbrido.
+pub const CLASSICAL_HANDSHAKE_CLOSE: u32 = 0x5051;
+
+impl EndpointHooks for RequireHybridHandshake {
+    fn after_handshake<'a>(
+        &'a self,
+        conn: &'a Connection,
+    ) -> impl std::future::Future<Output = AfterHandshakeOutcome> + Send + 'a {
+        let hybrid = negotiated_group(conn) == Some(NamedGroup::X25519MLKEM768);
+        async move {
+            if hybrid {
+                AfterHandshakeOutcome::accept()
+            } else {
+                AfterHandshakeOutcome::Reject {
+                    error_code: VarInt::from_u32(CLASSICAL_HANDSHAKE_CLOSE),
+                    reason: b"post-quantum key exchange required".to_vec(),
+                }
+            }
+        }
+    }
+}
+
+/// El proveedor de compatibilidad (híbrido primero) y el hook que exige el
+/// híbrido en cada conexión de iroh.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RequiredPostQuantumTls<P>(pub P);
 
 impl<P: Preset> Preset for RequiredPostQuantumTls<P> {
     fn apply(self, builder: Builder) -> Builder {
-        self.0.apply(builder).crypto_provider(Arc::new(required_hybrid_provider()))
+        self.0
+            .apply(builder)
+            .crypto_provider(Arc::new(provider()))
+            .hooks(RequireHybridHandshake)
     }
 }
 
