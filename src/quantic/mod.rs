@@ -54,6 +54,8 @@ pub mod stark_net;
 #[cfg(feature = "quantic-pq")]
 pub mod stark_node;
 #[cfg(feature = "quantic-pq")]
+pub mod stark_peers;
+#[cfg(feature = "quantic-pq")]
 pub mod stark_stratum;
 
 /// El nodo numera desde 1 (la altura 0 es el génesis sintético de cada

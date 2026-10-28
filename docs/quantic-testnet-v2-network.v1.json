@@ -1,0 +1,14 @@
+{
+  "schema": "zoka-quantic-stark-network-v1",
+  "status": "pre-genesis",
+  "chain_id": "zoka-quantic-testnet-v2",
+  "alpn": "/zoka/quantic-stark/2",
+  "transport": "iroh QUIC with mandatory X25519MLKEM768 TLS and an ML-DSA-65 server signature bound to each connection. Relays and address lookup by n0, so no node needs an open port.",
+  "seed_nodes": [],
+  "notes": [
+    "Zoka Quantic Testnet v2: the fully post-quantum private pool (Plonky3 STARK over Poseidon2, X-Wing note encryption, ML-DSA node identities). Test coins with no value. It replaces the v1 testnet when it launches.",
+    "Pre-genesis: block 1 does not exist yet and no seed is listed. The team's PC becomes seed1 at launch.",
+    "A seed is pinned by its iroh endpoint id and the key id (blake3) of its ML-DSA-65 public key; `quantic-pq-node identity` prints both.",
+    "Peers learned from other nodes are dialed and authenticated before they are shared. Blocks are validated locally whoever serves them."
+  ]
+}

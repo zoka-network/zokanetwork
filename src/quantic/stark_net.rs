@@ -2,11 +2,19 @@
 //! this connection's TLS exporter, not a reusable greeting or an unbound nonce.
 //! TLS must negotiate X25519MLKEM768. Only STARK v2 chains are served, each one
 //! named in the descriptor and bound into the signed context.
-use std::{sync::Arc, time::Duration};
+//!
+//! Peer exchange: a node announces only its own endpoint (the id must be the
+//! connection's authenticated remote id) and answers `PEERS` with endpoints it
+//! has itself dialed and authenticated. Neither makes a learned peer trusted:
+//! blocks are validated locally whoever serves them.
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use iroh::{
     endpoint::{presets::Preset, Connection, QuicTransportConfig, RecvStream, SendStream},
-    Endpoint, EndpointAddr, EndpointId, SecretKey,
+    Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{sync::Semaphore, task::JoinHandle};
@@ -24,39 +32,72 @@ use crate::{network::pq_tls::RequiredPostQuantumTls, state::chain::apply_block, 
 use stark::protocol::transaction::{Transaction, MAX_TRANSACTION_BYTES};
 
 pub const ALPN: &[u8] = b"/zoka/quantic-stark/2";
+pub const DESCRIPTOR_VERSION: u8 = 3;
 pub const MAX_BLOCK_WIRE_BYTES: usize = 2 * stark::protocol::ledger::MAX_BLOCK_BYTES + 1024 * 1024;
 const MAGIC: &[u8; 4] = b"ZQS2";
 const AUTH_CONTEXT: &[u8] = b"zoka-quantic-stark-server-v2";
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-ZOKA-QUANTIC-STARK-v2";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-const MAX_CONNECTIONS: usize = 8;
+/// Inbound sessions. Each one holds at most one stream, and verification
+/// work shares the node's two crypto permits whatever this number is.
+const MAX_CONNECTIONS: usize = 64;
 const HEAD: u8 = 1;
 const GET_BLOCK: u8 = 2;
 const SUBMIT_BLOCK: u8 = 3;
 const SUBMIT_TX: u8 = 4;
 const GET_HASH: u8 = 5;
+const PEERS: u8 = 6;
+const ANNOUNCE: u8 = 7;
 const MAX_ERROR_BYTES: usize = 2048;
+const MAX_ANNOUNCE_BYTES: usize = 4096;
+/// Endpoints answered per `PEERS` request.
+pub const MAX_SHARED_PEERS: usize = 16;
+const MAX_PEERS_RESPONSE_BYTES: usize = MAX_SHARED_PEERS * MAX_ANNOUNCE_BYTES;
+/// One `PEERS` answer per connection and interval; earlier repeats get `[]`.
+const PEERS_INTERVAL: Duration = Duration::from_secs(60);
+/// Transport addresses a descriptor may carry.
+const MAX_ADDRESSES: usize = 8;
+const KEY_ID_CONTEXT: &str = "ZOKA STARK ML-DSA key id v2";
 
 fn err(value: impl std::fmt::Display) -> String {
     value.to_string()
 }
 
+/// The 32-byte pin of an ML-DSA-65 public key. The server sends the key
+/// itself during the handshake; a descriptor only has to name it.
+pub fn key_id(public: &[u8]) -> String {
+    hex::encode(blake3::derive_key(KEY_ID_CONTEXT, public))
+}
+
 /// Store this descriptor through an authenticated channel. Receiving a key
 /// from an untrusted peer is not a substitute for pinning its expected identity.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeDescriptor {
     pub version: u8,
     pub chain_id: String,
     pub endpoint_addr: EndpointAddr,
-    pub ml_dsa_public_key: Vec<u8>,
+    /// [`key_id`] of the server's ML-DSA-65 public key.
+    pub ml_dsa_key_id: String,
 }
 impl NodeDescriptor {
     pub fn validate(&self) -> Result<(), String> {
-        if self.version != 2 || Profile::for_chain(&self.chain_id).is_none() {
+        if self.version != DESCRIPTOR_VERSION || Profile::for_chain(&self.chain_id).is_none() {
             return Err("STARK descriptor network/version".into());
         }
-        MlDsa65PublicKey::from_bytes(&self.ml_dsa_public_key).map_err(err)?;
+        let pin = hex::decode(&self.ml_dsa_key_id).map_err(err)?;
+        if pin.len() != 32 || self.ml_dsa_key_id != hex::encode(&pin) {
+            return Err("STARK descriptor ML-DSA key id".into());
+        }
+        let addresses = &self.endpoint_addr.addrs;
+        if addresses.len() > MAX_ADDRESSES
+            || addresses
+                .iter()
+                .any(|a| !matches!(a, TransportAddr::Ip(_) | TransportAddr::Relay(_)))
+        {
+            return Err("STARK descriptor addresses".into());
+        }
         Ok(())
     }
 }
@@ -81,6 +122,12 @@ impl ServerIdentity {
     }
     pub fn public_key(&self) -> Vec<u8> {
         self.signature.public_key().to_bytes().to_vec()
+    }
+    pub fn endpoint_id(&self) -> EndpointId {
+        self.transport.public()
+    }
+    pub fn key_id(&self) -> String {
+        key_id(&self.public_key())
     }
 }
 
@@ -154,10 +201,10 @@ pub async fn serve(
         .await
         .map_err(err)?;
     let descriptor = NodeDescriptor {
-        version: 2,
+        version: DESCRIPTOR_VERSION,
         chain_id: state.profile.chain_id.into(),
         endpoint_addr: endpoint.addr(),
-        ml_dsa_public_key: identity.public_key(),
+        ml_dsa_key_id: identity.key_id(),
     };
     let listener = endpoint.clone();
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
@@ -172,6 +219,7 @@ pub async fn serve(
             let server_id = listener.id();
             tokio::spawn(async move {
                 let _permit = permit;
+                let _inbound = state.peers.inbound();
                 let connected = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
                     let connection = incoming.await.map_err(err)?;
                     let (send, recv) =
@@ -230,10 +278,11 @@ async fn authenticate_server(
 
 fn request_limit(tag: u8) -> Result<usize, String> {
     match tag {
-        HEAD => Ok(0),
+        HEAD | PEERS => Ok(0),
         GET_BLOCK | GET_HASH => Ok(8),
         SUBMIT_BLOCK => Ok(MAX_BLOCK_WIRE_BYTES),
         SUBMIT_TX => Ok(MAX_TRANSACTION_BYTES),
+        ANNOUNCE => Ok(MAX_ANNOUNCE_BYTES),
         _ => Err("unknown STARK request".into()),
     }
 }
@@ -272,15 +321,68 @@ async fn write_response(
     send.write_all(&bytes).await.map_err(err)
 }
 
+/// Peer-exchange limits of one inbound connection.
+#[derive(Default)]
+struct Exchange {
+    announced: bool,
+    answered: Option<Instant>,
+}
+
+/// Cheap and bounded: answered without a crypto permit or the state gate.
+fn peer_request(
+    state: &NodeState,
+    remote: EndpointId,
+    tag: u8,
+    body: &[u8],
+    exchange: &mut Exchange,
+) -> Result<Vec<u8>, String> {
+    if tag == ANNOUNCE {
+        if std::mem::replace(&mut exchange.announced, true) {
+            return Err("one STARK announce per connection".into());
+        }
+        let descriptor: NodeDescriptor = serde_json::from_slice(body).map_err(err)?;
+        descriptor.validate()?;
+        if descriptor.chain_id != state.profile.chain_id {
+            return Err("STARK announce for another chain".into());
+        }
+        if descriptor.endpoint_addr.id != remote {
+            return Err("STARK announce must name the announcing endpoint".into());
+        }
+        state.peers.book().learn(descriptor);
+        return Ok(Vec::new());
+    }
+    let fresh = exchange
+        .answered
+        .is_none_or(|at| at.elapsed() >= PEERS_INTERVAL);
+    let peers = if fresh {
+        exchange.answered = Some(Instant::now());
+        state
+            .peers
+            .book()
+            .share(MAX_SHARED_PEERS, super::now_secs())
+    } else {
+        Vec::new()
+    };
+    serde_json::to_vec(&peers).map_err(err)
+}
+
 async fn serve_requests(
     connection: &Connection,
     mut send: SendStream,
     mut recv: RecvStream,
     state: NodeState,
 ) -> Result<(), String> {
+    let mut exchange = Exchange::default();
     loop {
         let request = async {
             let (tag, len) = read_request_header(&mut recv).await?;
+            if matches!(tag, PEERS | ANNOUNCE) {
+                let mut body = vec![0; len];
+                recv.read_exact(&mut body).await.map_err(err)?;
+                let response =
+                    peer_request(&state, connection.remote_id(), tag, &body, &mut exchange);
+                return write_response(&mut send, response).await;
+            }
             let shared = state.clone();
             let permit = shared.work.clone().acquire_owned().await.map_err(err)?;
             // Read only the small fixed header before admission. Large bodies
@@ -415,12 +517,16 @@ pub struct Client {
     /// From the pinned descriptor: every head must name this chain.
     chain_id: String,
     endpoint: Endpoint,
+    /// False when the endpoint is the node's own server endpoint, shared by
+    /// every outbound session and closed only with the server.
+    owned: bool,
     connection: Connection,
     send: SendStream,
     recv: RecvStream,
 }
 
 impl Client {
+    /// A one-off client on its own endpoint (mirror sync, broadcast).
     pub async fn connect(descriptor: &NodeDescriptor, preset: impl Preset) -> Result<Self, String> {
         descriptor.validate()?;
         let endpoint = Endpoint::builder(RequiredPostQuantumTls(preset))
@@ -428,6 +534,27 @@ impl Client {
             .bind()
             .await
             .map_err(err)?;
+        Self::handshake(endpoint, true, descriptor).await
+    }
+
+    /// Dial from a node's server endpoint. The peer then sees this node's own
+    /// endpoint id, which is what lets it accept this node's announce.
+    pub async fn connect_from(
+        endpoint: &Endpoint,
+        descriptor: &NodeDescriptor,
+    ) -> Result<Self, String> {
+        descriptor.validate()?;
+        if descriptor.endpoint_addr.id == endpoint.id() {
+            return Err("STARK descriptor names this node".into());
+        }
+        Self::handshake(endpoint.clone(), false, descriptor).await
+    }
+
+    async fn handshake(
+        endpoint: Endpoint,
+        owned: bool,
+        descriptor: &NodeDescriptor,
+    ) -> Result<Self, String> {
         let authenticated = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
             let connection = endpoint
                 .connect(descriptor.endpoint_addr.clone(), ALPN)
@@ -439,7 +566,8 @@ impl Client {
             let mut signature = vec![0u8; ML_DSA_65_SIGNATURE_BYTES];
             recv.read_exact(&mut public).await.map_err(err)?;
             recv.read_exact(&mut signature).await.map_err(err)?;
-            if public != descriptor.ml_dsa_public_key {
+            if key_id(&public) != descriptor.ml_dsa_key_id {
+                connection.close(1u32.into(), b"STARK pinned key mismatch");
                 return Err("STARK pinned ML-DSA key mismatch".into());
             }
             let message = auth_message(
@@ -466,12 +594,15 @@ impl Client {
             Ok(Ok((connection, send, recv))) => Ok(Self {
                 chain_id: descriptor.chain_id.clone(),
                 endpoint,
+                owned,
                 connection,
                 send,
                 recv,
             }),
             other => {
-                endpoint.close().await;
+                if owned {
+                    endpoint.close().await;
+                }
                 Err(match other {
                     Ok(Err(reason)) => reason,
                     _ => "STARK authentication timeout".into(),
@@ -482,7 +613,30 @@ impl Client {
 
     pub async fn close(&self) {
         self.connection.close(0u32.into(), b"client done");
-        self.endpoint.close().await;
+        if self.owned {
+            self.endpoint.close().await;
+        }
+    }
+
+    /// Endpoints the peer has authenticated itself. Unverified here: callers
+    /// dial them before sharing them further.
+    pub async fn peers(&mut self) -> Result<Vec<NodeDescriptor>, String> {
+        let bytes = self.request(PEERS, &[], MAX_PEERS_RESPONSE_BYTES).await?;
+        let peers: Vec<NodeDescriptor> = serde_json::from_slice(&bytes).map_err(err)?;
+        if peers.len() > MAX_SHARED_PEERS {
+            return Err("STARK peers response length".into());
+        }
+        Ok(peers
+            .into_iter()
+            .filter(|peer| peer.validate().is_ok() && peer.chain_id == self.chain_id)
+            .collect())
+    }
+
+    /// Announce this node's own server endpoint. Only meaningful on a client
+    /// made with [`Client::connect_from`] on that endpoint.
+    pub async fn announce(&mut self, own: &NodeDescriptor) -> Result<(), String> {
+        let bytes = serde_json::to_vec(own).map_err(err)?;
+        self.request(ANNOUNCE, &bytes, 0).await.map(drop)
     }
 
     async fn request(
@@ -785,7 +939,7 @@ mod tests {
         let encoded = serde_json::to_vec(&descriptor).unwrap();
         let descriptor: NodeDescriptor = serde_json::from_slice(&encoded).unwrap();
         let mut bad_pin = descriptor.clone();
-        bad_pin.ml_dsa_public_key = ServerIdentity::from_seed(&[72; 32]).unwrap().public_key();
+        bad_pin.ml_dsa_key_id = ServerIdentity::from_seed(&[72; 32]).unwrap().key_id();
         let rejected = Client::connect(&bad_pin, presets::Minimal)
             .await
             .err()
@@ -904,6 +1058,10 @@ mod tests {
             .unwrap();
         let (first, _first_send, _first_recv, public, signature) =
             raw_hello(&endpoint, &descriptor).await;
+        assert_eq!(
+            crate::network::pq_tls::negotiated_group(&first),
+            Some(rustls::NamedGroup::X25519MLKEM768)
+        );
         let key = MlDsa65PublicKey::from_bytes(&public).unwrap();
         let signature = MlDsa65Signature::from_bytes(&signature).unwrap();
         let original =
@@ -927,5 +1085,72 @@ mod tests {
             .expect("oversized frame closed");
         endpoint.close().await;
         server.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn peer_exchange_takes_only_self_announces_and_shares_only_dialed_peers() {
+        let (seed_state, _seed_dir) = state();
+        let (node_state, _node_dir) = state();
+        let seed = serve(
+            seed_state.clone(),
+            ServerIdentity::from_seed(&[74; 32]).unwrap(),
+            presets::Minimal,
+        )
+        .await
+        .unwrap();
+        let node = serve(
+            node_state,
+            ServerIdentity::from_seed(&[75; 32]).unwrap(),
+            presets::Minimal,
+        )
+        .await
+        .unwrap();
+        seed_state
+            .peers
+            .book()
+            .configure(seed.endpoint.id(), false, &[]);
+        let target = localhost(&seed);
+        let own = localhost(&node);
+
+        // A client on its own endpoint cannot announce someone else's.
+        let mut stranger = Client::connect(&target, presets::Minimal).await.unwrap();
+        let refused = stranger.announce(&own).await.unwrap_err();
+        assert!(refused.contains("announcing endpoint"), "{refused}");
+        assert_eq!(seed_state.peers.book().pending_len(), 0);
+        stranger.close().await;
+
+        let mut client = Client::connect_from(&node.endpoint, &target).await.unwrap();
+        assert!(client.peers().await.unwrap().is_empty());
+        client.announce(&own).await.unwrap();
+        let again = client.announce(&own).await.unwrap_err();
+        assert!(again.contains("one STARK announce"), "{again}");
+        assert!(
+            client.peers().await.unwrap().is_empty(),
+            "an announce is not shared before the seed dials it"
+        );
+        let pending = seed_state.peers.book().next_pending().unwrap();
+        assert_eq!(pending, own);
+
+        // The seed dials back: the endpoint authenticates with its pinned key.
+        let mut back = Client::connect_from(&seed.endpoint, &pending)
+            .await
+            .unwrap();
+        assert_eq!(back.head().await.unwrap().chain_id, CHAIN);
+        back.close().await;
+        seed_state
+            .peers
+            .book()
+            .verified(pending, super::super::now_secs());
+        let mut fresh = Client::connect(&target, presets::Minimal).await.unwrap();
+        assert_eq!(fresh.peers().await.unwrap(), vec![own]);
+        assert!(
+            fresh.peers().await.unwrap().is_empty(),
+            "one answer per connection and minute"
+        );
+        assert!(Client::connect_from(&seed.endpoint, &target).await.is_err());
+        fresh.close().await;
+        client.close().await;
+        node.close().await;
+        seed.close().await;
     }
 }

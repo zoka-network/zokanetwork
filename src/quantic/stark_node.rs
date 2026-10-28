@@ -1,6 +1,11 @@
 //! Explicit-path node, mirror synchronization and broadcast tools for the STARK
 //! v2 chains. The database marker names the chain; `--network` picks it for a
 //! new database.
+//!
+//! A serving node keeps a session with every pinned peer (`--peer` files and
+//! the manifest's seeds) and with up to eight peers learned through the
+//! exchange in `stark_net`. All of them are dialed from the node's own server
+//! endpoint.
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -8,10 +13,10 @@ use std::{
     time::Duration,
 };
 
-use iroh::endpoint::presets;
+use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use tokio::sync::watch;
+use tokio::{sync::watch, task::JoinSet};
 use zeroize::Zeroizing;
 
 use super::{
@@ -19,6 +24,7 @@ use super::{
     stark_api::{self, NodeState},
     stark_cli::{open_db, read_bounded, write_new},
     stark_net::{self, Client, Head, NodeDescriptor, ServerIdentity},
+    stark_peers::{Manifest, PeerBook, MAX_MANIFEST_BYTES},
     stark_stratum::StarkBackend,
 };
 use crate::{
@@ -35,6 +41,14 @@ const MAX_IDENTITY_BYTES: usize = 8 * 1024;
 const MAX_DESCRIPTOR_BYTES: usize = 64 * 1024;
 const PEER_BATCH: usize = 64;
 const MAX_PEERS: usize = 8;
+/// Outbound sessions with learned peers, besides the pinned ones.
+const LEARNED_TARGET: usize = 8;
+const EXCHANGE_INTERVAL: Duration = Duration::from_secs(600);
+const MANAGER_TICK: Duration = Duration::from_secs(10);
+const SAVE_INTERVAL: Duration = Duration::from_secs(300);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const RETRY_MIN: Duration = Duration::from_secs(5);
+const RETRY_MAX: Duration = Duration::from_secs(300);
 
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -82,12 +96,28 @@ impl Options {
     fn network(&self) -> Result<Option<Profile>, String> {
         self.get("--network").map(Profile::named).transpose()
     }
-    fn relay(&self) -> Result<bool, String> {
+    /// On by default on the public testnet, where nobody has to open a port:
+    /// relays carry what hole punching cannot. Regtest stays direct.
+    fn relay(&self, profile: Profile) -> Result<bool, String> {
         match self.get("--relay") {
-            None | Some("none") => Ok(false),
+            None => Ok(profile == Profile::TESTNET),
+            Some("none") => Ok(false),
             Some("N0") => Ok(true),
             _ => Err("--relay must be none or N0".into()),
         }
+    }
+    /// `builtin` (the manifest compiled in for a public chain), `none`, or
+    /// the path of a manifest file.
+    fn seeds(&self, profile: Profile) -> Result<Vec<NodeDescriptor>, String> {
+        let manifest = match self.get("--seeds").unwrap_or("builtin") {
+            "builtin" => Manifest::builtin(profile)?,
+            "none" => None,
+            path => Some(Manifest::parse(
+                &read_bounded(Path::new(path), MAX_MANIFEST_BYTES)?,
+                profile,
+            )?),
+        };
+        manifest.map_or(Ok(Vec::new()), |manifest| manifest.seeds())
     }
 }
 
@@ -148,6 +178,12 @@ fn identity_file(
         write_new(path, &serde_json::to_vec_pretty(&file).map_err(err)?)?;
         Ok(identity)
     }
+}
+
+fn identity_chain(path: &Path) -> Result<Profile, String> {
+    let file: IdentityFile =
+        serde_json::from_slice(&read_bounded(path, MAX_IDENTITY_BYTES)?).map_err(err)?;
+    Profile::for_chain(&file.chain_id).ok_or_else(|| "node identity names an unknown chain".into())
 }
 
 fn descriptor(path: &Path) -> Result<NodeDescriptor, String> {
@@ -245,6 +281,32 @@ async fn connect(peer: &NodeDescriptor, relay: bool) -> Result<Client, String> {
     } else {
         Client::connect(peer, presets::Minimal).await
     }
+}
+
+/// `--peer`, or else the chain's seeds, first reachable wins. The client has
+/// its own endpoint: these commands serve nothing.
+async fn connect_any(options: &Options, profile: Profile) -> Result<Client, String> {
+    let relay = options.relay(profile)?;
+    let candidates = match options.peers() {
+        [] => options.seeds(profile)?,
+        [one] => vec![descriptor(Path::new(one))?],
+        _ => return Err("this command takes at most one --peer descriptor file".into()),
+    };
+    if candidates.is_empty() {
+        return Err(format!(
+            "no --peer given and {} lists no seed yet",
+            profile.chain_id
+        ));
+    }
+    same_chain(&candidates, profile)?;
+    let mut last = String::new();
+    for peer in &candidates {
+        match connect(peer, relay).await {
+            Ok(client) => return Ok(client),
+            Err(reason) => last = reason,
+        }
+    }
+    Err(format!("no peer reachable: {last}"))
 }
 
 async fn head(state: &NodeState) -> Result<Head, String> {
@@ -407,35 +469,188 @@ async fn stopped(stop: &mut watch::Receiver<bool>) {
     let _ = stop.changed().await;
 }
 
-async fn peer_loop(
+/// What every outbound session shares: the node state, its server endpoint
+/// (dials come from it, so peers see this node's endpoint id) and the
+/// descriptor this node announces, if any.
+#[derive(Clone)]
+struct Network {
     state: NodeState,
-    peer: NodeDescriptor,
-    relay: bool,
-    mut stop: watch::Receiver<bool>,
-) {
+    endpoint: Endpoint,
+    own: Option<NodeDescriptor>,
+}
+
+fn rejected(reason: &str) -> bool {
+    reason.starts_with("STARK peer rejected request:")
+}
+
+/// One authenticated outbound session: announce, then sync cycles with a
+/// peer exchange every ten minutes. Ends with the peer's first transport
+/// failure, or with `Ok` at shutdown.
+async fn session(
+    net: &Network,
+    client: &mut Client,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<(), String> {
+    if let Some(own) = &net.own {
+        match client.announce(own).await {
+            Err(reason) if !rejected(&reason) => return Err(reason),
+            Err(reason) => eprintln!("STARK announce: {reason}"),
+            Ok(()) => {}
+        }
+    }
+    let mut cursor = None;
+    let mut sent = BTreeSet::new();
+    let mut exchange = tokio::time::Instant::now();
     loop {
-        let connected = tokio::select! { _ = stopped(&mut stop) => return, result = connect(&peer, relay) => result };
+        tokio::select! {
+            _ = stopped(stop) => return Ok(()),
+            result = peer_cycle(client, &net.state, &mut cursor, &mut sent) => result?,
+        }
+        if exchange <= tokio::time::Instant::now() {
+            exchange = tokio::time::Instant::now() + EXCHANGE_INTERVAL;
+            let peers = tokio::select! {
+                _ = stopped(stop) => return Ok(()),
+                result = client.peers() => result,
+            };
+            match peers {
+                Ok(peers) => {
+                    let mut book = net.state.peers.book();
+                    for peer in peers {
+                        book.learn(peer);
+                    }
+                }
+                Err(reason) if rejected(&reason) => eprintln!("STARK peer exchange: {reason}"),
+                Err(reason) => return Err(reason),
+            }
+        }
+        tokio::select! { _ = stopped(stop) => return Ok(()), _ = tokio::time::sleep(Duration::from_secs(5)) => {} }
+    }
+}
+
+/// A `--peer` or manifest seed: redialed for as long as the node runs, with
+/// a delay that doubles up to five minutes while it stays unreachable.
+async fn pinned_loop(net: Network, peer: NodeDescriptor, mut stop: watch::Receiver<bool>) {
+    let id = peer.endpoint_addr.id;
+    let mut wait = RETRY_MIN;
+    loop {
+        let connected = tokio::select! { _ = stopped(&mut stop) => return, result = Client::connect_from(&net.endpoint, &peer) => result };
         match connected {
             Ok(mut client) => {
-                let mut cursor = None;
-                let mut sent = BTreeSet::new();
-                loop {
-                    let result = tokio::select! {
-                        _ = stopped(&mut stop) => { client.close().await; return; },
-                        result = peer_cycle(&mut client, &state, &mut cursor, &mut sent) => result,
-                    };
-                    if let Err(reason) = result {
-                        eprintln!("STARK peer: {reason}; retrying");
-                        break;
-                    }
-                    tokio::select! { _ = stopped(&mut stop) => { client.close().await; return; }, _ = tokio::time::sleep(Duration::from_secs(5)) => {} }
-                }
+                wait = RETRY_MIN;
+                net.state.peers.book().connected(id);
+                let result = session(&net, &mut client, &mut stop).await;
+                net.state.peers.book().disconnected(id);
                 client.close().await;
+                match result {
+                    Ok(()) => return,
+                    Err(reason) => eprintln!("STARK peer {}: {reason}; retrying", id.fmt_short()),
+                }
             }
-            Err(reason) => eprintln!("STARK peer connection: {reason}; retrying"),
+            Err(reason) => eprintln!(
+                "STARK peer {} connection: {reason}; retrying in {} s",
+                id.fmt_short(),
+                wait.as_secs()
+            ),
         }
-        tokio::select! { _ = stopped(&mut stop) => return, _ = tokio::time::sleep(Duration::from_secs(5)) => {} }
+        tokio::select! { _ = stopped(&mut stop) => return, _ = tokio::time::sleep(wait) => {} }
+        wait = (wait * 2).min(RETRY_MAX);
     }
+}
+
+/// A session with a learned peer. Reports whether it authenticated, so the
+/// manager can back off unreachable endpoints.
+async fn learned(
+    net: Network,
+    peer: NodeDescriptor,
+    mut stop: watch::Receiver<bool>,
+) -> (EndpointId, bool) {
+    let id = peer.endpoint_addr.id;
+    let connected = tokio::select! { _ = stopped(&mut stop) => return (id, true), result = Client::connect_from(&net.endpoint, &peer) => result };
+    let Ok(mut client) = connected else {
+        return (id, false);
+    };
+    {
+        let mut book = net.state.peers.book();
+        book.verified(peer, super::now_secs());
+        book.connected(id);
+    }
+    if let Err(reason) = session(&net, &mut client, &mut stop).await {
+        eprintln!("STARK learned peer {}: {reason}", id.fmt_short());
+    }
+    net.state.peers.book().disconnected(id);
+    client.close().await;
+    (id, true)
+}
+
+/// Dial an announced or shared endpoint once. It joins the book only if it
+/// authenticates with its pinned key and serves this chain.
+async fn probe(net: Network, peer: NodeDescriptor) {
+    let checked = tokio::time::timeout(PROBE_TIMEOUT, async {
+        let mut client = Client::connect_from(&net.endpoint, &peer).await?;
+        let head = client.head().await;
+        client.close().await;
+        head
+    })
+    .await;
+    if let Ok(Ok(_)) = checked {
+        net.state.peers.book().verified(peer, super::now_secs());
+    }
+}
+
+fn save_book(state: &NodeState) {
+    let snapshot = state.peers.book().snapshot();
+    if let Err(reason) = PeerBook::save(snapshot, &state.storage) {
+        eprintln!("STARK peer table: {reason}");
+    }
+}
+
+/// Keeps up to `LEARNED_TARGET` sessions with learned peers, dials one
+/// pending endpoint per tick and saves the book every five minutes.
+async fn manager_loop(net: Network, mut stop: watch::Receiver<bool>) {
+    let mut sessions = JoinSet::new();
+    let mut busy = BTreeSet::new();
+    let mut probing: Option<tokio::task::JoinHandle<()>> = None;
+    let mut saved = tokio::time::Instant::now();
+    let mut tick = tokio::time::interval(MANAGER_TICK);
+    loop {
+        tokio::select! {
+            _ = stopped(&mut stop) => break,
+            Some(done) = sessions.join_next() => {
+                if let Ok((id, connected)) = done {
+                    busy.remove(&id);
+                    let mut book = net.state.peers.book();
+                    if connected {
+                        book.ended(id, super::now_secs());
+                    } else {
+                        book.failed(id, super::now_secs());
+                    }
+                }
+                continue;
+            }
+            _ = tick.tick() => {}
+        }
+        let now = super::now_secs();
+        while sessions.len() < LEARNED_TARGET {
+            let Some(peer) = net.state.peers.book().candidate(now, &busy) else {
+                break;
+            };
+            busy.insert(peer.endpoint_addr.id);
+            sessions.spawn(learned(net.clone(), peer, stop.clone()));
+        }
+        if probing.as_ref().is_none_or(|task| task.is_finished()) {
+            let next = net.state.peers.book().next_pending();
+            probing = next.map(|peer| tokio::spawn(probe(net.clone(), peer)));
+        }
+        if saved.elapsed() >= SAVE_INTERVAL {
+            save_book(&net.state);
+            saved = tokio::time::Instant::now();
+        }
+    }
+    if let Some(task) = probing {
+        task.abort();
+    }
+    while sessions.join_next().await.is_some() {}
+    save_book(&net.state);
 }
 
 async fn mining_loop(
@@ -483,7 +698,11 @@ async fn serve(options: Options) -> Result<(), String> {
         return Err("--interval must be 1..86400 seconds".into());
     }
     let network = options.network()?;
-    let relay = options.relay()?;
+    let announce = match options.get("--announce") {
+        None | Some("yes") => true,
+        Some("no") => false,
+        _ => return Err("--announce must be yes or no".into()),
+    };
     let peers = options
         .peers()
         .iter()
@@ -495,6 +714,8 @@ async fn serve(options: Options) -> Result<(), String> {
     );
     let state = new_state(db, network).await?;
     let profile = state.profile;
+    let relay = options.relay(profile)?;
+    let seeds = options.seeds(profile)?;
     same_chain(&peers, profile)?;
     let miner = options
         .get("--mine-to")
@@ -571,12 +792,36 @@ async fn serve(options: Options) -> Result<(), String> {
             return Err(reason);
         }
     }
+    // A seed that lists itself does not dial itself; repeated pins collapse.
+    let own_id = server.endpoint.id();
+    let mut pinned: Vec<NodeDescriptor> = Vec::new();
+    for peer in peers.into_iter().chain(seeds) {
+        let id = peer.endpoint_addr.id;
+        if id != own_id && !pinned.iter().any(|p| p.endpoint_addr.id == id) {
+            pinned.push(peer);
+        }
+    }
+    state.peers.book().configure(own_id, relay, &pinned);
+    // With relays, address lookup resolves the id: announce nothing else.
+    let own = announce.then(|| {
+        let mut own = server.descriptor.clone();
+        if relay {
+            own.endpoint_addr = EndpointAddr::new(own_id);
+        }
+        own
+    });
+    let net = Network {
+        state: state.clone(),
+        endpoint: server.endpoint.clone(),
+        own,
+    };
     // The descriptor contains public transport and authentication keys only.
     println!(
         "{}",
         serde_json::json!({"chain_id":profile.chain_id,"api":format!("http://{actual_bind}"),
         "pow_algorithm":profile.pow_algorithm(),"xmrig_compatible":profile.xmrig_compatible(),
-        "stratum":options.get("--stratum"),"descriptor":server.descriptor})
+        "stratum":options.get("--stratum"),"relay":relay,"pinned_peers":pinned.len(),
+        "announce":announce,"descriptor":server.descriptor})
     );
     let (shutdown, stop) = watch::channel(false);
     let mut api_stop = stop.clone();
@@ -590,14 +835,10 @@ async fn serve(options: Options) -> Result<(), String> {
             .map_err(err)
     });
     let mut workers = Vec::new();
-    for peer in peers {
-        workers.push(tokio::spawn(peer_loop(
-            state.clone(),
-            peer,
-            relay,
-            stop.clone(),
-        )));
+    for peer in pinned {
+        workers.push(tokio::spawn(pinned_loop(net.clone(), peer, stop.clone())));
     }
+    workers.push(tokio::spawn(manager_loop(net, stop.clone())));
     // The accept loop never ends by itself: it is aborted at shutdown.
     let mut stratum_task = None;
     if let Some((bind, backend)) = stratum {
@@ -654,17 +895,8 @@ fn same_chain(peers: &[NodeDescriptor], profile: Profile) -> Result<(), String> 
     }
 }
 
-fn one_peer(options: &Options) -> Result<NodeDescriptor, String> {
-    if options.peers().len() != 1 {
-        return Err("this command requires exactly one --peer descriptor file".into());
-    }
-    descriptor(Path::new(&options.peers()[0]))
-}
-
 async fn sync(options: Options) -> Result<(), String> {
     let db = PathBuf::from(options.required("--db")?);
-    let peer = one_peer(&options)?;
-    let relay = options.relay()?;
     let maximum: usize = options
         .get("--max-blocks")
         .unwrap_or("8192")
@@ -674,8 +906,7 @@ async fn sync(options: Options) -> Result<(), String> {
         return Err("--max-blocks must be 1..1000000".into());
     }
     let state = new_state(db, options.network()?).await?;
-    same_chain(std::slice::from_ref(&peer), state.profile)?;
-    let mut client = connect(&peer, relay).await?;
+    let mut client = connect_any(&options, state.profile).await?;
     let result = tokio::select! {
         signal = tokio::signal::ctrl_c() => signal.map_err(err),
         result = async {
@@ -706,21 +937,58 @@ async fn sync(options: Options) -> Result<(), String> {
 }
 
 async fn broadcast(options: Options) -> Result<(), String> {
-    let peer = one_peer(&options)?;
-    let relay = options.relay()?;
+    let profile = match (options.network()?, options.peers()) {
+        (Some(profile), _) => profile,
+        (None, [one]) => Profile::for_chain(&descriptor(Path::new(one))?.chain_id)
+            .ok_or("peer descriptor names an unknown chain")?,
+        (None, _) => Profile::REGTEST,
+    };
     let path = PathBuf::from(options.required("--tx")?);
     let transaction = tokio::task::spawn_blocking(move || {
         Transaction::decode(&read_bounded(&path, MAX_TRANSACTION_BYTES)?).map_err(err)
     })
     .await
     .map_err(err)??;
-    let mut client = connect(&peer, relay).await?;
+    let mut client = connect_any(&options, profile).await?;
     let result = tokio::select! {
         signal = tokio::signal::ctrl_c() => signal.map_err(err),
         result = client.submit_tx(&transaction) => result.map(|id| println!("{}", serde_json::json!({"accepted":true,"txid":hex::encode(id)}))),
     };
     client.close().await;
     result
+}
+
+/// Create or open the node identity and print what a manifest pins: the
+/// endpoint id and the ML-DSA key id. Nothing secret is printed.
+async fn identity(options: Options) -> Result<(), String> {
+    let path = PathBuf::from(options.required("--identity")?);
+    let profile = match options.network()? {
+        Some(profile) => profile,
+        None if path.exists() => identity_chain(&path)?,
+        None => Profile::REGTEST,
+    };
+    let password = Zeroizing::new(
+        std::env::var("ZOKA_PQ_PASSWORD")
+            .map_err(|_| "set ZOKA_PQ_PASSWORD for the encrypted node identity")?,
+    );
+    let identity = tokio::task::spawn_blocking(move || identity_file(&path, profile, &password))
+        .await
+        .map_err(err)??;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "chain_id": profile.chain_id,
+            "seed_entry": {
+                "label": "seed1",
+                "operator": "zoka-core",
+                "endpoint_id": identity.endpoint_id().to_string(),
+                "ml_dsa_key_id": identity.key_id(),
+                "status": "active"
+            }
+        }))
+        .map_err(err)?
+    );
+    Ok(())
 }
 
 pub async fn run(args: &[String]) -> Result<(), String> {
@@ -741,6 +1009,8 @@ pub async fn run(args: &[String]) -> Result<(), String> {
                     "--relay",
                     "--network",
                     "--stratum",
+                    "--seeds",
+                    "--announce",
                 ],
             )?)
             .await
@@ -748,24 +1018,43 @@ pub async fn run(args: &[String]) -> Result<(), String> {
         "sync" => {
             sync(Options::parse(
                 rest,
-                &["--db", "--peer", "--relay", "--max-blocks", "--network"],
+                &[
+                    "--db",
+                    "--peer",
+                    "--relay",
+                    "--max-blocks",
+                    "--network",
+                    "--seeds",
+                ],
             )?)
             .await
         }
-        "broadcast" => broadcast(Options::parse(rest, &["--peer", "--tx", "--relay"])?).await,
+        "broadcast" => {
+            broadcast(Options::parse(
+                rest,
+                &["--peer", "--tx", "--relay", "--network", "--seeds"],
+            )?)
+            .await
+        }
+        "identity" => identity(Options::parse(rest, &["--identity", "--network"])?).await,
         "help" | "--help" | "-h" => {
             println!("STARK v2 node. --network regtest (default for a new --db: CPU test PoW)\n\
 or testnet (zoka-quantic-testnet-v2: RandomX, ASERT). An existing --db keeps its chain.\n\
   serve --db DIR --identity FILE [--network NAME] [--api 127.0.0.1:9140] [--descriptor-out FILE]\n\
-        [--peer DESCRIPTOR ...] [--mine-to ADDRESS] [--interval 120] [--relay=N0]\n\
+        [--peer DESCRIPTOR ...] [--seeds builtin|none|MANIFEST] [--relay N0|none]\n\
+        [--announce yes|no] [--mine-to ADDRESS] [--interval 120]\n\
         [--stratum 127.0.0.1:3333]   (testnet: XMRig logs in with its v2 address;\n\
         --mine-to pays logins that are not addresses. Regtest: built-in miner.)\n\
-  sync --db MIRROR_DIR --peer DESCRIPTOR [--network NAME] [--max-blocks 8192] [--relay=N0]\n\
-  broadcast --peer DESCRIPTOR --tx FILE [--relay=N0]\n\
+  sync --db MIRROR_DIR [--peer DESCRIPTOR] [--network NAME] [--max-blocks 8192] [--relay N0|none]\n\
+  broadcast --tx FILE [--peer DESCRIPTOR | --network NAME] [--relay N0|none]\n\
+  identity --identity FILE [--network NAME]   (prints the endpoint id and ML-DSA key id a\n\
+        manifest pins; creates the identity if the file does not exist)\n\
 Set ZOKA_PQ_PASSWORD to create/open the encrypted node identity. Files are never overwritten.\n\
 Use a separate mirror database for wallet commands while the node database is open.\n\
-Exchange public peer descriptors through an authenticated channel before connecting.\n\
-Default transport is direct (no relay); N0 explicitly enables public relays. Ctrl+C stops the node.");
+Seeds come from the manifest compiled in for the chain (none on regtest); without --peer,\n\
+sync and broadcast use them. The node learns more peers from its peers, dials each one and\n\
+shares only those that authenticated. Testnet uses n0 relays and address lookup by default\n\
+(no open port needed); regtest is direct. Ctrl+C stops the node.");
             Ok(())
         }
         _ => Err(format!("unknown STARK node command {command}; use help")),
@@ -851,8 +1140,15 @@ mod tests {
         assert!(Options::parse(&args(&["--unknown=1"]), &["--db"]).is_err());
         assert!(Options::parse(&args(&["--relay=N0"]), &["--relay"])
             .unwrap()
-            .relay()
+            .relay(P)
             .unwrap());
+        let none = Options::parse(&args(&["--relay", "none"]), &["--relay"]).unwrap();
+        assert!(!none.relay(Profile::TESTNET).unwrap());
+        assert!(Options::default().relay(Profile::TESTNET).unwrap());
+        assert!(!Options::default().relay(P).unwrap());
+        assert!(Options::default().seeds(P).unwrap().is_empty());
+        let none = Options::parse(&args(&["--seeds", "none"]), &["--seeds"]).unwrap();
+        assert!(none.seeds(Profile::TESTNET).unwrap().is_empty());
         let peers: Vec<_> = (0..9)
             .flat_map(|_| ["--peer".to_string(), "peer.json".to_string()])
             .collect();
@@ -996,5 +1292,107 @@ mod tests {
             state.work.available_permits(),
             stark_api::MAX_CRYPTO_WORKERS
         );
+    }
+
+    /// A node on loopback with its pinned loops and peer manager running.
+    async fn start_node(
+        dir: &Path,
+        seed: u8,
+        pins: Vec<NodeDescriptor>,
+        stop: &watch::Receiver<bool>,
+    ) -> (
+        Network,
+        stark_net::Server,
+        NodeDescriptor,
+        Vec<tokio::task::JoinHandle<()>>,
+    ) {
+        let state = new_state(dir.join(format!("node-{seed}")), None)
+            .await
+            .unwrap();
+        let server = stark_net::serve(
+            state.clone(),
+            ServerIdentity::from_seed(&[seed; 32]).unwrap(),
+            presets::Minimal,
+        )
+        .await
+        .unwrap();
+        let mut own = server.descriptor.clone();
+        own.endpoint_addr = EndpointAddr::new(server.endpoint.id());
+        for mut socket in server.endpoint.bound_sockets() {
+            socket.set_ip(if socket.is_ipv4() {
+                std::net::Ipv4Addr::LOCALHOST.into()
+            } else {
+                std::net::Ipv6Addr::LOCALHOST.into()
+            });
+            own.endpoint_addr = own.endpoint_addr.with_ip_addr(socket);
+        }
+        state
+            .peers
+            .book()
+            .configure(server.endpoint.id(), false, &pins);
+        let net = Network {
+            state,
+            endpoint: server.endpoint.clone(),
+            own: Some(own.clone()),
+        };
+        let mut tasks: Vec<_> = pins
+            .into_iter()
+            .map(|peer| tokio::spawn(pinned_loop(net.clone(), peer, stop.clone())))
+            .collect();
+        tasks.push(tokio::spawn(manager_loop(net.clone(), stop.clone())));
+        (net, server, own, tasks)
+    }
+
+    async fn eventually(what: &str, mut check: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        while !check() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_node_that_knows_one_peer_finds_the_rest_and_follows_their_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shutdown, stop) = watch::channel(false);
+        let alice = Account::from_seed(&[94; 32], 3, 0).unwrap().address();
+        let (a, a_server, a_own, mut tasks) = start_node(dir.path(), 101, vec![], &stop).await;
+        mine_once(&a.state, alice.clone()).await.unwrap();
+        let (b, b_server, b_own, more) =
+            start_node(dir.path(), 102, vec![a_own.clone()], &stop).await;
+        tasks.extend(more);
+        eventually("B's session with A", || b.state.peers.book().outbound_len() == 1).await;
+
+        // C is given only B. B shares A (pinned, in session); C dials A, and
+        // A learns B and C from their announces, after dialing each back.
+        let (c, c_server, _, more) = start_node(dir.path(), 103, vec![b_own], &stop).await;
+        tasks.extend(more);
+        eventually("C to find and dial A", || {
+            let book = c.state.peers.book();
+            book.known_len() == 1 && book.outbound_len() == 2
+        })
+        .await;
+        assert_eq!(c.state.peers.book().share(16, super::super::now_secs())[0], a_own);
+        eventually("A to know B and C", || a.state.peers.book().known_len() == 2).await;
+
+        let (second, _) = mine_once(&a.state, alice).await.unwrap();
+        eventually("C to follow A", || {
+            c.state.storage.get_last_block_hash().unwrap() == second.header.hash
+        })
+        .await;
+
+        let _ = shutdown.send(true);
+        for task in tasks {
+            task.await.unwrap();
+        }
+        // The manager saved its book on the way out: it survives a restart.
+        let saved = PeerBook::load(&c.state.storage, P);
+        assert_eq!(saved.known_len(), 1);
+        for server in [a_server, b_server, c_server] {
+            server.close().await;
+        }
     }
 }

@@ -30,6 +30,7 @@ use super::stark::{
         wallet::Address,
     },
 };
+use super::stark_peers::{PeerBook, Peers};
 use crate::{
     mining::pow,
     state::chain::{apply_block, ChainError},
@@ -52,6 +53,8 @@ pub struct NodeState {
     pub mempool: Arc<Mutex<stark::Mempool>>,
     pub gate: Arc<Mutex<()>>,
     pub work: Arc<Semaphore>,
+    /// Peer table and session counts; its lock is independent of `gate`.
+    pub peers: Arc<Peers>,
 }
 
 impl NodeState {
@@ -66,12 +69,14 @@ impl NodeState {
             .ok_or("STARK API requires a database marked with a STARK v2 chain id")?;
         let parent = current_tip(profile, &storage).map_err(|e| e.message)?;
         stark::branch(&storage, profile, &parent)?;
+        let peers = Peers::new(PeerBook::load(&storage, profile));
         Ok(Self {
             profile,
             storage,
             mempool: Arc::new(Mutex::new(stark::Mempool::default())),
             gate: Arc::new(Mutex::new(())),
             work: Arc::new(Semaphore::new(MAX_CRYPTO_WORKERS)),
+            peers,
         })
     }
 
@@ -302,7 +307,7 @@ async fn status(
             "issued_atoms":ledger.issued,"notes":ledger.notes,"mempool_transactions":count,
             "pow_algorithm":state.profile.pow_algorithm(),"xmrig_compatible":state.profile.xmrig_compatible(),
             "max_transaction_bytes":MAX_TRANSACTION_BYTES,"max_block_request_bytes":MAX_BLOCK_REQUEST_BYTES,
-            "stratum":super::stratum::status(),
+            "stratum":super::stratum::status(),"peers":state.peers.status(),
         }))
     }).await
 }
