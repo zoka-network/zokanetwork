@@ -1,5 +1,7 @@
-//! Explicit-path local tools for the separate STARK regtest chain.
-//! No command selects a public wallet or chain directory by default.
+//! Explicit-path local tools for the STARK v2 chains (`--network regtest`, the
+//! default, or `testnet`). Wallets and databases record their chain and are
+//! never opened as another one. No command selects a public wallet or chain
+//! directory by default.
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
@@ -14,6 +16,7 @@ use zeroize::Zeroizing;
 
 use super::stark::{
     self,
+    Profile,
     protocol::{
         crypto::Digest,
         ledger::{conventional_fee, Ledger},
@@ -22,12 +25,7 @@ use super::stark::{
         wallet::{Account, Address, MEMO_BYTES},
     },
 };
-use crate::{
-    economics::QUANTIC_PQ_REGTEST_CHAIN_ID as CHAIN,
-    state::chain::{apply_block, genesis_parent_for},
-    storage::RocksDbStorage,
-    types::Block,
-};
+use crate::{state::chain::apply_block, storage::RocksDbStorage, types::Block};
 
 const SCHEMA: &str = "zoka-quantic-stark-wallet-v2";
 const DB_MARKER: &str = "quantic:stark:chain-id";
@@ -52,6 +50,10 @@ fn required<'a>(args: &'a [String], name: &str) -> Result<&'a str, String> {
 }
 fn path(args: &[String], name: &str) -> Result<PathBuf, String> {
     required(args, name).map(PathBuf::from)
+}
+/// `--network`, when given. Wallets and databases already know theirs.
+pub(crate) fn network_option(args: &[String]) -> Result<Option<Profile>, String> {
+    option(args, "--network").map(Profile::named).transpose()
 }
 fn integer(args: &[String], name: &str) -> Result<u64, String> {
     required(args, name)?
@@ -130,23 +132,28 @@ struct WalletFile {
     encrypted_seed_hex: String,
 }
 
-fn read_wallet(path: &Path) -> Result<WalletFile, String> {
+fn read_wallet(path: &Path) -> Result<(WalletFile, Profile), String> {
     let file: WalletFile =
         serde_json::from_slice(&read_bounded(path, MAX_WALLET_BYTES)?).map_err(error)?;
-    if file.schema != SCHEMA || file.chain_id != CHAIN {
-        return Err("not a STARK v2 regtest wallet".into());
-    }
-    Address::decode(&file.address, 3).map_err(error)?;
-    Ok(file)
+    let profile = Profile::for_chain(&file.chain_id)
+        .filter(|_| file.schema == SCHEMA)
+        .ok_or("not a STARK v2 wallet")?;
+    Address::decode(&file.address, profile.network).map_err(error)?;
+    Ok((file, profile))
 }
 
-fn create_wallet(path: &Path, seed: &[u8; 32], password: &str) -> Result<String, String> {
-    let account = Account::from_seed(seed, 3, 0).map_err(error)?;
+fn create_wallet(
+    path: &Path,
+    profile: Profile,
+    seed: &[u8; 32],
+    password: &str,
+) -> Result<String, String> {
+    let account = Account::from_seed(seed, profile.network, 0).map_err(error)?;
     let address = account.address().encode().map_err(error)?;
     let encrypted = crate::wallet::storage::encrypt_data(seed, password).map_err(error)?;
     let file = WalletFile {
         schema: SCHEMA.into(),
-        chain_id: CHAIN.into(),
+        chain_id: profile.chain_id.into(),
         address: address.clone(),
         encrypted_seed_hex: hex::encode(encrypted),
     };
@@ -154,8 +161,8 @@ fn create_wallet(path: &Path, seed: &[u8; 32], password: &str) -> Result<String,
     Ok(address)
 }
 
-fn open_wallet(path: &Path, password: &str) -> Result<Account, String> {
-    let file = read_wallet(path)?;
+fn open_wallet(path: &Path, password: &str) -> Result<(Account, Profile), String> {
+    let (file, profile) = read_wallet(path)?;
     let encrypted = hex::decode(&file.encrypted_seed_hex).map_err(error)?;
     // The shared decoder supports old XOR wallets. This new schema never does.
     if !encrypted.starts_with(b"ZOKAENC1") {
@@ -169,37 +176,55 @@ fn open_wallet(path: &Path, password: &str) -> Result<Account, String> {
         .as_slice()
         .try_into()
         .map_err(|_| "invalid seed length".to_string())?;
-    let account = Account::from_seed(seed, 3, 0).map_err(error)?;
+    let account = Account::from_seed(seed, profile.network, 0).map_err(error)?;
     if account.address().encode().map_err(error)? != file.address {
         return Err("wallet address mismatch".into());
     }
-    Ok(account)
+    Ok((account, profile))
 }
 
-/// Refuse existing DBs without the v2 marker, including v1 and public chains.
-/// Only a genuinely new directory may be initialized by these tools.
-pub(crate) fn open_db(path: &Path) -> Result<RocksDbStorage, String> {
+/// Refuse existing DBs without a v2 marker, including v1 and public chains, and
+/// a marked DB of another chain than `wanted`. Only a genuinely new directory
+/// may be initialized by these tools (as `wanted`, regtest when not given).
+pub(crate) fn open_db(
+    path: &Path,
+    wanted: Option<Profile>,
+) -> Result<(RocksDbStorage, Profile), String> {
     let new =
         !path.exists() || (path.is_dir() && fs::read_dir(path).map_err(error)?.next().is_none());
     let db = RocksDbStorage::new(path).map_err(error)?;
-    match db.get_raw(DB_MARKER).map_err(error)? {
-        Some(marker) if marker == CHAIN.as_bytes() => {}
+    let profile = match db.get_raw(DB_MARKER).map_err(error)? {
+        Some(marker) => {
+            let Some(found) = std::str::from_utf8(&marker)
+                .ok()
+                .and_then(Profile::for_chain)
+            else {
+                return Err("database is not a STARK v2 chain; use a new --db directory".into());
+            };
+            if let Some(wanted) = wanted.filter(|wanted| *wanted != found) {
+                return Err(format!(
+                    "database belongs to {}, not {}",
+                    found.chain_id, wanted.chain_id
+                ));
+            }
+            found
+        }
         None if new => {
-            db.put_raw(DB_MARKER, CHAIN.as_bytes().to_vec())
+            let profile = wanted.unwrap_or(Profile::REGTEST);
+            db.put_raw(DB_MARKER, profile.chain_id.as_bytes().to_vec())
                 .map_err(error)?;
+            profile
         }
-        _ => {
-            return Err(
-                "database is not initialized as STARK v2 regtest; use a new --db directory".into(),
-            )
+        None => {
+            return Err("database is not a STARK v2 chain; use a new --db directory".into())
         }
-    }
-    Ok(db)
+    };
+    Ok((db, profile))
 }
 
-fn tip(db: &RocksDbStorage) -> Result<Block, String> {
+fn tip(db: &RocksDbStorage, profile: Profile) -> Result<Block, String> {
     if db.get_chain_height().map_err(error)? == 0 {
-        return Ok(genesis_parent_for(CHAIN));
+        return Ok(profile.genesis_parent());
     }
     let hash = db.get_last_block_hash().map_err(error)?;
     db.get_block(&hash)
@@ -216,9 +241,9 @@ struct Scan {
     state: Ledger,
     notes: Vec<OwnedNote>,
 }
-fn scan(db: &RocksDbStorage, account: &Account) -> Result<Scan, String> {
-    let parent = tip(db)?;
-    let state = stark::state_after(db, &parent)?;
+fn scan(db: &RocksDbStorage, profile: Profile, account: &Account) -> Result<Scan, String> {
+    let parent = tip(db, profile)?;
+    let state = stark::state_after(db, profile, &parent)?;
     let mut positions = BTreeMap::new();
     for index in 0..state.tree.len() {
         let index = u32::try_from(index).map_err(error)?;
@@ -238,7 +263,9 @@ fn scan(db: &RocksDbStorage, account: &Account) -> Result<Scan, String> {
         for tx in stark::decode(&block)? {
             for (cm, envelope) in tx.statement.commitments.iter().zip(&tx.envelopes) {
                 if let Ok((note, _memo)) = account.receive(*cm, envelope) {
-                    let nullifier = note.nullifier(&account.spend, 3).map_err(error)?;
+                    let nullifier = note
+                        .nullifier(&account.spend, profile.network)
+                        .map_err(error)?;
                     if !state.spent.contains(&nullifier) && seen.insert(nullifier) {
                         notes.push(OwnedNote {
                             note,
@@ -258,7 +285,11 @@ fn pending_path(wallet: &Path) -> PathBuf {
     name.push(".stark-pending");
     PathBuf::from(name)
 }
-fn pending(wallet: &Path, password: &str) -> Result<Option<Transaction>, String> {
+fn pending(
+    wallet: &Path,
+    password: &str,
+    profile: Profile,
+) -> Result<Option<Transaction>, String> {
     let path = pending_path(wallet);
     if !path.exists() {
         return Ok(None);
@@ -270,7 +301,7 @@ fn pending(wallet: &Path, password: &str) -> Result<Option<Transaction>, String>
     let plaintext =
         Zeroizing::new(crate::wallet::storage::decrypt_data(&bytes, password).map_err(error)?);
     let tx = Transaction::decode(&plaintext).map_err(error)?;
-    if tx.statement.network != 3 || tx.statement.nullifiers.is_empty() {
+    if tx.statement.network != profile.network || tx.statement.nullifiers.is_empty() {
         return Err("invalid pending payment".into());
     }
     Ok(Some(tx))
@@ -313,15 +344,15 @@ fn send(args: &[String]) -> Result<(), String> {
     }
     let _lock = wallet_lock(&wallet)?;
     let password = password(args)?;
-    let account = open_wallet(&wallet, &password)?;
-    let to = Address::decode(required(args, "--to")?, 3).map_err(error)?;
+    let (account, profile) = open_wallet(&wallet, &password)?;
+    let to = Address::decode(required(args, "--to")?, profile.network).map_err(error)?;
     let amount = integer(args, "--amount-atoms")?;
     if amount == 0 {
         return Err("amount must be greater than zero".into());
     }
-    let db = open_db(&path(args, "--db")?)?;
-    let Scan { state, mut notes } = scan(&db, &account)?;
-    if let Some(tx) = pending(&wallet, &password)? {
+    let (db, _) = open_db(&path(args, "--db")?, Some(profile))?;
+    let Scan { state, mut notes } = scan(&db, profile, &account)?;
+    if let Some(tx) = pending(&wallet, &password, profile)? {
         if live_pending(&tx, &state) {
             return Err("wallet already has a pending payment; mine it or use abandon".into());
         }
@@ -397,16 +428,17 @@ pub fn run(args: &[String]) -> Result<(), String> {
     match command {
         "help" | "--help" => {
             println!(
-                "ZOKA QUANTIC STARK v2 local regtest\n\
-wallet-create --wallet FILE [--password-stdin]\n\
-wallet-restore --wallet FILE --phrase-stdin [--password-stdin]\n\
+                "ZOKA QUANTIC STARK v2 (regtest by default; --network testnet for the RandomX chain)\n\
+wallet-create --wallet FILE [--network NAME] [--password-stdin]\n\
+wallet-restore --wallet FILE --phrase-stdin [--network NAME] [--password-stdin]\n\
 address --wallet FILE\n\
 balance --db DIR --wallet FILE [--password-stdin]\n\
 send --db DIR --wallet FILE --to ADDRESS --amount-atoms N --out FILE [--memo TEXT]\n\
 pending-export --wallet FILE --out FILE | abandon --wallet FILE\n\
-mine --db DIR --to ADDRESS [--tx FILE] [--out FILE]\n\
+mine --db DIR --to ADDRESS [--tx FILE] [--out FILE] [--network NAME]\n\
 import-block --db DIR --in FILE | export-block --db DIR --height N --out FILE\n\
 status --db DIR\n\
+A new --db takes --network (regtest if omitted); an existing one keeps its chain.\n\
 Passwords come from ZOKA_PQ_PASSWORD unless --password-stdin is set.\n\
 Restore reads 24 English BIP-39 words from stdin after the password, if requested.\n\
 Wallet creation never prints the seed: back up the encrypted wallet file.\n\
@@ -418,6 +450,7 @@ One atom = 0.000001 ZKA. No public chain or wallet path is selected automaticall
             if wallet.exists() {
                 return Err("wallet already exists".into());
             }
+            let profile = network_option(args)?.unwrap_or(Profile::REGTEST);
             let password = password(args)?;
             let mut seed = Zeroizing::new([0u8; 32]);
             if command == "wallet-restore" {
@@ -437,23 +470,24 @@ One atom = 0.000001 ZKA. No public chain or wallet path is selected automaticall
                     .try_fill_bytes(seed.as_mut())
                     .map_err(error)?;
             }
-            let address = create_wallet(&wallet, &seed, &password)?;
+            let address = create_wallet(&wallet, profile, &seed, &password)?;
             println!(
                 "{}",
-                serde_json::json!({"chain_id":CHAIN,"wallet":wallet,"address":address,"backup":"copy the encrypted wallet file"})
+                serde_json::json!({"chain_id":profile.chain_id,"wallet":wallet,"address":address,"backup":"copy the encrypted wallet file"})
             );
         }
         "address" => {
-            println!("{}", read_wallet(&path(args, "--wallet")?)?.address);
+            println!("{}", read_wallet(&path(args, "--wallet")?)?.0.address);
         }
         "balance" => {
             let wallet = fs::canonicalize(path(args, "--wallet")?).map_err(error)?;
             let _lock = wallet_lock(&wallet)?;
             let password = password(args)?;
-            let account = open_wallet(&wallet, &password)?;
-            let db = open_db(&path(args, "--db")?)?;
-            let Scan { state, notes } = scan(&db, &account)?;
-            let reservation = pending(&wallet, &password)?.filter(|tx| live_pending(tx, &state));
+            let (account, profile) = open_wallet(&wallet, &password)?;
+            let (db, _) = open_db(&path(args, "--db")?, Some(profile))?;
+            let Scan { state, notes } = scan(&db, profile, &account)?;
+            let reservation =
+                pending(&wallet, &password, profile)?.filter(|tx| live_pending(tx, &state));
             let mut available = 0u64;
             let mut immature = 0u64;
             let mut reserved = 0u64;
@@ -482,9 +516,9 @@ One atom = 0.000001 ZKA. No public chain or wallet path is selected automaticall
             let wallet = fs::canonicalize(path(args, "--wallet")?).map_err(error)?;
             let _lock = wallet_lock(&wallet)?;
             let password = password(args)?;
-            open_wallet(&wallet, &password)?;
+            let (_, profile) = open_wallet(&wallet, &password)?;
             if command == "pending-export" {
-                let tx = pending(&wallet, &password)?.ok_or("no pending payment")?;
+                let tx = pending(&wallet, &password, profile)?.ok_or("no pending payment")?;
                 write_new(&path(args, "--out")?, &tx.encode().map_err(error)?)?;
                 println!(
                     "{}",
@@ -501,8 +535,8 @@ One atom = 0.000001 ZKA. No public chain or wallet path is selected automaticall
             }
         }
         "mine" => {
-            let db = open_db(&path(args, "--db")?)?;
-            let to = Address::decode(required(args, "--to")?, 3).map_err(error)?;
+            let (db, profile) = open_db(&path(args, "--db")?, network_option(args)?)?;
+            let to = Address::decode(required(args, "--to")?, profile.network).map_err(error)?;
             let txs = option(args, "--tx")
                 .map(|p| {
                     read_bounded(Path::new(p), MAX_TRANSACTION_BYTES)
@@ -516,8 +550,15 @@ One atom = 0.000001 ZKA. No public chain or wallet path is selected automaticall
                     return Err("output already exists".into());
                 }
             }
-            let block = stark::mine(&db, &tip(&db)?, &to, txs, super::now_secs())?;
-            let result = apply_block(&db, CHAIN, &block).map_err(error)?;
+            let block = stark::mine(
+                &db,
+                profile,
+                &tip(&db, profile)?,
+                &to,
+                txs,
+                super::now_secs(),
+            )?;
+            let result = apply_block(&db, profile.chain_id, &block).map_err(error)?;
             if let Some(out) = option(args, "--out") {
                 write_new(Path::new(out), &serde_json::to_vec(&block).map_err(error)?).map_err(
                     |e| {
@@ -530,15 +571,15 @@ One atom = 0.000001 ZKA. No public chain or wallet path is selected automaticall
             }
             println!(
                 "{}",
-                serde_json::json!({"height":result.height,"hash":result.hash,"chain_id":CHAIN})
+                serde_json::json!({"height":result.height,"hash":result.hash,"chain_id":profile.chain_id})
             );
         }
         "import-block" => {
-            let db = open_db(&path(args, "--db")?)?;
+            let (db, profile) = open_db(&path(args, "--db")?, network_option(args)?)?;
             let bytes = read_bounded(&path(args, "--in")?, MAX_BLOCK_JSON_BYTES)?;
             let block: Block = serde_json::from_slice(&bytes).map_err(error)?;
             // Same ingress as gossip/mining: header, PoW, body, STARKs and fork choice.
-            match apply_block(&db, CHAIN, &block) {
+            match apply_block(&db, profile.chain_id, &block) {
                 Ok(result) => println!(
                     "{}",
                     serde_json::json!({"height":result.height,"hash":result.hash,"canonical":true})
@@ -559,7 +600,7 @@ One atom = 0.000001 ZKA. No public chain or wallet path is selected automaticall
             }
         }
         "export-block" => {
-            let db = open_db(&path(args, "--db")?)?;
+            let (db, _) = open_db(&path(args, "--db")?, network_option(args)?)?;
             let block = db
                 .get_canonical_block_by_height(integer(args, "--height")?)
                 .map_err(error)?
@@ -570,12 +611,12 @@ One atom = 0.000001 ZKA. No public chain or wallet path is selected automaticall
             )?;
         }
         "status" => {
-            let db = open_db(&path(args, "--db")?)?;
-            let parent = tip(&db)?;
-            let state = stark::state_after(&db, &parent)?;
+            let (db, profile) = open_db(&path(args, "--db")?, network_option(args)?)?;
+            let parent = tip(&db, profile)?;
+            let state = stark::state_after(&db, profile, &parent)?;
             println!(
                 "{}",
-                serde_json::json!({"chain_id":CHAIN,"height":state.height,"hash":parent.header.hash,"issued_atoms":state.issued,"notes":state.tree.len()})
+                serde_json::json!({"chain_id":profile.chain_id,"height":state.height,"hash":parent.header.hash,"issued_atoms":state.issued,"notes":state.tree.len()})
             );
         }
         _ => {
@@ -591,11 +632,14 @@ One atom = 0.000001 ZKA. No public chain or wallet path is selected automaticall
 mod tests {
     use super::*;
 
+    const P: Profile = Profile::REGTEST;
+    const CHAIN: &str = P.chain_id;
+
     #[test]
     fn wallet_sidecar_lock_allows_decryption_and_excludes_other_writers() {
         let dir = tempfile::tempdir().unwrap();
         let wallet = dir.path().join("alice.json");
-        let expected = create_wallet(&wallet, &[19; 32], "temporary lock test").unwrap();
+        let expected = create_wallet(&wallet, P, &[19; 32], "temporary lock test").unwrap();
         let original = fs::read(&wallet).unwrap();
         let subdir = dir.path().join("alias");
         fs::create_dir(&subdir).unwrap();
@@ -609,6 +653,7 @@ mod tests {
         assert_eq!(
             open_wallet(&wallet, "temporary lock test")
                 .unwrap()
+                .0
                 .address()
                 .encode()
                 .unwrap(),
@@ -641,18 +686,19 @@ mod tests {
     fn encrypted_wallet_refuses_overwrite_wrong_password_and_legacy_format() {
         let dir = tempfile::tempdir().unwrap();
         let wallet = dir.path().join("alice.json");
-        let address = create_wallet(&wallet, &[9; 32], "test password").unwrap();
+        let address = create_wallet(&wallet, P, &[9; 32], "test password").unwrap();
         assert_eq!(
             open_wallet(&wallet, "test password")
                 .unwrap()
+                .0
                 .address()
                 .encode()
                 .unwrap(),
             address
         );
         assert!(open_wallet(&wallet, "wrong").is_err());
-        assert!(create_wallet(&wallet, &[8; 32], "different").is_err());
-        let mut file = read_wallet(&wallet).unwrap();
+        assert!(create_wallet(&wallet, P, &[8; 32], "different").is_err());
+        let (mut file, _) = read_wallet(&wallet).unwrap();
         file.encrypted_seed_hex = hex::encode([0; 32]);
         fs::write(&wallet, serde_json::to_vec(&file).unwrap()).unwrap();
         assert!(open_wallet(&wallet, "test password").is_err());
@@ -661,13 +707,41 @@ mod tests {
     fn database_marker_keeps_existing_databases_separate() {
         let dir = tempfile::tempdir().unwrap();
         let v2 = dir.path().join("v2");
-        let db = open_db(&v2).unwrap();
+        let (db, profile) = open_db(&v2, None).unwrap();
+        assert_eq!(profile, P);
         drop(db);
-        assert!(open_db(&v2).is_ok());
+        assert!(open_db(&v2, None).is_ok());
+        assert!(open_db(&v2, Some(P)).is_ok());
+        let err = open_db(&v2, Some(Profile::TESTNET)).err().unwrap();
+        assert!(err.contains("belongs to zoka-quantic-regtest-v2"), "{err}");
+        let testnet = dir.path().join("testnet");
+        let (db, profile) = open_db(&testnet, Some(Profile::TESTNET)).unwrap();
+        assert_eq!(profile, Profile::TESTNET);
+        drop(db);
+        assert_eq!(open_db(&testnet, None).unwrap().1, Profile::TESTNET);
+        assert!(open_db(&testnet, Some(P)).is_err());
         let foreign = dir.path().join("foreign");
         let db = RocksDbStorage::new(&foreign).unwrap();
         drop(db);
-        assert!(open_db(&foreign).is_err());
+        assert!(open_db(&foreign, None).is_err());
+    }
+
+    #[test]
+    fn a_wallet_records_its_chain_and_address_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = dir.path().join("miner.json");
+        let address = create_wallet(&wallet, Profile::TESTNET, &[3; 32], "test password").unwrap();
+        assert!(address.starts_with("zqtest2"), "{address}");
+        let (account, profile) = open_wallet(&wallet, "test password").unwrap();
+        assert_eq!(profile, Profile::TESTNET);
+        assert_eq!(account.network, 2);
+        let local = dir.path().join("local.json");
+        let address = create_wallet(&local, P, &[3; 32], "test password").unwrap();
+        assert!(address.starts_with("zqregtest2"), "{address}");
+        let args = |values: &[&str]| values.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(network_option(&args(&["--network", "testnet"])).unwrap(), Some(Profile::TESTNET));
+        assert_eq!(network_option(&args(&[])).unwrap(), None);
+        assert!(network_option(&args(&["--network", "mainnet"])).is_err());
     }
 
     #[test]
@@ -675,24 +749,25 @@ mod tests {
         use stark::protocol::ledger::{ATOMS, PREMINE};
         let dir = tempfile::tempdir().unwrap();
         let wallet = dir.path().join("alice.json");
-        create_wallet(&wallet, &[1; 32], "test password").unwrap();
-        let alice = open_wallet(&wallet, "test password").unwrap();
+        create_wallet(&wallet, P, &[1; 32], "test password").unwrap();
+        let (alice, _) = open_wallet(&wallet, "test password").unwrap();
         let bob = Account::from_seed(&[2; 32], 3, 0).unwrap();
-        let db = open_db(&dir.path().join("chain")).unwrap();
+        let (db, _) = open_db(&dir.path().join("chain"), None).unwrap();
         let genesis = stark::mine(
             &db,
-            &tip(&db).unwrap(),
+            P,
+            &tip(&db, P).unwrap(),
             &alice.address(),
             vec![],
             1_700_000_000,
         )
         .unwrap();
         apply_block(&db, CHAIN, &genesis).unwrap();
-        let initial = scan(&db, &alice).unwrap();
+        let initial = scan(&db, P, &alice).unwrap();
         assert_eq!(initial.notes.len(), 1);
         assert_eq!(initial.notes[0].note.value, PREMINE);
         assert_eq!(initial.notes[0].index, Some(0));
-        assert!(scan(&db, &bob).unwrap().notes.is_empty());
+        assert!(scan(&db, P, &bob).unwrap().notes.is_empty());
         let tx = transaction::transfer(
             &alice,
             initial.state.tree.root(),
@@ -712,17 +787,17 @@ mod tests {
         let encrypted =
             crate::wallet::storage::encrypt_data(&tx.encode().unwrap(), "test password").unwrap();
         write_new(&pending_path(&wallet), &encrypted).unwrap();
-        let restored = pending(&wallet, "test password").unwrap().unwrap();
+        let restored = pending(&wallet, "test password", P).unwrap().unwrap();
         assert_eq!(restored.txid(), tx.txid());
         assert!(live_pending(&restored, &initial.state));
-        assert!(pending(&wallet, "wrong password").is_err());
-        let paid = stark::mine(&db, &genesis, &bob.address(), vec![tx], 1_700_000_120).unwrap();
+        assert!(pending(&wallet, "wrong password", P).is_err());
+        let paid = stark::mine(&db, P, &genesis, &bob.address(), vec![tx], 1_700_000_120).unwrap();
         apply_block(&db, CHAIN, &paid).unwrap();
-        let after = scan(&db, &alice).unwrap();
+        let after = scan(&db, P, &alice).unwrap();
         assert!(!live_pending(&restored, &after.state));
         assert_eq!(after.notes.len(), 1);
         assert_eq!(after.notes[0].note.value, PREMINE - ATOMS - 200);
-        let received = scan(&db, &bob).unwrap();
+        let received = scan(&db, P, &bob).unwrap();
         assert_eq!(
             received
                 .notes

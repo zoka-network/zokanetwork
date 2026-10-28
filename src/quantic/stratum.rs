@@ -16,6 +16,10 @@
 //!
 //! Escucha en `127.0.0.1` salvo que se pida otra cosa: abrirlo a la red local
 //! es una decisión de quien corre el nodo.
+//!
+//! El protocolo es uno solo; lo que cambia con la cadena (con qué dirección
+//! cobra un login, el bloque de trabajo y qué hacer con uno encontrado) es un
+//! [`Backend`]: el de Ironwood está acá y el del pool STARK en `stark_stratum`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -79,6 +83,96 @@ pub struct StratumConfig {
     pub default_address: Option<QuanticAddress>,
 }
 
+/// Lo que el Stratum necesita de una cadena. Todo corre en hilos de bloqueo
+/// (`spawn_blocking`): puede esperar una prueba o un candado.
+pub trait Backend: Send + Sync + 'static {
+    fn chain_id(&self) -> &str;
+    fn storage(&self) -> &RocksDbStorage;
+    /// A qué dirección cobra un login, codificada: la clave de sus trabajos.
+    fn payout_for(&self, login: &str) -> Result<String, String>;
+    /// El bloque de `payout` sobre la punta, sin prueba de trabajo, y lo que
+    /// cobra (subsidio y comisiones; el premine no cuenta).
+    fn template(&self, payout: &str) -> Result<(Block, u64), String>;
+    /// Un bloque que alcanzó el objetivo de la red, con su prueba de trabajo.
+    fn found(&self, block: Block, reward_atoms: u64);
+    /// Cada cuánto se rehace una plantilla aunque la punta no cambie.
+    fn template_refresh(&self) -> Duration {
+        TEMPLATE_REFRESH
+    }
+    /// Direcciones de cobro distintas a la vez (cada una, una plantilla).
+    fn max_payout_addresses(&self) -> usize {
+        MAX_PAYOUT_ADDRESSES
+    }
+}
+
+/// La cadena de Ironwood: el mempool y el runtime del nodo de siempre.
+struct IronwoodBackend {
+    chain_id: String,
+    network: Network,
+    storage: Arc<RocksDbStorage>,
+    default_address: Option<QuanticAddress>,
+}
+
+impl Backend for IronwoodBackend {
+    fn chain_id(&self) -> &str {
+        &self.chain_id
+    }
+
+    fn storage(&self) -> &RocksDbStorage {
+        &self.storage
+    }
+
+    fn payout_for(&self, login: &str) -> Result<String, String> {
+        let login = login.trim();
+        let address = match Recipient::decode_for(login, self.network) {
+            Ok(Recipient::Full(full)) => full,
+            Ok(Recipient::Short(short)) => super::directory::lookup(&self.storage, &short)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "this node does not know that short address: publish it first".to_string())?,
+            // Parece una dirección de Zoka Quantic pero no es de esta red (o
+            // está mal copiada): cobrarle a la del nodo sería minar para otro
+            // sin que el minero se entere.
+            Err(error) if looks_like_quantic_address(login) => {
+                return Err(format!("that is not a {} address: {error}", self.network.address_prefix()))
+            }
+            Err(_) => self
+                .default_address
+                .clone()
+                .ok_or_else(|| "login with your Zoka Quantic address".to_string())?,
+        };
+        Ok(address.encode())
+    }
+
+    /// Una prueba Halo 2 del coinbase, alrededor de un segundo.
+    fn template(&self, payout: &str) -> Result<(Block, u64), String> {
+        let payout = QuanticAddress::decode_for(payout, self.network).map_err(|e| e.to_string())?;
+        let transactions = mempool::global()
+            .lock()
+            .map(|pool| pool.select(super::runtime::MINER_MAX_BLOCK_ACTIONS))
+            .unwrap_or_default();
+        let (block, validated) = miner::build_template(
+            &self.storage,
+            &self.chain_id,
+            &payout,
+            super::runtime::proving_key(),
+            transactions,
+            super::runtime::now_secs(),
+        )?;
+        let pays_the_premine = block.header.block_height == super::GENESIS_HEIGHT
+            && super::consensus_params(self.network).premine.is_some();
+        let reward_atoms = if pays_the_premine {
+            0
+        } else {
+            validated.minted.saturating_add(validated.fees)
+        };
+        Ok((block, reward_atoms))
+    }
+
+    fn found(&self, block: Block, reward_atoms: u64) {
+        push_found(FoundBlock { block, reward_atoms });
+    }
+}
+
 struct Job {
     id: String,
     block: Block,
@@ -121,9 +215,7 @@ impl Job {
 
 struct Hub {
     chain_id: String,
-    network: Network,
-    storage: Arc<RocksDbStorage>,
-    default_address: Option<QuanticAddress>,
+    backend: Arc<dyn Backend>,
     /// El trabajo vigente de cada dirección de cobro.
     current: Mutex<HashMap<String, Arc<Job>>>,
     /// Los últimos trabajos por id, para los aciertos que llegan tarde.
@@ -141,34 +233,34 @@ struct Hub {
 }
 
 impl Hub {
-    /// Arma el trabajo de `payout` sobre la punta actual (una prueba Halo 2 del
-    /// coinbase, alrededor de un segundo).
-    fn build_job(&self, payout: &QuanticAddress) -> Result<Arc<Job>, String> {
-        let transactions = mempool::global()
-            .lock()
-            .map(|pool| pool.select(super::runtime::MINER_MAX_BLOCK_ACTIONS))
-            .unwrap_or_default();
-        let (block, validated) = miner::build_template(
-            &self.storage,
-            &self.chain_id,
-            payout,
-            super::runtime::proving_key(),
-            transactions,
-            super::runtime::now_secs(),
-        )?;
-        let pays_the_premine = block.header.block_height == super::GENESIS_HEIGHT
-            && super::consensus_params(self.network).premine.is_some();
-        let reward_atoms = if pays_the_premine {
-            0
-        } else {
-            validated.minted.saturating_add(validated.fees)
-        };
-        let parent = self
-            .storage
+    fn new(backend: Arc<dyn Backend>) -> Self {
+        let (jobs, _) = broadcast::channel(64);
+        Self {
+            chain_id: backend.chain_id().to_string(),
+            backend,
+            current: Mutex::new(HashMap::new()),
+            recent: Mutex::new(VecDeque::new()),
+            miners: Mutex::new(HashMap::new()),
+            seen: Mutex::new(HashSet::new()),
+            next_extranonce: AtomicU32::new(rand::random::<u32>() | 1),
+            next_job: AtomicU64::new(1),
+            engine: Mutex::new(None),
+            jobs,
+            accepted: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+            blocks: AtomicU64::new(0),
+        }
+    }
+
+    /// Arma el trabajo de `payout` sobre la punta actual.
+    fn build_job(&self, payout: &str) -> Result<Arc<Job>, String> {
+        let (block, reward_atoms) = self.backend.template(payout)?;
+        let storage = self.backend.storage();
+        let parent = storage
             .get_block(&block.header.prev_hash)
             .map_err(|e| format!("{e:?}"))?
             .unwrap_or_else(|| crate::state::chain::genesis_parent_for(&self.chain_id));
-        let compact = super::compact_target_for_child(&self.storage, &self.chain_id, &parent)
+        let compact = super::compact_target_for_child(storage, &self.chain_id, &parent)
             .map_err(|e| e.to_string())?;
         let network_target = difficulty::from_compact(compact);
         // Más fácil que un bloque, pero nunca más difícil: en una red con
@@ -189,21 +281,20 @@ impl Hub {
         });
         if let Ok(mut recent) = self.recent.lock() {
             recent.push_back(Arc::clone(&job));
-            while recent.len() > RECENT_JOBS * MAX_PAYOUT_ADDRESSES {
+            while recent.len() > RECENT_JOBS * self.backend.max_payout_addresses() {
                 recent.pop_front();
             }
         }
         Ok(job)
     }
 
-    fn job_for(&self, payout: &QuanticAddress) -> Result<Arc<Job>, String> {
-        let key = payout.encode();
-        if let Some(job) = self.current.lock().ok().and_then(|jobs| jobs.get(&key).cloned()) {
+    fn job_for(&self, payout: &str) -> Result<Arc<Job>, String> {
+        if let Some(job) = self.current.lock().ok().and_then(|jobs| jobs.get(payout).cloned()) {
             return Ok(job);
         }
         let job = self.build_job(payout)?;
         if let Ok(mut jobs) = self.current.lock() {
-            jobs.insert(key, Arc::clone(&job));
+            jobs.insert(payout.to_string(), Arc::clone(&job));
         }
         Ok(job)
     }
@@ -223,24 +314,23 @@ impl Hub {
         engine.calculate_hash(blob).map_err(|e| e.to_string())
     }
 
-    /// El login de un minero: a qué dirección cobra.
-    fn payout_for(&self, login: &str) -> Result<QuanticAddress, String> {
-        let login = login.trim();
-        match Recipient::decode_for(login, self.network) {
-            Ok(Recipient::Full(full)) => Ok(full),
-            Ok(Recipient::Short(short)) => super::directory::lookup(&self.storage, &short)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "this node does not know that short address: publish it first".to_string()),
-            // Parece una dirección de Zoka Quantic pero no es de esta red (o
-            // está mal copiada): cobrarle a la del nodo sería minar para otro
-            // sin que el minero se entere.
-            Err(error) if looks_like_quantic_address(login) => {
-                Err(format!("that is not a {} address: {error}", self.network.address_prefix()))
-            }
-            Err(_) => self
-                .default_address
-                .clone()
-                .ok_or_else(|| "login with your Zoka Quantic address".to_string()),
+    /// Arma el verificador de la época de `seed` antes del primer acierto: el
+    /// dataset de RandomX (uno por proceso, el mismo que valida los bloques)
+    /// tarda decenas de segundos y XMRig esperaría la respuesta todo ese
+    /// tiempo. No espera el candado: si está tomado, alguien ya lo arma o lo usa.
+    fn warm(self: &Arc<Self>, seed: &[u8]) {
+        let ready = match self.engine.try_lock() {
+            Ok(engine) => engine.as_ref().map(|(cached, _)| cached.as_slice()) == Some(seed),
+            Err(_) => true,
+        };
+        if !ready {
+            let hub = Arc::clone(self);
+            let seed = seed.to_vec();
+            tokio::task::spawn_blocking(move || {
+                if let Err(error) = hub.hash(&seed, &[0; pow::QUANTIC_POW_BLOB_BYTES]) {
+                    tracing::warn!(target: "zoka.stratum", "pow verifier not built: {error}");
+                }
+            });
         }
     }
 
@@ -284,10 +374,7 @@ impl Hub {
         block.header.nonce = nonce;
         block.header.seal = Signature(hash);
         block.header.hash = block.compute_hash();
-        push_found(FoundBlock {
-            block,
-            reward_atoms: job.reward_atoms,
-        });
+        self.backend.found(block, job.reward_atoms);
         self.blocks.fetch_add(1, Ordering::Relaxed);
         Ok(true)
     }
@@ -296,7 +383,7 @@ impl Hub {
 /// Empieza como una dirección de alguna red de Zoka Quantic (`zq1`, `zqtest1`,
 /// `zqregtest1`). Un login así que no se decodifica en esta red es un error del
 /// minero, no un nombre de trabajador.
-fn looks_like_quantic_address(login: &str) -> bool {
+pub(crate) fn looks_like_quantic_address(login: &str) -> bool {
     [Network::Mainnet, Network::Testnet, Network::Regtest]
         .iter()
         .any(|network| login.starts_with(network.address_prefix()))
@@ -351,41 +438,46 @@ pub fn status() -> StratumStatus {
 
 static LISTENING: OnceLock<String> = OnceLock::new();
 
-/// Escucha mineros hasta que se apague el nodo.
+/// Escucha mineros de la cadena de Ironwood hasta que se apague el nodo.
 pub async fn serve(config: StratumConfig, storage: Arc<RocksDbStorage>, chain_id: String) -> Result<(), String> {
     let network = network_for_chain(&chain_id).ok_or_else(|| format!("{chain_id} is not a Quantic chain"))?;
-    // XMRig calcula RandomX (rx/0): en una cadena que hashea con otra cosa
-    // (regtest usa SHA3 para ir rápido) ningún acierto coincidiría.
-    if !crate::economics::chain_uses_randomx(&chain_id) {
-        return Err(format!(
-            "stratum: {chain_id} does not use RandomX (regtest hashes with SHA3); XMRig can only mine quantic-testnet or quantic-mainnet"
-        ));
-    }
-    let listener = TcpListener::bind(config.bind)
-        .await
-        .map_err(|e| format!("stratum: cannot listen on {}: {e}", config.bind))?;
-    let _ = LISTENING.set(config.bind.to_string());
-    let (jobs, _) = broadcast::channel(64);
-    let hub = Arc::new(Hub {
+    let backend = IronwoodBackend {
         chain_id,
         network,
         storage,
         default_address: config.default_address,
-        current: Mutex::new(HashMap::new()),
-        recent: Mutex::new(VecDeque::new()),
-        miners: Mutex::new(HashMap::new()),
-        seen: Mutex::new(HashSet::new()),
-        next_extranonce: AtomicU32::new(rand::random::<u32>() | 1),
-        next_job: AtomicU64::new(1),
-        engine: Mutex::new(None),
-        jobs,
-        accepted: AtomicU64::new(0),
-        rejected: AtomicU64::new(0),
-        blocks: AtomicU64::new(0),
-    });
+    };
+    serve_backend(config.bind, Arc::new(backend)).await
+}
+
+/// Escucha mineros de la cadena de `backend` hasta que se apague el nodo.
+pub async fn serve_backend(bind: SocketAddr, backend: Arc<dyn Backend>) -> Result<(), String> {
+    // XMRig calcula RandomX (rx/0): en una cadena que hashea con otra cosa
+    // (regtest usa SHA3 para ir rápido) ningún acierto coincidiría.
+    let chain_id = backend.chain_id();
+    if !crate::economics::chain_uses_randomx(chain_id) {
+        return Err(format!(
+            "stratum: {chain_id} does not use RandomX (regtest hashes with SHA3); XMRig can only mine the Quantic testnet or mainnet"
+        ));
+    }
+    let listener = TcpListener::bind(bind)
+        .await
+        .map_err(|e| format!("stratum: cannot listen on {bind}: {e}"))?;
+    let _ = LISTENING.set(bind.to_string());
+    serve_listener(listener, backend).await
+}
+
+/// El servidor sobre un puerto ya abierto. No mira si la cadena usa RandomX:
+/// eso lo hace [`serve_backend`] (las pruebas usan regtest, con su SHA3).
+pub(crate) async fn serve_listener(listener: TcpListener, backend: Arc<dyn Backend>) -> Result<(), String> {
+    let hub = Arc::new(Hub::new(backend));
     let _ = HUB.set(Arc::clone(&hub));
+    let next = hub.backend.storage().get_chain_height().unwrap_or(0).saturating_add(1);
+    hub.warm(&pow::epoch_seed(&hub.chain_id, next));
     tokio::spawn(refresh_templates(Arc::clone(&hub)));
-    tracing::info!(target: "zoka.stratum", "Stratum listening on {}", config.bind);
+    if let Ok(bind) = listener.local_addr() {
+        tracing::info!(target: "zoka.stratum", "Stratum listening on {bind}");
+    }
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -416,7 +508,16 @@ pub async fn serve(config: StratumConfig, storage: Arc<RocksDbStorage>, chain_id
 async fn refresh_templates(hub: Arc<Hub>) {
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let tip = hub.storage.get_last_block_hash().unwrap_or_default();
+        // Una cadena vacía no tiene punta guardada (dice "0"): sus plantillas
+        // van sobre el padre sintético del génesis. Sin esto, cada vuelta las
+        // daba por viejas y rehacía una prueba por segundo.
+        let storage = hub.backend.storage();
+        let tip = if storage.get_chain_height().unwrap_or(0) == 0 {
+            crate::state::chain::genesis_parent_for(&hub.chain_id).header.hash
+        } else {
+            storage.get_last_block_hash().unwrap_or_default()
+        };
+        let refresh = hub.backend.template_refresh();
         let active: Vec<String> = hub
             .miners
             .lock()
@@ -428,16 +529,15 @@ async fn refresh_templates(hub: Arc<Hub>) {
                 .lock()
                 .ok()
                 .and_then(|jobs| jobs.get(&key).cloned())
-                .is_none_or(|job| job.tip != tip || job.created.elapsed() >= TEMPLATE_REFRESH);
+                .is_none_or(|job| job.tip != tip || job.created.elapsed() >= refresh);
             if !stale {
                 continue;
             }
-            let Ok(payout) = QuanticAddress::decode_for(&key, hub.network) else {
-                continue;
-            };
             let builder = Arc::clone(&hub);
+            let payout = key.clone();
             match tokio::task::spawn_blocking(move || builder.build_job(&payout)).await {
                 Ok(Ok(job)) => {
+                    hub.warm(&job.seed);
                     if let Ok(mut jobs) = hub.current.lock() {
                         jobs.insert(key.clone(), job);
                     }
@@ -488,6 +588,10 @@ async fn session_loop(
     let mut lines = BufReader::new(reader).lines();
     let mut jobs = hub.jobs.subscribe();
     let session_id = format!("{extranonce:08x}");
+    // Mientras se contesta un acierto, los avisos de trabajo se acumulan, y
+    // cada uno manda el trabajo vigente: XMRig, al ver dos veces el mismo, se
+    // desconecta («duplicate job received, reconnect»).
+    let mut sent_job: Option<String> = None;
     loop {
         tokio::select! {
             line = lines.next_line() => {
@@ -503,7 +607,13 @@ async fn session_loop(
                 let id = request.get("id").cloned().unwrap_or(Value::Null);
                 let params = request.get("params").cloned().unwrap_or(Value::Null);
                 let reply = match request.get("method").and_then(Value::as_str).unwrap_or("") {
-                    "login" => login(hub, id, &params, extranonce, &session_id, payout).await?,
+                    "login" => {
+                        let reply = login(hub, id, &params, extranonce, &session_id, payout).await?;
+                        if let Some(job_id) = reply.pointer("/result/job/job_id").and_then(Value::as_str) {
+                            sent_job = Some(job_id.to_string());
+                        }
+                        reply
+                    }
                     "submit" => {
                         let job_id = params.get("job_id").and_then(Value::as_str).unwrap_or("").to_string();
                         let nonce = params.get("nonce").and_then(Value::as_str).unwrap_or("").to_string();
@@ -538,9 +648,10 @@ async fn session_loop(
                     continue;
                 }
                 let job = hub.current.lock().ok().and_then(|jobs| jobs.get(&changed).cloned());
-                if let Some(job) = job {
+                if let Some(job) = job.filter(|job| sent_job.as_deref() != Some(job.id.as_str())) {
                     let notice = json!({"jsonrpc": "2.0", "method": "job", "params": job.notification(&hub.chain_id, extranonce)});
                     send(&mut writer, &notice).await?;
+                    sent_job = Some(job.id.clone());
                 }
             }
         }
@@ -558,20 +669,29 @@ async fn login(
     let login = params.get("login").and_then(Value::as_str).unwrap_or("").to_string();
     let resolver = Arc::clone(hub);
     let built = tokio::task::spawn_blocking(move || {
-        let address = resolver.payout_for(&login)?;
-        let job = resolver.job_for(&address)?;
-        Ok::<_, String>((address, job))
+        let key = resolver.backend.payout_for(&login)?;
+        // El tope antes de armar la plantilla: cada dirección nueva cuesta una.
+        let busy = resolver
+            .miners
+            .lock()
+            .map(|miners| miners.len() >= resolver.backend.max_payout_addresses() && !miners.contains_key(&key))
+            .unwrap_or(true);
+        if busy {
+            return Err("too many payout addresses on this node".to_string());
+        }
+        let job = resolver.job_for(&key)?;
+        Ok::<_, String>((key, job))
     })
     .await
     .map_err(|e| e.to_string())?;
-    let (address, job) = match built {
+    let (key, job) = match built {
         Ok(built) => built,
         Err(error) => return Ok(json!({"id": id, "jsonrpc": "2.0", "error": {"code": -1, "message": error}})),
     };
-    let key = address.encode();
+    hub.warm(&job.seed);
     if payout.as_deref() != Some(key.as_str()) {
         let mut miners = hub.miners.lock().map_err(|_| "miners lock poisoned".to_string())?;
-        if miners.len() >= MAX_PAYOUT_ADDRESSES && !miners.contains_key(&key) {
+        if miners.len() >= hub.backend.max_payout_addresses() && !miners.contains_key(&key) {
             return Ok(json!({"id": id, "jsonrpc": "2.0", "error": {"code": -1, "message": "too many payout addresses on this node"}}));
         }
         if let Some(previous) = payout.as_ref() {

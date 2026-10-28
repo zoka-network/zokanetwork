@@ -240,7 +240,7 @@ impl Chain {
         position: &Position,
         timestamp: u64,
     ) -> Result<Mined, String> {
-        let block = stark::mine(&self.storage, &position.parent, to, txs, timestamp)?;
+        let block = stark::mine(&self.storage, stark::Profile::REGTEST, &position.parent, to, txs, timestamp)?;
         let head = apply_block(&self.storage, QUANTIC_PQ_REGTEST_CHAIN_ID, &block)
             .map_err(|e| e.to_string())?;
         Ok(Mined {
@@ -294,7 +294,7 @@ impl Chain {
             blocks.push(block);
         }
         let parent = blocks.last().expect("height > 0").clone();
-        let ledger = stark::state_after(&self.storage, &parent)?;
+        let ledger = stark::state_after(&self.storage, stark::Profile::REGTEST, &parent)?;
         let inserted = commitment_order(&blocks)?;
         if inserted.len() as u64 != ledger.tree.len() {
             return Err("el orden de las notas no coincide con el árbol guardado".into());
@@ -379,8 +379,8 @@ fn validate_existing_v2(storage: &RocksDbStorage) -> Result<(), String> {
         },
     )
     .map_err(|e| format!("génesis v2 inválido: {e}"))?;
-    stark::validate(storage, &genesis, &parent)?;
-    stark::state_after(storage, &genesis)?;
+    stark::validate(storage, stark::Profile::REGTEST, &genesis, &parent)?;
+    stark::state_after(storage, stark::Profile::REGTEST, &genesis)?;
     let hash = storage.get_last_block_hash().map_err(|e| e.to_string())?;
     let tip = storage
         .get_canonical_block_by_height(height)
@@ -389,7 +389,7 @@ fn validate_existing_v2(storage: &RocksDbStorage) -> Result<(), String> {
     if tip.header.hash != hash {
         return Err("la punta de la base existente no coincide con el índice".into());
     }
-    stark::state_after(storage, &tip)?;
+    stark::state_after(storage, stark::Profile::REGTEST, &tip)?;
     Ok(())
 }
 

@@ -53,6 +53,8 @@ pub mod stark_api;
 pub mod stark_net;
 #[cfg(feature = "quantic-pq")]
 pub mod stark_node;
+#[cfg(feature = "quantic-pq")]
+pub mod stark_stratum;
 
 /// El nodo numera desde 1 (la altura 0 es el génesis sintético de cada
 /// cadena), así que el génesis de Quantic, con el premine, es el bloque 1.
@@ -104,6 +106,18 @@ pub fn network_for_chain(chain_id: &str) -> Option<Network> {
         return Some(Network::Regtest);
     }
     Network::ALL.into_iter().find(|n| n.chain_id() == chain_id)
+}
+
+/// La red cuyas reglas de dificultad sigue una cadena. Las de STARK v2 toman
+/// las de su par v1 (regtest fija, testnet con ASERT) y nada más: la testnet v2
+/// no está en [`network_for_chain`] para que nunca le llegue el génesis de la v1.
+fn difficulty_network(chain_id: &str) -> Option<Network> {
+    match crate::economics::stark_pool_network(chain_id) {
+        Some(1) => Some(Network::Mainnet),
+        Some(2) => Some(Network::Testnet),
+        Some(_) => Some(Network::Regtest),
+        None => network_for_chain(chain_id),
+    }
 }
 
 /// Raíz de la wallet del equipo en regtest. **Pública a propósito**: regtest
@@ -477,7 +491,7 @@ pub fn target_for_child(
     chain_id: &str,
     parent: &Block,
 ) -> Result<num_bigint::BigUint, QuanticBlockError> {
-    let network = network_for_chain(chain_id).ok_or_else(|| QuanticBlockError::NotQuantic(chain_id.to_string()))?;
+    let network = difficulty_network(chain_id).ok_or_else(|| QuanticBlockError::NotQuantic(chain_id.to_string()))?;
     if network == Network::Regtest {
         return Ok(difficulty::target_for_bits(crate::economics::QUANTIC_REGTEST_DIFFICULTY_BITS));
     }

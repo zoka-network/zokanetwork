@@ -1,6 +1,7 @@
 //! Authenticated STARK-chain transport. The pinned ML-DSA server identity signs
 //! this connection's TLS exporter, not a reusable greeting or an unbound nonce.
-//! TLS must negotiate X25519MLKEM768. Only the separate local v2 chain is served.
+//! TLS must negotiate X25519MLKEM768. Only STARK v2 chains are served, each one
+//! named in the descriptor and bound into the signed context.
 use std::{sync::Arc, time::Duration};
 
 use iroh::{
@@ -15,13 +16,11 @@ use zoka_pq::{
     ML_DSA_65_SIGNATURE_BYTES,
 };
 
-use super::{stark, stark_api::NodeState};
-use crate::{
-    economics::QUANTIC_PQ_REGTEST_CHAIN_ID as CHAIN,
-    network::pq_tls::RequiredPostQuantumTls,
-    state::chain::{apply_block, genesis_parent_for},
-    types::Block,
+use super::{
+    stark::{self, Profile},
+    stark_api::NodeState,
 };
+use crate::{network::pq_tls::RequiredPostQuantumTls, state::chain::apply_block, types::Block};
 use stark::protocol::transaction::{Transaction, MAX_TRANSACTION_BYTES};
 
 pub const ALPN: &[u8] = b"/zoka/quantic-stark/2";
@@ -54,7 +53,7 @@ pub struct NodeDescriptor {
 }
 impl NodeDescriptor {
     pub fn validate(&self) -> Result<(), String> {
-        if self.version != 2 || self.chain_id != CHAIN {
+        if self.version != 2 || Profile::for_chain(&self.chain_id).is_none() {
             return Err("STARK descriptor network/version".into());
         }
         MlDsa65PublicKey::from_bytes(&self.ml_dsa_public_key).map_err(err)?;
@@ -102,6 +101,7 @@ fn transport_config() -> QuicTransportConfig {
 
 fn auth_message(
     connection: &Connection,
+    chain_id: &str,
     server: EndpointId,
     client: EndpointId,
     public: &[u8],
@@ -109,7 +109,7 @@ fn auth_message(
     let mut context = Vec::new();
     context.extend_from_slice(ALPN);
     context.push(0);
-    context.extend_from_slice(CHAIN.as_bytes());
+    context.extend_from_slice(chain_id.as_bytes());
     context.push(0);
     context.extend_from_slice(server.as_bytes());
     context.extend_from_slice(client.as_bytes());
@@ -155,7 +155,7 @@ pub async fn serve(
         .map_err(err)?;
     let descriptor = NodeDescriptor {
         version: 2,
-        chain_id: CHAIN.into(),
+        chain_id: state.profile.chain_id.into(),
         endpoint_addr: endpoint.addr(),
         ml_dsa_public_key: identity.public_key(),
     };
@@ -206,7 +206,13 @@ async fn authenticate_server(
         return Err("STARK handshake version".into());
     }
     let public = identity.public_key();
-    let message = auth_message(connection, server, connection.remote_id(), &public)?;
+    let message = auth_message(
+        connection,
+        state.profile.chain_id,
+        server,
+        connection.remote_id(),
+        &public,
+    )?;
     let key = identity.signature.clone();
     let permit = state.work.clone().acquire_owned().await.map_err(err)?;
     let signature = tokio::task::spawn_blocking(move || {
@@ -309,20 +315,21 @@ pub struct Head {
     pub hash: String,
 }
 
-fn tip(storage: &crate::storage::RocksDbStorage) -> Result<Block, String> {
-    if storage.get_chain_height().map_err(err)? == 0 {
-        return Ok(genesis_parent_for(CHAIN));
+fn tip(state: &NodeState) -> Result<Block, String> {
+    if state.storage.get_chain_height().map_err(err)? == 0 {
+        return Ok(state.profile.genesis_parent());
     }
-    let hash = storage.get_last_block_hash().map_err(err)?;
-    storage
+    let hash = state.storage.get_last_block_hash().map_err(err)?;
+    state
+        .storage
         .get_block(&hash)
         .map_err(err)?
         .ok_or_else(|| "missing STARK tip".into())
 }
-fn head(storage: &crate::storage::RocksDbStorage) -> Result<Head, String> {
-    let block = tip(storage)?;
+fn head(state: &NodeState) -> Result<Head, String> {
+    let block = tip(state)?;
     Ok(Head {
-        chain_id: CHAIN.into(),
+        chain_id: state.profile.chain_id.into(),
         height: block.header.block_height,
         hash: block.header.hash,
     })
@@ -331,7 +338,7 @@ fn head(storage: &crate::storage::RocksDbStorage) -> Result<Head, String> {
 fn handle_request(state: &NodeState, tag: u8, body: &[u8]) -> Result<Vec<u8>, String> {
     let _gate = state.gate.lock().map_err(|_| "STARK state lock poisoned")?;
     match tag {
-        HEAD => serde_json::to_vec(&head(&state.storage)?).map_err(err),
+        HEAD => serde_json::to_vec(&head(state)?).map_err(err),
         GET_BLOCK => {
             let height =
                 u64::from_be_bytes(body.try_into().map_err(|_| "STARK block height length")?);
@@ -348,7 +355,7 @@ fn handle_request(state: &NodeState, tag: u8, body: &[u8]) -> Result<Vec<u8>, St
             let height =
                 u64::from_be_bytes(body.try_into().map_err(|_| "STARK hash height length")?);
             if height == 0 {
-                return Ok(genesis_parent_for(CHAIN).header.hash.into_bytes());
+                return Ok(state.profile.genesis_parent().header.hash.into_bytes());
             }
             Ok(state
                 .storage
@@ -360,7 +367,7 @@ fn handle_request(state: &NodeState, tag: u8, body: &[u8]) -> Result<Vec<u8>, St
         SUBMIT_TX => {
             let tx = Transaction::decode(body).map_err(err)?;
             let txid = tx.txid();
-            let ledger = stark::state_after(&state.storage, &tip(&state.storage)?)?;
+            let ledger = stark::state_after(&state.storage, state.profile, &tip(state)?)?;
             state
                 .mempool
                 .lock()
@@ -371,7 +378,7 @@ fn handle_request(state: &NodeState, tag: u8, body: &[u8]) -> Result<Vec<u8>, St
         SUBMIT_BLOCK => {
             let block: Block = serde_json::from_slice(body).map_err(err)?;
             import_block_locked(state, &block)?;
-            serde_json::to_vec(&head(&state.storage)?).map_err(err)
+            serde_json::to_vec(&head(state)?).map_err(err)
         }
         _ => Err("unknown STARK request".into()),
     }
@@ -381,15 +388,15 @@ fn handle_request(state: &NodeState, tag: u8, body: &[u8]) -> Result<Vec<u8>, St
 /// even when it has not yet accumulated more work than the current tip.
 fn import_block_locked(state: &NodeState, block: &Block) -> Result<bool, String> {
     use crate::state::chain::ChainError;
-    let previous = tip(&state.storage)?.header.hash;
-    let fresh = match apply_block(&state.storage, CHAIN, block) {
+    let previous = tip(state)?.header.hash;
+    let fresh = match apply_block(&state.storage, state.profile.chain_id, block) {
         Ok(_) | Err(ChainError::SideBranchNotHeavier { .. }) => true,
         Err(ChainError::BlockAlreadyKnown(_)) => false,
         Err(error) => return Err(err(error)),
     };
-    let current = tip(&state.storage)?;
+    let current = tip(state)?;
     if current.header.hash != previous {
-        let ledger = stark::state_after(&state.storage, &current)?;
+        let ledger = stark::state_after(&state.storage, state.profile, &current)?;
         state
             .mempool
             .lock()
@@ -405,6 +412,8 @@ fn client_work() -> Arc<Semaphore> {
 }
 
 pub struct Client {
+    /// From the pinned descriptor: every head must name this chain.
+    chain_id: String,
     endpoint: Endpoint,
     connection: Connection,
     send: SendStream,
@@ -433,8 +442,13 @@ impl Client {
             if public != descriptor.ml_dsa_public_key {
                 return Err("STARK pinned ML-DSA key mismatch".into());
             }
-            let message =
-                auth_message(&connection, connection.remote_id(), endpoint.id(), &public)?;
+            let message = auth_message(
+                &connection,
+                &descriptor.chain_id,
+                connection.remote_id(),
+                endpoint.id(),
+                &public,
+            )?;
             let permit = client_work().acquire_owned().await.map_err(err)?;
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
@@ -450,6 +464,7 @@ impl Client {
         .await;
         match authenticated {
             Ok(Ok((connection, send, recv))) => Ok(Self {
+                chain_id: descriptor.chain_id.clone(),
                 endpoint,
                 connection,
                 send,
@@ -519,7 +534,7 @@ impl Client {
     }
 
     pub async fn head(&mut self) -> Result<Head, String> {
-        decode_head(&self.request(HEAD, &[], 1024).await?)
+        decode_head(&self.request(HEAD, &[], 1024).await?, &self.chain_id)
     }
 
     /// Transport authentication is not consensus validation. `pull` verifies
@@ -571,7 +586,7 @@ impl Client {
 
     pub async fn submit_block(&mut self, block: &Block) -> Result<Head, String> {
         let bytes = serde_json::to_vec(block).map_err(err)?;
-        decode_head(&self.request(SUBMIT_BLOCK, &bytes, 1024).await?)
+        decode_head(&self.request(SUBMIT_BLOCK, &bytes, 1024).await?, &self.chain_id)
     }
 
     pub async fn pull(&mut self, state: &NodeState) -> Result<usize, String> {
@@ -589,8 +604,11 @@ impl Client {
         if max_blocks == 0 || max_blocks > 256 {
             return Err("STARK pull batch limit must be 1..256".into());
         }
+        if state.profile.chain_id != self.chain_id {
+            return Err("STARK peer serves another chain".into());
+        }
         let remote = self.head().await?;
-        let local = with_state(state, |state| head(&state.storage)).await?;
+        let local = with_state(state, |state| head(state)).await?;
         if remote.height == 0 || (remote.height == local.height && remote.hash == local.hash) {
             return Ok(0);
         }
@@ -660,9 +678,9 @@ impl Drop for Client {
     }
 }
 
-fn decode_head(bytes: &[u8]) -> Result<Head, String> {
+fn decode_head(bytes: &[u8], chain_id: &str) -> Result<Head, String> {
     let head: Head = serde_json::from_slice(bytes).map_err(err)?;
-    if head.chain_id != CHAIN
+    if head.chain_id != chain_id
         || head.height > u32::MAX as u64
         || head.hash.len() != 64
         || hex::decode(&head.hash).is_err()
@@ -702,6 +720,8 @@ mod tests {
         wallet::Account,
     };
 
+    const CHAIN: &str = Profile::REGTEST.chain_id;
+
     fn state() -> (NodeState, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let storage = Arc::new(crate::storage::RocksDbStorage::new(dir.path()).unwrap());
@@ -734,7 +754,14 @@ mod tests {
     ) -> Block {
         with_state(state, move |state| {
             let alice = Account::from_seed(&[31; 32], 3, 0).map_err(err)?;
-            let block = stark::mine(&state.storage, &parent, &alice.address(), txs, timestamp)?;
+            let block = stark::mine(
+                &state.storage,
+                state.profile,
+                &parent,
+                &alice.address(),
+                txs,
+                timestamp,
+            )?;
             import_block_locked(state, &block)?;
             Ok(block)
         })
@@ -746,7 +773,7 @@ mod tests {
     async fn pq_pinned_localhost_sync_private_tx_invalid_proof_and_bounded_fork_recovery() {
         let (remote, _remote_dir) = state();
         let (local, _local_dir) = state();
-        let genesis = mine_on(&remote, genesis_parent_for(CHAIN), vec![], 1_700_000_000).await;
+        let genesis = mine_on(&remote, Profile::REGTEST.genesis_parent(), vec![], 1_700_000_000).await;
         let server = serve(
             remote.clone(),
             ServerIdentity::from_seed(&[71; 32]).unwrap(),
@@ -773,7 +800,7 @@ mod tests {
         let payment = with_state(&local, move |state| {
             let alice = Account::from_seed(&[31; 32], 3, 0).map_err(err)?;
             let bob = Account::from_seed(&[32; 32], 3, 0).map_err(err)?;
-            let ledger = stark::state_after(&state.storage, &for_payment)?;
+            let ledger = stark::state_after(&state.storage, state.profile, &for_payment)?;
             let cb = stark::decode(&for_payment)?.remove(0);
             let (note, _) = alice
                 .receive(cb.statement.commitments[0], &cb.envelopes[0])
@@ -879,14 +906,15 @@ mod tests {
             raw_hello(&endpoint, &descriptor).await;
         let key = MlDsa65PublicKey::from_bytes(&public).unwrap();
         let signature = MlDsa65Signature::from_bytes(&signature).unwrap();
-        let original = auth_message(&first, server.endpoint.id(), endpoint.id(), &public).unwrap();
+        let original =
+            auth_message(&first, CHAIN, server.endpoint.id(), endpoint.id(), &public).unwrap();
         key.verify(original.as_ref(), AUTH_CONTEXT, &signature)
             .unwrap();
         first.close(0u32.into(), b"reconnect");
         let (second, mut send, _recv, again, _) = raw_hello(&endpoint, &descriptor).await;
         assert_eq!(again, public);
         let replay_target =
-            auth_message(&second, server.endpoint.id(), endpoint.id(), &public).unwrap();
+            auth_message(&second, CHAIN, server.endpoint.id(), endpoint.id(), &public).unwrap();
         assert_ne!(original.as_slice(), replay_target.as_slice());
         assert!(key
             .verify(replay_target.as_ref(), AUTH_CONTEXT, &signature)

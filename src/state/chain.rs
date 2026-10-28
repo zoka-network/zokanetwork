@@ -734,9 +734,11 @@ fn validate_quantic_body(
     }
     #[cfg(feature = "quantic")]
     {
-        if chain_id == crate::economics::QUANTIC_PQ_REGTEST_CHAIN_ID {
+        if crate::economics::stark_pool_network(chain_id).is_some() {
             #[cfg(feature = "quantic-pq")]
-            return crate::quantic::stark::validate(storage, candidate, parent)
+            return crate::quantic::stark::Profile::for_chain(chain_id)
+                .ok_or_else(|| "unknown STARK chain".to_string())
+                .and_then(|profile| crate::quantic::stark::validate(storage, profile, candidate, parent))
                 .map(|v| Some(QuanticValidation::Stark(v)))
                 .map_err(ChainError::InvalidQuanticBlock);
             #[cfg(not(feature = "quantic-pq"))]

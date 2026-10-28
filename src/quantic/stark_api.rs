@@ -1,4 +1,4 @@
-//! Bounded loopback API for the separate STARK v2 regtest chain.
+//! Bounded loopback API for a STARK v2 chain (see `stark::Profile`).
 //!
 //! API, peer synchronization and mining share `NodeState`. Every state mutation
 //! takes `work` asynchronously, moves its permit into `spawn_blocking`, then
@@ -24,15 +24,15 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::stark::{
     self,
+    Profile,
     protocol::{
         transaction::{Transaction, MAX_TRANSACTION_BYTES},
         wallet::Address,
     },
 };
 use crate::{
-    economics::QUANTIC_PQ_REGTEST_CHAIN_ID as CHAIN,
     mining::pow,
-    state::chain::{apply_block, genesis_parent_for, ChainError},
+    state::chain::{apply_block, ChainError},
     storage::RocksDbStorage,
     types::Block,
 };
@@ -46,6 +46,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
 pub struct NodeState {
+    /// The chain named by the database marker.
+    pub profile: Profile,
     pub storage: Arc<RocksDbStorage>,
     pub mempool: Arc<Mutex<stark::Mempool>>,
     pub gate: Arc<Mutex<()>>,
@@ -56,22 +58,26 @@ impl NodeState {
     /// Callers initialize or adopt the dedicated v2 database explicitly. This
     /// constructor cannot silently repurpose a public or unmarked database.
     pub fn new(storage: Arc<RocksDbStorage>) -> Result<Self, String> {
-        if storage
+        let profile = storage
             .get_raw(DB_MARKER)
             .map_err(|e| e.to_string())?
-            .as_deref()
-            != Some(CHAIN.as_bytes())
-        {
-            return Err("STARK API requires a database marked as zoka-quantic-regtest-v2".into());
-        }
-        let parent = current_tip(&storage).map_err(|e| e.message)?;
-        stark::state_after(&storage, &parent)?;
+            .and_then(|marker| String::from_utf8(marker).ok())
+            .and_then(|marker| Profile::for_chain(&marker))
+            .ok_or("STARK API requires a database marked with a STARK v2 chain id")?;
+        let parent = current_tip(profile, &storage).map_err(|e| e.message)?;
+        stark::state_after(&storage, profile, &parent)?;
         Ok(Self {
+            profile,
             storage,
             mempool: Arc::new(Mutex::new(stark::Mempool::default())),
             gate: Arc::new(Mutex::new(())),
             work: Arc::new(Semaphore::new(MAX_CRYPTO_WORKERS)),
         })
+    }
+
+    /// The canonical tip (the genesis parent of an empty chain). Hold `gate`.
+    pub fn tip(&self) -> Result<Block, String> {
+        current_tip(self.profile, &self.storage).map_err(|e| e.message)
     }
 }
 
@@ -225,9 +231,9 @@ fn json_response<T: Serialize>(status: StatusCode, value: &T) -> ApiResult<Respo
     Ok((status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response())
 }
 
-fn current_tip(storage: &RocksDbStorage) -> ApiResult<Block> {
+fn current_tip(profile: Profile, storage: &RocksDbStorage) -> ApiResult<Block> {
     if storage.get_chain_height().map_err(ApiError::internal)? == 0 {
-        return Ok(genesis_parent_for(CHAIN));
+        return Ok(profile.genesis_parent());
     }
     let hash = storage.get_last_block_hash().map_err(ApiError::internal)?;
     storage
@@ -287,14 +293,15 @@ async fn status(
 ) -> ApiResult<Response> {
     blocking(permit, move || {
         let _gate = state.gate.lock().map_err(|_| ApiError::internal("node gate poisoned"))?;
-        let tip = current_tip(&state.storage)?;
-        let ledger = stark::state_after(&state.storage, &tip).map_err(ApiError::internal)?;
+        let tip = current_tip(state.profile, &state.storage)?;
+        let ledger = stark::state_after(&state.storage, state.profile, &tip).map_err(ApiError::internal)?;
         let count = state.mempool.lock().map_err(|_| ApiError::internal("mempool poisoned"))?.len();
         json_response(StatusCode::OK, &serde_json::json!({
-            "chain_id":CHAIN,"pool_version":2,"height":ledger.height,"hash":tip.header.hash,
+            "chain_id":state.profile.chain_id,"pool_version":2,"height":ledger.height,"hash":tip.header.hash,
             "issued_atoms":ledger.issued,"notes":ledger.tree.len(),"mempool_transactions":count,
-            "pow_algorithm":crate::economics::pow_algorithm_for_chain(CHAIN),"xmrig_compatible":false,
+            "pow_algorithm":state.profile.pow_algorithm(),"xmrig_compatible":state.profile.xmrig_compatible(),
             "max_transaction_bytes":MAX_TRANSACTION_BYTES,"max_block_request_bytes":MAX_BLOCK_REQUEST_BYTES,
+            "stratum":super::stratum::status(),
         }))
     }).await
 }
@@ -333,8 +340,8 @@ async fn submit_transaction(
             .gate
             .lock()
             .map_err(|_| ApiError::internal("node gate poisoned"))?;
-        let tip = current_tip(&state.storage)?;
-        let ledger = stark::state_after(&state.storage, &tip).map_err(ApiError::internal)?;
+        let tip = current_tip(state.profile, &state.storage)?;
+        let ledger = stark::state_after(&state.storage, state.profile, &tip).map_err(ApiError::internal)?;
         state
             .mempool
             .lock()
@@ -373,13 +380,14 @@ async fn mining_template(
     Query(query): Query<TemplateQuery>,
 ) -> ApiResult<Response> {
     blocking(permit, move || {
-        let address = Address::decode(&query.address, 3).map_err(ApiError::invalid)?;
+        let profile = state.profile;
+        let address = Address::decode(&query.address, profile.network).map_err(ApiError::invalid)?;
         let (parent, txs) = {
             let _gate = state
                 .gate
                 .lock()
                 .map_err(|_| ApiError::internal("node gate poisoned"))?;
-            let parent = current_tip(&state.storage)?;
+            let parent = current_tip(profile, &state.storage)?;
             let txs = state
                 .mempool
                 .lock()
@@ -389,15 +397,22 @@ async fn mining_template(
         };
         // The parent state is immutable. A concurrent new tip may make this a
         // stale template, as with ordinary mining, without changing its rules.
-        let block = stark::template(&state.storage, &parent, &address, txs, super::now_secs())
-            .map_err(ApiError::invalid)?;
-        let compact = super::compact_target_for_child(&state.storage, CHAIN, &parent)
+        let block = stark::template(
+            &state.storage,
+            profile,
+            &parent,
+            &address,
+            txs,
+            super::now_secs(),
+        )
+        .map_err(ApiError::invalid)?;
+        let compact = super::compact_target_for_child(&state.storage, profile.chain_id, &parent)
             .map_err(ApiError::internal)?;
         let mut target = super::difficulty::from_compact(compact).to_bytes_le();
         target.resize(32, 0);
         let header = &block.header;
         let blob = pow::build_quantic_pow_input(
-            CHAIN,
+            profile.chain_id,
             &header.prev_hash,
             &header.merkle_root,
             &header.state_root,
@@ -406,12 +421,12 @@ async fn mining_template(
             header.nonce,
         );
         let response = TemplateResponse {
-            chain_id: CHAIN,
-            pow_algorithm: crate::economics::pow_algorithm_for_chain(CHAIN),
-            xmrig_compatible: false,
+            chain_id: profile.chain_id,
+            pow_algorithm: profile.pow_algorithm(),
+            xmrig_compatible: profile.xmrig_compatible(),
             blob_hex: hex::encode(blob),
             target_hex_le: hex::encode(target),
-            seed_hex: hex::encode(pow::epoch_seed(CHAIN, header.block_height)),
+            seed_hex: hex::encode(pow::epoch_seed(profile.chain_id, header.block_height)),
             nonce_offset: pow::QUANTIC_POW_NONCE_OFFSET,
             nonce_bytes: 4,
             block,
@@ -431,17 +446,17 @@ async fn submit_block(
     blocking(permit, move || {
         let block: Block = serde_json::from_slice(&body).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
         let _gate = state.gate.lock().map_err(|_| ApiError::internal("node gate poisoned"))?;
-        let old_tip = current_tip(&state.storage)?;
-        let (status, known) = match apply_block(&state.storage, CHAIN, &block) {
+        let old_tip = current_tip(state.profile, &state.storage)?;
+        let (status, known) = match apply_block(&state.storage, state.profile.chain_id, &block) {
             Ok(_) => (StatusCode::ACCEPTED, false),
             Err(ChainError::SideBranchNotHeavier { .. }) => (StatusCode::ACCEPTED, false),
             Err(ChainError::BlockAlreadyKnown(_)) => (StatusCode::OK, true),
             Err(ChainError::Storage(message)) => return Err(ApiError::internal(message)),
             Err(e) => return Err(ApiError::invalid(e)),
         };
-        let tip = current_tip(&state.storage)?;
+        let tip = current_tip(state.profile, &state.storage)?;
         if tip.header.hash != old_tip.header.hash {
-            let ledger = stark::state_after(&state.storage, &tip).map_err(ApiError::internal)?;
+            let ledger = stark::state_after(&state.storage, state.profile, &tip).map_err(ApiError::internal)?;
             state.mempool.lock().map_err(|_| ApiError::internal("mempool poisoned"))?.revalidate(&ledger);
         }
         let canonical = state.storage.get_canonical_block_by_height(block.header.block_height)
@@ -463,6 +478,8 @@ mod tests {
         wallet::Account,
     };
     use tower::ServiceExt;
+
+    const CHAIN: &str = Profile::REGTEST.chain_id;
 
     fn test_state() -> (tempfile::TempDir, NodeState) {
         let dir = tempfile::tempdir().unwrap();
@@ -683,7 +700,7 @@ mod tests {
         );
         let storage = state.storage.clone();
         tokio::task::spawn_blocking(move || {
-            let parent = current_tip(&storage).unwrap();
+            let parent = current_tip(Profile::REGTEST, &storage).unwrap();
             let target =
                 crate::quantic::compact_target_for_child(&storage, CHAIN, &parent).unwrap();
             crate::quantic::solve_pow(CHAIN, &mut block, target).unwrap();
@@ -715,7 +732,7 @@ mod tests {
         let storage = state.storage.clone();
         let recipient = bob.address();
         let payment = tokio::task::spawn_blocking(move || {
-            let ledger = stark::state_after(&storage, &genesis).unwrap();
+            let ledger = stark::state_after(&storage, Profile::REGTEST, &genesis).unwrap();
             let reward = stark::decode(&genesis).unwrap().remove(0);
             let (note, _) = alice
                 .receive(reward.statement.commitments[0], &reward.envelopes[0])

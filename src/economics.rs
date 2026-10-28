@@ -441,6 +441,21 @@ pub const QUANTIC_TESTNET_CHAIN_ID: &str = "zoka-quantic-testnet-v1";
 pub const QUANTIC_REGTEST_CHAIN_ID: &str = "zoka-quantic-regtest-v1";
 /// Separate chain identity: v1 peers must never follow a STARK test chain.
 pub const QUANTIC_PQ_REGTEST_CHAIN_ID: &str = "zoka-quantic-regtest-v2";
+/// La testnet que reemplaza a la v1 cuando salga el pool STARK: RandomX (XMRig)
+/// y la ASERT de la v1, con el pool postcuántico desde su primer bloque.
+pub const QUANTIC_PQ_TESTNET_CHAIN_ID: &str = "zoka-quantic-testnet-v2";
+/// El hash de su bloque 1 (el premine). `None` hasta el lanzamiento, que lo
+/// fija en el binario: antes, quien mina el bloque 1 arma su propia cadena local.
+pub const QUANTIC_PQ_TESTNET_GENESIS: Option<&str> = None;
+
+/// El byte de red del pool STARK (`zoka-pq-pool`) de una cadena v2.
+pub fn stark_pool_network(chain_id: &str) -> Option<u8> {
+    match chain_id {
+        QUANTIC_PQ_TESTNET_CHAIN_ID => Some(2),
+        QUANTIC_PQ_REGTEST_CHAIN_ID => Some(3),
+        _ => None,
+    }
+}
 
 /// El génesis de una red pública de Quantic: el hash de su bloque 1 y la
 /// dirección que recibe el premine. Fijo en el binario, como el de Bitcoin:
@@ -470,15 +485,16 @@ pub fn is_quantic_chain_id(chain_id: &str) -> bool {
     chain_id == QUANTIC_MAINNET_CHAIN_ID
         || chain_id == QUANTIC_TESTNET_CHAIN_ID
         || chain_id == QUANTIC_REGTEST_CHAIN_ID
-        || chain_id == QUANTIC_PQ_REGTEST_CHAIN_ID
+        || stark_pool_network(chain_id).is_some()
 }
 
-/// Las cadenas públicas usan RandomX: Zenith y las dos de Quantic.
+/// Las cadenas públicas usan RandomX: Zenith y las de Quantic.
 pub fn chain_uses_randomx(chain_id: &str) -> bool {
     chain_id == MAINNET_CHAIN_ID
         || chain_id == TESTNET_CHAIN_ID
         || chain_id == QUANTIC_MAINNET_CHAIN_ID
         || chain_id == QUANTIC_TESTNET_CHAIN_ID
+        || chain_id == QUANTIC_PQ_TESTNET_CHAIN_ID
 }
 
 pub fn pow_algorithm_for_chain(chain_id: &str) -> &'static str {
