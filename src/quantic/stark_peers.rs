@@ -79,6 +79,8 @@ pub struct PeerBook {
     pending: VecDeque<NodeDescriptor>,
     /// Endpoints with an authenticated outbound session right now.
     connected: BTreeSet<EndpointId>,
+    /// The tip height each outbound session last reported.
+    observed: BTreeMap<EndpointId, u64>,
     dirty: bool,
 }
 
@@ -92,6 +94,7 @@ impl PeerBook {
             known: BTreeMap::new(),
             pending: VecDeque::new(),
             connected: BTreeSet::new(),
+            observed: BTreeMap::new(),
             dirty: false,
         }
     }
@@ -313,6 +316,12 @@ impl PeerBook {
     }
     pub fn disconnected(&mut self, id: EndpointId) {
         self.connected.remove(&id);
+        self.observed.remove(&id);
+    }
+    pub fn observe(&mut self, id: EndpointId, height: u64) {
+        if self.connected.contains(&id) {
+            self.observed.insert(id, height);
+        }
     }
     pub fn known_len(&self) -> usize {
         self.known.len()
@@ -343,6 +352,14 @@ impl Peers {
     /// holds a consistent table.
     pub fn book(&self) -> MutexGuard<'_, PeerBook> {
         self.book.lock().unwrap_or_else(|p| p.into_inner())
+    }
+    /// What a checkpoint authority needs before it signs: some peer is in
+    /// session and no outbound peer reported a higher tip. A node alone would
+    /// otherwise sign the branch it mines by itself and bind the network to it.
+    pub fn confirm_tip(&self, height: u64) -> bool {
+        let book = self.book();
+        let connected = book.outbound_len() > 0 || self.inbound.load(Ordering::Relaxed) > 0;
+        connected && book.observed.values().all(|seen| *seen <= height)
     }
     /// Counts one inbound session for as long as the guard lives.
     pub fn inbound(self: &Arc<Self>) -> Inbound {
@@ -579,6 +596,22 @@ mod tests {
             "a peer in session is never evicted"
         );
         assert!(book.candidate(1_000, &BTreeSet::new()).is_some());
+    }
+
+    #[test]
+    fn an_authority_needs_a_peer_and_none_ahead_to_confirm_its_tip() {
+        let peers = Peers::new(PeerBook::new(P));
+        assert!(!peers.confirm_tip(10), "alone");
+        let inbound = peers.inbound();
+        assert!(peers.confirm_tip(10));
+        drop(inbound);
+        peers.book().connected(id(1));
+        peers.book().observe(id(1), 12);
+        assert!(!peers.confirm_tip(10), "a peer is ahead");
+        assert!(peers.confirm_tip(12));
+        peers.book().disconnected(id(1));
+        peers.book().observe(id(1), 99);
+        assert!(!peers.confirm_tip(12), "nobody in session");
     }
 
     #[test]

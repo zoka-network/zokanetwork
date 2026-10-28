@@ -497,6 +497,10 @@ pub fn template(
     block.header.state_root = state_root(&record.state)?;
     block.header.merkle_root = block.compute_merkle_root();
     block.header.hash = block.compute_hash();
+    // No node follows a branch that contradicts an accepted checkpoint, so
+    // there is no template for one: miners pause until the node reorganizes.
+    crate::state::chain::validate_candidate_checkpoints(storage, profile.chain_id, &block)
+        .map_err(|e| format!("mining paused: {e}"))?;
     Ok(block)
 }
 

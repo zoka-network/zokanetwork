@@ -315,6 +315,17 @@ fn candidate_ancestor_hash_at_height(
     }
 }
 
+/// Whether `candidate`'s branch holds every active checkpoint at or below its
+/// height: the compiled ones and the latest signed. `candidate` itself need
+/// not be stored (a mining template), only its ancestors.
+pub fn validate_candidate_checkpoints(
+    storage: &RocksDbStorage,
+    chain_id: &str,
+    candidate: &Block,
+) -> Result<(), ChainError> {
+    validate_candidate_mainnet_checkpoints(storage, chain_id, candidate)
+}
+
 fn validate_candidate_mainnet_checkpoints(
     storage: &RocksDbStorage,
     chain_id: &str,

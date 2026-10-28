@@ -32,6 +32,7 @@ use super::stark::{
 };
 use super::stark_peers::{PeerBook, Peers};
 use crate::{
+    checkpoint_authority::{self, Acceptance, AuthorityKeys, SignedCheckpoint},
     mining::pow,
     state::chain::{apply_block, ChainError},
     storage::RocksDbStorage,
@@ -43,6 +44,8 @@ pub const DB_MARKER: &str = "quantic:stark:chain-id";
 pub const MAX_BLOCK_REQUEST_BYTES: usize =
     2 * stark::protocol::ledger::MAX_BLOCK_BYTES + 1024 * 1024;
 pub const MAX_CRYPTO_WORKERS: usize = 2;
+/// A hybrid checkpoint is about 7 KB of JSON (the ML-DSA half is 6,618 hex).
+pub const MAX_CHECKPOINT_BYTES: usize = 16 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
@@ -55,6 +58,9 @@ pub struct NodeState {
     pub work: Arc<Semaphore>,
     /// Peer table and session counts; its lock is independent of `gate`.
     pub peers: Arc<Peers>,
+    /// Keys that sign this chain's checkpoints: the compiled ones, or the
+    /// environment's on a local test network. None: only work decides.
+    pub authority: Option<AuthorityKeys>,
 }
 
 impl NodeState {
@@ -77,7 +83,39 @@ impl NodeState {
             gate: Arc::new(Mutex::new(())),
             work: Arc::new(Semaphore::new(MAX_CRYPTO_WORKERS)),
             peers,
+            authority: checkpoint_authority::authority_keys_for_chain(profile.chain_id),
         })
+    }
+
+    /// Verify a checkpoint against this chain's authority and keep it if it is
+    /// the newest. `state::chain` then enforces it. Hold `gate`.
+    pub fn accept_checkpoint(&self, checkpoint: &SignedCheckpoint) -> Result<Acceptance, String> {
+        let keys = self
+            .authority
+            .as_ref()
+            .ok_or_else(|| format!("{} has no checkpoint authority", self.profile.chain_id))?;
+        checkpoint_authority::accept_signed_checkpoint(
+            &self.storage,
+            self.profile.chain_id,
+            checkpoint,
+            keys,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    /// The latest accepted checkpoint. Hold `gate`.
+    pub fn latest_checkpoint(&self) -> Result<Option<SignedCheckpoint>, String> {
+        checkpoint_authority::latest_signed_checkpoint(&self.storage).map_err(|e| e.to_string())
+    }
+
+    /// Whether the canonical chain holds `checkpoint` (false while it is
+    /// above the tip or on another branch). Hold `gate`.
+    pub fn follows(&self, checkpoint: &SignedCheckpoint) -> Result<bool, String> {
+        Ok(self
+            .storage
+            .get_canonical_block_hash_at_height(checkpoint.height)
+            .map_err(|e| e.to_string())?
+            .is_some_and(|hash| hash == checkpoint.block_hash))
     }
 
     /// The canonical tip (the genesis parent of an empty chain). Hold `gate`.
@@ -173,6 +211,7 @@ async fn admit(State(state): State<NodeState>, mut request: Request, next: Next)
     let limit = match request.uri().path() {
         "/transactions" => MAX_TRANSACTION_BYTES,
         "/blocks" => MAX_BLOCK_REQUEST_BYTES,
+        "/checkpoint" => MAX_CHECKPOINT_BYTES,
         _ => 0,
     };
     if request
@@ -276,6 +315,12 @@ pub fn router(state: NodeState) -> Router {
             "/blocks",
             post(submit_block).layer(DefaultBodyLimit::max(MAX_BLOCK_REQUEST_BYTES)),
         )
+        .route(
+            "/checkpoint",
+            get(latest_checkpoint)
+                .post(submit_checkpoint)
+                .layer(DefaultBodyLimit::max(MAX_CHECKPOINT_BYTES)),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), admit))
         .with_state(state)
 }
@@ -302,12 +347,18 @@ async fn status(
         let branch = stark::branch(&state.storage, state.profile, &tip).map_err(ApiError::internal)?;
         let ledger = branch.state();
         let count = state.mempool.lock().map_err(|_| ApiError::internal("mempool poisoned"))?.len();
+        let checkpoint = match state.latest_checkpoint().map_err(ApiError::internal)? {
+            Some(cp) => serde_json::json!({"height":cp.height,"block_hash":cp.block_hash,
+                "followed":state.follows(&cp).map_err(ApiError::internal)?}),
+            None => serde_json::Value::Null,
+        };
         json_response(StatusCode::OK, &serde_json::json!({
             "chain_id":state.profile.chain_id,"pool_version":2,"height":ledger.height,"hash":tip.header.hash,
             "issued_atoms":ledger.issued,"notes":ledger.notes,"mempool_transactions":count,
             "pow_algorithm":state.profile.pow_algorithm(),"xmrig_compatible":state.profile.xmrig_compatible(),
             "max_transaction_bytes":MAX_TRANSACTION_BYTES,"max_block_request_bytes":MAX_BLOCK_REQUEST_BYTES,
             "stratum":super::stratum::status(),"peers":state.peers.status(),
+            "checkpoint":checkpoint,"checkpoint_authority":state.authority.is_some(),
         }))
     }).await
 }
@@ -470,6 +521,40 @@ async fn submit_block(
         json_response(status, &serde_json::json!({"accepted":true,"hash":block.header.hash,"height":block.header.block_height,
             "canonical":canonical,"already_known":known,"tip_hash":tip.header.hash,"tip_height":tip.header.block_height}))
     }).await
+}
+
+async fn latest_checkpoint(
+    State(state): State<NodeState>,
+    Extension(permit): Extension<WorkPermit>,
+) -> ApiResult<Response> {
+    blocking(permit, move || {
+        let _gate = state.gate.lock().map_err(|_| ApiError::internal("node gate poisoned"))?;
+        json_response(StatusCode::OK, &state.latest_checkpoint().map_err(ApiError::internal)?)
+    })
+    .await
+}
+
+/// Verified like one from a peer: this is how a checkpoint signed by hand
+/// (`quantic-pq-node checkpoint-sign`) enters the network.
+async fn submit_checkpoint(
+    State(state): State<NodeState>,
+    Extension(permit): Extension<WorkPermit>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Response> {
+    content_type(&headers, "application/json")?;
+    blocking(permit, move || {
+        let checkpoint: SignedCheckpoint = serde_json::from_slice(&body)
+            .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+        let _gate = state.gate.lock().map_err(|_| ApiError::internal("node gate poisoned"))?;
+        let accepted = state.accept_checkpoint(&checkpoint).map_err(ApiError::invalid)?;
+        json_response(StatusCode::OK, &serde_json::json!({
+            "accepted":true,"already_known":accepted == Acceptance::AlreadyKnown,
+            "height":checkpoint.height,"block_hash":checkpoint.block_hash,
+            "followed":state.follows(&checkpoint).map_err(ApiError::internal)?,
+        }))
+    })
+    .await
 }
 
 #[cfg(test)]

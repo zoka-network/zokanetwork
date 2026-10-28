@@ -7,6 +7,11 @@
 //! connection's authenticated remote id) and answers `PEERS` with endpoints it
 //! has itself dialed and authenticated. Neither makes a learned peer trusted:
 //! blocks are validated locally whoever serves them.
+//!
+//! `HEAD` carries the height of the node's latest accepted checkpoint, so a
+//! session fetches (`CHECKPOINT`) or offers (`SUBMIT_CHECKPOINT`) only when
+//! the two sides differ. Each node verifies a checkpoint against its chain's
+//! compiled authority before keeping it.
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -26,9 +31,14 @@ use zoka_pq::{
 
 use super::{
     stark::{self, Profile},
-    stark_api::NodeState,
+    stark_api::{NodeState, MAX_CHECKPOINT_BYTES},
 };
-use crate::{network::pq_tls::RequiredPostQuantumTls, state::chain::apply_block, types::Block};
+use crate::{
+    checkpoint_authority::{Acceptance, SignedCheckpoint},
+    network::pq_tls::RequiredPostQuantumTls,
+    state::chain::apply_block,
+    types::Block,
+};
 use stark::protocol::transaction::{Transaction, MAX_TRANSACTION_BYTES};
 
 pub const ALPN: &[u8] = b"/zoka/quantic-stark/2";
@@ -49,6 +59,8 @@ const SUBMIT_TX: u8 = 4;
 const GET_HASH: u8 = 5;
 const PEERS: u8 = 6;
 const ANNOUNCE: u8 = 7;
+const CHECKPOINT: u8 = 8;
+const SUBMIT_CHECKPOINT: u8 = 9;
 const MAX_ERROR_BYTES: usize = 2048;
 const MAX_ANNOUNCE_BYTES: usize = 4096;
 /// Endpoints answered per `PEERS` request.
@@ -278,11 +290,12 @@ async fn authenticate_server(
 
 fn request_limit(tag: u8) -> Result<usize, String> {
     match tag {
-        HEAD | PEERS => Ok(0),
+        HEAD | PEERS | CHECKPOINT => Ok(0),
         GET_BLOCK | GET_HASH => Ok(8),
         SUBMIT_BLOCK => Ok(MAX_BLOCK_WIRE_BYTES),
         SUBMIT_TX => Ok(MAX_TRANSACTION_BYTES),
         ANNOUNCE => Ok(MAX_ANNOUNCE_BYTES),
+        SUBMIT_CHECKPOINT => Ok(MAX_CHECKPOINT_BYTES),
         _ => Err("unknown STARK request".into()),
     }
 }
@@ -415,6 +428,9 @@ pub struct Head {
     pub chain_id: String,
     pub height: u64,
     pub hash: String,
+    /// Height of the latest accepted checkpoint.
+    #[serde(default)]
+    pub checkpoint: Option<u64>,
 }
 
 fn tip(state: &NodeState) -> Result<Block, String> {
@@ -428,12 +444,14 @@ fn tip(state: &NodeState) -> Result<Block, String> {
         .map_err(err)?
         .ok_or_else(|| "missing STARK tip".into())
 }
-fn head(state: &NodeState) -> Result<Head, String> {
+/// Caller holds the gate.
+pub(crate) fn head(state: &NodeState) -> Result<Head, String> {
     let block = tip(state)?;
     Ok(Head {
         chain_id: state.profile.chain_id.into(),
         height: block.header.block_height,
         hash: block.header.hash,
+        checkpoint: state.latest_checkpoint()?.map(|cp| cp.height),
     })
 }
 
@@ -481,6 +499,14 @@ fn handle_request(state: &NodeState, tag: u8, body: &[u8]) -> Result<Vec<u8>, St
             let block: Block = serde_json::from_slice(body).map_err(err)?;
             import_block_locked(state, &block)?;
             serde_json::to_vec(&head(state)?).map_err(err)
+        }
+        CHECKPOINT => serde_json::to_vec(&state.latest_checkpoint()?).map_err(err),
+        SUBMIT_CHECKPOINT => {
+            let checkpoint: SignedCheckpoint = serde_json::from_slice(body).map_err(err)?;
+            Ok(match state.accept_checkpoint(&checkpoint)? {
+                Acceptance::Accepted => b"accepted".to_vec(),
+                Acceptance::AlreadyKnown => b"known".to_vec(),
+            })
         }
         _ => Err("unknown STARK request".into()),
     }
@@ -616,6 +642,26 @@ impl Client {
         if self.owned {
             self.endpoint.close().await;
         }
+    }
+
+    pub fn remote_id(&self) -> EndpointId {
+        self.connection.remote_id()
+    }
+
+    /// The peer's latest accepted checkpoint. Not verified here: callers keep
+    /// it only through `NodeState::accept_checkpoint`.
+    pub async fn checkpoint(&mut self) -> Result<Option<SignedCheckpoint>, String> {
+        let bytes = self.request(CHECKPOINT, &[], MAX_CHECKPOINT_BYTES).await?;
+        let checkpoint: Option<SignedCheckpoint> = serde_json::from_slice(&bytes).map_err(err)?;
+        if checkpoint.as_ref().is_some_and(|cp| cp.chain_id != self.chain_id) {
+            return Err("STARK checkpoint for another chain".into());
+        }
+        Ok(checkpoint)
+    }
+
+    pub async fn submit_checkpoint(&mut self, checkpoint: &SignedCheckpoint) -> Result<(), String> {
+        let bytes = serde_json::to_vec(checkpoint).map_err(err)?;
+        self.request(SUBMIT_CHECKPOINT, &bytes, 16).await.map(drop)
     }
 
     /// Endpoints the peer has authenticated itself. Unverified here: callers
@@ -838,6 +884,7 @@ fn decode_head(bytes: &[u8], chain_id: &str) -> Result<Head, String> {
         || head.height > u32::MAX as u64
         || head.hash.len() != 64
         || hex::decode(&head.hash).is_err()
+        || head.checkpoint.is_some_and(|h| h == 0 || h > u32::MAX as u64)
     {
         return Err("STARK head network/height/hash".into());
     }
@@ -1152,5 +1199,75 @@ mod tests {
         client.close().await;
         node.close().await;
         seed.close().await;
+    }
+
+    fn authority() -> (
+        crate::hybrid_signature::HybridSigningKey,
+        crate::checkpoint_authority::AuthorityKeys,
+    ) {
+        let key = crate::hybrid_signature::HybridSigningKey::from_parts(
+            ed25519_dalek::SigningKey::from_bytes(&[76; 32]),
+            &[77; 32],
+        )
+        .unwrap();
+        let public = key.verifying_key();
+        let keys = crate::checkpoint_authority::AuthorityKeys {
+            ed25519: *public.ed25519(),
+            mldsa: Some(public.mldsa().clone()),
+        };
+        (key, keys)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkpoints_travel_only_with_the_authority_signature() {
+        let (key, keys) = authority();
+        let (mut chain, _dir) = state();
+        chain.authority = Some(keys);
+        let genesis = mine_on(&chain, Profile::REGTEST.genesis_parent(), vec![], 1_700_000_000).await;
+        let server = serve(
+            chain.clone(),
+            ServerIdentity::from_seed(&[78; 32]).unwrap(),
+            presets::Minimal,
+        )
+        .await
+        .unwrap();
+        let mut client = Client::connect(&localhost(&server), presets::Minimal)
+            .await
+            .unwrap();
+        assert_eq!(client.head().await.unwrap().checkpoint, None);
+        assert_eq!(client.checkpoint().await.unwrap(), None);
+
+        let checkpoint = SignedCheckpoint::sign_hybrid(&key, CHAIN, 1, &genesis.header.hash);
+        let mut forged = checkpoint.clone();
+        forged.block_hash = "00".repeat(32);
+        let refused = client.submit_checkpoint(&forged).await.unwrap_err();
+        assert!(refused.contains("signature"), "{refused}");
+        client.submit_checkpoint(&checkpoint).await.unwrap();
+        client.submit_checkpoint(&checkpoint).await.unwrap();
+        assert_eq!(client.head().await.unwrap().checkpoint, Some(1));
+        assert_eq!(client.checkpoint().await.unwrap(), Some(checkpoint));
+        let conflict = SignedCheckpoint::sign_hybrid(&key, CHAIN, 1, &"cd".repeat(32));
+        let refused = client.submit_checkpoint(&conflict).await.unwrap_err();
+        assert!(refused.contains("conflicting"), "{refused}");
+        client.close().await;
+        server.close().await;
+
+        // A node that does not know the chain's authority keeps nothing.
+        let (keyless, _keyless_dir) = state();
+        let server = serve(
+            keyless,
+            ServerIdentity::from_seed(&[79; 32]).unwrap(),
+            presets::Minimal,
+        )
+        .await
+        .unwrap();
+        let mut client = Client::connect(&localhost(&server), presets::Minimal)
+            .await
+            .unwrap();
+        let conflict = SignedCheckpoint::sign_hybrid(&key, CHAIN, 1, &genesis.header.hash);
+        let refused = client.submit_checkpoint(&conflict).await.unwrap_err();
+        assert!(refused.contains("no checkpoint authority"), "{refused}");
+        client.close().await;
+        server.close().await;
     }
 }
