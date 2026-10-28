@@ -111,12 +111,15 @@ struct HashJob {
 struct NoteLayout {
     owner: usize,
     rho: usize,
+    rcm: usize,
     bits: usize,
+    hide: usize,
     commitment: usize,
 }
 struct InputLayout {
     note: NoteLayout,
     key: usize,
+    nullifier: usize,
     index: usize,
     siblings: usize,
 }
@@ -153,22 +156,37 @@ impl Program {
             result,
         });
     }
+    /// Registers of a note and its two jobs, `hide = H(owner ‖ rcm)` and
+    /// `cm = H(rho ‖ value ‖ hide)` (see `model::Note`).
     fn note(&mut self) -> NoteLayout {
         let note = NoteLayout {
             owner: self.alloc(WORDS),
             rho: self.alloc(WORDS),
+            rcm: self.alloc(WORDS),
             bits: self.bit_registers(64),
+            hide: self.alloc(WORDS),
             commitment: self.alloc(WORDS),
         };
-        let mut fields = (note.owner..note.owner + WORDS)
-            .chain(note.rho..note.rho + WORDS)
+        self.hash(
+            crypto::HIDE,
+            (note.owner..note.owner + WORDS)
+                .chain(note.rcm..note.rcm + WORDS)
+                .map(Source::Register)
+                .collect(),
+            note.hide,
+        );
+        let mut fields = (note.rho..note.rho + WORDS)
             .map(Source::Register)
             .collect::<Vec<_>>();
         fields.extend((0..4).map(|i| Source::Limb(note.bits + i * 16)));
+        fields.extend((note.hide..note.hide + WORDS).map(Source::Register));
         self.hash(crypto::NOTE, fields, note.commitment);
         note
     }
+    /// `n >= 1`: output `rho`s come from the first nullifier. A coinbase has
+    /// no inputs and no proof (`transaction::Transaction::verify`).
     fn new(n: usize, m: usize) -> Self {
+        assert!(n >= 1, "a proven transfer spends at least one note");
         let mut p = Self {
             registers: 0,
             inputs: vec![],
@@ -184,13 +202,13 @@ impl Program {
             let key = p.alloc(WORDS);
             let note = p.note();
             // Reorder owner derivation before its note commitment.
-            let note_job = p.jobs.pop().unwrap();
+            let note_jobs = p.jobs.split_off(p.jobs.len() - 2);
             p.hash(
                 crypto::OWNER,
                 (key..key + WORDS).map(Source::Register).collect(),
                 note.owner,
             );
-            p.jobs.push(note_job);
+            p.jobs.extend(note_jobs);
             let nullifier = p.alloc(WORDS);
             p.hash(
                 crypto::NULLIFIER,
@@ -226,12 +244,23 @@ impl Program {
             p.inputs.push(InputLayout {
                 note,
                 key,
+                nullifier,
                 index,
                 siblings,
             });
         }
+        let first = p.inputs[0].nullifier;
         for i in 0..m {
             let note = p.note();
+            // The output's rho is H(first nullifier ‖ i), never the sender's
+            // choice: no two notes on a chain can share a nullifier.
+            let note_jobs = p.jobs.split_off(p.jobs.len() - 2);
+            let mut fields = (first..first + WORDS)
+                .map(Source::Register)
+                .collect::<Vec<_>>();
+            fields.push(Source::Constant(i as u32));
+            p.hash(crypto::RHO, fields, note.rho);
+            p.jobs.extend(note_jobs);
             p.bindings
                 .extend((0..WORDS).map(|j| (note.commitment + j, 26 + (n + i) * WORDS + j)));
             p.outputs.push(note);
@@ -259,6 +288,7 @@ impl Program {
         fn note(r: &mut [F], layout: &NoteLayout, n: &Note) -> Result<(), Error> {
             r[layout.owner..layout.owner + WORDS].copy_from_slice(&n.owner.fields()?);
             r[layout.rho..layout.rho + WORDS].copy_from_slice(&n.rho.fields()?);
+            r[layout.rcm..layout.rcm + WORDS].copy_from_slice(&n.rcm.fields()?);
             bits(r, layout.bits, n.value, 64);
             Ok(())
         }
@@ -279,7 +309,10 @@ impl Program {
                     .copy_from_slice(&sibling.fields()?);
             }
         }
-        for (layout, n) in self.outputs.iter().zip(&w.outputs) {
+        for (i, (layout, n)) in self.outputs.iter().zip(&w.outputs).enumerate() {
+            if n.rho != crate::model::transfer_rho(s.network, s.nullifiers[0], i)? {
+                return Err(Error::Witness("output rho"));
+            }
             note(&mut registers, layout, n)?;
         }
         let incoming: u128 = w
@@ -535,6 +568,9 @@ pub struct ProofEnvelope {
 
 pub fn prove_transfer(statement: &Statement, witness: &Witness) -> Result<ProofEnvelope, Error> {
     let public = statement.public_values()?;
+    if statement.nullifiers.is_empty() {
+        return Err(Error::Shape);
+    }
     let air = TransferAir::new(statement.nullifiers.len(), statement.commitments.len());
     let trace = air.program.trace(statement, witness)?;
     let proof =
@@ -553,6 +589,9 @@ pub fn verify_transfer(statement: &Statement, envelope: &ProofEnvelope) -> Resul
     let public = statement.public_values()?;
     if envelope.version != 2 || envelope.proof.len() > MAX_PROOF_BYTES {
         return Err(Error::Encoding);
+    }
+    if statement.nullifiers.is_empty() {
+        return Err(Error::Shape);
     }
     let air = TransferAir::new(statement.nullifiers.len(), statement.commitments.len());
     let (proof, rest): (Proof<Config>, &[u8]) =
@@ -581,8 +620,11 @@ mod tests {
         let note = Note {
             owner: key.owner(network),
             rho: Digest([12; WORDS]),
+            rcm: Digest([13; WORDS]),
             value: 1000,
         };
+        let first = note.nullifier(&key, network).unwrap();
+        let rho = |i| crate::model::transfer_rho(network, first, i).unwrap();
         let path = MerklePath {
             index: 17,
             siblings: std::array::from_fn(|i| Digest([i as u32 + 100; WORDS])),
@@ -593,12 +635,14 @@ mod tests {
         let outputs = vec![
             Note {
                 owner: other.owner(network),
-                rho: Digest([21; WORDS]),
+                rho: rho(0),
+                rcm: Digest([21; WORDS]),
                 value: 600,
             },
             Note {
                 owner: key.owner(network),
-                rho: Digest([22; WORDS]),
+                rho: rho(1),
+                rcm: Digest([22; WORDS]),
                 value: 395,
             },
         ];
@@ -660,6 +704,15 @@ mod tests {
         let (s, mut w) = fixture();
         w.inputs[0].path.siblings[0].0[0] += 1;
         assert!(prove_transfer(&s, &w).is_err());
+        // A sender cannot pick an output rho (Faerie Gold): a reused one,
+        // even with every public commitment recomputed, is refused.
+        let (_, mut w) = fixture();
+        w.outputs[1].rho = w.outputs[0].rho;
+        let s = Statement::from_witness(3, s.anchor, 5, 0, [7; 32], &w).unwrap();
+        assert!(matches!(
+            prove_transfer(&s, &w),
+            Err(Error::Witness("output rho"))
+        ));
     }
 
     #[test]
@@ -674,9 +727,12 @@ mod tests {
         for register in [
             air.program.inputs[0].key,
             air.program.inputs[0].note.bits,
+            air.program.inputs[0].note.rcm,
             air.program.inputs[0].index,
             air.program.inputs[0].siblings,
             air.program.outputs[0].bits,
+            air.program.outputs[0].rho,
+            air.program.outputs[0].rcm,
             air.program.carries,
         ] {
             let mut trace = original.clone();
@@ -720,12 +776,39 @@ mod tests {
     }
 
     #[test]
+    fn air_rejects_a_chosen_output_rho_after_recomputing_every_hash() {
+        let (s, w) = fixture();
+        let air = TransferAir::new(1, 2);
+        let public = s.public_values().unwrap();
+        let trace = air.program.trace(&s, &w).unwrap();
+        // Overwrite the second output's rho with the first one's and redo
+        // all permutations: the RHO job's result no longer matches.
+        let mut registers = trace.values[HASH_COLS..trace.width].to_vec();
+        let (from, to) = (air.program.outputs[0].rho, air.program.outputs[1].rho);
+        for i in 0..WORDS {
+            registers[to + i] = registers[from + i];
+        }
+        let (mut forged, registers) = air.program.hash_trace(registers, &public);
+        // hash_trace writes the true rho back; force the chosen one again.
+        for row in forged.values.chunks_exact_mut(forged.width) {
+            for i in 0..WORDS {
+                row[HASH_COLS + to + i] = registers[from + i];
+            }
+        }
+        let mut forged_public = public.clone();
+        for &(r, p) in &air.program.bindings {
+            forged_public[p] = registers[r];
+        }
+        assert!(!p3_air::check_all_constraints(&air, &forged, &forged_public, Some(8)).is_ok());
+    }
+
+    #[test]
     fn parameter_soundness_estimates_cover_every_supported_shape() {
         use p3_field::coset::TwoAdicMultiplicativeCoset;
         use p3_uni_stark::{AirLayout, OpeningShape, ProvenSecurity, StarkSecurityParams};
         // This is the upstream classical algebraic estimator with an explicit
         // 128-bit collision-resistance assumption. It is not a PQ/ZK audit.
-        for n in 0..=MAX_INPUTS {
+        for n in 1..=MAX_INPUTS {
             for m in 1..=MAX_OUTPUTS {
                 let air = TransferAir::new(n, m);
                 let fri = FriParameters::<()> {
@@ -775,9 +858,11 @@ mod tests {
             .map(|i| Note {
                 owner: key.owner(3),
                 rho: Digest([100 + i as u32; WORDS]),
+                rcm: Digest([150 + i as u32; WORDS]),
                 value: u64::MAX - i as u64 * 1000,
             })
             .collect();
+        let first = notes[0].nullifier(&key, 3).unwrap();
         for note in &notes {
             tree.append(note.commitment(3).unwrap()).unwrap();
         }
@@ -795,7 +880,8 @@ mod tests {
             .enumerate()
             .map(|(i, note)| Note {
                 owner: note.owner,
-                rho: Digest([200 + i as u32; WORDS]),
+                rho: crate::model::transfer_rho(3, first, i).unwrap(),
+                rcm: Digest([200 + i as u32; WORDS]),
                 value: note.value - if i == 0 { 255 } else { 0 },
             })
             .collect();

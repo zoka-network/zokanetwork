@@ -17,6 +17,12 @@ pub const OWNER: u32 = 1;
 pub const NOTE: u32 = 2;
 pub const NULLIFIER: u32 = 3;
 pub const TREE: u32 = 4;
+/// `H(owner ‖ rcm)`: hides the owner inside a note commitment.
+pub const HIDE: u32 = 5;
+/// The `rho` of a transfer output, from the transaction's first nullifier.
+pub const RHO: u32 = 6;
+/// The `rho` of a coinbase output, from its block height.
+pub const COINBASE_RHO: u32 = 7;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Digest(pub [u32; WORDS]);

@@ -678,8 +678,8 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_notes_do_not_inflate_the_wallet_balance() {
-        use protocol::model::{Statement, Witness};
+    fn a_payment_cannot_repeat_a_note_or_its_nullifier() {
+        use protocol::model::{transfer_rho, Statement, Witness};
         use protocol::wallet::encrypt_note;
         let dir = tempfile::tempdir().unwrap();
         let chain = Chain::open(dir.path()).unwrap();
@@ -692,14 +692,19 @@ mod tests {
         let bob = chain.open_account("bob", "bob password").unwrap();
         let position = chain.position(&alice).unwrap();
         let source = &position.spendable[0];
+        let first = source.note.nullifier(&alice.spend, NETWORK).unwrap();
+        let rho = |i| transfer_rho(NETWORK, first, i).unwrap();
         let fee = conventional_fee(1, 3);
-        let (note, envelope) =
-            encrypt_note(&bob.address(), ATOMS, &[0; 512], Some(&alice)).unwrap();
-        let (change, change_envelope) = encrypt_note(
+        // The same note twice: same rho, so same nullifier for Bob (the
+        // "Faerie Gold" attack). Output rhos are bound to their index, so the
+        // second copy cannot be proven.
+        let (note, _) = encrypt_note(&bob.address(), ATOMS, &[0; 512], Some(&alice), rho(0)).unwrap();
+        let (change, _) = encrypt_note(
             &alice.address(),
             PREMINE - 2 * ATOMS - fee,
             &[0; 512],
             Some(&alice),
+            rho(2),
         )
         .unwrap();
         let witness = Witness {
@@ -719,22 +724,6 @@ mod tests {
             &witness,
         )
         .unwrap();
-        let mut tx = Transaction {
-            statement,
-            height: 40,
-            envelopes: vec![envelope.clone(), envelope, change_envelope],
-            proof: protocol::ProofEnvelope {
-                version: 2,
-                proof: vec![],
-            },
-        };
-        tx.statement.binding = tx.effects_digest().unwrap();
-        tx.proof = protocol::prove_transfer(&tx.statement, &witness).unwrap();
-        chain
-            .mine_block(&alice.address(), vec![tx], &position, 1_700_000_120)
-            .unwrap();
-        let balance = chain.balance("bob", "bob password").unwrap();
-        assert_eq!(balance.spendable_atoms, ATOMS);
-        assert_eq!(balance.spendable_notes, 1);
+        assert!(protocol::prove_transfer(&statement, &witness).is_err());
     }
 }

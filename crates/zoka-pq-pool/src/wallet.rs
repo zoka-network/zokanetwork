@@ -11,7 +11,8 @@ use zeroize::Zeroizing;
 use zoka_pq::{XWingCiphertext, XWingPublicKey, XWingSecretKey, X_WING_CIPHERTEXT_BYTES};
 
 pub const MEMO_BYTES: usize = 512;
-const PLAINTEXT_BYTES: usize = 1 + 64 + 64 + 8 + MEMO_BYTES;
+/// Version byte, owner, rho, rcm, value and memo.
+const PLAINTEXT_BYTES: usize = 1 + 64 + 64 + 64 + 8 + MEMO_BYTES;
 pub const SEALED_NOTE_BYTES: usize = PLAINTEXT_BYTES + 16;
 
 pub(crate) fn digest(domain: &[u8; 16], parts: &[&[u8]]) -> [u8; 32] {
@@ -213,8 +214,8 @@ fn associated(network: u8, commitment: Digest, kem: &[u8]) -> Vec<u8> {
     aad
 }
 fn plaintext(note: &Note, memo: &[u8; MEMO_BYTES]) -> Zeroizing<Vec<u8>> {
-    let mut bytes = Zeroizing::new(vec![2]);
-    for word in note.owner.0.into_iter().chain(note.rho.0) {
+    let mut bytes = Zeroizing::new(vec![3]);
+    for word in note.owner.0.into_iter().chain(note.rho.0).chain(note.rcm.0) {
         bytes.extend(word.to_le_bytes());
     }
     bytes.extend(note.value.to_le_bytes());
@@ -222,7 +223,7 @@ fn plaintext(note: &Note, memo: &[u8; MEMO_BYTES]) -> Zeroizing<Vec<u8>> {
     bytes
 }
 fn decode_plaintext(bytes: &[u8]) -> Result<(Note, [u8; MEMO_BYTES]), Error> {
-    if bytes.len() != PLAINTEXT_BYTES || bytes[0] != 2 {
+    if bytes.len() != PLAINTEXT_BYTES || bytes[0] != 3 {
         return Err(Error::Encryption);
     }
     let read = |start| {
@@ -233,9 +234,10 @@ fn decode_plaintext(bytes: &[u8]) -> Result<(Note, [u8; MEMO_BYTES]), Error> {
     let note = Note {
         owner: read(1),
         rho: read(65),
-        value: u64::from_le_bytes(bytes[129..137].try_into().unwrap()),
+        rcm: read(129),
+        value: u64::from_le_bytes(bytes[193..201].try_into().unwrap()),
     };
-    Ok((note, bytes[137..].try_into().unwrap()))
+    Ok((note, bytes[201..].try_into().unwrap()))
 }
 fn seal(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], plain: &[u8]) -> Result<Vec<u8>, Error> {
     let mut body = plain.to_vec();
@@ -266,25 +268,30 @@ fn open(
     Ok(body)
 }
 
+/// `rho` comes from the transaction (`model::transfer_rho`/`coinbase_rho`);
+/// the hiding randomness `rcm` is fresh.
 pub fn encrypt_note(
     to: &Address,
     value: u64,
     memo: &[u8; MEMO_BYTES],
     sender: Option<&Account>,
+    rho: Digest,
 ) -> Result<(Note, Envelope), Error> {
     use p3_field::PrimeField32;
     to.validate()?;
     if sender.is_some_and(|s| s.network != to.network) {
         return Err(Error::Network);
     }
+    let _ = rho.fields()?;
     let entropy = fresh::<64>()?;
-    let rho = Digest(std::array::from_fn(|i| {
+    let rcm = Digest(std::array::from_fn(|i| {
         u32::from_le_bytes(entropy[i * 4..i * 4 + 4].try_into().unwrap())
             % crate::crypto::F::ORDER_U32
     }));
     let note = Note {
         owner: to.owner,
         rho,
+        rcm,
         value,
     };
     let commitment = note.commitment(to.network)?;
@@ -329,7 +336,10 @@ mod tests {
         );
         assert!(Address::decode(&address.encode().unwrap(), 2).is_err());
         assert!(address.short().unwrap().len() < 65);
-        let (note, envelope) = encrypt_note(&address, 456, &[9; MEMO_BYTES], Some(&alice)).unwrap();
+        let rho = Digest([5; crate::crypto::WORDS]);
+        let (note, envelope) =
+            encrypt_note(&address, 456, &[9; MEMO_BYTES], Some(&alice), rho).unwrap();
+        assert_eq!(note.rho, rho);
         let cm = note.commitment(3).unwrap();
         assert_eq!(bob.receive(cm, &envelope).unwrap().0.value, 456);
         assert_eq!(

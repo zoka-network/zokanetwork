@@ -45,24 +45,56 @@ impl std::fmt::Debug for SpendKey {
     }
 }
 
+/// `rho` is unique on a chain and never chosen by the sender: a transfer
+/// output's comes from the transaction's first nullifier ([`transfer_rho`],
+/// enforced by the AIR) and a coinbase output's from its height
+/// ([`coinbase_rho`], enforced by the ledger). Two notes can therefore never
+/// share a nullifier. Being derivable, `rho` hides nothing: `rcm` does.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Note {
     pub owner: Digest,
     pub rho: Digest,
+    pub rcm: Digest,
     pub value: u64,
 }
 impl Note {
-    pub fn commitment(&self, network: u8) -> Result<Digest, Error> {
+    /// The hidden owner, `H(owner ‖ rcm)`. A coinbase publishes it with the
+    /// value so that no proof is needed to check its commitment.
+    pub fn hide(&self, network: u8) -> Result<Digest, Error> {
         let mut fields = self.owner.fields()?.to_vec();
-        fields.extend(self.rho.fields()?);
-        fields.extend(crypto::value_fields(self.value));
-        Ok(crypto::hash(crypto::NOTE, network, &fields))
+        fields.extend(self.rcm.fields()?);
+        Ok(crypto::hash(crypto::HIDE, network, &fields))
+    }
+    pub fn commitment(&self, network: u8) -> Result<Digest, Error> {
+        commit(network, self.rho, self.value, self.hide(network)?)
     }
     pub fn nullifier(&self, key: &SpendKey, network: u8) -> Result<Digest, Error> {
         let mut fields = key.fields().to_vec();
         fields.extend(self.rho.fields()?);
         Ok(crypto::hash(crypto::NULLIFIER, network, &fields))
     }
+}
+
+/// `H(rho ‖ value ‖ hide)`, the note commitment the tree stores.
+pub fn commit(network: u8, rho: Digest, value: u64, hide: Digest) -> Result<Digest, Error> {
+    let mut fields = rho.fields()?.to_vec();
+    fields.extend(crypto::value_fields(value));
+    fields.extend(hide.fields()?);
+    Ok(crypto::hash(crypto::NOTE, network, &fields))
+}
+
+/// The `rho` of output `index` of a transfer whose first nullifier is `first`.
+pub fn transfer_rho(network: u8, first: Digest, index: usize) -> Result<Digest, Error> {
+    let mut fields = first.fields()?.to_vec();
+    fields.push(F::from_u32(index as u32));
+    Ok(crypto::hash(crypto::RHO, network, &fields))
+}
+
+/// The `rho` of output `index` of the coinbase of block `height`.
+pub fn coinbase_rho(network: u8, height: u32, index: usize) -> Digest {
+    let mut fields = crypto::value_fields(u64::from(height)).to_vec();
+    fields.push(F::from_u32(index as u32));
+    crypto::hash(crypto::COINBASE_RHO, network, &fields)
 }
 
 #[derive(Clone)]
