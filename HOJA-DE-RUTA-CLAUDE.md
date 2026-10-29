@@ -1,6 +1,6 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
-Actualizada: **29 de octubre de 2026**, Argentina (**testnet v2 lanzada**: bloque 1 fijado y la PC como seed1; nodo, minero CLI y ZSilent 4.0.0 armados y verificados, sin publicar).
+Actualizada: **29 de octubre de 2026**, Argentina (**testnet v2 lanzada**: bloque 1 fijado y la PC como seed1; nodo, minero CLI y ZSilent 4.0.0 publicados, web al día y la 4.0.0 instalada en la PC).
 Proyecto: `C:\Users\mderramus\ZOKA`.
 
 ## 29/10: lanzamiento de la testnet v2 (Claude, rama `quantic-v2-genesis`)
@@ -39,13 +39,26 @@ aquí». El procedimiento y el registro completo están en
     `third_party/tor/windows-x86_64-0.4.9.14`. Se verificó extrayéndolo: el
     binario y el manifiesto son los de la fuente;
   - minero CLI en `target/cli-miner/4.0.0`.
-- **Pusheado:** las ramas `quantic-v2-genesis` (nodo) y `quantic-v2`
-  (zsilent-core), a GitHub y GitLab.
-- **Falta, con el OK del usuario:**
-  - instalar el MSI en la PC: se cierra la app de desarrollo y la API vuelve a
-    9140; XMRig se reconecta solo;
-  - releases `zokanetwork` v4.0.0 (los dos paquetes CLI) y `zsilent-core`
-    v4.0.0, `main` y las etiquetas, la web y Discord.
+- **PUBLICADO el 29/10** (el usuario: «Sí, todo»):
+  - `main` y las etiquetas `v4.0.0` (anotadas) en GitHub y GitLab, por avance
+    rápido: nodo `v4.0.0` = `8e63f913` y zsilent-core `v4.0.0` = `7b8547f`;
+  - releases en GitHub: `zokanetwork` v4.0.0, con los dos paquetes CLI y
+    `SHA256SUMS.txt`, y `zsilent-core` v4.0.0, con `ZSilent-Core-4.0.0.msi`.
+    Bajados de vuelta, los hashes coinciden. El `SHA256SUMS.txt` del nodo salió
+    con una línea CRLF que `sha256sum -c` no leía; se subió corregido y el
+    armado quedó arreglado (`8ae8995b`). La 3.0.4 y la 3.0.5 quedaron marcadas
+    como reemplazadas;
+  - la web zoka.network (`zokaweb` `58f7600`), con Tech y Docs de la v2:
+    STARK, iroh sin Tor, XMRig por el Stratum, `zqtest2` y los puertos
+    9140/9180/3333. Se verificó en vivo. El `dist` anterior quedó en
+    `target/zokaweb-dist-0805a5c-en-vivo`;
+  - ZSilent 4.0.0 **instalada en la PC** (`msiexec /passive`, código 0, nodo
+    `dd259065…`). La app de desarrollo se cerró a las 13:05.
+- **Falta:**
+  - que el usuario entre a ZSilent 4.0: hasta entonces su nodo de pre-login
+    sirve la cadena pero sin Stratum, y XMRig espera;
+  - el aviso en Discord: no hay bot ni conector, lo pega el usuario;
+  - los papers (whitepaper y litepaper 2.4) todavía describen la v1.
 - **Después:** Android, RPC para pools y la revisión externa. Pendientes
   menores:
   - el Stratum cuenta también los bloques laterales;
