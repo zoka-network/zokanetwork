@@ -255,7 +255,7 @@ pub(crate) fn import_mined_locked(state: &NodeState, block: &Block) -> Result<bo
     Ok(current.header.hash == block.header.hash)
 }
 
-async fn mine_once(state: &NodeState, to: Address) -> Result<(Block, bool), String> {
+pub(crate) async fn mine_once(state: &NodeState, to: Address) -> Result<(Block, bool), String> {
     let permit = state.work.clone().acquire_owned().await.map_err(err)?;
     let state = state.clone();
     tokio::task::spawn_blocking(move || {
@@ -1226,6 +1226,49 @@ async fn sync(options: Options) -> Result<(), String> {
         .await
         .map_err(err)?;
     drop(drained);
+    result
+}
+
+/// Bring a wallet mirror up to `peer`, the wallet's own node, over a direct
+/// connection: checkpoint first, then at most `maximum` blocks. Returns the
+/// mirror's head and whether it reached the node's tip. Prints no progress.
+pub(crate) async fn follow(
+    state: &NodeState,
+    peer: &NodeDescriptor,
+    maximum: usize,
+) -> Result<(Head, bool), String> {
+    if peer.chain_id != state.profile.chain_id {
+        return Err("the node descriptor names another chain".into());
+    }
+    let mut client = Client::connect(peer, presets::Minimal).await?;
+    let result = async {
+        exchange_checkpoint(&mut client, state, false, &mut None).await?;
+        let mut total = 0;
+        while total < maximum {
+            let imported = client
+                .pull_limited(state, PEER_BATCH.min(maximum - total))
+                .await?;
+            if imported == 0 {
+                break;
+            }
+            total += imported;
+        }
+        let local = head(state).await?;
+        let reached = client.head().await?.hash == local.hash;
+        Ok::<_, String>((local, reached))
+    }
+    .await;
+    client.close().await;
+    // Verifications still running hold permits: the caller drops the mirror
+    // only after they end.
+    drop(
+        state
+            .work
+            .clone()
+            .acquire_many_owned(stark_api::MAX_CRYPTO_WORKERS as u32)
+            .await
+            .map_err(err)?,
+    );
     result
 }
 

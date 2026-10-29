@@ -18845,6 +18845,8 @@ async fn run() -> Result<(), String> {
         "quantic-pq" => zoka::quantic::stark_cli::run(tail),
         #[cfg(feature = "quantic-pq")]
         "quantic-pq-node" => zoka::quantic::stark_node::run(tail).await,
+        #[cfg(feature = "quantic-pq")]
+        "quantic-pq-wallet" => zoka::quantic::stark_wallet::run(tail).await,
         "version" | "--version" | "-V" => {
             println!("zoka {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -20185,7 +20187,7 @@ fn command_uses_invocation_directory(command: Option<&str>) -> bool {
     cfg!(feature = "quantic-pq")
         && matches!(
             command,
-            Some("quantic-pq" | "quantic-pq-node" | "pq-regtest")
+            Some("quantic-pq" | "quantic-pq-node" | "quantic-pq-wallet" | "pq-regtest")
         )
 }
 

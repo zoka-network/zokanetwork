@@ -3,7 +3,7 @@
 //! never opened as another one. No command selects a public wallet or chain
 //! directory by default.
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{BufRead, Read, Write},
     path::{Path, PathBuf},
@@ -27,23 +27,23 @@ use super::stark::{
 };
 use crate::{state::chain::apply_block, storage::RocksDbStorage, types::Block};
 
-const SCHEMA: &str = "zoka-quantic-stark-wallet-v2";
+pub(crate) const SCHEMA: &str = "zoka-quantic-stark-wallet-v2";
 const DB_MARKER: &str = "quantic:stark:chain-id";
-const MAX_WALLET_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_WALLET_BYTES: usize = 16 * 1024;
 const MAX_BLOCK_JSON_BYTES: usize = 2 * stark::protocol::ledger::MAX_BLOCK_BYTES + 128 * 1024;
 
-fn error(e: impl std::fmt::Display) -> String {
+pub(crate) fn error(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
-fn option<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+pub(crate) fn option<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.windows(2)
         .find(|pair| pair[0] == name)
         .map(|pair| pair[1].as_str())
 }
-fn flag(args: &[String], name: &str) -> bool {
+pub(crate) fn flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
-fn required<'a>(args: &'a [String], name: &str) -> Result<&'a str, String> {
+pub(crate) fn required<'a>(args: &'a [String], name: &str) -> Result<&'a str, String> {
     option(args, name)
         .filter(|v| !v.starts_with("--"))
         .ok_or_else(|| format!("missing {name}"))
@@ -72,7 +72,7 @@ fn integer(args: &[String], name: &str) -> Result<u64, String> {
         .map_err(|_| format!("{name} must be an unsigned integer"))
 }
 
-fn secret_line(label: &str) -> Result<Zeroizing<String>, String> {
+pub(crate) fn secret_line(label: &str) -> Result<Zeroizing<String>, String> {
     let mut line = Zeroizing::new(String::new());
     // Bound stdin before allocation; no interactive echo or secret logging here.
     std::io::stdin()
@@ -136,14 +136,14 @@ pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 #[derive(Serialize, Deserialize)]
-struct WalletFile {
-    schema: String,
-    chain_id: String,
-    address: String,
-    encrypted_seed_hex: String,
+pub(crate) struct WalletFile {
+    pub(crate) schema: String,
+    pub(crate) chain_id: String,
+    pub(crate) address: String,
+    pub(crate) encrypted_seed_hex: String,
 }
 
-fn read_wallet(path: &Path) -> Result<(WalletFile, Profile), String> {
+pub(crate) fn read_wallet(path: &Path) -> Result<(WalletFile, Profile), String> {
     let file: WalletFile =
         serde_json::from_slice(&read_bounded(path, MAX_WALLET_BYTES)?).map_err(error)?;
     let profile = Profile::for_chain(&file.chain_id)
@@ -153,7 +153,7 @@ fn read_wallet(path: &Path) -> Result<(WalletFile, Profile), String> {
     Ok((file, profile))
 }
 
-fn create_wallet(
+pub(crate) fn create_wallet(
     path: &Path,
     profile: Profile,
     seed: &[u8; 32],
@@ -172,7 +172,16 @@ fn create_wallet(
     Ok(address)
 }
 
-fn open_wallet(path: &Path, password: &str) -> Result<(Account, Profile), String> {
+pub(crate) fn open_wallet(path: &Path, password: &str) -> Result<(Account, Profile), String> {
+    let (account, profile, _) = open_wallet_seed(path, password)?;
+    Ok((account, profile))
+}
+
+/// Like [`open_wallet`], with the seed: the recovery phrase is its BIP-39 form.
+pub(crate) fn open_wallet_seed(
+    path: &Path,
+    password: &str,
+) -> Result<(Account, Profile, Zeroizing<[u8; 32]>), String> {
     let (file, profile) = read_wallet(path)?;
     let encrypted = hex::decode(&file.encrypted_seed_hex).map_err(error)?;
     // The shared decoder supports old XOR wallets. This new schema never does.
@@ -183,15 +192,16 @@ fn open_wallet(path: &Path, password: &str) -> Result<(Account, Profile), String
         crate::wallet::storage::decrypt_data(&encrypted, password)
             .map_err(|_| "incorrect password or corrupt wallet".to_string())?,
     );
-    let seed: &[u8; 32] = plaintext
+    let seed: [u8; 32] = plaintext
         .as_slice()
         .try_into()
         .map_err(|_| "invalid seed length".to_string())?;
-    let account = Account::from_seed(seed, profile.network, 0).map_err(error)?;
+    let seed = Zeroizing::new(seed);
+    let account = Account::from_seed(&seed, profile.network, 0).map_err(error)?;
     if account.address().encode().map_err(error)? != file.address {
         return Err("wallet address mismatch".into());
     }
-    Ok((account, profile))
+    Ok((account, profile, seed))
 }
 
 /// Refuse existing DBs without a v2 marker, including v1 and public chains, and
@@ -233,7 +243,7 @@ pub(crate) fn open_db(
     Ok((db, profile))
 }
 
-fn tip(db: &RocksDbStorage, profile: Profile) -> Result<Block, String> {
+pub(crate) fn tip(db: &RocksDbStorage, profile: Profile) -> Result<Block, String> {
     if db.get_chain_height().map_err(error)? == 0 {
         return Ok(profile.genesis_parent());
     }
@@ -243,16 +253,30 @@ fn tip(db: &RocksDbStorage, profile: Profile) -> Result<Block, String> {
         .ok_or_else(|| "missing canonical tip".into())
 }
 
-struct OwnedNote {
-    note: Note,
-    index: Option<u32>,
-    nullifier: Digest,
+pub(crate) struct OwnedNote {
+    pub(crate) note: Note,
+    /// Position in the note tree; none while a coinbase output is immature.
+    pub(crate) index: Option<u32>,
+    pub(crate) nullifier: Digest,
 }
-struct Scan {
-    state: Ledger,
-    notes: Vec<OwnedNote>,
+/// One transaction that touched the wallet: what it paid to the wallet and
+/// what it spent of the wallet's notes.
+pub(crate) struct Movement {
+    pub(crate) txid: [u8; 32],
+    pub(crate) height: u64,
+    pub(crate) timestamp: u64,
+    pub(crate) coinbase: bool,
+    pub(crate) received: u64,
+    pub(crate) spent: u64,
 }
-fn scan(db: &RocksDbStorage, profile: Profile, account: &Account) -> Result<Scan, String> {
+pub(crate) struct Scan {
+    pub(crate) state: Ledger,
+    /// Unspent notes.
+    pub(crate) notes: Vec<OwnedNote>,
+    /// Oldest first.
+    pub(crate) history: Vec<Movement>,
+}
+pub(crate) fn scan(db: &RocksDbStorage, profile: Profile, account: &Account) -> Result<Scan, String> {
     let parent = tip(db, profile)?;
     let state = stark::full_ledger(db, profile, &parent)?;
     let mut positions = BTreeMap::new();
@@ -265,19 +289,30 @@ fn scan(db: &RocksDbStorage, profile: Profile, account: &Account) -> Result<Scan
         positions.entry(cm).or_insert(index);
     }
     let mut notes = Vec::new();
-    let mut seen = BTreeSet::new();
+    // Every note the wallet ever received, by nullifier: what a later
+    // transaction spends of it.
+    let mut values = BTreeMap::new();
+    let mut history = Vec::new();
     for height in 1..=parent.header.block_height {
         let block = db
             .get_canonical_block_by_height(height)
             .map_err(error)?
             .ok_or("scan requires unpruned canonical blocks")?;
         for tx in stark::decode(&block)? {
+            let mut received = 0u64;
             for (cm, envelope) in tx.statement.commitments.iter().zip(&tx.envelopes) {
                 if let Ok((note, _memo)) = account.receive(*cm, envelope) {
                     let nullifier = note
                         .nullifier(&account.spend, profile.network)
                         .map_err(error)?;
-                    if !state.spent.contains(&nullifier) && seen.insert(nullifier) {
+                    if values.contains_key(&nullifier) {
+                        continue;
+                    }
+                    values.insert(nullifier, note.value);
+                    received = received
+                        .checked_add(note.value)
+                        .ok_or("balance overflow")?;
+                    if !state.spent.contains(&nullifier) {
                         notes.push(OwnedNote {
                             note,
                             index: positions.get(cm).copied(),
@@ -286,17 +321,147 @@ fn scan(db: &RocksDbStorage, profile: Profile, account: &Account) -> Result<Scan
                     }
                 }
             }
+            let mut spent = 0u64;
+            for nullifier in &tx.statement.nullifiers {
+                if let Some(value) = values.get(nullifier) {
+                    spent = spent.checked_add(*value).ok_or("balance overflow")?;
+                }
+            }
+            if received > 0 || spent > 0 {
+                history.push(Movement {
+                    txid: tx.txid(),
+                    height,
+                    timestamp: block.header.timestamp,
+                    coinbase: tx.statement.nullifiers.is_empty(),
+                    received,
+                    spent,
+                });
+            }
         }
     }
-    Ok(Scan { state, notes })
+    Ok(Scan {
+        state,
+        notes,
+        history,
+    })
 }
 
-fn pending_path(wallet: &Path) -> PathBuf {
+/// The largest mature notes first, at most [`MAX_INPUTS`], until they pay
+/// `amount` and the fee of a two-output payment. Returns the inputs, their
+/// total and the fee.
+pub(crate) fn select_inputs(
+    mut notes: Vec<OwnedNote>,
+    amount: u64,
+) -> Result<(Vec<OwnedNote>, u64, u64), String> {
+    notes.retain(|note| note.index.is_some());
+    notes.sort_by_key(|note| std::cmp::Reverse(note.note.value));
+    let mut selected = Vec::new();
+    let mut total = 0u64;
+    for note in notes.into_iter().take(MAX_INPUTS) {
+        total = total
+            .checked_add(note.note.value)
+            .ok_or("input sum overflow")?;
+        selected.push(note);
+        let required = amount
+            .checked_add(conventional_fee(selected.len(), 2))
+            .ok_or("amount overflow")?;
+        if total >= required {
+            break;
+        }
+    }
+    let fee = conventional_fee(selected.len(), 2);
+    let needed = amount.checked_add(fee).ok_or("amount overflow")?;
+    if total < needed {
+        return Err("insufficient mature funds within the eight-input limit".into());
+    }
+    Ok((selected, total, fee))
+}
+
+/// The most one payment can send: the eight largest mature notes less the
+/// payment's fee.
+pub(crate) fn max_sendable(notes: &[OwnedNote]) -> u64 {
+    let mut values: Vec<u64> = notes
+        .iter()
+        .filter(|note| note.index.is_some())
+        .map(|note| note.note.value)
+        .collect();
+    values.sort_unstable_by(|a, b| b.cmp(a));
+    values.truncate(MAX_INPUTS);
+    let total = values.iter().fold(0u64, |sum, value| sum.saturating_add(*value));
+    total.saturating_sub(conventional_fee(values.len().max(1), 2))
+}
+
+/// Build a payment of `amount` to `to` and reserve its inputs in the
+/// wallet's pending file before returning it. The caller holds the wallet
+/// lock. Returns the transaction, its fee and its expiry height.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pay(
+    db: &RocksDbStorage,
+    profile: Profile,
+    wallet: &Path,
+    account: &Account,
+    password: &str,
+    to: Address,
+    amount: u64,
+    memo: Option<&str>,
+) -> Result<(Transaction, u64, u32), String> {
+    if amount == 0 {
+        return Err("amount must be greater than zero".into());
+    }
+    if memo.is_some_and(|memo| memo.len() > MEMO_BYTES) {
+        return Err("memo exceeds 512 UTF-8 bytes".into());
+    }
+    let Scan { state, notes, .. } = scan(db, profile, account)?;
+    if let Some(tx) = pending(wallet, password, profile)? {
+        if live_pending(&tx, &state) {
+            return Err("wallet already has a pending payment; mine it or use abandon".into());
+        }
+        fs::remove_file(pending_path(wallet)).map_err(error)?;
+    }
+    let (selected, total, fee) = select_inputs(notes, amount)?;
+    let needed = amount.checked_add(fee).ok_or("amount overflow")?;
+    let mut payment = Payment::new(to, amount);
+    if let Some(memo) = memo {
+        payment.memo[..memo.len()].copy_from_slice(memo.as_bytes());
+    }
+    let inputs = selected
+        .into_iter()
+        .map(|owned| {
+            Ok(Input {
+                key: account.spend.clone(),
+                note: owned.note,
+                path: state
+                    .tree
+                    .path(owned.index.ok_or("immature input")?)
+                    .map_err(error)?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let expiry = state.height.checked_add(20).ok_or("expiry overflow")?;
+    let tx = transaction::transfer(
+        account,
+        state.tree.root(),
+        inputs,
+        vec![payment, Payment::new(account.address(), total - needed)],
+        fee,
+        expiry,
+    )
+    .map_err(error)?;
+    state.check_transfer(&tx).map_err(error)?;
+    let bytes = tx.encode().map_err(error)?;
+    let encrypted = crate::wallet::storage::encrypt_data(&bytes, password).map_err(error)?;
+    // Reserve before export. If export fails, pending-export recovers the same
+    // transaction without creating a conflicting payment or exposing a seed.
+    write_new(&pending_path(wallet), &encrypted)?;
+    Ok((tx, fee, expiry))
+}
+
+pub(crate) fn pending_path(wallet: &Path) -> PathBuf {
     let mut name = wallet.as_os_str().to_os_string();
     name.push(".stark-pending");
     PathBuf::from(name)
 }
-fn pending(
+pub(crate) fn pending(
     wallet: &Path,
     password: &str,
     profile: Profile,
@@ -317,7 +482,7 @@ fn pending(
     }
     Ok(Some(tx))
 }
-fn live_pending(tx: &Transaction, state: &Ledger) -> bool {
+pub(crate) fn live_pending(tx: &Transaction, state: &Ledger) -> bool {
     (tx.height == 0 || tx.height > state.height)
         && !tx
             .statement
@@ -332,7 +497,7 @@ fn wallet_lock_path(path: &Path) -> Result<PathBuf, String> {
     Ok(PathBuf::from(canonical))
 }
 
-fn wallet_lock(path: &Path) -> Result<File, String> {
+pub(crate) fn wallet_lock(path: &Path) -> Result<File, String> {
     // Lock a persistent sidecar: Windows mandatory locks would prevent the
     // separate handle used by open_wallet from reading a locked wallet file.
     // Never unlink the sidecar, since that could create two independent locks.
@@ -362,71 +527,17 @@ fn send(args: &[String]) -> Result<(), String> {
         return Err("amount must be greater than zero".into());
     }
     let (db, _) = open_db(&path(args, "--db")?, Some(profile))?;
-    let Scan { state, mut notes } = scan(&db, profile, &account)?;
-    if let Some(tx) = pending(&wallet, &password, profile)? {
-        if live_pending(&tx, &state) {
-            return Err("wallet already has a pending payment; mine it or use abandon".into());
-        }
-        fs::remove_file(pending_path(&wallet)).map_err(error)?;
-    }
-    notes.retain(|note| note.index.is_some());
-    notes.sort_by_key(|note| std::cmp::Reverse(note.note.value));
-    let mut selected = Vec::new();
-    let mut total = 0u64;
-    for note in notes.into_iter().take(MAX_INPUTS) {
-        total = total
-            .checked_add(note.note.value)
-            .ok_or("input sum overflow")?;
-        selected.push(note);
-        let required = amount
-            .checked_add(conventional_fee(selected.len(), 2))
-            .ok_or("amount overflow")?;
-        if total >= required {
-            break;
-        }
-    }
-    let fee = conventional_fee(selected.len(), 2);
-    let needed = amount.checked_add(fee).ok_or("amount overflow")?;
-    if total < needed {
-        return Err("insufficient mature funds within the eight-input limit".into());
-    }
-    let mut payment = Payment::new(to, amount);
-    if let Some(memo) = option(args, "--memo") {
-        if memo.len() > MEMO_BYTES {
-            return Err("memo exceeds 512 UTF-8 bytes".into());
-        }
-        payment.memo[..memo.len()].copy_from_slice(memo.as_bytes());
-    }
-    let inputs = selected
-        .into_iter()
-        .map(|owned| {
-            Ok(Input {
-                key: account.spend.clone(),
-                note: owned.note,
-                path: state
-                    .tree
-                    .path(owned.index.ok_or("immature input")?)
-                    .map_err(error)?,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let expiry = state.height.checked_add(20).ok_or("expiry overflow")?;
-    let tx = transaction::transfer(
+    let (tx, fee, expiry) = pay(
+        &db,
+        profile,
+        &wallet,
         &account,
-        state.tree.root(),
-        inputs,
-        vec![payment, Payment::new(account.address(), total - needed)],
-        fee,
-        expiry,
-    )
-    .map_err(error)?;
-    state.check_transfer(&tx).map_err(error)?;
-    let bytes = tx.encode().map_err(error)?;
-    let encrypted = crate::wallet::storage::encrypt_data(&bytes, &password).map_err(error)?;
-    // Reserve before export. If export fails, pending-export recovers the same
-    // transaction without creating a conflicting payment or exposing a seed.
-    write_new(&pending_path(&wallet), &encrypted)?;
-    write_new(&out, &bytes)?;
+        &password,
+        to,
+        amount,
+        option(args, "--memo"),
+    )?;
+    write_new(&out, &tx.encode().map_err(error)?)?;
     println!(
         "{}",
         serde_json::json!({"txid":hex::encode(tx.txid()),"fee_atoms":fee,"expires_at":expiry,"file":out})
@@ -502,7 +613,7 @@ One atom = 0.000001 ZKA. No public chain or wallet path is selected automaticall
             let password = password(args)?;
             let (account, profile) = open_wallet(&wallet, &password)?;
             let (db, _) = open_db(&path(args, "--db")?, Some(profile))?;
-            let Scan { state, notes } = scan(&db, profile, &account)?;
+            let Scan { state, notes, .. } = scan(&db, profile, &account)?;
             let reservation =
                 pending(&wallet, &password, profile)?.filter(|tx| live_pending(tx, &state));
             let mut available = 0u64;
