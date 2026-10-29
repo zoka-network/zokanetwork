@@ -28,6 +28,9 @@ use super::{
     stark::{self, Profile},
     stark_api::{self, NodeState},
     stark_cli::{open_db, read_bounded, write_new},
+    stark_directory::{
+        self, AddressRecord, LOOKUPS_PER_CYCLE, PUSHES_PER_MINUTE, REPUBLISH_EVERY,
+    },
     stark_net::{self, Client, Head, NodeDescriptor, ServerIdentity},
     stark_peers::{Manifest, PeerBook, MAX_MANIFEST_BYTES},
     stark_stratum::StarkBackend,
@@ -43,7 +46,7 @@ use crate::{
 };
 use stark::protocol::{
     transaction::{Transaction, MAX_TRANSACTION_BYTES},
-    wallet::Address,
+    wallet::{Address, ShortAddress},
 };
 
 const IDENTITY_SCHEMA: &str = "zoka-quantic-stark-node-identity-v2";
@@ -504,6 +507,145 @@ async fn peer_cycle_limited(
     Ok(())
 }
 
+/// What one outbound session did with the address directory.
+#[derive(Default)]
+struct AddressExchange {
+    /// Records pushed; own ones leave this set every `REPUBLISH_EVERY`.
+    sent: BTreeSet<[u8; 32]>,
+    /// Wanted short addresses asked for in this round. A round ends when
+    /// every one was asked, so each is asked again while it is wanted.
+    asked: BTreeSet<[u8; 32]>,
+    republish: Option<tokio::time::Instant>,
+    /// Start of the current minute and the records pushed in it.
+    window: Option<(tokio::time::Instant, u32)>,
+}
+
+impl AddressExchange {
+    /// Count one push, if this minute's budget has room.
+    fn push_allowed(&mut self, now: tokio::time::Instant) -> bool {
+        let (start, count) = match self.window {
+            Some((start, count)) if now.duration_since(start) < Duration::from_secs(60) => {
+                (start, count)
+            }
+            _ => (now, 0),
+        };
+        let allowed = count < PUSHES_PER_MINUTE;
+        self.window = Some((start, count + u32::from(allowed)));
+        allowed
+    }
+}
+
+/// Check the stamp with a crypto permit, outside the gate, and keep the
+/// record. Returns whether it was new.
+async fn store_record(state: &NodeState, record: AddressRecord) -> Result<bool, String> {
+    let permit = state.work.clone().acquire_owned().await.map_err(err)?;
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        state
+            .directory
+            .store(&state.storage, state.profile.network, &record)
+            .map(|(_, new)| new)
+            .map_err(err)
+    })
+    .await
+    .map_err(err)?
+}
+
+async fn stored_record(
+    state: &NodeState,
+    digest: [u8; 32],
+) -> Result<Option<AddressRecord>, String> {
+    let storage = state.storage.clone();
+    let short = ShortAddress {
+        network: state.profile.network,
+        digest,
+    };
+    tokio::task::spawn_blocking(move || stark_directory::lookup(&storage, &short))
+        .await
+        .map_err(err)?
+        .map(|found| found.map(|(_, record)| record))
+        .map_err(err)
+}
+
+/// Ask the peer for the short addresses an API caller waits for, then push
+/// this node's own records and the ones it stored lately, within budget.
+async fn exchange_addresses(
+    client: &mut Client,
+    state: &NodeState,
+    exchange: &mut AddressExchange,
+) -> Result<(), String> {
+    let network = state.profile.network;
+    let wanted = state.directory.wanted();
+    exchange.asked.retain(|digest| wanted.contains(digest));
+    if wanted.iter().all(|digest| exchange.asked.contains(digest)) {
+        exchange.asked.clear();
+    }
+    let ask: Vec<_> = wanted
+        .into_iter()
+        .filter(|digest| !exchange.asked.contains(digest))
+        .take(LOOKUPS_PER_CYCLE)
+        .collect();
+    for digest in ask {
+        exchange.asked.insert(digest);
+        let record = match client.get_address(&digest).await {
+            Ok(Some(record)) => record,
+            Ok(None) => continue,
+            Err(reason) if rejected(&reason) => {
+                eprintln!("STARK address lookup: {reason}");
+                continue;
+            }
+            Err(reason) => return Err(reason),
+        };
+        let from = client.remote_id().fmt_short().to_string();
+        let answers = stark_directory::decode_full(&record.address, network)
+            .ok()
+            .and_then(|full| full.short_address().ok())
+            .is_some_and(|short| short.digest == digest);
+        if !answers {
+            eprintln!("STARK address lookup: {from} answered with another address");
+            continue;
+        }
+        if let Err(reason) = store_record(state, record).await {
+            eprintln!("STARK address from {from}: {reason}");
+        }
+    }
+
+    let storage = state.storage.clone();
+    let own = tokio::task::spawn_blocking(move || stark_directory::local(&storage, network))
+        .await
+        .map_err(err)?
+        .map_err(err)?;
+    let now = tokio::time::Instant::now();
+    if exchange.republish.is_none_or(|at| at <= now) {
+        exchange.republish = Some(now + REPUBLISH_EVERY);
+        for short in &own {
+            exchange.sent.remove(&short.digest);
+        }
+    }
+    let mut pending: Vec<_> = own.iter().map(|short| short.digest).collect();
+    pending.extend(state.directory.relayed());
+    let current: BTreeSet<_> = pending.iter().copied().collect();
+    exchange.sent.retain(|digest| current.contains(digest));
+    let mut seen = BTreeSet::new();
+    pending.retain(|digest| !exchange.sent.contains(digest) && seen.insert(*digest));
+    for digest in pending {
+        if !exchange.push_allowed(now) {
+            break;
+        }
+        exchange.sent.insert(digest);
+        let Some(record) = stored_record(state, digest).await? else {
+            continue;
+        };
+        match client.submit_address(&record).await {
+            Ok(_) => {}
+            Err(reason) if rejected(&reason) => eprintln!("STARK address push: {reason}"),
+            Err(reason) => return Err(reason),
+        }
+    }
+    Ok(())
+}
+
 async fn stopped(stop: &mut watch::Receiver<bool>) {
     if *stop.borrow() {
         return;
@@ -544,13 +686,17 @@ async fn session(
     let mut cursor = None;
     let mut sent = BTreeSet::new();
     let mut refused = None;
+    let mut addresses = AddressExchange::default();
+    let mut asked = net.state.directory.asked();
     let mut exchange = tokio::time::Instant::now();
     loop {
+        // Addresses go before blocks: a lookup should not wait for a sync.
         tokio::select! {
             _ = stopped(stop) => return Ok(()),
             result = async {
                 let remote = exchange_checkpoint(client, &net.state, true, &mut refused).await?;
                 net.state.peers.book().observe(id, remote.height);
+                exchange_addresses(client, &net.state, &mut addresses).await?;
                 peer_cycle(client, &net.state, &mut cursor, &mut sent).await
             } => result?,
         }
@@ -571,7 +717,11 @@ async fn session(
                 Err(reason) => return Err(reason),
             }
         }
-        tokio::select! { _ = stopped(stop) => return Ok(()), _ = tokio::time::sleep(Duration::from_secs(5)) => {} }
+        tokio::select! {
+            _ = stopped(stop) => return Ok(()),
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+            Ok(()) = asked.changed() => {}
+        }
     }
 }
 
@@ -1227,8 +1377,9 @@ or testnet (zoka-quantic-testnet-v2: RandomX, ASERT). An existing --db keeps its
   serve --db DIR --identity FILE [--network NAME] [--api 127.0.0.1:9140] [--descriptor-out FILE]\n\
         [--peer DESCRIPTOR ...] [--seeds builtin|none|MANIFEST] [--relay N0|none]\n\
         [--announce yes|no] [--authority DIR] [--mine-to ADDRESS] [--interval 120]\n\
-        [--stratum 127.0.0.1:3333]   (testnet: XMRig logs in with its v2 address;\n\
-        --mine-to pays logins that are not addresses. Regtest: built-in miner.)\n\
+        [--stratum 127.0.0.1:3333]   (testnet: XMRig logs in with its v2 address, full or a\n\
+        short one the node knows; --mine-to pays logins that are not addresses. Regtest:\n\
+        built-in miner.)\n\
   sync --db MIRROR_DIR [--peer DESCRIPTOR] [--network NAME] [--max-blocks 8192] [--relay N0|none]\n\
   broadcast --tx FILE [--peer DESCRIPTOR | --network NAME] [--relay N0|none]\n\
   identity --identity FILE [--network NAME]   (prints the endpoint id and ML-DSA key id a\n\
@@ -1237,6 +1388,8 @@ or testnet (zoka-quantic-testnet-v2: RandomX, ASERT). An existing --db keeps its
         (signs by hand to correct the branch; POST the output to a node's /checkpoint)\n\
 --authority DIR makes the node the chain's checkpoint authority: DIR holds the team's\n\
 checkpoint-authority.key and checkpoint-authority-mldsa.key, which must be the compiled keys.\n\
+Short addresses: POST /address publishes a wallet's full address, which the node pushes to its\n\
+peers; GET /address/SHORT answers the full one, asking the node's peers when it does not know it.\n\
 Set ZOKA_PQ_PASSWORD to create/open the encrypted node identity. Files are never overwritten.\n\
 Use a separate mirror database for wallet commands while the node database is open.\n\
 Seeds come from the manifest compiled in for the chain (none on regtest); without --peer,\n\
@@ -1734,6 +1887,66 @@ mod tests {
         assert_eq!(c.state.storage.get_chain_height().unwrap(), 8);
         assert_eq!(a.state.storage.get_canonical_block_hash_at_height(1).unwrap(), first);
         assert_eq!(c.state.latest_checkpoint().unwrap().unwrap().height, 2);
+
+        let _ = shutdown.send(true);
+        for task in tasks {
+            task.await.unwrap();
+        }
+        for server in [a_server, b_server, c_server] {
+            server.close().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_short_address_published_on_one_node_resolves_on_another() {
+        use axum::{
+            body::{to_bytes, Body},
+            http::{Request, StatusCode},
+        };
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (shutdown, stop) = watch::channel(false);
+        // A is the seed. B and C only dial it, as nodes behind NAT do.
+        let state = node_state(dir.path(), "a", None).await;
+        let (a, a_server, a_own, mut tasks) = start_node(state, 111, vec![], &stop, None).await;
+        let state = node_state(dir.path(), "b", None).await;
+        let (b, b_server, _, more) =
+            start_node(state, 112, vec![a_own.clone()], &stop, None).await;
+        tasks.extend(more);
+        let state = node_state(dir.path(), "c", None).await;
+        let (c, c_server, _, more) = start_node(state, 113, vec![a_own], &stop, None).await;
+        tasks.extend(more);
+
+        // Bob publishes on B (what `POST /address` does); B pushes it to A.
+        let bob = Account::from_seed(&[97; 32], 3, 0).unwrap().address();
+        let short = bob.short_address().unwrap();
+        let record = AddressRecord::new(&bob).unwrap();
+        b.state.directory.store(&b.state.storage, 3, &record).unwrap();
+        stark_directory::mark_local(&b.state.storage, &short).unwrap();
+        eventually("A to receive Bob's address", || {
+            stark_directory::lookup(&a.state.storage, &short)
+                .unwrap()
+                .is_some()
+        })
+        .await;
+
+        // C never heard of it: its API asks A through C's session.
+        eventually("C's session with A", || c.state.peers.book().outbound_len() == 1).await;
+        let request = Request::builder()
+            .uri(format!("/address/{}", short.encode()))
+            .body(Body::empty())
+            .unwrap();
+        let response = stark_api::router(c.state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap())
+                .unwrap();
+        assert_eq!(body["address"], bob.encode().unwrap());
+        assert_eq!(
+            stark_directory::lookup(&c.state.storage, &short).unwrap(),
+            Some((bob, record))
+        );
 
         let _ = shutdown.send(true);
         for task in tasks {

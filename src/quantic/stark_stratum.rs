@@ -9,9 +9,13 @@
 use super::{
     stark::{
         self,
-        protocol::{ledger::subsidy, wallet::Address},
+        protocol::{
+            ledger::subsidy,
+            wallet::{Address, ShortAddress},
+        },
     },
     stark_api::NodeState,
+    stark_directory,
     stratum::{looks_like_quantic_address, Backend},
 };
 use crate::{storage::RocksDbStorage, types::Block};
@@ -68,9 +72,20 @@ impl Backend for StarkBackend {
         if let Ok(address) = Address::decode(login, profile.network) {
             return address.encode().map_err(|e| e.to_string());
         }
-        // An address of another network, a v1 address or a short v2 one (this
-        // node has no v2 directory yet): paying the node's default instead
-        // would mine for someone else without the miner noticing.
+        // A short address pays its full one, if this node's directory has it.
+        if let Ok(short) = ShortAddress::decode(login, profile.network) {
+            return match stark_directory::lookup(&self.state.storage, &short) {
+                Ok(Some((full, _))) => full.encode().map_err(|e| e.to_string()),
+                Ok(None) => Err(format!(
+                    "this node does not know the short address {login}: publish the \
+                     wallet's address on it, or log in with the full v2 address"
+                )),
+                Err(error) => Err(error.to_string()),
+            };
+        }
+        // An address of another network, a v1 address or a mistyped one:
+        // paying the node's default instead would mine for someone else
+        // without the miner noticing.
         if looks_like_v2_address(login) || looks_like_quantic_address(login) {
             return Err(format!(
                 "log in with the full {} v2 address of your wallet ({})",
@@ -174,12 +189,23 @@ mod tests {
         assert_eq!(backend.payout_for("rig-01").unwrap(), encoded);
         for login in [
             other.encode().unwrap(),
-            mine.short().unwrap(),
+            other.short().unwrap(),
             "zqtest1abc".to_string(),
         ] {
             let err = backend.payout_for(&login).err().unwrap();
             assert!(err.contains("full regtest v2 address"), "{err}");
         }
+        // A short address pays only once the directory knows it.
+        let short = mine.short().unwrap();
+        let err = backend.payout_for(&short).err().unwrap();
+        assert!(err.contains("does not know the short address"), "{err}");
+        let record = stark_directory::AddressRecord::new(&mine).unwrap();
+        backend
+            .state
+            .directory
+            .store(&backend.state.storage, 3, &record)
+            .unwrap();
+        assert_eq!(backend.payout_for(&short).unwrap(), encoded);
     }
 
     async fn call(

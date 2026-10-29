@@ -78,23 +78,29 @@ fn storage_error(error: impl fmt::Debug) -> DirectoryError {
 }
 
 fn stamp_hash(short: &QuanticShortAddress, stamp: u64) -> [u8; 32] {
+    let mut input = Vec::with_capacity(48);
+    input.extend_from_slice(short.network().address_prefix().as_bytes());
+    input.extend_from_slice(short.digest());
+    input.extend_from_slice(&stamp.to_le_bytes());
+    work_hash(STAMP_SALT, &input)
+}
+
+/// Una prueba del sello: Argon2id de [`STAMP_MEMORY_KIB`] y una pasada. La
+/// usa también el directorio de la v2 (`stark_directory`), con su propia sal.
+pub(crate) fn work_hash(salt: &[u8], input: &[u8]) -> [u8; 32] {
     static ARGON: OnceLock<argon2::Argon2<'static>> = OnceLock::new();
     let argon = ARGON.get_or_init(|| {
         let params = argon2::Params::new(STAMP_MEMORY_KIB, 1, 1, Some(32)).expect("fixed Argon2 parameters");
         argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
     });
-    let mut input = Vec::with_capacity(48);
-    input.extend_from_slice(short.network().address_prefix().as_bytes());
-    input.extend_from_slice(short.digest());
-    input.extend_from_slice(&stamp.to_le_bytes());
     let mut out = [0u8; 32];
     argon
-        .hash_password_into(&input, STAMP_SALT, &mut out)
+        .hash_password_into(input, salt, &mut out)
         .expect("Argon2 with fixed parameters and salt");
     out
 }
 
-fn leading_zero_bits(bytes: &[u8]) -> u32 {
+pub(crate) fn leading_zero_bits(bytes: &[u8]) -> u32 {
     let mut bits = 0;
     for byte in bytes {
         if *byte == 0 {

@@ -27,9 +27,10 @@ use super::stark::{
     Profile,
     protocol::{
         transaction::{Transaction, MAX_TRANSACTION_BYTES},
-        wallet::Address,
+        wallet::{Address, ShortAddress},
     },
 };
+use super::stark_directory::{self, AddressRecord, Directory, DirectoryError};
 use super::stark_peers::{PeerBook, Peers};
 use crate::{
     checkpoint_authority::{self, Acceptance, AuthorityKeys, SignedCheckpoint},
@@ -61,6 +62,8 @@ pub struct NodeState {
     /// Keys that sign this chain's checkpoints: the compiled ones, or the
     /// environment's on a local test network. None: only work decides.
     pub authority: Option<AuthorityKeys>,
+    /// Short-address lookups and relay; its locks are independent of `gate`.
+    pub directory: Arc<Directory>,
 }
 
 impl NodeState {
@@ -84,6 +87,7 @@ impl NodeState {
             work: Arc::new(Semaphore::new(MAX_CRYPTO_WORKERS)),
             peers,
             authority: checkpoint_authority::authority_keys_for_chain(profile.chain_id),
+            directory: Arc::new(Directory::default()),
         })
     }
 
@@ -212,6 +216,7 @@ async fn admit(State(state): State<NodeState>, mut request: Request, next: Next)
         "/transactions" => MAX_TRANSACTION_BYTES,
         "/blocks" => MAX_BLOCK_REQUEST_BYTES,
         "/checkpoint" => MAX_CHECKPOINT_BYTES,
+        "/address" => stark_directory::MAX_RECORD_BYTES,
         _ => 0,
     };
     if request
@@ -321,6 +326,11 @@ pub fn router(state: NodeState) -> Router {
                 .post(submit_checkpoint)
                 .layer(DefaultBodyLimit::max(MAX_CHECKPOINT_BYTES)),
         )
+        .route(
+            "/address",
+            post(publish_address).layer(DefaultBodyLimit::max(stark_directory::MAX_RECORD_BYTES)),
+        )
+        .route("/address/:short", get(address_of))
         .layer(middleware::from_fn_with_state(state.clone(), admit))
         .with_state(state)
 }
@@ -352,6 +362,10 @@ async fn status(
                 "followed":state.follows(&cp).map_err(ApiError::internal)?}),
             None => serde_json::Value::Null,
         };
+        let addresses = stark_directory::count(&state.storage).map_err(directory_error)?;
+        let published = stark_directory::local(&state.storage, state.profile.network)
+            .map_err(directory_error)?
+            .len();
         json_response(StatusCode::OK, &serde_json::json!({
             "chain_id":state.profile.chain_id,"pool_version":2,"height":ledger.height,"hash":tip.header.hash,
             "issued_atoms":ledger.issued,"notes":ledger.notes,"mempool_transactions":count,
@@ -359,6 +373,7 @@ async fn status(
             "max_transaction_bytes":MAX_TRANSACTION_BYTES,"max_block_request_bytes":MAX_BLOCK_REQUEST_BYTES,
             "stratum":super::stratum::status(),"peers":state.peers.status(),
             "checkpoint":checkpoint,"checkpoint_authority":state.authority.is_some(),
+            "directory":{"addresses":addresses,"published_here":published},
         }))
     }).await
 }
@@ -555,6 +570,124 @@ async fn submit_checkpoint(
         }))
     })
     .await
+}
+
+/// The v1 request (`POST /quantic/address`).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublishAddress {
+    address: String,
+    /// Without one the node finds it (seconds), or keeps the one it has.
+    stamp: Option<u64>,
+}
+
+fn directory_error(error: DirectoryError) -> ApiError {
+    match error {
+        DirectoryError::Address | DirectoryError::ShortAddress | DirectoryError::Stamp => {
+            ApiError::invalid(error)
+        }
+        DirectoryError::Full => ApiError::new(StatusCode::INSUFFICIENT_STORAGE, error.to_string()),
+        DirectoryError::Storage(_) => ApiError::internal(error),
+    }
+}
+
+/// Publish a full address. The node pushes it to its outbound peers, and
+/// again on every new session.
+async fn publish_address(
+    State(state): State<NodeState>,
+    Extension(permit): Extension<WorkPermit>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Response> {
+    content_type(&headers, "application/json")?;
+    blocking(permit, move || {
+        let request: PublishAddress = serde_json::from_slice(&body)
+            .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+        let network = state.profile.network;
+        let full = stark_directory::decode_full(&request.address, network).map_err(directory_error)?;
+        let short = full.short_address().map_err(ApiError::internal)?;
+        let record = match request.stamp {
+            Some(stamp) => AddressRecord {
+                address: full.encode().map_err(ApiError::internal)?,
+                stamp,
+            },
+            None => match stark_directory::lookup(&state.storage, &short).map_err(directory_error)? {
+                Some((_, stored)) => stored,
+                None => AddressRecord::new(&full).map_err(directory_error)?,
+            },
+        };
+        let (short, new) = state
+            .directory
+            .store(&state.storage, network, &record)
+            .map_err(directory_error)?;
+        stark_directory::mark_local(&state.storage, &short).map_err(directory_error)?;
+        json_response(
+            StatusCode::OK,
+            &serde_json::json!({"short_address":short.encode(),"new":new}),
+        )
+    })
+    .await
+}
+
+/// The full address of a short one: from this node's directory, or asked of
+/// its outbound peers for up to `LOOKUP_TIMEOUT`.
+async fn address_of(
+    State(state): State<NodeState>,
+    Path(short): Path<String>,
+    Extension(permit): Extension<WorkPermit>,
+) -> ApiResult<Response> {
+    // Waiting on peers holds no crypto worker.
+    drop(
+        permit
+            .0
+            .lock()
+            .map_err(|_| ApiError::internal("worker permit lock poisoned"))?
+            .take(),
+    );
+    let short = ShortAddress::decode(short.trim(), state.profile.network)
+        .map_err(|_| ApiError::invalid("not a short v2 address of this chain"))?;
+    let deadline = std::time::Instant::now() + stark_directory::LOOKUP_TIMEOUT;
+    let mut stored = state.directory.stored();
+    let mut asked = false;
+    loop {
+        let storage = state.storage.clone();
+        let found = tokio::task::spawn_blocking(move || stark_directory::lookup(&storage, &short))
+            .await
+            .map_err(ApiError::internal)?
+            .map_err(directory_error)?;
+        if let Some((full, _)) = found {
+            return json_response(
+                StatusCode::OK,
+                &serde_json::json!({"short_address":short.encode(),
+                    "address":full.encode().map_err(ApiError::internal)?}),
+            );
+        }
+        if !asked {
+            asked = true;
+            if state.peers.book().outbound_len() == 0 {
+                return Err(ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "this node does not know that short address and has no outbound peers to ask",
+                ));
+            }
+            if !state.directory.want(&short, deadline) {
+                return Err(ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "too many address lookups are waiting; retry later",
+                ));
+            }
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match tokio::time::timeout(left, stored.changed()).await {
+            Ok(Ok(())) => {}
+            _ => {
+                return Err(ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "neither this node nor its peers know that short address",
+                ))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -898,5 +1031,43 @@ mod tests {
             .receive(payment.statement.commitments[0], &payment.envelopes[0])
             .unwrap();
         assert_eq!(received.value, ATOMS);
+    }
+
+    #[tokio::test]
+    async fn an_address_is_published_and_resolved_by_its_short_form() {
+        let (_dir, state) = test_state();
+        let app = router(state.clone());
+        let bob = Account::from_seed(&[61; 32], 3, 0).unwrap().address();
+        let full = bob.encode().unwrap();
+        let short = bob.short().unwrap();
+        // Unknown, and no outbound peer to ask: answered at once.
+        let response = get(&app, &format!("/address/{short}")).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let body = serde_json::json!({ "address": full }).to_string().into_bytes();
+        let published = json(post(&app, "/address", "application/json", body.clone()).await).await;
+        assert_eq!(published["short_address"], short);
+        assert_eq!(published["new"], true);
+        // Publishing again keeps the stored stamp.
+        let again = json(post(&app, "/address", "application/json", body).await).await;
+        assert_eq!(again["new"], false);
+        let resolved = json(get(&app, &format!("/address/{short}")).await).await;
+        assert_eq!(resolved["address"], full);
+        assert_eq!(resolved["short_address"], short);
+        let status = json(get(&app, "/status").await).await;
+        assert_eq!(status["directory"]["addresses"], 1);
+        assert_eq!(status["directory"]["published_here"], 1);
+
+        // Only full addresses are published, and only short ones resolve.
+        let body = serde_json::json!({ "address": short }).to_string().into_bytes();
+        let response = post(&app, "/address", "application/json", body).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let error = json(response).await["error"].as_str().unwrap().to_string();
+        assert!(error.contains("publish the full one"), "{error}");
+        let response = get(&app, &format!("/address/{full}")).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let testnet = Account::from_seed(&[61; 32], 2, 0).unwrap().address();
+        let response = get(&app, &format!("/address/{}", testnet.short().unwrap())).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

@@ -48,6 +48,8 @@ pub mod stark;
 #[cfg(feature = "quantic-pq")]
 pub mod stark_cli;
 #[cfg(feature = "quantic-pq")]
+pub mod stark_directory;
+#[cfg(feature = "quantic-pq")]
 pub mod stark_api;
 #[cfg(feature = "quantic-pq")]
 pub mod stark_net;

@@ -22,7 +22,7 @@ use super::stark::{
         ledger::{conventional_fee, Ledger},
         model::{Input, Note, MAX_INPUTS},
         transaction::{self, Payment, Transaction, MAX_TRANSACTION_BYTES},
-        wallet::{Account, Address, MEMO_BYTES},
+        wallet::{Account, Address, ShortAddress, MEMO_BYTES},
     },
 };
 use crate::{state::chain::apply_block, storage::RocksDbStorage, types::Block};
@@ -50,6 +50,17 @@ fn required<'a>(args: &'a [String], name: &str) -> Result<&'a str, String> {
 }
 fn path(args: &[String], name: &str) -> Result<PathBuf, String> {
     required(args, name).map(PathBuf::from)
+}
+/// `--to`: a full address. A short one is resolved by a node first.
+fn recipient(args: &[String], profile: Profile) -> Result<Address, String> {
+    let text = required(args, "--to")?.trim();
+    Address::decode(text, profile.network).map_err(|e| {
+        if ShortAddress::decode(text, profile.network).is_ok() {
+            format!("{text} is a short address: resolve it with GET /address/{text} on your node and pay the full address")
+        } else {
+            error(e)
+        }
+    })
 }
 /// `--network`, when given. Wallets and databases already know theirs.
 pub(crate) fn network_option(args: &[String]) -> Result<Option<Profile>, String> {
@@ -345,7 +356,7 @@ fn send(args: &[String]) -> Result<(), String> {
     let _lock = wallet_lock(&wallet)?;
     let password = password(args)?;
     let (account, profile) = open_wallet(&wallet, &password)?;
-    let to = Address::decode(required(args, "--to")?, profile.network).map_err(error)?;
+    let to = recipient(args, profile)?;
     let amount = integer(args, "--amount-atoms")?;
     if amount == 0 {
         return Err("amount must be greater than zero".into());
@@ -431,7 +442,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 "ZOKA QUANTIC STARK v2 (regtest by default; --network testnet for the RandomX chain)\n\
 wallet-create --wallet FILE [--network NAME] [--password-stdin]\n\
 wallet-restore --wallet FILE --phrase-stdin [--network NAME] [--password-stdin]\n\
-address --wallet FILE\n\
+address --wallet FILE [--short]\n\
 balance --db DIR --wallet FILE [--password-stdin]\n\
 send --db DIR --wallet FILE --to ADDRESS --amount-atoms N --out FILE [--memo TEXT]\n\
 pending-export --wallet FILE --out FILE | abandon --wallet FILE\n\
@@ -477,7 +488,13 @@ One atom = 0.000001 ZKA. No public chain or wallet path is selected automaticall
             );
         }
         "address" => {
-            println!("{}", read_wallet(&path(args, "--wallet")?)?.0.address);
+            let (file, profile) = read_wallet(&path(args, "--wallet")?)?;
+            if flag(args, "--short") {
+                let full = Address::decode(&file.address, profile.network).map_err(error)?;
+                println!("{}", full.short().map_err(error)?);
+            } else {
+                println!("{}", file.address);
+            }
         }
         "balance" => {
             let wallet = fs::canonicalize(path(args, "--wallet")?).map_err(error)?;
@@ -536,7 +553,7 @@ One atom = 0.000001 ZKA. No public chain or wallet path is selected automaticall
         }
         "mine" => {
             let (db, profile) = open_db(&path(args, "--db")?, network_option(args)?)?;
-            let to = Address::decode(required(args, "--to")?, profile.network).map_err(error)?;
+            let to = recipient(args, profile)?;
             let txs = option(args, "--tx")
                 .map(|p| {
                     read_bounded(Path::new(p), MAX_TRANSACTION_BYTES)
@@ -743,6 +760,13 @@ mod tests {
         assert_eq!(network_option(&args(&["--network", "testnet"])).unwrap(), Some(Profile::TESTNET));
         assert_eq!(network_option(&args(&[])).unwrap(), None);
         assert!(network_option(&args(&["--network", "mainnet"])).is_err());
+        // `--to` takes a full address; a short one is named as such.
+        let full = Address::decode(&address, P.network).unwrap();
+        assert_eq!(recipient(&args(&["--to", &address]), P).unwrap(), full);
+        let short = full.short().unwrap();
+        let refused = recipient(&args(&["--to", &short]), P).err().unwrap();
+        assert!(refused.contains("is a short address"), "{refused}");
+        assert!(recipient(&args(&["--to", "zqregtest2abc"]), P).is_err());
     }
 
     #[test]

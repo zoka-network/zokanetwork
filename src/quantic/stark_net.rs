@@ -12,6 +12,10 @@
 //! session fetches (`CHECKPOINT`) or offers (`SUBMIT_CHECKPOINT`) only when
 //! the two sides differ. Each node verifies a checkpoint against its chain's
 //! compiled authority before keeping it.
+//!
+//! Address directory (`stark_directory`): `GET_ADDRESS` asks for the record
+//! of a short-address digest and `SUBMIT_ADDRESS` offers one, with a budget
+//! per connection because each stamp costs a crypto worker to check.
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -30,8 +34,9 @@ use zoka_pq::{
 };
 
 use super::{
-    stark::{self, Profile},
+    stark::{self, protocol::wallet::ShortAddress, Profile},
     stark_api::{NodeState, MAX_CHECKPOINT_BYTES},
+    stark_directory::{self, AddressRecord, MAX_RECORD_BYTES, SUBMITS_PER_MINUTE},
 };
 use crate::{
     checkpoint_authority::{Acceptance, SignedCheckpoint},
@@ -61,6 +66,8 @@ const PEERS: u8 = 6;
 const ANNOUNCE: u8 = 7;
 const CHECKPOINT: u8 = 8;
 const SUBMIT_CHECKPOINT: u8 = 9;
+const GET_ADDRESS: u8 = 10;
+const SUBMIT_ADDRESS: u8 = 11;
 const MAX_ERROR_BYTES: usize = 2048;
 const MAX_ANNOUNCE_BYTES: usize = 4096;
 /// Endpoints answered per `PEERS` request.
@@ -296,6 +303,8 @@ fn request_limit(tag: u8) -> Result<usize, String> {
         SUBMIT_TX => Ok(MAX_TRANSACTION_BYTES),
         ANNOUNCE => Ok(MAX_ANNOUNCE_BYTES),
         SUBMIT_CHECKPOINT => Ok(MAX_CHECKPOINT_BYTES),
+        GET_ADDRESS => Ok(32),
+        SUBMIT_ADDRESS => Ok(MAX_RECORD_BYTES),
         _ => Err("unknown STARK request".into()),
     }
 }
@@ -305,7 +314,10 @@ async fn read_request_header(recv: &mut RecvStream) -> Result<(u8, usize), Strin
     recv.read_exact(&mut header).await.map_err(err)?;
     let tag = header[0];
     let len = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
-    if len > request_limit(tag)? || (matches!(tag, GET_BLOCK | GET_HASH) && len != 8) {
+    if len > request_limit(tag)?
+        || (matches!(tag, GET_BLOCK | GET_HASH) && len != 8)
+        || (tag == GET_ADDRESS && len != 32)
+    {
         return Err("STARK request length".into());
     }
     Ok((tag, len))
@@ -334,11 +346,52 @@ async fn write_response(
     send.write_all(&bytes).await.map_err(err)
 }
 
-/// Peer-exchange limits of one inbound connection.
+/// Peer-exchange and directory limits of one inbound connection.
 #[derive(Default)]
 struct Exchange {
     announced: bool,
     answered: Option<Instant>,
+    /// Start of the current minute and the records submitted in it.
+    submitted: Option<(Instant, u32)>,
+}
+
+impl Exchange {
+    /// Count one `SUBMIT_ADDRESS`, if this minute's budget has room.
+    fn submit_allowed(&mut self) -> bool {
+        let now = Instant::now();
+        let (start, count) = match self.submitted {
+            Some((start, count)) if now.duration_since(start) < Duration::from_secs(60) => {
+                (start, count)
+            }
+            _ => (now, 0),
+        };
+        let allowed = count < SUBMITS_PER_MINUTE;
+        self.submitted = Some((start, count + u32::from(allowed)));
+        allowed
+    }
+}
+
+/// The stored record of a short-address digest, or an empty answer. A point
+/// read: no crypto permit and no gate.
+fn address_answer(state: &NodeState, digest: [u8; 32]) -> Result<Vec<u8>, String> {
+    let short = ShortAddress {
+        network: state.profile.network,
+        digest,
+    };
+    match stark_directory::lookup(&state.storage, &short).map_err(err)? {
+        Some((_, record)) => serde_json::to_vec(&record).map_err(err),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Caller holds a crypto permit; the directory has its own lock.
+fn accept_address(state: &NodeState, body: &[u8]) -> Result<Vec<u8>, String> {
+    let record: AddressRecord = serde_json::from_slice(body).map_err(err)?;
+    let (_, new) = state
+        .directory
+        .store(&state.storage, state.profile.network, &record)
+        .map_err(err)?;
+    Ok(if new { b"accepted".to_vec() } else { b"known".to_vec() })
 }
 
 /// Cheap and bounded: answered without a crypto permit or the state gate.
@@ -394,6 +447,34 @@ async fn serve_requests(
                 recv.read_exact(&mut body).await.map_err(err)?;
                 let response =
                     peer_request(&state, connection.remote_id(), tag, &body, &mut exchange);
+                return write_response(&mut send, response).await;
+            }
+            if tag == GET_ADDRESS {
+                let mut digest = [0u8; 32];
+                recv.read_exact(&mut digest).await.map_err(err)?;
+                let shared = state.clone();
+                let response = tokio::task::spawn_blocking(move || address_answer(&shared, digest))
+                    .await
+                    .map_err(err)?;
+                return write_response(&mut send, response).await;
+            }
+            if tag == SUBMIT_ADDRESS {
+                let mut body = vec![0; len];
+                recv.read_exact(&mut body).await.map_err(err)?;
+                if !exchange.submit_allowed() {
+                    let limit = format!(
+                        "STARK address submissions are limited to {SUBMITS_PER_MINUTE} per minute"
+                    );
+                    return write_response(&mut send, Err(limit)).await;
+                }
+                let shared = state.clone();
+                let permit = shared.work.clone().acquire_owned().await.map_err(err)?;
+                let response = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    accept_address(&shared, &body)
+                })
+                .await
+                .map_err(err)?;
                 return write_response(&mut send, response).await;
             }
             let shared = state.clone();
@@ -676,6 +757,27 @@ impl Client {
             .into_iter()
             .filter(|peer| peer.validate().is_ok() && peer.chain_id == self.chain_id)
             .collect())
+    }
+
+    /// The peer's record of a short-address digest. Unverified here: callers
+    /// keep it only through `Directory::store`, after checking that it is the
+    /// address asked for.
+    pub async fn get_address(&mut self, digest: &[u8; 32]) -> Result<Option<AddressRecord>, String> {
+        let bytes = self.request(GET_ADDRESS, digest, MAX_RECORD_BYTES).await?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        serde_json::from_slice(&bytes).map(Some).map_err(err)
+    }
+
+    /// Whether the peer kept the record as new.
+    pub async fn submit_address(&mut self, record: &AddressRecord) -> Result<bool, String> {
+        let bytes = serde_json::to_vec(record).map_err(err)?;
+        match self.request(SUBMIT_ADDRESS, &bytes, 16).await?.as_slice() {
+            b"accepted" => Ok(true),
+            b"known" => Ok(false),
+            _ => Err("STARK address acknowledgement".into()),
+        }
     }
 
     /// Announce this node's own server endpoint. Only meaningful on a client
@@ -1267,6 +1369,47 @@ mod tests {
         let conflict = SignedCheckpoint::sign_hybrid(&key, CHAIN, 1, &genesis.header.hash);
         let refused = client.submit_checkpoint(&conflict).await.unwrap_err();
         assert!(refused.contains("no checkpoint authority"), "{refused}");
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_directory_answers_and_takes_records_within_budget() {
+        let (node, _dir) = state();
+        let server = serve(
+            node.clone(),
+            ServerIdentity::from_seed(&[80; 32]).unwrap(),
+            presets::Minimal,
+        )
+        .await
+        .unwrap();
+        let mut client = Client::connect(&localhost(&server), presets::Minimal)
+            .await
+            .unwrap();
+        let bob = Account::from_seed(&[81; 32], 3, 0).unwrap().address();
+        let short = bob.short_address().unwrap();
+        assert_eq!(client.get_address(&short.digest).await.unwrap(), None);
+        let record = AddressRecord::new(&bob).unwrap();
+        let mut unstamped = record.clone();
+        unstamped.stamp = (0u64..)
+            .find(|stamp| !stark_directory::stamp_is_valid(&short, *stamp))
+            .unwrap();
+        let refused = client.submit_address(&unstamped).await.unwrap_err();
+        assert!(refused.contains("work stamp"), "{refused}");
+        assert!(client.submit_address(&record).await.unwrap());
+        assert!(!client.submit_address(&record).await.unwrap());
+        assert_eq!(
+            client.get_address(&short.digest).await.unwrap(),
+            Some(record.clone())
+        );
+        // Three submissions so far. The budget refuses the next one past it,
+        // and the connection stays open.
+        for _ in 3..SUBMITS_PER_MINUTE {
+            assert!(!client.submit_address(&record).await.unwrap());
+        }
+        let limited = client.submit_address(&record).await.unwrap_err();
+        assert!(limited.contains("per minute"), "{limited}");
+        assert!(client.get_address(&short.digest).await.unwrap().is_some());
         client.close().await;
         server.close().await;
     }
