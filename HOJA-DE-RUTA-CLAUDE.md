@@ -1,7 +1,55 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
-Actualizada: **28 de octubre de 2026**, Argentina (núcleo STARK local verificado; testnet v2 minada con XMRig en local; red pública v2 probada por los relays de n0; checkpoints de la PC y direcciones cortas en el nodo v2).
+Actualizada: **29 de octubre de 2026**, Argentina (**testnet v2 lanzada**: bloque 1 fijado y la PC como seed1; nodo, minero CLI y ZSilent 4.0.0 armados y verificados, sin publicar).
 Proyecto: `C:\Users\mderramus\ZOKA`.
+
+## 29/10: lanzamiento de la testnet v2 (Claude, rama `quantic-v2-genesis`)
+
+Quinto punto del orden acordado. El usuario: «encargate de todo vos desde
+aquí». El procedimiento y el registro completo están en
+[docs/LANZAMIENTO-TESTNET-V2.md](docs/LANZAMIENTO-TESTNET-V2.md).
+
+- **Bloque 1** a las 08:35 (-03:00), con el premine en la wallet del equipo,
+  que el usuario llamó `zsilent`: hash
+  `69249437d8c35b7e4bf28ec524491fe18384b9869670fadff546fef29148fdb2`. Se minó
+  con XMRig por el Stratum del nodo de ZSilent 4.0 de desarrollo, la opción A.
+  `85cc0c19` lo fija junto con seed1, la PC (endpoint `e3bf05e2…`).
+- **La semilla, hasta instalar el MSI:** la app de desarrollo (`gradlew run` en
+  zsilent-core) corre el nodo con la API en 127.0.0.1:3000 y el Stratum en
+  3333. XMRig va con 3 hilos y `-u equipo`, que cobra el `--mine-to`. Cerrar la
+  app para la red.
+- **Probado:**
+  - un nodo en una carpeta nueva, solo con las semillas compiladas, sincronizó,
+    siguió la cadena y aceptó los checkpoints 2 y 33 de la PC;
+  - el minero CLI de Windows, en una ruta con espacios: el nodo, XMRig y la
+    corta publicada (la semilla la conocía); su XMRig de prueba encontró el
+    bloque 57, que es canónico en la semilla.
+- **Arreglado en el camino:**
+  - `zsilent-core` `7b8547f`: `--mine-to` sin el Stratum, el manifiesto de
+    Zenith y el Tor del arranque automático;
+  - `5ada09f5`: versión 4.0.0, RocksDB con 5 logs viejos en vez de 1000, el
+    saldo legible y el minero CLI v2 (sin Tor, con XMRig);
+  - `8e63f913`: los comandos v2 usan RandomX liviano. Antes cada comando de
+    wallet con bloques nuevos armaba el dataset de 2 GB (unos 50 s con todos
+    los núcleos); ahora tarda 2,3 s y el nodo usa 270 MB.
+- **Armado, sin publicar:**
+  - nodo `zoka.exe` 4.0.0 `dd259065…`;
+  - MSI `ZSilent Core-4.0.0.msi` en `target/zsilent-4.0.0/build/release/4.0.0`
+    (`e55caae9…`), armado en un worktree de zsilent-core con el Tor de
+    `third_party/tor/windows-x86_64-0.4.9.14`. Se verificó extrayéndolo: el
+    binario y el manifiesto son los de la fuente;
+  - minero CLI en `target/cli-miner/4.0.0`.
+- **Pusheado:** las ramas `quantic-v2-genesis` (nodo) y `quantic-v2`
+  (zsilent-core), a GitHub y GitLab.
+- **Falta, con el OK del usuario:**
+  - instalar el MSI en la PC: se cierra la app de desarrollo y la API vuelve a
+    9140; XMRig se reconecta solo;
+  - releases `zokanetwork` v4.0.0 (los dos paquetes CLI) y `zsilent-core`
+    v4.0.0, `main` y las etiquetas, la web y Discord.
+- **Después:** Android, RPC para pools y la revisión externa. Pendientes
+  menores:
+  - el Stratum cuenta también los bloques laterales;
+  - el paquete de Tor sigue en el MSI aunque la v2 no lo usa.
 
 ## 28/10, noche (5): ZSilent v2 (Claude, ramas `quantic-v2-zsilent` y `quantic-v2`)
 
