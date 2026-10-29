@@ -77,7 +77,9 @@ try {
     $archive.Dispose()
 }
 $zipHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-Add-Content -LiteralPath (Join-Path $outRoot "SHA256SUMS.txt") -Value ("{0}  {1}.zip" -f $zipHash, $name)
+# Con LF y no con Add-Content (CRLF): build-cli-miner-linux.sh suma su línea al
+# mismo archivo, y sha256sum -c no lee una línea con CR.
+[System.IO.File]::AppendAllText((Join-Path $outRoot "SHA256SUMS.txt"), ("{0}  {1}.zip`n" -f $zipHash, $name))
 
 Write-Host "Prepared (not published): $zip"
 Write-Host "SHA-256: $zipHash"
