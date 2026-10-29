@@ -3,6 +3,40 @@
 Actualizada: **29 de octubre de 2026**, Argentina (**testnet v2 lanzada**: bloque 1 fijado y la PC como seed1; nodo, minero CLI y ZSilent 4.0.0 publicados, web al día y la 4.0.0 instalada en la PC).
 Proyecto: `C:\Users\mderramus\ZOKA`.
 
+## 29/10, tarde: 4.0.1 y papers 2.5 (Claude; el usuario: «arreglá eso inmediatamente»)
+
+Los tres pendientes chicos de la 4.0.0, arreglados:
+
+- **Stratum** (`28083c02`): `Backend::found` devuelve si el bloque cuenta. El
+  backend STARK lo importa en el momento y solo cuenta el canónico; una segunda
+  solución del mismo trabajo queda como rama lateral y ya no suma a
+  `blocks_found`. La prueba de punta a punta lo cubre, y pasan también las del
+  Stratum de la v1.
+- **ZSilent sin Tor** (zsilent-core `0f8a614`): la app nunca arrancaba Tor y el
+  paquete viajaba en el MSI. Se sacó del armado y de `prepare-release.ps1`. El
+  MSI pasó de 154 a 132 MB.
+- **Papers 2.5** (zokaweb `cdc23aa`, rama `web-papers-2.5`, sin publicar):
+  - whitepaper y litepaper reescritos para la v2 (STARK, iroh, límites);
+  - los PDF actuales se llaman `ZOKA_Quantic_Whitepaper.pdf` y
+    `ZOKA_Quantic_Litepaper.pdf`, con la versión adentro (pedido del usuario);
+  - `public/_redirects` manda los nombres `_v2.0.pdf` a los nuevos.
+- **Armado y verificado:**
+  - nodo 4.0.1 `zoka.exe` `4264f8f5…`;
+  - minero CLI 4.0.1, Windows `e045b6fc…` y Linux `4df6cb07…`, probado en
+    WSL;
+  - MSI `ZSilent-Core-4.0.1.msi` `77fdc92b…`, extraído: binario idéntico y sin
+    Tor.
+- **Pusheado:** `main` y las etiquetas `v4.0.1` (nodo en `e18fe03c` y
+  zsilent-core en `0f8a614`), a GitHub y GitLab.
+- **Frenado por permisos** (crear superficies públicas), espera el OK del
+  usuario:
+  - los releases 4.0.1 en GitHub, con las notas en
+    `target/cli-miner/4.0.1/RELEASE-NOTES.md` y
+    `target/zsilent-4.0.1/build/release/4.0.1/publicar/`;
+  - marcar la 4.0.0 como reemplazada;
+  - publicar la web (`web-papers-2.5` a `main`, wrangler);
+  - instalar el MSI 4.0.1 en la PC, que pide entrar de nuevo.
+
 ## 29/10: lanzamiento de la testnet v2 (Claude, rama `quantic-v2-genesis`)
 
 Quinto punto del orden acordado. El usuario: «encargate de todo vos desde
