@@ -48,5 +48,5 @@ if ! in_root "command -v cargo > /dev/null"; then
     in_root "curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain $RUST_VERSION"
 fi
 in_root "rustc --version && ldd --version | head -1"
-in_root "cd /src && CARGO_TARGET_DIR=/root/target cargo build --release --locked --features randomx,quantic --bins"
+in_root "cd /src && CARGO_TARGET_DIR=/root/target cargo build --release --locked --features randomx,quantic-pq --bins"
 in_root "/root/target/release/zoka --version"

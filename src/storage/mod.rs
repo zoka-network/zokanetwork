@@ -64,6 +64,10 @@ impl RocksDbStorage {
 
         let mut opts = Options::default();
         opts.create_if_missing(true);
+        // Every open rotates RocksDB's info LOG into a LOG.old.* file, and the
+        // default keeps 1000 of them. Wallet commands open their mirror on
+        // each call (ZSilent several times a minute), so keep only a few.
+        opts.set_keep_log_file_num(5);
 
         let db = Arc::new(
             DB::open(&opts, &path).map_err(|e| StorageError::DatabaseError(e.to_string()))?,

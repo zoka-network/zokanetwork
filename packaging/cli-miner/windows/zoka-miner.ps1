@@ -1,34 +1,40 @@
-# Minero de Zoka Quantic por línea de comandos, para Windows.
+# Minero de Zoka Quantic Testnet v2 por línea de comandos, para Windows.
 #
-# Todo queda dentro de la carpeta del paquete: los datos (cadena, wallets, Tor)
-# en .\data. Usa puertos propios (API 3180, P2P 28181, Tor 19150), así que puede
-# convivir con ZSilent en la misma PC; pero no tiene sentido minar con los dos a
-# la vez: se reparten la CPU.
+# Todo queda dentro de la carpeta del paquete, en .\data\quantic-testnet-v2,
+# con el mismo orden que ZSilent 4.0: node (la cadena y la identidad del nodo),
+# wallets y wallet-mirror (la copia de la cadena que leen las wallets). El nodo
+# llega a la red por los relays de n0, sin abrir puertos. Su API va en
+# 127.0.0.1:9180, así que puede convivir con ZSilent; el Stratum para XMRig, en
+# 127.0.0.1:3333, el mismo puerto que el Stratum de ZSilent (-StratumPort lo
+# cambia). No tiene sentido minar con los dos a la vez: se reparten la CPU.
 #
-# Uso: zoka-miner.ps1 <create-wallet | restore-wallet | address | mine | balance | xmrig-node | status> [-Wallet nombre] [-Threads n]
+# En la testnet el nodo no mina solo: mina XMRig a través de su Stratum. Si
+# XMRig está al lado de este script, "mine" lo arranca.
+#
+# Uso: zoka-miner.ps1 <create-wallet | restore-wallet | address | mine | balance | status> [-Wallet nombre] [-Threads n] [-StratumPort n] [-Xmrig ruta]
 
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("create-wallet", "restore-wallet", "address", "mine", "balance", "xmrig-node", "status", "help")]
+    [ValidateSet("create-wallet", "restore-wallet", "address", "mine", "balance", "status", "help")]
     [string]$Command = "help",
     [string]$Wallet = "miner",
     [int]$Threads = 0,
-    [int]$StratumPort = 3333
+    [int]$StratumPort = 3333,
+    [string]$Xmrig = ""
 )
 
 $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
 $Zoka = Join-Path $Root "zoka.exe"
-$Network = "quantic-testnet"
-$Data = Join-Path $Root "data"
-$ApiBind = "127.0.0.1:3180"
+$Network = "testnet"
+$V2 = Join-Path $Root "data\quantic-testnet-v2"
+$NodeDir = Join-Path $V2 "node"
+$Descriptor = Join-Path $NodeDir "peer.json"
+$ApiBind = "127.0.0.1:9180"
 $Api = "http://$ApiBind"
-$Listen = "/ip4/127.0.0.1/tcp/28181"
-$TorSocks = "127.0.0.1:19150"
-$StratumBind = "0.0.0.0:$StratumPort"
+$Stratum = "127.0.0.1:$StratumPort"
 
-$env:ZOKA_HOME = $Data
-New-Item -ItemType Directory -Force -Path $Data | Out-Null
+New-Item -ItemType Directory -Force -Path $NodeDir | Out-Null
 
 function Say([string]$Text, [string]$Color = "Gray") { Write-Host $Text -ForegroundColor $Color }
 
@@ -46,78 +52,126 @@ function Invoke-WithPassword([string]$Password, [scriptblock]$Action) {
     try { & $Action } finally { Remove-Item Env:ZOKA_CLI_PASSWORD -ErrorAction SilentlyContinue }
 }
 
-function Test-WalletExists {
-    $file = Join-Path $Data ".zoka\$Network\quantic-wallets\$Wallet.json"
-    return (Test-Path -LiteralPath $file)
-}
+function Test-WalletExists { return (Test-Path -LiteralPath (Join-Path $V2 "wallets\$Wallet.json")) }
 
-function Get-ShortAddress {
-    $out = & $Zoka quantic-wallet address --network $Network --name $Wallet 2>&1
+function Get-Address([switch]$Full) {
+    $extra = @()
+    if ($Full) { $extra = @("--full") }
+    $out = & $Zoka quantic-pq-wallet address --network $Network --dir $V2 --name $Wallet @extra 2>&1
     if ($LASTEXITCODE -ne 0) { throw "Could not read the address of wallet '$Wallet': $out" }
     return ("" + $out).Trim()
 }
 
 function Test-NodeOnline {
-    try { Invoke-RestMethod -Uri "$Api/quantic/info" -TimeoutSec 3 | Out-Null; return $true } catch { return $false }
+    try { Invoke-RestMethod -Uri "$Api/status" -TimeoutSec 3 | Out-Null; return $true } catch { return $false }
 }
 
-# Como ZSilent: barras normales, y entre comillas si la ruta tiene espacios.
-function TorPath([string]$Path) {
-    $p = $Path -replace '\\', '/'
-    if ($p -match '\s') { return "`"$p`"" }
-    return $p
-}
-
-# Tor propio, solo para salir: el nodo llega a los demás por sus direcciones
-# .onion. Sin Tor, un minero en otra casa no podría publicar sus bloques. El
-# registro va por la salida estándar a un archivo: "Log notice file <ruta>" se
-# rompe con una ruta con espacios.
-function Start-Tor {
-    $torExe = Join-Path $Root "tor\tor.exe"
-    $torData = Join-Path $Data "tor"
-    $torLog = Join-Path $torData "tor.log"
-    New-Item -ItemType Directory -Force -Path $torData | Out-Null
-    $torrc = Join-Path $torData "torrc"
-    @(
-        "SocksPort $TorSocks",
-        "DataDirectory $(TorPath $torData)",
-        "GeoIPFile $(TorPath (Join-Path $Root 'tor\geoip'))",
-        "GeoIPv6File $(TorPath (Join-Path $Root 'tor\geoip6'))",
-        "Log notice stdout"
-    ) | Set-Content -LiteralPath $torrc -Encoding ASCII
-    if (Test-Path -LiteralPath $torLog) { Remove-Item -LiteralPath $torLog -Force }
-    $process = Start-Process -FilePath $torExe -ArgumentList @("-f", "`"$torrc`"") -NoNewWindow -RedirectStandardOutput $torLog -PassThru
-    Say "Starting Tor (this takes up to a minute)..."
-    $deadline = (Get-Date).AddMinutes(3)
-    while ((Get-Date) -lt $deadline) {
-        Start-Sleep -Seconds 2
-        if ($process.HasExited) { throw "Tor stopped. See $torLog" }
-        if ((Test-Path -LiteralPath $torLog) -and (Select-String -LiteralPath $torLog -Pattern "Bootstrapped 100%" -Quiet)) {
-            Say "Tor is ready." "Green"
-            return $process
-        }
+# La identidad del nodo se cifra con 32 bytes al azar que se crean la primera
+# vez, como en ZSilent 4.0. Nunca se muestran.
+function Get-NodeSecret {
+    $file = Join-Path $NodeDir "node.identity.secret"
+    if (-not (Test-Path -LiteralPath $file)) {
+        $bytes = New-Object byte[] 32
+        [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+        [System.IO.File]::WriteAllText($file, (($bytes | ForEach-Object { $_.ToString("x2") }) -join ""))
     }
-    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-    throw "Tor did not finish starting in 3 minutes. Check your internet connection; details in $torLog"
+    $secret = [System.IO.File]::ReadAllText($file).Trim()
+    if ($secret.Length -eq 0) { throw "$file is empty" }
+    return $secret
 }
 
-function Start-Node([string[]]$Extra) {
+# XMRig no viene en el paquete: -Xmrig, o xmrig.exe al lado de este script (suelto
+# o en la carpeta del zip oficial, xmrig-<versión>), o en el PATH.
+function Find-Xmrig {
+    if ($Xmrig) {
+        if (-not (Test-Path -LiteralPath $Xmrig -PathType Leaf)) { throw "XMRig not found at $Xmrig" }
+        return (Resolve-Path -LiteralPath $Xmrig).Path
+    }
+    $here = Join-Path $Root "xmrig.exe"
+    if (Test-Path -LiteralPath $here -PathType Leaf) { return $here }
+    $nested = Get-ChildItem -LiteralPath $Root -Directory -Filter "xmrig*" -ErrorAction SilentlyContinue |
+        ForEach-Object { Join-Path $_.FullName "xmrig.exe" } |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+    if ($nested) { return $nested }
+    $onPath = Get-Command xmrig.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($onPath) { return $onPath.Source }
+    return $null
+}
+
+# Start-Process junta los argumentos con espacios: los que tienen espacios van
+# entre comillas (la carpeta del paquete puede tenerlos).
+function Join-Arguments([string[]]$Values) {
+    return ($Values | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join " "
+}
+
+function Start-Mining {
     if (-not (Test-WalletExists)) {
         throw "There is no wallet '$Wallet' yet. Run 1-create-wallet.cmd (or restore-wallet.cmd) first."
     }
     if (Test-NodeOnline) { throw "A node is already running on $Api. Close it first." }
-    $address = Get-ShortAddress
-    $tor = Start-Tor
+    $address = Get-Address -Full
+    $short = Get-Address
+    $cores = [Environment]::ProcessorCount
+    if ($Threads -le 0) { $Threads = [Math]::Max(1, $cores - 1) }
+    $miner = Find-Xmrig
+
+    # El nodo nunca pisa un archivo: el descriptor de la corrida anterior se borra.
+    if (Test-Path -LiteralPath $Descriptor) { Remove-Item -LiteralPath $Descriptor }
+    $log = Join-Path $V2 "node.log"
+    $errLog = Join-Path $V2 "node-errors.log"
+    $argv = @("quantic-pq-node", "serve", "--network", $Network,
+        "--db", (Join-Path $NodeDir "db"), "--identity", (Join-Path $NodeDir "node.identity"),
+        "--api", $ApiBind, "--descriptor-out", $Descriptor, "--stratum", $Stratum, "--mine-to", $address)
+
+    # El nodo no mina: para verificar bloques alcanza el modo liviano de RandomX
+    # (256 MB, los mismos hashes) y los 2 GB del rápido quedan para XMRig.
+    if (-not $env:ZOKA_RANDOMX_MODE) { $env:ZOKA_RANDOMX_MODE = "light" }
+    $env:ZOKA_PQ_PASSWORD = Get-NodeSecret
     try {
-        $env:ZOKA_API_BIND = $ApiBind
-        Say ""
-        Say "Mining rewards go to wallet '$Wallet': $address" "Cyan"
-        Say "Press Ctrl+C to stop." "Cyan"
-        Say ""
-        & $Zoka fullnode --network $Network --quantic-mine-to $address --listen $Listen --tor-proxy $TorSocks --min-mine-peers 1 @Extra
+        $node = Start-Process -FilePath $Zoka -ArgumentList (Join-Arguments $argv) -NoNewWindow -PassThru `
+            -RedirectStandardOutput $log -RedirectStandardError $errLog
     } finally {
-        Stop-Process -Id $tor.Id -Force -ErrorAction SilentlyContinue
-        Say "Node and Tor stopped."
+        Remove-Item Env:ZOKA_PQ_PASSWORD -ErrorAction SilentlyContinue
+    }
+    try {
+        Say "Starting the node and joining the network..."
+        $deadline = (Get-Date).AddMinutes(3)
+        while (-not (Test-NodeOnline)) {
+            if ($node.HasExited) { throw "The node stopped. Details in $errLog" }
+            if ((Get-Date) -gt $deadline) { throw "The node did not start in 3 minutes. Details in $errLog" }
+            Start-Sleep -Seconds 2
+        }
+        # Publica la dirección corta en la red, así cualquiera puede pagarte con ella.
+        & $Zoka quantic-pq-wallet publish-address --network $Network --dir $V2 --name $Wallet --api $Api 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { Say "Your short address could not be published yet; the full one always works." "Yellow" }
+
+        Say ""
+        Say "Mining rewards go to wallet '$Wallet': $short" "Cyan"
+        Say "The node's log is $log" "Cyan"
+        if ($miner) {
+            Say "Mining with XMRig, $Threads of $cores CPU threads (-Threads n changes it). Ctrl+C stops both." "Cyan"
+            Say ""
+            & $miner -o $Stratum -u $Wallet -p x -a rx/0 -t $Threads
+            Say "XMRig stopped (exit code $LASTEXITCODE)." "Yellow"
+        } else {
+            Say "XMRig was not found next to this script, so the node is waiting for miners. Start it with:" "Yellow"
+            Say "  xmrig -o $Stratum -u $Wallet -p x -a rx/0 -t $Threads" "Yellow"
+            Say "Ctrl+C stops the node." "Cyan"
+            Say ""
+            $shown = 0
+            while (-not $node.HasExited) {
+                Start-Sleep -Seconds 2
+                $lines = @(Get-Content -LiteralPath $log -ErrorAction SilentlyContinue)
+                if ($lines.Count -gt $shown) { $lines[$shown..($lines.Count - 1)] | ForEach-Object { Say $_ }; $shown = $lines.Count }
+            }
+            Say "The node stopped. Details in $errLog" "Yellow"
+        }
+    } finally {
+        # Ctrl+C también le llega al nodo, que cierra su base solo; si no termina, se corta.
+        if (-not $node.HasExited -and -not $node.WaitForExit(15000)) {
+            Stop-Process -Id $node.Id -Force -ErrorAction SilentlyContinue
+        }
+        Say "Node stopped."
     }
 }
 
@@ -134,7 +188,7 @@ switch ($Command) {
         Say "They are the only way to recover this wallet. They are shown only once," "Yellow"
         Say "and anyone who has them can spend your coins. Never type them on a website." "Yellow"
         Say ""
-        Invoke-WithPassword $p1 { & $Zoka quantic-wallet new --network $Network --name $Wallet --password-env ZOKA_CLI_PASSWORD }
+        Invoke-WithPassword $p1 { & $Zoka quantic-pq-wallet new --network $Network --dir $V2 --name $Wallet --password-env ZOKA_CLI_PASSWORD }
         if ($LASTEXITCODE -ne 0) { throw "The wallet was not created." }
     }
     "restore-wallet" {
@@ -143,51 +197,46 @@ switch ($Command) {
         $p1 = Read-Password "Choose a password for this computer"
         $p2 = Read-Password "Repeat the password"
         if ($p1 -ne $p2) { throw "The two passwords are different. Nothing was restored." }
+        if ($p1.Length -lt 8) { throw "Use at least 8 characters. Nothing was restored." }
         $env:ZOKA_CLI_PHRASE = $phrase
         try {
-            Invoke-WithPassword $p1 { & $Zoka quantic-wallet restore --network $Network --name $Wallet --phrase-env ZOKA_CLI_PHRASE --password-env ZOKA_CLI_PASSWORD }
+            Say "Restored. Your address:" "Cyan"
+            Invoke-WithPassword $p1 { & $Zoka quantic-pq-wallet restore --network $Network --dir $V2 --name $Wallet --phrase-env ZOKA_CLI_PHRASE --password-env ZOKA_CLI_PASSWORD }
         } finally { Remove-Item Env:ZOKA_CLI_PHRASE -ErrorAction SilentlyContinue }
         if ($LASTEXITCODE -ne 0) { throw "The wallet was not restored." }
     }
     "address" {
         Say "Your address (share this one to get paid):" "Cyan"
-        Get-ShortAddress
+        Get-Address
     }
-    "mine" {
-        $cores = [Environment]::ProcessorCount
-        if ($Threads -le 0) { $Threads = [Math]::Max(1, $cores - 1) }
-        Say "Mining with $Threads of $cores CPU threads (use -Threads n to change it)."
-        Start-Node @("--threads", "$Threads")
-    }
-    "xmrig-node" {
-        Say "Node with a Stratum server for XMRig on port $StratumPort; the node itself does not mine." "Cyan"
-        Say "If another program (for example ZSilent's Stratum) already uses it, pick another with -StratumPort <port>."
-        Say "XMRig on this PC:  xmrig -o 127.0.0.1:$StratumPort -u <your address> -p x -a rx/0"
-        Say "XMRig on another PC of your network: use this PC's local IP instead of 127.0.0.1."
-        Say "Windows may ask whether zoka.exe can accept connections: allow private networks only."
-        Start-Node @("--stratum", $StratumBind, "--no-mine")
-    }
+    "mine" { Start-Mining }
     "balance" {
-        if (-not (Test-NodeOnline)) { throw "The node is not running. Start mining first (2-start-mining.cmd), then check the balance from another window." }
+        if (-not (Test-WalletExists)) { throw "There is no wallet '$Wallet' yet." }
+        # Con el nodo andando, la copia de la wallet se pone al día con él antes de contar.
+        $peer = @()
+        if ((Test-NodeOnline) -and (Test-Path -LiteralPath $Descriptor)) {
+            $peer = @("--peer", $Descriptor)
+        } else {
+            Say "The node is not running: this is the balance as of the last time it ran." "Yellow"
+        }
         $p = Read-Password "Password of wallet '$Wallet'"
-        Invoke-WithPassword $p { & $Zoka quantic-wallet balance --network $Network --name $Wallet --password-env ZOKA_CLI_PASSWORD --rpc $Api }
+        Invoke-WithPassword $p { & $Zoka quantic-pq-wallet balance --network $Network --dir $V2 --name $Wallet --password-env ZOKA_CLI_PASSWORD --api $Api @peer }
     }
     "status" {
         if (-not (Test-NodeOnline)) { Say "The node is not running."; break }
-        $info = Invoke-RestMethod -Uri "$Api/quantic/info" -TimeoutSec 5
-        $mining = Invoke-RestMethod -Uri "$Api/quantic/mining" -TimeoutSec 5
-        Say ("Height {0} · your blocks this session {1} · hashrate {2} H/s" -f $info.height, $mining.blocks_mined, $mining.hashrate_hps)
+        $s = Invoke-RestMethod -Uri "$Api/status" -TimeoutSec 5
+        Say ("Height {0} · peers {1} out, {2} in · XMRig miners {3} · blocks found this session {4}" -f
+            $s.height, $s.peers.outbound, $s.peers.inbound, $s.stratum.miners, $s.stratum.blocks_found)
     }
     default {
-        Say "Zoka Quantic CLI miner (testnet). Commands:"
+        Say "Zoka Quantic Testnet v2 CLI miner. Commands:"
         Say "  create-wallet   a new wallet (shows its 24 words once)"
         Say "  restore-wallet  a wallet from its 24 words"
         Say "  address         the address you share to get paid"
-        Say "  mine            run the node and mine (-Threads n)"
-        Say "  balance         your balance (with the node running)"
-        Say "  xmrig-node      run the node for XMRig instead of mining"
-        Say "  status          height and your blocks"
-        Say "Options: -Wallet <name> (default: miner), -Threads n, -StratumPort n (default: 3333)."
+        Say "  mine            run the node, and XMRig if it is next to this script (-Threads n)"
+        Say "  balance         your balance"
+        Say "  status          height, peers and miners"
+        Say "Options: -Wallet <name> (default: miner), -Threads n, -StratumPort n (default: 3333), -Xmrig <path to xmrig.exe>."
         Say "Data lives in .\data next to this script."
     }
 }

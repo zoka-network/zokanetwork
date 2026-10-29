@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Arma el minero CLI de Zoka Quantic para Linux:
+# Arma el minero CLI de Zoka Quantic Testnet v2 para Linux:
 # <salida>/zoka-cli-miner-<versión>-linux-x64.tar.gz
 #
 # Como build-cli-miner.ps1 (el de Windows): el binario tiene que ser la versión
-# de Cargo.toml y traer Zoka Quantic; además no puede pedir una glibc más nueva
-# que la 2.31 (ver build-linux-bullseye.sh), así anda de Ubuntu 20.04 y Debian 11
-# en adelante. Tor no va adentro: en Linux se usa el de la distribución. Adentro
-# va un SHA256SUMS de todos los archivos, y al lado del archivo, el hash del
-# archivo. No publica nada.
+# de Cargo.toml y traer el nodo y la wallet v2 (feature quantic-pq); además no
+# puede pedir una glibc más nueva que la 2.31 (ver build-linux-bullseye.sh), así
+# anda de Ubuntu 20.04 y Debian 11 en adelante. Adentro va un SHA256SUMS de
+# todos los archivos, y al lado del archivo, el hash del archivo. No publica
+# nada.
 #
 # Uso: build-cli-miner-linux.sh <carpeta del repo> <binario zoka> <carpeta de salida>
 set -euo pipefail
@@ -24,9 +24,9 @@ reported="$("$ZOKA" --version)"
 [ "$reported" = "zoka $version" ] || { echo "The binary says '$reported', the source is $version" >&2; exit 1; }
 
 probe="$(mktemp -d)"
-ZOKA_HOME="$probe" "$ZOKA" quantic-wallet list --network quantic-testnet --json | grep -q '"wallets"' \
-    || { echo "The binary was built without Zoka Quantic" >&2; exit 1; }
-rmdir "$probe" 2> /dev/null || true
+ZOKA_HOME="$probe" "$ZOKA" quantic-pq-wallet list --network testnet --dir "$probe/quantic-testnet-v2" --json \
+    | grep -q '"wallets"' || { echo "The binary was built without the Zoka Quantic v2 wallet" >&2; exit 1; }
+rmdir "$probe/quantic-testnet-v2" "$probe" 2> /dev/null || true
 
 newest="$(objdump -T "$ZOKA" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -u -V | tail -1)"
 if [ "$(printf '%s\n%s\n' "$newest" "$MAX_GLIBC" | sort -V | tail -1)" != "$MAX_GLIBC" ]; then

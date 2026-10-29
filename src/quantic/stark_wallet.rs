@@ -780,6 +780,18 @@ fn human(action: &str, reply: &Value) -> String {
         ),
         "generate-phrase" => field("recovery_phrase"),
         "restore" | "address" | "publish-address" => field("short_address"),
+        "balance" => {
+            let mut text = format!(
+                "Spendable: {} ZKA\nImmature: {} ZKA\nHeight: {}",
+                field("spendable"),
+                field("immature"),
+                reply["height"]
+            );
+            if let Some(reason) = reply["sync_error"].as_str() {
+                text.push_str(&format!("\nThe wallet may be behind: {reason}"));
+            }
+            text
+        }
         "list" => reply["wallets"]
             .as_array()
             .map(|names| {

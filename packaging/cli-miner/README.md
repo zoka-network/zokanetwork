@@ -1,168 +1,178 @@
-# Zoka Quantic CLI miner (testnet)
+# Zoka Quantic Testnet v2 CLI miner
 
-Mine **Zoka Quantic Testnet** from a terminal, without the desktop wallet. This
-package is the Zoka node (`zoka`, the same one ZSilent runs inside) plus a few
-scripts that create a wallet, mine, and show your balance.
+Mine the **Zoka Quantic Testnet v2** from a terminal, without the desktop
+wallet. This package is the Zoka node (`zoka`, the same one ZSilent 4.0 runs
+inside) plus a few scripts that create a wallet, start the node so XMRig can
+mine through it, and show your balance.
 
-> **Prefer an app?** Use **ZSilent**, the official desktop wallet: same node,
-> same network, with buttons instead of commands.
+> **Prefer an app?** Use **ZSilent 4.0**, the official desktop wallet for
+> Windows: the same node and the same network, with buttons instead of
+> commands.
 
-- **Test coins with no value.** The testnet restarts from zero when the fully
-  post-quantum private pool is ready.
-- **Private by default.** Rewards are shielded notes: the chain does not show
-  which address received them.
-- **No open ports.** The node reaches the network through Tor, which is
-  included (Windows) or installed from your distribution (Linux).
+- **Test coins, no value.** Testnet v2 replaces testnet v1 (the ZSilent 3.0
+  one): v1 wallets and coins do not carry over.
+- **Private and post-quantum.** Rewards and payments are shielded notes, with
+  STARK proofs and X-Wing encryption: the chain does not show which address
+  receives them.
+- **No open ports.** The node reaches its peers over QUIC, through n0's relays.
+  Nothing to change on your router, and no Tor to install.
 
-## What is inside
+## What's inside
 
-| File | What it does |
+| File | What for |
 | --- | --- |
-| `zoka` / `zoka.exe` | The Zoka Quantic node and wallet (version 3.0.4) |
+| `zoka` / `zoka.exe` | The Zoka Quantic node and wallet (version 4.0.0) |
 | `zoka-miner.ps1` / `zoka-miner.sh` | One script for every step below |
 | `*.cmd` (Windows) | Double-click shortcuts to that script |
-| `tor/` (Windows) | Tor 0.4.9.14, from the official Tor Expert Bundle 15.0.25 |
-| `SHA256SUMS.txt` | Checksums of every file in the package |
+| `SHA256SUMS.txt` | The hashes of every file in the package |
 
-Everything the miner writes (chain, wallet, Tor) stays in a `data` folder next
-to the scripts.
+**XMRig is not included** (see step 3). Everything the miner writes (the chain,
+the node's identity, the wallets) stays in a `data` folder next to the scripts.
 
 ## Requirements
 
-- A 64-bit CPU and **4 GB of RAM or more** (the RandomX dataset takes about 2 GB).
-- **Windows 10 or 11** (x64), or **Linux x86-64** with `tor` installed
-  (`sudo apt install tor` on Debian or Ubuntu).
+- A 64-bit processor and **4 GB of RAM or more**: XMRig uses about 2.5 GB.
+- **Windows 10 or 11** (x64), or **Linux x86-64** with glibc 2.31 or newer
+  (Ubuntu 20.04 or Debian 11 onwards).
 - An internet connection. Nothing to open on your router.
 
 ## 1. Verify the download
 
-Compare the SHA-256 of the archive with the one published next to it in the
-release:
+Compare the file's SHA-256 with the one published next to it in the release:
 
 ```powershell
 # Windows (PowerShell)
-Get-FileHash .\zoka-cli-miner-3.0.4-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\zoka-cli-miner-4.0.0-windows-x64.zip -Algorithm SHA256
 ```
 
 ```bash
 # Linux
-sha256sum zoka-cli-miner-3.0.4-linux-x64.tar.gz
+sha256sum zoka-cli-miner-4.0.0-linux-x64.tar.gz
 ```
 
-If they do not match, do not run it: download it again from the official release.
+If they do not match, do not run it: download it again from the official
+release.
 
 ## 2. Create your wallet
 
-- **Windows:** unzip the package anywhere (for example, in Documents) and
+- **Windows:** unzip the package anywhere (for example in Documents) and
   double-click **`1-create-wallet.cmd`**.
-- **Linux:** `tar xzf zoka-cli-miner-3.0.4-linux-x64.tar.gz`, `cd` into the
+- **Linux:** `tar xzf zoka-cli-miner-4.0.0-linux-x64.tar.gz`, `cd` into the
   folder and run `./zoka-miner.sh create-wallet`.
 
-Choose a password (at least 8 characters). You will then see **24 words**:
+Choose a password (at least 8 characters). Then you will see **24 words**:
 **write them down on paper and keep them safe.** They are the only way to
-recover the wallet, they are shown only once, and anyone who has them can spend
+recover the wallet, they are shown only once, and whoever has them can spend
 your coins.
 
-You also get your **address** (57 characters, starting with `zqtest1`). That is
-the one you share to get paid.
+You also get your **short address** (57 characters, starting with `zqtest2`).
+That is the one you share to get paid.
 
-Already have a wallet (for example, from ZSilent)? Use **`restore-wallet.cmd`**
-or `./zoka-miner.sh restore-wallet` with your 24 words.
+Already have a testnet v2 wallet, for example in ZSilent 4.0? Use
+**`restore-wallet.cmd`** or `./zoka-miner.sh restore-wallet` with your 24 words.
 
-## 3. Mine
+## 3. Get XMRig
+
+On testnet v2 the node does not mine by itself: [XMRig](https://xmrig.com), the
+RandomX miner (`rx/0`, Monero's algorithm), mines through the node's Stratum
+server. Every block it finds pays your wallet in full: this is solo mining
+through your own node, not a shared pool.
+
+1. Download XMRig only from its [official releases](https://github.com/xmrig/xmrig/releases)
+   (`xmrig-<version>-windows-x64.zip`, or `linux-static-x64` on Linux) and check
+   its SHA-256 against the `SHA256SUMS` published next to it.
+2. Unpack it **inside this package's folder**. The folder the archive comes
+   with (`xmrig-<version>`) works as it is. You can also say where it is:
+   `zoka-miner.ps1 mine -Xmrig C:\path\xmrig.exe` or
+   `./zoka-miner.sh mine --xmrig /path/xmrig`.
+
+Antivirus programs, Windows Defender included, flag CPU miners such as XMRig
+and stop them.
+
+## 4. Mine
 
 - **Windows:** double-click **`2-start-mining.cmd`**.
 - **Linux:** `./zoka-miner.sh mine`
 
-The script starts Tor, then the node. The node downloads the chain, waits until
-it is connected to at least one other node (so that your blocks reach the
-network) and starts mining. It uses all CPU threads but one; to change it, run
+The script starts the node, which connects to the network and downloads the
+chain. Then it publishes your short address, so anyone can pay you with it, and
+starts XMRig. XMRig uses every CPU thread but one. To change that:
 `zoka-miner.ps1 mine -Threads 2` (Windows) or `./zoka-miner.sh mine --threads 2`
-(Linux). Press **Ctrl+C** to stop.
+(Linux). **Ctrl+C** stops both.
 
-Each block pays **12 ZKA** to your wallet. They can be spent after **60 blocks**,
-about two hours at the target pace of one block every two minutes.
+If the script does not find XMRig, it leaves the node waiting and shows the
+command to start XMRig yourself in another window:
 
-## 4. Check your balance
+```text
+xmrig -o 127.0.0.1:3333 -u miner -p x -a rx/0
+```
+
+Each block pays **12 ZKA** to your wallet. They can be spent after **60
+blocks**, about two hours at the intended pace of one block every two minutes.
+
+## 5. Check your balance
 
 With the miner running, open another window and run **`check-balance.cmd`**
-(Windows) or `./zoka-miner.sh balance` (Linux). It asks for your wallet password.
+(Windows) or `./zoka-miner.sh balance` (Linux). It asks for the wallet's
+password. With the node off, it shows the balance as of the last time it ran.
 
 Other commands: **`show-address.cmd`** / `./zoka-miner.sh address` shows your
-address, and **`status.cmd`** / `./zoka-miner.sh status` shows the height and
-your blocks.
+address, and **`status.cmd`** / `./zoka-miner.sh status` shows the height, the
+peers and the connected miners.
 
-Your address is published to the network automatically while the node runs, so
-anyone can pay it.
+## Your data and your backups
 
-## Mining with XMRig (optional)
-
-Zoka Quantic uses RandomX (`rx/0`), the same algorithm as Monero, so
-[XMRig](https://xmrig.com) can mine it through the node's Stratum server:
-
-1. Run **`start-node-for-xmrig.cmd`** (Windows) or `./zoka-miner.sh xmrig-node`
-   (Linux). The node opens a Stratum server on port 3333 and does not mine by itself.
-   If ZSilent's Stratum already uses that port on this computer, pick another one:
-   `zoka-miner.ps1 xmrig-node -StratumPort 3334` or `./zoka-miner.sh xmrig-node --stratum-port 3334`.
-2. Start XMRig with your address:
-
-   ```text
-   xmrig -o 127.0.0.1:3333 -u <your address> -p x -a rx/0
-   ```
-
-   From another computer on your local network, use this computer's local IP
-   instead of `127.0.0.1`. Windows may ask whether `zoka.exe` can accept
-   connections: allow private networks only.
-
-Each miner logs in with its own address and gets the whole reward of every block
-it finds. It is solo mining through your node, not a shared pool.
-
-XMRig is a separate program; it is not included. Download it only from its
-official releases and check its SHA-256. Antivirus programs, Windows Defender
-included, flag CPU miners such as XMRig and stop them. A GPU can also mine
-RandomX, but it is slower and uses more power than a CPU.
-
-## Your data and backups
-
-- Everything lives in **`data`** next to the scripts. Do not delete it unless you
-  have your 24 words.
+- Everything is in **`data/quantic-testnet-v2`**, next to the scripts:
+  - `node`: the chain and the node's identity;
+  - `wallets`: your wallets, encrypted with their password;
+  - `wallet-mirror`: the copy of the chain the wallets read.
+- **Do not copy the `node` folder to another computer.** Two nodes with the same
+  identity get in each other's way on the network. Every install creates its
+  own.
 - Your **24 words** are the backup. With them you can restore the wallet in this
-  package or in ZSilent, on any computer.
-- An encrypted backup file is also possible:
-  `zoka quantic-wallet backup --network quantic-testnet --name miner --out <file>`
-  (with `ZOKA_HOME` pointing at the `data` folder).
+  package or in ZSilent 4.0, on any computer.
+- You can also make an encrypted copy in a file:
+  `zoka quantic-pq-wallet backup --network testnet --dir data/quantic-testnet-v2 --name miner --out <file>`
 
 ## Ports
 
 | Port | What for |
 | --- | --- |
-| `127.0.0.1:3180` | The node's local API (the scripts use it) |
-| `127.0.0.1:28181` | The node's P2P port, local only (peers come through Tor) |
-| `127.0.0.1:19150` | Tor's SOCKS port |
-| `0.0.0.0:3333` | Stratum for XMRig, only with `xmrig-node` |
+| `127.0.0.1:9180` | The node's local API (the scripts use it) |
+| `127.0.0.1:3333` | The Stratum for XMRig (`-StratumPort` / `--stratum-port` changes it) |
 
-They do not collide with ZSilent, so both can be installed on the same computer.
-Do not mine with both at once: they share the same CPU.
+Both listen on this computer only. Towards the internet the node uses QUIC
+(UDP) and n0's relays, with no open ports.
+
+The API does not clash with ZSilent 4.0's. The Stratum uses the same port as
+ZSilent's, though: if ZSilent's Stratum is on, pick another one with
+`zoka-miner.ps1 mine -StratumPort 3334` or `./zoka-miner.sh mine --stratum-port 3334`.
+Either way, do not mine with both at once: they share the same CPU.
 
 ## Troubleshooting
 
-- **"A node is already running":** another window is running the miner. Close it first.
-- **Tor does not start:** check your internet connection and any proxy or
-  firewall; details are in `data/tor/tor.log`.
-- **It never starts mining:** the node waits until it is connected to another
-  node, through Tor. Leave it a few minutes and check `status`.
-- **Windows warns about the program:** the binaries are not code-signed yet.
-  Verify the SHA-256 (step 1); if it matches the release, the file is the
+- **"A node is already running":** another window has the miner running. Close
+  it first.
+- **"The node stopped", or the node does not start:** the details are in
+  `data/quantic-testnet-v2/node-errors.log`.
+- **XMRig does not connect:** check that no other program (ZSilent, for example)
+  uses the Stratum port and that the node is still running (`status`).
+- **XMRig closes right after starting:** usually the antivirus. The script shows
+  its exit code.
+- **Windows warns about the program:** the binaries are not digitally signed
+  yet. Verify the SHA-256 (step 1): if it matches the release's, the file is the
   official one.
 
-## Using the commands directly
+## Running the commands by hand
 
-The scripts only call `zoka`. To use it by hand, point `ZOKA_HOME` at the `data`
-folder and pass `--network quantic-testnet`. For example, to send:
+The scripts only call `zoka`. To use it by hand, pass
+`--network testnet --dir data/quantic-testnet-v2`. For example, to send, with
+the node running:
 
 ```text
-zoka quantic-wallet send --network quantic-testnet --name miner --to <address> --amount 5 --password-env ZOKA_CLI_PASSWORD --rpc http://127.0.0.1:3180
+zoka quantic-pq-wallet send --network testnet --dir data/quantic-testnet-v2 --name miner --to <address> --amount 5 --password-env ZOKA_CLI_PASSWORD --peer data/quantic-testnet-v2/node/peer.json --api http://127.0.0.1:9180
 ```
 
-`zoka --help` lists every command. The password always goes through an
+`zoka quantic-pq-wallet help` lists the wallet's commands, and
+`zoka quantic-pq-node help` the node's. The password always goes through an
 environment variable (`--password-env`), never as an argument.
