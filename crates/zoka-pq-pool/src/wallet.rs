@@ -47,11 +47,7 @@ impl Address {
         Ok(())
     }
     fn prefix(&self) -> &'static str {
-        match self.network {
-            1 => "zq2",
-            2 => "zqtest2",
-            _ => "zqregtest2",
-        }
+        address_prefix(self.network)
     }
     pub fn encode(&self) -> Result<String, Error> {
         self.validate()?;
@@ -70,11 +66,7 @@ impl Address {
     }
     pub fn decode(text: &str, network: u8) -> Result<Self, Error> {
         check_network(network)?;
-        let prefix = match network {
-            1 => "zq2",
-            2 => "zqtest2",
-            _ => "zqregtest2",
-        };
+        let prefix = address_prefix(network);
         let body = text.strip_prefix(prefix).ok_or(Error::Network)?;
         if body.len() > 2100 {
             return Err(Error::Encoding);
@@ -99,17 +91,64 @@ impl Address {
         result.validate()?;
         Ok(result)
     }
+    pub fn short_address(&self) -> Result<ShortAddress, Error> {
+        Ok(ShortAddress {
+            network: self.network,
+            digest: digest(b"ZokaPQShort2____", &[self.encode()?.as_bytes()]),
+        })
+    }
     pub fn short(&self) -> Result<String, Error> {
-        let full = self.encode()?;
-        let hash = digest(b"ZokaPQShort2____", &[full.as_bytes()]);
-        let check = digest(b"ZokaPQShortSum2_", &[self.prefix().as_bytes(), &hash]);
-        let mut data = hash.to_vec();
+        Ok(self.short_address()?.encode())
+    }
+}
+
+/// `zq2`, `zqtest2` or `zqregtest2`: what both address forms start with.
+pub fn address_prefix(network: u8) -> &'static str {
+    match network {
+        1 => "zq2",
+        2 => "zqtest2",
+        _ => "zqregtest2",
+    }
+}
+
+/// The digest of a full address string. Paying to it needs the full address,
+/// fetched from a node and checked with [`ShortAddress::matches`]: whoever
+/// serves it can withhold it, not change its keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ShortAddress {
+    pub network: u8,
+    pub digest: [u8; 32],
+}
+impl ShortAddress {
+    pub fn encode(&self) -> String {
+        let prefix = address_prefix(self.network);
+        let check = digest(b"ZokaPQShortSum2_", &[prefix.as_bytes(), &self.digest]);
+        let mut data = self.digest.to_vec();
         data.extend(&check[..4]);
-        Ok(format!(
-            "{}{}",
-            self.prefix(),
-            bs58::encode(data).into_string()
-        ))
+        format!("{prefix}{}", bs58::encode(data).into_string())
+    }
+    pub fn decode(text: &str, network: u8) -> Result<Self, Error> {
+        check_network(network)?;
+        let prefix = address_prefix(network);
+        let body = text.strip_prefix(prefix).ok_or(Error::Network)?;
+        if body.len() > 64 {
+            return Err(Error::Encoding);
+        }
+        let raw = bs58::decode(body).into_vec().map_err(|_| Error::Encoding)?;
+        if raw.len() != 36 {
+            return Err(Error::Encoding);
+        }
+        let check = digest(b"ZokaPQShortSum2_", &[prefix.as_bytes(), &raw[..32]]);
+        if raw[32..] != check[..4] {
+            return Err(Error::Encoding);
+        }
+        Ok(Self {
+            network,
+            digest: raw[..32].try_into().unwrap(),
+        })
+    }
+    pub fn matches(&self, full: &Address) -> bool {
+        full.short_address().is_ok_and(|short| short == *self)
     }
 }
 
@@ -365,5 +404,33 @@ mod tests {
         let mut wrong = cm;
         wrong.0[0] += 1;
         assert!(bob.receive(wrong, &envelope).is_err());
+    }
+
+    #[test]
+    fn a_short_address_names_one_full_address() {
+        let bob = Account::from_seed(&[2; 32], 2, 0).unwrap().address();
+        let carol = Account::from_seed(&[3; 32], 2, 0).unwrap().address();
+        let short = bob.short_address().unwrap();
+        let text = short.encode();
+        assert_eq!(text, bob.short().unwrap());
+        // Wallets and node directories depend on this exact form.
+        assert_eq!(
+            text,
+            "zqtest22m1iDEYKpaemBFZMVj2k1SAzEV9BGL1uFXRZVABUrvAYuHQRbj"
+        );
+        assert_eq!(ShortAddress::decode(&text, 2).unwrap(), short);
+        assert!(short.matches(&bob) && !short.matches(&carol));
+        // Another network, a full address where a short one goes (and the
+        // reverse) and a typo are all refused.
+        assert!(ShortAddress::decode(&text, 3).is_err());
+        assert!(ShortAddress::decode(&bob.encode().unwrap(), 2).is_err());
+        assert!(Address::decode(&text, 2).is_err());
+        let last = text.chars().last().unwrap();
+        let typo = format!(
+            "{}{}",
+            &text[..text.len() - 1],
+            if last == 'a' { 'b' } else { 'a' }
+        );
+        assert!(ShortAddress::decode(&typo, 2).is_err());
     }
 }
