@@ -374,6 +374,9 @@ impl Peers {
             "known": book.known_len(),
             "pending": book.pending_len(),
             "relay": book.relay,
+            // The highest tip an outbound peer reported: how far this node
+            // still has to sync. Zero without outbound sessions.
+            "best_height": book.observed.values().copied().max().unwrap_or(0),
         })
     }
 }

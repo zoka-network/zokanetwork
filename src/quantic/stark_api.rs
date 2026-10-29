@@ -311,6 +311,7 @@ pub fn router(state: NodeState) -> Router {
     Router::new()
         .route("/status", get(status))
         .route("/blocks/:height", get(block_at))
+        .route("/blocks/:height/summary", get(block_summary))
         .route(
             "/transactions",
             post(submit_transaction).layer(DefaultBodyLimit::max(MAX_TRANSACTION_BYTES)),
@@ -368,6 +369,7 @@ async fn status(
             .len();
         json_response(StatusCode::OK, &serde_json::json!({
             "chain_id":state.profile.chain_id,"pool_version":2,"height":ledger.height,"hash":tip.header.hash,
+            "tip_timestamp":tip.header.timestamp,
             "issued_atoms":ledger.issued,"notes":ledger.notes,"mempool_transactions":count,
             "pow_algorithm":state.profile.pow_algorithm(),"xmrig_compatible":state.profile.xmrig_compatible(),
             "max_transaction_bytes":MAX_TRANSACTION_BYTES,"max_block_request_bytes":MAX_BLOCK_REQUEST_BYTES,
@@ -394,6 +396,44 @@ async fn block_at(
             .map_err(ApiError::internal)?
             .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "unknown block height"))?;
         json_response(StatusCode::OK, &block)
+    })
+    .await
+}
+
+/// A canonical block without its transaction bodies, which carry the proofs:
+/// what an explorer lists. The coinbase's outputs are public, so is its total.
+async fn block_summary(
+    State(state): State<NodeState>,
+    Path(height): Path<u64>,
+    Extension(permit): Extension<WorkPermit>,
+) -> ApiResult<Response> {
+    blocking(permit, move || {
+        let block = {
+            let _gate = state.gate.lock().map_err(|_| ApiError::internal("node gate poisoned"))?;
+            state
+                .storage
+                .get_canonical_block_by_height(height)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "unknown block height"))?
+        };
+        let transactions = stark::decode(&block).map_err(ApiError::internal)?;
+        let coinbase = transactions
+            .first()
+            .filter(|tx| tx.statement.nullifiers.is_empty());
+        let reward = coinbase
+            .map(|tx| tx.openings.iter().fold(0u64, |sum, o| sum.saturating_add(o.value)))
+            .unwrap_or(0);
+        let size: usize = block.quantic_transactions.iter().map(Vec::len).sum();
+        let nullifiers: usize = transactions.iter().map(|tx| tx.statement.nullifiers.len()).sum();
+        json_response(StatusCode::OK, &serde_json::json!({
+            "hash":block.header.hash,"height":block.header.block_height,"timestamp":block.header.timestamp,
+            "state_root":block.header.state_root,"previous_hash":block.header.prev_hash,"nonce":block.header.nonce,
+            "size_bytes":size,"reward_atoms":reward,
+            "reward_zka_display":crate::economics::format_zka_amount(reward),
+            "transactions_count":transactions.len(),
+            "private_tx_count":transactions.len() - usize::from(coinbase.is_some()),
+            "private_nullifier_count":nullifiers,"private_coinbase":coinbase.is_some(),
+        }))
     })
     .await
 }
@@ -629,13 +669,22 @@ async fn publish_address(
     .await
 }
 
+#[derive(Deserialize)]
+struct AddressQuery {
+    /// `1` or `true`: only this node's directory, without asking its peers
+    /// (whether a wallet's own address is published yet).
+    local: Option<String>,
+}
+
 /// The full address of a short one: from this node's directory, or asked of
 /// its outbound peers for up to `LOOKUP_TIMEOUT`.
 async fn address_of(
     State(state): State<NodeState>,
     Path(short): Path<String>,
+    Query(query): Query<AddressQuery>,
     Extension(permit): Extension<WorkPermit>,
 ) -> ApiResult<Response> {
+    let local_only = matches!(query.local.as_deref(), Some("1" | "true"));
     // Waiting on peers holds no crypto worker.
     drop(
         permit
@@ -664,6 +713,12 @@ async fn address_of(
         }
         if !asked {
             asked = true;
+            if local_only {
+                return Err(ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "this node does not know that short address",
+                ));
+            }
             if state.peers.book().outbound_len() == 0 {
                 return Err(ApiError::new(
                     StatusCode::NOT_FOUND,
@@ -1057,6 +1112,12 @@ mod tests {
         let status = json(get(&app, "/status").await).await;
         assert_eq!(status["directory"]["addresses"], 1);
         assert_eq!(status["directory"]["published_here"], 1);
+        // `?local=1` answers from this node alone, at once.
+        let local = get(&app, &format!("/address/{short}?local=1")).await;
+        assert_eq!(local.status(), StatusCode::OK);
+        let nobody = Account::from_seed(&[62; 32], 3, 0).unwrap().address().short().unwrap();
+        let response = get(&app, &format!("/address/{nobody}?local=1")).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         // Only full addresses are published, and only short ones resolve.
         let body = serde_json::json!({ "address": short }).to_string().into_bytes();
@@ -1069,5 +1130,25 @@ mod tests {
         let testnet = Account::from_seed(&[61; 32], 2, 0).unwrap().address();
         let response = get(&app, &format!("/address/{}", testnet.short().unwrap())).await;
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn a_block_summary_names_its_public_reward_without_the_proofs() {
+        let (_dir, state) = test_state();
+        let app = router(state.clone());
+        assert_eq!(get(&app, "/blocks/1/summary").await.status(), StatusCode::NOT_FOUND);
+        let alice = Account::from_seed(&[63; 32], 3, 0).unwrap().address();
+        let (block, _) = super::super::stark_node::mine_once(&state, alice).await.unwrap();
+        let summary = json(get(&app, "/blocks/1/summary").await).await;
+        assert_eq!(summary["hash"], block.header.hash);
+        assert_eq!(summary["height"], 1);
+        assert_eq!(summary["reward_atoms"], PREMINE);
+        assert_eq!(summary["transactions_count"], 1);
+        assert_eq!(summary["private_tx_count"], 0);
+        assert_eq!(summary["private_coinbase"], true);
+        assert!(summary["size_bytes"].as_u64().unwrap() > 0);
+        let status = json(get(&app, "/status").await).await;
+        assert_eq!(status["tip_timestamp"], block.header.timestamp);
+        assert_eq!(status["peers"]["best_height"], 0);
     }
 }
