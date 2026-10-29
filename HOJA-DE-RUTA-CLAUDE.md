@@ -28,14 +28,17 @@ Los tres pendientes chicos de la 4.0.0, arreglados:
     Tor.
 - **Pusheado:** `main` y las etiquetas `v4.0.1` (nodo en `e18fe03c` y
   zsilent-core en `0f8a614`), a GitHub y GitLab.
-- **Frenado por permisos** (crear superficies públicas), espera el OK del
-  usuario:
-  - los releases 4.0.1 en GitHub, con las notas en
-    `target/cli-miner/4.0.1/RELEASE-NOTES.md` y
-    `target/zsilent-4.0.1/build/release/4.0.1/publicar/`;
-  - marcar la 4.0.0 como reemplazada;
-  - publicar la web (`web-papers-2.5` a `main`, wrangler);
-  - instalar el MSI 4.0.1 en la PC, que pide entrar de nuevo.
+- **PUBLICADO** (el clasificador lo frenó primero; el usuario dio el OK, «Sí,
+  todo ahora»):
+  - releases 4.0.1 en GitHub (`zokanetwork` con los dos paquetes CLI y
+    `zsilent-core` con el MSI). Bajados de vuelta, `sha256sum -c` da OK. La
+    4.0.0 quedó marcada como reemplazada;
+  - la web (zokaweb `fe3635c`), verificada en vivo: JS, PDF y redirecciones
+    301 de los nombres viejos. `.gitattributes` fija LF para
+    `public/_redirects` (git lo pasaba a CRLF al hacer checkout);
+  - ZSilent 4.0.1 **instalada en la PC** (código 0; nodo `4264f8f5…`, sin la
+    carpeta de Tor). Al abrirla, el usuario vuelve a entrar para que el nodo
+    arranque con el Stratum.
 
 ## 29/10: lanzamiento de la testnet v2 (Claude, rama `quantic-v2-genesis`)
 
