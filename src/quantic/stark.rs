@@ -754,7 +754,12 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let db = RocksDbStorage::new(dir.path()).unwrap();
-        let testnet = Profile::TESTNET;
+        // The launched testnet takes only its own block 1; its rules are
+        // checked here with the same profile before the genesis was fixed.
+        let testnet = Profile {
+            genesis: None,
+            ..Profile::TESTNET
+        };
         let parent = testnet.genesis_parent();
         let local = Account::from_seed(&[5; 32], 3, 0).unwrap().address();
         let err = template(&db, testnet, &parent, &local, vec![], 1_700_000_000)
@@ -773,6 +778,13 @@ mod tests {
             ..testnet
         };
         let err = validate(&db, launched, &block, &parent).err().unwrap();
+        assert!(err.contains("genesis"), "{err}");
+        // The real testnet is launched: another block 1 is not its genesis.
+        assert_eq!(
+            Profile::TESTNET.genesis,
+            Some("69249437d8c35b7e4bf28ec524491fe18384b9869670fadff546fef29148fdb2")
+        );
+        let err = validate(&db, Profile::TESTNET, &block, &parent).err().unwrap();
         assert!(err.contains("genesis"), "{err}");
     }
 }

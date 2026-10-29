@@ -640,7 +640,15 @@ mod tests {
     fn manifests_pin_seeds_by_id_and_key_and_the_builtin_one_parses() {
         let builtin = Manifest::builtin(P).unwrap().unwrap();
         assert_eq!(builtin.chain_id, P.chain_id);
-        builtin.seeds().unwrap();
+        // Launched: the team's PC is seed1, pinned by id and key alone (n0
+        // address lookup finds the rest).
+        let seeds = builtin.seeds().unwrap();
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(
+            seeds[0].endpoint_addr.id.to_string(),
+            "e3bf05e22b0f491d74e07028ffa02db833bc9d06f441acb820cbf723c7eb70c4"
+        );
+        assert!(seeds[0].endpoint_addr.addrs.is_empty());
         assert!(Manifest::builtin(Profile::REGTEST).unwrap().is_none());
 
         let seed = peer(9);

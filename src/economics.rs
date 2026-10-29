@@ -453,9 +453,12 @@ pub const QUANTIC_PQ_REGTEST_CHAIN_ID: &str = "zoka-quantic-regtest-v2";
 /// La testnet que reemplaza a la v1 cuando salga el pool STARK: RandomX (XMRig)
 /// y la ASERT de la v1, con el pool postcuántico desde su primer bloque.
 pub const QUANTIC_PQ_TESTNET_CHAIN_ID: &str = "zoka-quantic-testnet-v2";
-/// El hash de su bloque 1 (el premine). `None` hasta el lanzamiento, que lo
-/// fija en el binario: antes, quien mina el bloque 1 arma su propia cadena local.
-pub const QUANTIC_PQ_TESTNET_GENESIS: Option<&str> = None;
+/// El hash de su bloque 1, el del premine de 5.000.000 ZKA a la wallet del
+/// equipo: lo minó XMRig por el Stratum de la PC el 29/10/2026 a las 08:35:05
+/// (hora de Argentina). La ASERT se ancla en esa hora. Antes de fijarlo, quien
+/// minaba un bloque 1 armaba su propia cadena local.
+pub const QUANTIC_PQ_TESTNET_GENESIS: Option<&str> =
+    Some("69249437d8c35b7e4bf28ec524491fe18384b9869670fadff546fef29148fdb2");
 
 /// El byte de red del pool STARK (`zoka-pq-pool`) de una cadena v2.
 pub fn stark_pool_network(chain_id: &str) -> Option<u8> {

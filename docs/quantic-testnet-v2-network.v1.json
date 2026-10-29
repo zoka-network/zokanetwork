@@ -1,13 +1,22 @@
 {
   "schema": "zoka-quantic-stark-network-v1",
-  "status": "pre-genesis",
+  "status": "active",
   "chain_id": "zoka-quantic-testnet-v2",
   "alpn": "/zoka/quantic-stark/2",
   "transport": "iroh QUIC with mandatory X25519MLKEM768 TLS and an ML-DSA-65 server signature bound to each connection. Relays and address lookup by n0, so no node needs an open port.",
-  "seed_nodes": [],
+  "seed_nodes": [
+    {
+      "label": "seed1",
+      "operator": "Zoka Network",
+      "endpoint_id": "e3bf05e22b0f491d74e07028ffa02db833bc9d06f441acb820cbf723c7eb70c4",
+      "ml_dsa_key_id": "2a29953c90132b1067d1325d45534132b8acac43805479b33cfd1841afe822f9",
+      "status": "active",
+      "note": "The team's PC: the first seed and the checkpoint authority."
+    }
+  ],
   "notes": [
-    "Zoka Quantic Testnet v2: the fully post-quantum private pool (Plonky3 STARK over Poseidon2, X-Wing note encryption, ML-DSA node identities). Test coins with no value. It replaces the v1 testnet when it launches.",
-    "Pre-genesis: block 1 does not exist yet and no seed is listed. The team's PC becomes seed1 at launch.",
+    "Zoka Quantic Testnet v2: the fully post-quantum private pool (Plonky3 STARK over Poseidon2, X-Wing note encryption, ML-DSA node identities). Test coins with no value. It replaces the v1 testnet.",
+    "Launched on 2026-10-29: block 1 (69249437d8c35b7e4bf28ec524491fe18384b9869670fadff546fef29148fdb2) carries the 5,000,000 ZKA premine and is fixed in the binary.",
     "A seed is pinned by its iroh endpoint id and the key id (blake3) of its ML-DSA-65 public key; `quantic-pq-node identity` prints both.",
     "Peers learned from other nodes are dialed and authenticated before they are shared. Blocks are validated locally whoever serves them."
   ]
