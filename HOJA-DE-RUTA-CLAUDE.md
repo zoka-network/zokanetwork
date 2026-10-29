@@ -3,10 +3,57 @@
 Actualizada: **28 de octubre de 2026**, Argentina (núcleo STARK local verificado; testnet v2 minada con XMRig en local; red pública v2 probada por los relays de n0; checkpoints de la PC y direcciones cortas en el nodo v2).
 Proyecto: `C:\Users\mderramus\ZOKA`.
 
+## 28/10, noche (5): ZSilent v2 (Claude, ramas `quantic-v2-zsilent` y `quantic-v2`)
+
+Quinto punto del orden acordado. **Nada pusheado, armado ni instalado:** la
+3.0.5 sigue siendo la publicada y la que usa la PC.
+
+- **Nodo** (rama `quantic-v2-zsilent`, sobre la de cortas):
+  - `06d897c2`: `zoka quantic-pq-wallet`, con las 13 acciones y el JSON de la
+    `quantic-wallet` v1 sobre wallets v2:
+    - la frase BIP-39 es la de la semilla;
+    - la copia `<dir>/wallet-mirror` se sincroniza con el nodo local por
+      `--peer`;
+    - la API va por `--api`, con un cliente HTTP mínimo de loopback.
+  - `c5ce56b7`: `/blocks/<altura>/summary`, `tip_timestamp` y
+    `peers.best_height` en `/status`, y `?local=1` en `/address`.
+- **ZSilent** (rama `quantic-v2` de zsilent-core, sobre la 3.0.5):
+  - `5bda4c7`: los servicios. `NodeController` arranca `quantic-pq-node
+    serve`; la identidad se cifra con un secreto al azar guardado al lado.
+    Si encuentra las claves de la autoridad en la carpeta de la v1, pasa
+    `--authority`. `WalletService` usa `quantic-pq-wallet` y `ZokaRpcClient`
+    lee `/status`. Ya no levanta Tor, no consulta `mine-status` ni sincroniza
+    por RPC.
+  - `d94197b`: las pantallas.
+    - Setup propio por red v2, así que el onboarding se hace de nuevo y ahí se
+      crea la wallet del equipo.
+    - Sin la sección Mining: la testnet v2 se mina con XMRig por el Stratum.
+    - Tablero, Node y Privacy sin Tor. Node muestra checkpoint, directorio e
+      identidad del nodo.
+    - El tablero contaba los pares por la lista de la v1 y con el nodo v2 iba
+      a dar siempre "sin pares".
+  - `3616def`: el armado prueba el binario con `quantic-pq-wallet` y pide
+    `--features randomx,quantic-pq`. La versión queda propuesta como 4.0.0.
+    El paquete de Tor sigue (no se usa).
+- **Validado:**
+  - el comando con un nodo regtest real: pago de 12,5 ZKA a una corta (127 s
+    sin optimizar), un segundo envío con el primero pendiente se rechaza, y el
+    historial de los dos lados queda bien;
+  - pruebas de Rust del comando y de la API;
+  - ZSilent: 80 pruebas, `V2NodeWalletE2ETest` con un nodo regtest real
+    (opcional, con `ZSILENT_V2_E2E_ZOKA`) y capturas de las pantallas v2
+    (`QuanticV2ScreensScreenshotsTest`).
+- **Falta para el lanzamiento:**
+  - el génesis v2 (wallet del equipo con ZSilent 4.0, identidad de la PC al
+    manifiesto, el ancla de ASERT);
+  - armar el MSI con el nodo `--features randomx,quantic-pq`;
+  - decidir si el paquete de Tor se queda;
+  - probar la app entera en la PC (ventana real).
+
 ## 28/10, noche (4): direcciones cortas v2 (Claude, rama `quantic-v2-direcciones-cortas`)
 
-Cuarto punto del orden acordado. Rama sobre `quantic-v2-checkpoints`, **sin
-pushear**.
+Cuarto punto del orden acordado. Rama sobre `quantic-v2-checkpoints`,
+**pusheada** con el OK del usuario (`96327230` en GitHub y GitLab).
 
 - **Formato** (`c33ee7ae`): `ShortAddress` en `zoka-pq-pool`. La corta v2 ya
   se calculaba (`zqtest2…`, 57 caracteres) pero no se podía leer. El formato

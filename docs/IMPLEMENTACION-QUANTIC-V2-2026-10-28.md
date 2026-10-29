@@ -262,6 +262,27 @@ Validado con 9 pruebas nuevas y tres procesos reales: una corta publicada en
 un nodo se resolvió en otro que solo estaba conectado a la semilla. Detalle en
 [QUANTIC-DIRECCIONES-CORTAS.md](QUANTIC-DIRECCIONES-CORTAS.md).
 
+## ZSilent v2 (28/10, ramas `quantic-v2-zsilent` del nodo y `quantic-v2` de ZSilent)
+
+- `zoka quantic-pq-wallet`: las 13 acciones y el JSON de la `quantic-wallet`
+  v1 sobre wallets v2. La copia de la cadena se sincroniza con
+  `stark_node::follow` contra el nodo local, y la API del nodo se usa para
+  cortas, pagos y publicación. El historial sale del escaneo (recibido,
+  gastado, coinbase y hora del bloque).
+- La API agrega `/blocks/<altura>/summary`, `tip_timestamp`,
+  `peers.best_height` y `?local=1`.
+- ZSilent:
+  - arranca `quantic-pq-node serve` (con `--authority` si encuentra las
+    claves de la autoridad);
+  - usa `quantic-pq-wallet` y lee `/status`;
+  - no tiene Tor ni minero integrado: se mina con XMRig por el Stratum;
+  - lleva un setup propio por red v2 y su carpeta es
+    `.zoka/quantic-testnet-v2`.
+
+Validado: el comando con un nodo real (pago a una corta), los servicios de
+ZSilent con un nodo regtest real y las pantallas en capturas. No se armó ni
+publicó un instalador.
+
 La misma frase aplicada a esquemas diferentes no migra las notas ni los saldos.
 No se publicó un instalador, no se activó un génesis público nuevo y no se
 sustituyeron los JNI existentes como parte de este trabajo.

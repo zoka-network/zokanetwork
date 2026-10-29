@@ -336,6 +336,37 @@ ya exportado**: ese pago todavía puede entrar en un bloque hasta caducar o
 hasta que una de sus entradas sea gastada. Sincronice antes de decidir volver
 a gastar fondos reservados.
 
+## Wallets con nombre: `quantic-pq-wallet`
+
+`quantic-pq-wallet` es la wallet que usa ZSilent 4.0: tiene las acciones y las
+respuestas JSON de la `quantic-wallet` de la v1, sobre wallets v2. Las wallets
+son archivos `<dir>/wallets/<nombre>.json` del mismo formato que
+`quantic-pq wallet-create`. Saldo, historial y envíos leen una copia de la
+cadena (`<dir>/wallet-mirror`) que cada llamada pone al día con el nodo de la
+wallet, por conexión directa con su descriptor (`--peer`). La API del nodo
+(`--api`) resuelve cortas, recibe el pago y publica la dirección.
+
+```powershell
+$W = @('--network', 'testnet', '--dir', '.\stark-lab\zsilent', '--peer', '.\stark-lab\testnet-a.peer.json', '--api', 'http://127.0.0.1:9140', '--password-env', 'ZOKA_PQ_PASSWORD', '--json')
+& $Zoka quantic-pq-wallet new --name main @W
+& $Zoka quantic-pq-wallet balance --name main @W
+& $Zoka quantic-pq-wallet history --name main --limit 10 @W
+& $Zoka quantic-pq-wallet publish-address --name main @W
+& $Zoka quantic-pq-wallet send --name main --to <completa o corta> --amount 12.5 --memo "hola" @W
+```
+
+- `new` imprime una sola vez la frase de 24 palabras, la forma BIP-39 de la
+  semilla de 32 bytes. Con `restore --phrase-env VAR` se recupera la misma
+  wallet; `show-phrase` la vuelve a mostrar con la contraseña.
+- También están `list`, `address`, `generate-phrase`, `estimate-fee`,
+  `backup` (copia el archivo cifrado), `import-backup` y `change-password`
+  (vuelve a cifrar también el pago pendiente).
+- Si el nodo no responde, `balance` y `history` contestan con la copia y
+  `node_behind` en verdadero; `send` necesita la copia al día.
+- `send` reserva las entradas antes de entregar el pago. Si el nodo lo
+  rechaza, las libera. Mientras un pago está pendiente no sale otro: se espera
+  a que se mine o caduque (20 bloques).
+
 ## Minar la testnet v2 con XMRig
 
 En la testnet v2 el nodo no mina solo: abre un Stratum y XMRig (o cualquier
@@ -427,15 +458,16 @@ para exponer directamente a Internet.
 
 | Operación | Solicitud | Resultado |
 | --- | --- | --- |
-| Estado | `GET /status` | Cadena, altura, hash, emisión, cantidad de notas y mempool, algoritmo, límites, estado del Stratum, pares (salientes, entrantes, conocidos, pendientes, relay), checkpoint vigente (altura, hash y si la cadena lo contiene) y directorio (direcciones guardadas y publicadas desde este nodo) |
+| Estado | `GET /status` | Cadena, altura, hash y hora de la punta (`tip_timestamp`), emisión, cantidad de notas y mempool, algoritmo, límites, estado del Stratum, pares (salientes, entrantes, conocidos, pendientes, relay y `best_height`, la punta más alta que informa un par saliente), checkpoint vigente (altura, hash y si la cadena lo contiene) y directorio (direcciones guardadas y publicadas desde este nodo) |
 | Bloque canónico | `GET /blocks/ALTURA` | JSON del bloque; 404 si no existe |
+| Resumen de bloque | `GET /blocks/ALTURA/summary` | Hash, hora, tamaño, cantidad de transacciones y nullifiers y la recompensa (la coinbase es pública), sin los cuerpos que llevan las pruebas |
 | Admitir pago | `POST /transactions`, `application/octet-stream` | Transacción v2 binaria; 202 con txid si se acepta |
 | Plantilla de minería | `GET /mining/template?address=DIRECCION` | Bloque candidato, blob, target, seed y posición del nonce |
 | Admitir bloque | `POST /blocks`, `application/json` | Valida y almacena el bloque; conserva ramas válidas según fork choice |
 | Checkpoint vigente | `GET /checkpoint` | El último checkpoint aceptado, o `null` |
 | Admitir checkpoint | `POST /checkpoint`, `application/json` | Lo verifica contra las claves de la autoridad y lo guarda si es el más nuevo; 422 si la firma o la altura no sirven |
 | Publicar dirección | `POST /address`, `application/json` con `{"address": "<completa>"}` y opcionalmente `"stamp"` | La guarda en el directorio y la empuja a los pares; devuelve `short_address` y `new`. Sin `stamp`, el nodo busca el sello o usa el que ya tenía. 422 si no es una dirección completa de esta cadena |
-| Resolver una corta | `GET /address/CORTA` | `short_address` y `address` (la completa). Si el nodo no la tiene, la pregunta a sus pares salientes durante 20 s como máximo; 404 si nadie la tiene |
+| Resolver una corta | `GET /address/CORTA` | `short_address` y `address` (la completa). Si el nodo no la tiene, la pregunta a sus pares salientes durante 20 s como máximo; 404 si nadie la tiene. Con `?local=1` contesta solo con su directorio, al instante |
 
 Ejemplos con el nodo A activo:
 
