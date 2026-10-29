@@ -132,9 +132,7 @@ mine() {
     rm -f "$DESCRIPTOR"
     log="$V2/node.log"
     err_log="$V2/node-errors.log"
-    # El nodo no mina: para verificar bloques alcanza el modo liviano de RandomX
-    # (256 MB, los mismos hashes) y los 2 GB del rápido quedan para XMRig.
-    ZOKA_RANDOMX_MODE="${ZOKA_RANDOMX_MODE:-light}" ZOKA_PQ_PASSWORD="$secret" \
+    ZOKA_PQ_PASSWORD="$secret" \
         "$ZOKA" quantic-pq-node serve --network "$NETWORK" --db "$NODE_DIR/db" \
         --identity "$NODE_DIR/node.identity" --api "127.0.0.1:$API_PORT" --descriptor-out "$DESCRIPTOR" \
         --stratum "$STRATUM" --mine-to "$full" > "$log" 2> "$err_log" &
@@ -227,8 +225,8 @@ case "$COMMAND" in
         s="$(api_get /status)"
         # La altura de la punta va después de su hash; la del checkpoint, no.
         height="$(grep -o '"hash":"[0-9a-f]*","height":[0-9]*' <<< "$s" | head -1 | cut -d: -f3)"
-        echo "Height ${height:-?} · peers $(status_number outbound "$s") out, $(status_number inbound "$s") in" \
-            "· XMRig miners $(status_number miners "$s") · blocks found this session $(status_number blocks_found "$s")"
+        echo "Height ${height:-?} | peers $(status_number outbound "$s") out, $(status_number inbound "$s") in" \
+            "| XMRig miners $(status_number miners "$s") | blocks found this session $(status_number blocks_found "$s")"
         ;;
     *)
         cat << 'EOF'

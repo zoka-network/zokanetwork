@@ -1,6 +1,7 @@
 # Lanzamiento de la testnet v2
 
-29/10/2026. Preparado, **sin lanzar**. Rama `quantic-v2-genesis`.
+**Lanzada el 29/10/2026** (rama `quantic-v2-genesis`). El registro de lo que
+pasó está al final, en «Cómo salió».
 
 Decisiones del usuario (28/10): la testnet v2 reemplaza a la v1; el génesis se
 crea cuando estén el estado compacto y la red pública (ya están); el usuario
@@ -173,3 +174,47 @@ Mientras el hash no está en un binario publicado, se puede empezar de nuevo:
 2. se vuelve al paso 2.
 
 La identidad y la wallet del equipo se conservan.
+
+## Cómo salió
+
+29/10/2026, por la opción A (ZSilent 4.0 de desarrollo en la PC).
+
+- **La wallet del equipo** la creó el usuario en el onboarding con el nombre
+  `zsilent`, no `equipo`: `$V2\wallets\zsilent.json`.
+- **XMRig** (6.25.0, 3 hilos) entró al Stratum a las 08:35:10. El **bloque 1**
+  salió a las 08:35:20, con hora de cabecera 1793273705 (08:35:05 -03:00), el
+  hash `69249437d8c35b7e4bf28ec524491fe18384b9869670fadff546fef29148fdb2` y
+  los 5.000.000 ZKA del premine. Quedó fijado en el commit `85cc0c19`, junto
+  con `seed1` (endpoint `e3bf05e2…c7eb70c4`, clave `2a29953c…a822f9`).
+- **Ritmo de arranque:** un bloque cada 20 s más o menos durante la primera
+  media hora, como se esperaba con los 14 bits iniciales. El Stratum contó
+  algunos bloques de más: son soluciones dobles del mismo trabajo, que quedan
+  como ramas laterales. Con la dificultad mínima, uno de cada cuatro shares de
+  XMRig es un bloque.
+- **El paso 6** pasó con el binario del génesis: un nodo en una carpeta nueva,
+  sin `--peer`, encontró `seed1` por las semillas compiladas, bajó la cadena
+  con el bloque 1 fijado, la siguió y aceptó los checkpoints 2 y 33 que firmó
+  la PC.
+
+Lo que apareció en el camino, todo arreglado antes de armar la versión:
+
+1. ZSilent pasaba `--mine-to` sin el Stratum, y en la testnet el nodo v2 así
+   no arranca. El usuario encendió el Stratum; el código quedó arreglado en
+   `zsilent-core` `7b8547f`.
+2. La app de desarrollo buscaba el manifiesto por el nombre de la red y
+   encontraba el de Zenith (`testnet-network.v1.json`), con la API en el
+   puerto 3000. Por eso el nodo de la PC escucha en el 3000 hasta que se
+   instale el MSI. Ahora busca `quantic-testnet-v2-network.v1.json`
+   (`7b8547f`).
+3. Cada comando de la wallet que encontraba bloques nuevos armaba los 2 GB de
+   RandomX en modo rápido: unos 50 s con todos los núcleos, cada dos minutos
+   en ZSilent, compitiendo con XMRig. Los comandos v2 (`quantic-pq`,
+   `quantic-pq-node` y `quantic-pq-wallet`) ahora usan el modo liviano (256 MB,
+   los mismos hashes): ningún comando v2 mina con RandomX. La consulta baja a
+   medio segundo y el nodo, de 2,3 GB a unos 270 MB. `ZOKA_RANDOMX_MODE=full`
+   lo fuerza.
+4. RocksDB guardaba 1000 logs de información por base, y la copia de la wallet
+   se abre en cada comando. Ahora guarda 5.
+
+Con eso el nodo pasó a **4.0.0** y el minero CLI se rehízo para la v2: sin Tor,
+con XMRig por el Stratum.

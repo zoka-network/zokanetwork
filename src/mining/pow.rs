@@ -26,6 +26,17 @@ use crate::economics;
 /// `economics::POW_ALGORITHM_*` to detect mismatched / unsafe configurations.
 pub type AlgorithmId = &'static str;
 
+static PREFER_LIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Asks RandomX for light mode (the 256 MB cache) instead of the 2 GB
+/// dataset, for a process that only verifies hashes. The hashes are the same,
+/// only about 10× slower, and the cache builds in about a second where the
+/// dataset takes tens of seconds on every core. `ZOKA_RANDOMX_MODE` still
+/// overrides it.
+pub fn prefer_light_mode() {
+    PREFER_LIGHT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Errors a backend can surface while preparing or running.
 #[derive(Debug, thiserror::Error)]
 pub enum PowError {
@@ -461,8 +472,8 @@ mod randomx_backend {
             }
         } else {
             tracing::info!(
-                "RandomX: light mode ({} total / {} free RAM below full-mode threshold; \
-                 set ZOKA_RANDOMX_MODE=full to force)",
+                "RandomX: light mode (verification only, or {} total / {} free RAM below \
+                 the full-mode threshold; set ZOKA_RANDOMX_MODE=full to force)",
                 human_bytes(total_ram_bytes()),
                 human_bytes(free_ram_bytes())
             );
@@ -499,6 +510,9 @@ mod randomx_backend {
             Some("full") | Some("fast") => return true,
             Some("light") => return false,
             _ => {}
+        }
+        if PREFER_LIGHT.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
         }
         const GB: u64 = 1024 * 1024 * 1024;
         let total = total_ram_bytes();

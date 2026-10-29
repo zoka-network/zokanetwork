@@ -18840,6 +18840,12 @@ async fn run() -> Result<(), String> {
     if ZENITH_ONLY_COMMANDS.contains(&command.as_str()) {
         return Err(format!("`zoka {command}` belonged to Zenith. {ZENITH_RETIRED} {QUANTIC_INSTEAD}"));
     }
+    // The STARK v2 commands only verify RandomX hashes: on the testnet XMRig
+    // mines through the node's Stratum, and regtest uses the CPU test PoW.
+    #[cfg(feature = "quantic-pq")]
+    if matches!(command.as_str(), "quantic-pq" | "quantic-pq-node" | "quantic-pq-wallet") {
+        zoka::mining::pow::prefer_light_mode();
+    }
     match command.as_str() {
         #[cfg(feature = "quantic-pq")]
         "quantic-pq" => zoka::quantic::stark_cli::run(tail),

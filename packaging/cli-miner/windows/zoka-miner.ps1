@@ -123,9 +123,6 @@ function Start-Mining {
         "--db", (Join-Path $NodeDir "db"), "--identity", (Join-Path $NodeDir "node.identity"),
         "--api", $ApiBind, "--descriptor-out", $Descriptor, "--stratum", $Stratum, "--mine-to", $address)
 
-    # El nodo no mina: para verificar bloques alcanza el modo liviano de RandomX
-    # (256 MB, los mismos hashes) y los 2 GB del rápido quedan para XMRig.
-    if (-not $env:ZOKA_RANDOMX_MODE) { $env:ZOKA_RANDOMX_MODE = "light" }
     $env:ZOKA_PQ_PASSWORD = Get-NodeSecret
     try {
         $node = Start-Process -FilePath $Zoka -ArgumentList (Join-Arguments $argv) -NoNewWindow -PassThru `
@@ -225,7 +222,7 @@ switch ($Command) {
     "status" {
         if (-not (Test-NodeOnline)) { Say "The node is not running."; break }
         $s = Invoke-RestMethod -Uri "$Api/status" -TimeoutSec 5
-        Say ("Height {0} · peers {1} out, {2} in · XMRig miners {3} · blocks found this session {4}" -f
+        Say ("Height {0} | peers {1} out, {2} in | XMRig miners {3} | blocks found this session {4}" -f
             $s.height, $s.peers.outbound, $s.peers.inbound, $s.stratum.miners, $s.stratum.blocks_found)
     }
     default {
