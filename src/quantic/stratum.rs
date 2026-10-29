@@ -94,7 +94,10 @@ pub trait Backend: Send + Sync + 'static {
     /// cobra (subsidio y comisiones; el premine no cuenta).
     fn template(&self, payout: &str) -> Result<(Block, u64), String>;
     /// Un bloque que alcanzó el objetivo de la red, con su prueba de trabajo.
-    fn found(&self, block: Block, reward_atoms: u64);
+    /// Devuelve si cuenta como hallado: el backend STARK lo importa en el
+    /// momento y solo cuenta el que queda canónico (una segunda solución del
+    /// mismo trabajo queda como rama lateral).
+    fn found(&self, block: Block, reward_atoms: u64) -> bool;
     /// Cada cuánto se rehace una plantilla aunque la punta no cambie.
     fn template_refresh(&self) -> Duration {
         TEMPLATE_REFRESH
@@ -168,8 +171,10 @@ impl Backend for IronwoodBackend {
         Ok((block, reward_atoms))
     }
 
-    fn found(&self, block: Block, reward_atoms: u64) {
+    /// Lo importa el runtime después: se cuenta al encolarlo, como siempre.
+    fn found(&self, block: Block, reward_atoms: u64) -> bool {
         push_found(FoundBlock { block, reward_atoms });
+        true
     }
 }
 
@@ -374,8 +379,9 @@ impl Hub {
         block.header.nonce = nonce;
         block.header.seal = Signature(hash);
         block.header.hash = block.compute_hash();
-        self.backend.found(block, job.reward_atoms);
-        self.blocks.fetch_add(1, Ordering::Relaxed);
+        if self.backend.found(block, job.reward_atoms) {
+            self.blocks.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(true)
     }
 }

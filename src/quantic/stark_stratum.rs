@@ -138,18 +138,24 @@ impl Backend for StarkBackend {
         Ok((block, reward))
     }
 
-    fn found(&self, block: Block, reward_atoms: u64) {
+    fn found(&self, block: Block, reward_atoms: u64) -> bool {
         let imported = self.permit().and_then(|_permit| {
             let _gate = self.state.gate.lock().map_err(|_| "node gate poisoned")?;
             super::stark_node::import_mined_locked(&self.state, &block)
         });
         match imported {
-            Ok(canonical) => println!(
-                "{}",
-                serde_json::json!({"stratum_block":block.header.hash,"height":block.header.block_height,
-                    "reward_atoms":reward_atoms,"canonical":canonical})
-            ),
-            Err(reason) => eprintln!("STARK stratum block rejected: {reason}"),
+            Ok(canonical) => {
+                println!(
+                    "{}",
+                    serde_json::json!({"stratum_block":block.header.hash,"height":block.header.block_height,
+                        "reward_atoms":reward_atoms,"canonical":canonical})
+                );
+                canonical
+            }
+            Err(reason) => {
+                eprintln!("STARK stratum block rejected: {reason}");
+                false
+            }
         }
     }
 }
@@ -227,6 +233,10 @@ mod tests {
     /// What XMRig does with a job: put a 32-bit nonce at offset 39 of the blob
     /// and compare the top 64 bits of the hash (little endian) to the target.
     fn solve(job: &Value) -> (String, String) {
+        solve_from(job, 0)
+    }
+
+    fn solve_from(job: &Value, start: u32) -> (String, String) {
         let mut blob = hex::decode(job["blob"].as_str().unwrap()).unwrap();
         let seed = hex::decode(job["seed_hash"].as_str().unwrap()).unwrap();
         let target: [u8; 8] = hex::decode(job["target"].as_str().unwrap())
@@ -236,7 +246,7 @@ mod tests {
         let target = u64::from_le_bytes(target);
         let engine = pow::build_engine(P.pow_algorithm(), &seed).unwrap();
         let offset = pow::QUANTIC_POW_NONCE_OFFSET;
-        for nonce in 0u32.. {
+        for nonce in start.. {
             blob[offset..offset + 4].copy_from_slice(&nonce.to_le_bytes());
             let hash = engine.calculate_hash(&blob).unwrap();
             if u64::from_le_bytes(hash[24..32].try_into().unwrap()) < target {
@@ -319,5 +329,19 @@ mod tests {
         assert_ne!(notice["params"]["job_id"], job["job_id"]);
         let status = crate::quantic::stratum::status();
         assert!(status.accepted_shares >= 1 && status.blocks_found >= 1);
+
+        // A second solution of the old job is still a good share, but its
+        // block only joins a side branch: it does not count as found.
+        let first = u32::from_le_bytes(hex::decode(&nonce).unwrap().try_into().unwrap());
+        let (late, late_result) = solve_from(&job, first + 1);
+        let side = call(&mut writer, &mut lines, json!({"id":6,"method":"submit",
+            "params":{"id":session,"job_id":job["job_id"],"nonce":late,"result":late_result}})).await;
+        assert_eq!(side["result"]["status"], "OK", "{side}");
+        assert_eq!(state.storage.get_chain_height().unwrap(), 1);
+        assert_eq!(
+            state.storage.get_canonical_block_by_height(1).unwrap().unwrap().header.hash,
+            block.header.hash
+        );
+        assert_eq!(crate::quantic::stratum::status().blocks_found, status.blocks_found);
     }
 }
