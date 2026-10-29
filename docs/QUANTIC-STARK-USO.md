@@ -248,6 +248,39 @@ Detalle en [CHECKPOINTS-AUTORITATIVOS.md](CHECKPOINTS-AUTORITATIVOS.md).
   minero interno no arman plantillas (`mining paused`).
 - `checkpoint-sign` firma uno a mano. Se entrega con `POST /checkpoint`.
 
+## Direcciones cortas
+
+Una dirección v2 completa mide unos 1.760 caracteres. La corta (`zqtest2…`, 57
+caracteres) es su resumen BLAKE2b-256 con un checksum: entra en un QR normal y
+se puede pegar en un mensaje. Para pagarle, el nodo busca la completa y
+comprueba que el resumen coincida. Quien la entrega puede no darla, pero no
+cambiarla. Diseño en [QUANTIC-DIRECCIONES-CORTAS.md](QUANTIC-DIRECCIONES-CORTAS.md).
+
+Con los nodos A y B activos, Bob publica su dirección en A, y quien le paga
+resuelve la corta en B antes de armar el pago:
+
+```powershell
+$Bob = (& $Zoka quantic-pq address --wallet .\stark-lab\bob.wallet.json).Trim()
+$BobCorta = (& $Zoka quantic-pq address --wallet .\stark-lab\bob.wallet.json --short).Trim()
+Invoke-RestMethod -Method Post -ContentType application/json -Body (@{ address = $Bob } | ConvertTo-Json) http://127.0.0.1:9140/address
+$Completa = (Invoke-RestMethod "http://127.0.0.1:9141/address/$BobCorta").address
+& $Zoka quantic-pq send --db .\stark-lab\wallet-mirror --wallet .\stark-lab\alice.wallet.json --to $Completa --amount-atoms 1000000 --out .\stark-lab\alice-to-bob.tx
+```
+
+- **Publicar** no cuesta una comisión sino un sello de trabajo: Argon2id de
+  8 MiB, unas 256 pruebas, algunos segundos en una PC. El nodo guarda la
+  dirección, la empuja a sus pares salientes y la vuelve a empujar en cada
+  sesión nueva y cada 6 horas.
+- **Resolver:** si el nodo no tiene la corta, se la pregunta a sus pares
+  salientes y espera hasta 20 s. Un nodo sin pares salientes contesta 404 en el
+  acto. Una semilla solo tiene sesiones entrantes: quien publica se la empuja y
+  quien paga se la pregunta.
+- `send --to` pide la dirección completa. Con una corta avisa que hay que
+  resolverla primero.
+- **Límites:** hasta un millón de direcciones por nodo (unos 1,8 GB). Cada
+  conexión entrante puede entregar 30 registros por minuto, y cada sesión
+  empuja como máximo 20.
+
 ## Sincronizar una copia para la wallet y enviar
 
 RocksDB abre una base por proceso. Mientras A o B estén activos, use otra base
@@ -323,11 +356,13 @@ En otra terminal:
 xmrig.exe -o 127.0.0.1:3333 -u $Minera -p x -a rx/0
 ```
 
-- El login de XMRig (`-u`) es la **dirección v2 completa** de la wallet que
-  cobra. Una dirección de otra red, una de la v1 (`zqtest1…`) o una corta se
-  rechazan con un error, para no minar para otro sin saberlo. Con
-  `--mine-to DIRECCION` en `serve`, un login que no es una dirección (el
-  nombre de un equipo) cobra a esa.
+- El login de XMRig (`-u`) es la **dirección v2** de la wallet que cobra: la
+  completa, o la corta si el nodo la tiene en su directorio (ver
+  [Direcciones cortas](#direcciones-cortas)). Una dirección de otra red, una
+  de la v1 (`zqtest1…`) o una corta que el nodo no conoce se rechazan con un
+  error, para no minar para otro sin saberlo. Con `--mine-to DIRECCION` en
+  `serve`, un login que no es una dirección (el nombre de un equipo) cobra a
+  esa.
 - `--mine-to` sin `--stratum` es un error en la testnet: el minero interno
   resuelve una plantilla hasta el final con un hilo y es para la regtest.
   `--stratum` en la regtest también es un error: XMRig calcula RandomX y la
@@ -392,13 +427,15 @@ para exponer directamente a Internet.
 
 | Operación | Solicitud | Resultado |
 | --- | --- | --- |
-| Estado | `GET /status` | Cadena, altura, hash, emisión, cantidad de notas y mempool, algoritmo, límites, estado del Stratum, pares (salientes, entrantes, conocidos, pendientes, relay) y checkpoint vigente (altura, hash y si la cadena lo contiene) |
+| Estado | `GET /status` | Cadena, altura, hash, emisión, cantidad de notas y mempool, algoritmo, límites, estado del Stratum, pares (salientes, entrantes, conocidos, pendientes, relay), checkpoint vigente (altura, hash y si la cadena lo contiene) y directorio (direcciones guardadas y publicadas desde este nodo) |
 | Bloque canónico | `GET /blocks/ALTURA` | JSON del bloque; 404 si no existe |
 | Admitir pago | `POST /transactions`, `application/octet-stream` | Transacción v2 binaria; 202 con txid si se acepta |
 | Plantilla de minería | `GET /mining/template?address=DIRECCION` | Bloque candidato, blob, target, seed y posición del nonce |
 | Admitir bloque | `POST /blocks`, `application/json` | Valida y almacena el bloque; conserva ramas válidas según fork choice |
 | Checkpoint vigente | `GET /checkpoint` | El último checkpoint aceptado, o `null` |
 | Admitir checkpoint | `POST /checkpoint`, `application/json` | Lo verifica contra las claves de la autoridad y lo guarda si es el más nuevo; 422 si la firma o la altura no sirven |
+| Publicar dirección | `POST /address`, `application/json` con `{"address": "<completa>"}` y opcionalmente `"stamp"` | La guarda en el directorio y la empuja a los pares; devuelve `short_address` y `new`. Sin `stamp`, el nodo busca el sello o usa el que ya tenía. 422 si no es una dirección completa de esta cadena |
+| Resolver una corta | `GET /address/CORTA` | `short_address` y `address` (la completa). Si el nodo no la tiene, la pregunta a sus pares salientes durante 20 s como máximo; 404 si nadie la tiene |
 
 Ejemplos con el nodo A activo:
 
@@ -437,6 +474,7 @@ rendimiento ni de memoria constante por debajo de esos tamaños.
 | Número de entradas y salidas, tamaños, txid y sobres cifrados | Públicos |
 | Alturas, tiempos, prueba de trabajo y cabeceras | Públicos |
 | IP, identidad del peer y patrones de conexión/transmisión | No los oculta la STARK ni el relay. El operador del relay y el DNS de pkarr (n0) ven IP y EndpointId; los pares, su EndpointId y lo que piden |
+| Direcciones publicadas | El directorio no es secreto: cualquier nodo ve que una dirección existe y desde cuándo la tiene. Al resolver una corta, los pares consultados ven cuál se busca. Quien no quiera eso comparte la completa y no la publica |
 
 El cifrado de notas usa X-Wing, combinación de ML-KEM-768 y X25519, junto con
 ChaCha20-Poly1305. La propiedad de fondos, pertenencia y conservación de saldo
@@ -478,6 +516,11 @@ No demuestran por sí solos seguridad de Fiat-Shamir frente a consultas
 cuánticas, conocimiento cero de la composición completa ni seguridad de toda
 la aplicación. Tampoco ampliar la salida de un hash aumenta automáticamente
 su resistencia interna.
+
+El directorio de direcciones cortas es de los nodos, no del consenso: un nodo
+puede no tener una dirección, y la búsqueda llega solo a los pares directos.
+Antes de la mainnet hay que decidir si queda así o se lleva a la cadena
+([QUANTIC-DIRECCIONES-CORTAS.md](QUANTIC-DIRECCIONES-CORTAS.md)).
 
 La red pública depende hoy de los relays y del DNS de n0. No hay transporte por
 Tor (QUIC va sobre UDP y Tor solo lleva TCP), ni un modo en el que las semillas

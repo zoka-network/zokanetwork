@@ -177,7 +177,8 @@ testnet v2, que reemplaza a la v1. Rama `quantic-v2-checkpoints`.
 - **Claves:** la testnet v2 (`zoka-quantic-testnet-v2`) tiene compiladas las
   mismas dos mitades que la v1 de Quantic. Cada firma lleva el chain id, así
   que un checkpoint de una cadena no sirve en la otra, y la PC no necesita
-  claves nuevas. La versión 2 (híbrida) es la única que se acepta.
+  claves nuevas (el usuario lo confirmó el 28/10). La versión 2 (híbrida) es
+  la única que se acepta.
 - **Modo autoridad:** `quantic-pq-node serve --authority DIR`. `DIR` es la
   carpeta con `checkpoint-authority.key` y `checkpoint-authority-mldsa.key`, la
   de la red de la v1. Si alguna de las dos no es la compilada, el nodo no

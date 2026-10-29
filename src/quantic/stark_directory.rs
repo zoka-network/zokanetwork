@@ -26,7 +26,7 @@ use crate::storage::RocksDbStorage;
 
 /// Records a node keeps at most: about 1.8 GB of full addresses.
 pub const MAX_RECORDS: u64 = 1_000_000;
-/// A record as JSON: a 1,755-character address and its stamp.
+/// A record as JSON: an address of about 1,760 characters and its stamp.
 pub const MAX_RECORD_BYTES: usize = 4096;
 /// Records an inbound connection may submit per minute. Each stamp takes a
 /// crypto worker a few milliseconds to check.

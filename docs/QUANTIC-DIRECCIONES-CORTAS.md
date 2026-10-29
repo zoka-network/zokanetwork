@@ -19,6 +19,40 @@ además:
   módulos cuadrados, las esquinas de la norma, 4 módulos de margen, corrección M
   (33 módulos para una corta) y cada módulo en píxeles enteros.
 
+## Testnet v2 (STARK, 28/10/2026)
+
+La opción A, llevada al nodo v2. Rama `quantic-v2-direcciones-cortas`.
+
+- **Formato:** `zqtest2…`, 57 caracteres (`zq2…` en la mainnet). Es el resumen
+  BLAKE2b-256 de la dirección completa tal como se escribe, más un checksum de
+  4 bytes que cubre el prefijo. No lleva byte de versión: la versión la da el
+  prefijo. Un vector fijo en `crates/zoka-pq-pool/src/wallet.rs` impide
+  cambiarlo sin darse cuenta.
+- **Sello:** el de la v1 (Argon2id de 8 MiB y 8 bits) con otra sal, así que el
+  sello de una dirección v1 no sirve en la v2.
+- **Red:** la v2 no tiene gossip, sino sesiones de pregunta y respuesta. Cada
+  sesión saliente empuja las direcciones publicadas en el nodo (otra vez cada
+  6 horas) y las que guardó hace poco, y le pregunta al par por las cortas que
+  alguien espera resolver. Una semilla solo tiene sesiones entrantes: quien
+  publica se la empuja y quien paga se la pregunta.
+- **Topes:** un millón de registros por nodo (unos 1,8 GB), 30 por minuto por
+  conexión entrante, 20 por minuto empujados por sesión y búsquedas de 20 s
+  como máximo.
+- **API:** `POST /address` y `GET /address/<corta>`, con el JSON de la v1.
+  `/status` cuenta las direcciones guardadas y las publicadas desde el nodo.
+- **Stratum:** acepta la corta como login si el nodo la tiene, y cobra a su
+  completa.
+- **`quantic-pq`:** `address --short` imprime la corta. `send --to` pide la
+  completa y, con una corta, avisa que hay que resolverla.
+- **Probado** con tres procesos reales (A semilla; B y C solo conectados a A):
+  publicar en B tardó 0,6 s y B se la empujó a A. C, que nunca la había
+  visto, la resolvió a través de A en 0,2 s. Una corta desconocida da 404 a
+  los 20 s.
+- **Queda abierto:**
+  - la búsqueda llega solo a los pares directos;
+  - un nodo sin sesiones salientes solo contesta lo que tiene;
+  - decidir entre A y B antes de la mainnet sigue pendiente.
+
 ## El problema
 
 Una dirección de Quantic mide hoy **1.734 caracteres** (`zqtest1` + Base58 de

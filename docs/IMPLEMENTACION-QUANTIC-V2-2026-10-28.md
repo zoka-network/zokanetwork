@@ -245,6 +245,23 @@ reales. Un nodo que minó solo 30 bloques pasó a la cadena de 11 de la
 autoridad, y una firma a mano llegó a los tres. Detalle en
 [CHECKPOINTS-AUTORITATIVOS.md](CHECKPOINTS-AUTORITATIVOS.md).
 
+## Direcciones cortas (28/10, rama `quantic-v2-direcciones-cortas`)
+
+El directorio de direcciones cortas de la v1 (opción A), llevado al nodo v2.
+- `ShortAddress` en `zoka-pq-pool`: lee la corta que ya se calculaba
+  (`zqtest2…`, 57 caracteres), fijada en un vector de prueba.
+- `stark_directory.rs`: registros con sello Argon2id (sal propia de la v2) y
+  topes de tamaño.
+- Red: `GET_ADDRESS` y `SUBMIT_ADDRESS`, con 30 registros por minuto por
+  conexión. Cada sesión saliente empuja las direcciones propias y las recién
+  guardadas, y pregunta por las cortas que alguien espera.
+- API `POST /address` y `GET /address/<corta>`; Stratum con login corto;
+  `quantic-pq address --short`.
+
+Validado con 9 pruebas nuevas y tres procesos reales: una corta publicada en
+un nodo se resolvió en otro que solo estaba conectado a la semilla. Detalle en
+[QUANTIC-DIRECCIONES-CORTAS.md](QUANTIC-DIRECCIONES-CORTAS.md).
+
 La misma frase aplicada a esquemas diferentes no migra las notas ni los saldos.
 No se publicó un instalador, no se activó un génesis público nuevo y no se
 sustituyeron los JNI existentes como parte de este trabajo.

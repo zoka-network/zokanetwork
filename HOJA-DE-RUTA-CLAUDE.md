@@ -1,17 +1,62 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
-Actualizada: **28 de octubre de 2026**, Argentina (núcleo STARK local verificado; testnet v2 minada con XMRig en local; red pública v2 probada por los relays de n0).
+Actualizada: **28 de octubre de 2026**, Argentina (núcleo STARK local verificado; testnet v2 minada con XMRig en local; red pública v2 probada por los relays de n0; checkpoints de la PC y direcciones cortas en el nodo v2).
 Proyecto: `C:\Users\mderramus\ZOKA`.
+
+## 28/10, noche (4): direcciones cortas v2 (Claude, rama `quantic-v2-direcciones-cortas`)
+
+Cuarto punto del orden acordado. Rama sobre `quantic-v2-checkpoints`, **sin
+pushear**.
+
+- **Formato** (`c33ee7ae`): `ShortAddress` en `zoka-pq-pool`. La corta v2 ya
+  se calculaba (`zqtest2…`, 57 caracteres) pero no se podía leer. El formato
+  no cambió y queda fijado en un vector de prueba.
+- **Directorio** (`src/quantic/stark_directory.rs`): la opción A de la v1
+  sobre las sesiones de la v2, que no tienen gossip.
+  - Cada sesión saliente empuja las direcciones publicadas en el nodo (otra
+    vez cada 6 h) y las que guardó hace poco.
+  - Cada sesión le pregunta al par por las cortas que alguien espera.
+  - Sello Argon2id de la v1 con sal propia.
+  - Topes: un millón de registros, 30 por minuto por conexión, 20 por minuto
+    empujados por sesión y búsquedas de 20 s.
+- **API:** `POST /address` y `GET /address/<corta>`, con el mismo JSON que la
+  v1; `/status` cuenta el directorio.
+- **Stratum:** acepta la corta si el nodo la conoce.
+- **CLI:** `quantic-pq address --short`; `send --to <corta>` avisa que hay que
+  resolverla.
+- **Validado:**
+  - 9 pruebas nuevas (formato, directorio, red con el tope por conexión, API
+    y nodo) y 2 ampliadas (Stratum y CLI); las 5 del directorio v1 siguen
+    pasando con el sello separado;
+  - la suite de nodo, cadena y red: 250 de 251. La que falla,
+    `pq_pinned_localhost_sync_private_tx_…`, se pasa del límite de 120 s
+    armando una prueba STARK sin optimizar. Falla igual en `e57d4701`, sin los
+    cambios de esta etapa: es la velocidad de la PC esa noche, no una
+    regresión. Antes pasaba.
+  - tres procesos reales en `target/v2-cortas-2026-10-28/run1`:
+    - publicar en B tardó 0,6 s y B se la empujó a A;
+    - C, que nunca la había visto, la resolvió a través de A en 0,2 s;
+    - una corta desconocida da 404 a los 20 s en C, y al instante en A (sin
+      pares salientes);
+    - publicar una corta da 422, y `send --to <corta>` avisa;
+    - stderr vacíos.
+- **Ojo con los worktrees:** compartir `CARGO_TARGET_DIR` entre dos copias del
+  repo hace que cargo reutilice artefactos de la otra copia (los crates locales
+  se identifican por la ruta relativa). Pasó con la comparación contra
+  `e57d4701`: se arregló con `cargo clean -p zoka-pq-pool --profile dev`.
+- **ZSilent:** sigue la 3.0.5, que es de la v1. La actualización hace falta
+  recién con el lanzamiento de la v2, porque la 3.0.5 no habla con el nodo v2.
+- **Sigue:** ZSilent v2 y el génesis.
 
 ## 28/10, noche (3): checkpoints de la PC en el nodo STARK (Claude, rama `quantic-v2-checkpoints`)
 
 Tercer punto del orden acordado (decisión 3 del usuario). Rama sobre
-`quantic-v2-red-publica`, **sin pushear**.
+`quantic-v2-red-publica`, **pusheada** con el OK del usuario (`e57d4701` en
+GitHub y GitLab).
 
 - **Claves:** la testnet v2 usa las mismas claves de autoridad que la v1 (la
   misma PC, y cada firma lleva el chain id). El usuario no tiene que crear
-  nada. Si prefiere claves propias para la v2, es una línea en `economics.rs`
-  más `zoka checkpoint-keygen`.
+  nada; lo confirmó el 28/10.
 - **Nodo:** `serve --authority DIR`. `DIR` es la carpeta de la red de la v1
   donde están `checkpoint-authority.key` y `checkpoint-authority-mldsa.key`.
   Se firma con las reglas de la v1: cada 30 bloques, 6 por debajo de la punta,
