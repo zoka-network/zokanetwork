@@ -3,6 +3,35 @@
 Actualizada: **29 de octubre de 2026**, Argentina (**testnet v2 lanzada**: bloque 1 fijado y la PC como seed1; nodo, minero CLI y ZSilent 4.0.0 publicados, web al día y la 4.0.0 instalada en la PC).
 Proyecto: `C:\Users\mderramus\ZOKA`.
 
+## 29/10, tarde (2): revisión de ZSilent y 4.0.2 (el usuario: «controlá si zsilent está funcionando bien»)
+
+- **Bien:**
+  - el nodo de la 4.0.1 tiene el Stratum, el cobro, la autoridad, la API en 9140
+    y 270 MB;
+  - el contador del Stratum cuadra con la cadena, y una rama lateral (244) no
+    sumó;
+  - la emisión cierra (5.002.988 ZKA en la altura 250);
+  - un nodo nuevo con solo las semillas compiladas bajó los 254 bloques en
+    unos 20 s y aceptó el checkpoint 226;
+  - la copia de la wallet guarda 4 logs viejos.
+- **Error encontrado (4.0.0 y 4.0.1):** `Main.kt` arma el cliente del nodo local
+  con `networkSettings.localRpcUrl`, que salía de `desktop.localRpcUrl` del
+  manifiesto. El v2 no lo trae: la URL quedaba vacía y `status()` fallaba antes
+  de conectar (`netstat`: ninguna conexión de la app al 9140). La app no
+  mostraba altura, pares ni Stratum, y el saldo se refrescaba solo al entrar.
+  El nodo (que usa el getter con la caída a 9140) y la minería andaban. Lo
+  destapó el arreglo del nombre del manifiesto (`7b8547f`): el de Zenith traía
+  `desktop.localRpcUrl` con el puerto 3000.
+- **Arreglo:** zsilent-core `2db8911`, ZSilent 4.0.2 con el nodo 4.0.1. La
+  configuración cae en `http://127.0.0.1:9140`. La prueba nueva falla con el
+  código de la 4.0.1 y pasan las 81. El MSI `12ae31e6…` está en
+  `target/zsilent-4.0.2/build/release/4.0.2` y se verificó extrayéndolo.
+- **Falta, con el OK del usuario:** el release 4.0.2, la web (ZSilent 4.0.2) y
+  la instalación en la PC.
+- **A mirar:** la ventana usa ~16 % de un núcleo dibujando sin parar (hilos de
+  AWT y de Direct3D de skiko). Puede ser una animación de «esperando al nodo»
+  que con la 4.0.2 se apague.
+
 ## 29/10, tarde: 4.0.1 y papers 2.5 (Claude; el usuario: «arreglá eso inmediatamente»)
 
 Los tres pendientes chicos de la 4.0.0, arreglados:
