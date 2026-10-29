@@ -21,7 +21,7 @@ mine through it, and show your balance.
 
 | File | What for |
 | --- | --- |
-| `zoka` / `zoka.exe` | The Zoka Quantic node and wallet (version 4.0.0) |
+| `zoka` / `zoka.exe` | The Zoka Quantic node and wallet (version 4.0.1) |
 | `zoka-miner.ps1` / `zoka-miner.sh` | One script for every step below |
 | `*.cmd` (Windows) | Double-click shortcuts to that script |
 | `SHA256SUMS.txt` | The hashes of every file in the package |
@@ -42,12 +42,12 @@ Compare the file's SHA-256 with the one published next to it in the release:
 
 ```powershell
 # Windows (PowerShell)
-Get-FileHash .\zoka-cli-miner-4.0.0-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\zoka-cli-miner-4.0.1-windows-x64.zip -Algorithm SHA256
 ```
 
 ```bash
 # Linux
-sha256sum zoka-cli-miner-4.0.0-linux-x64.tar.gz
+sha256sum zoka-cli-miner-4.0.1-linux-x64.tar.gz
 ```
 
 If they do not match, do not run it: download it again from the official
@@ -57,7 +57,7 @@ release.
 
 - **Windows:** unzip the package anywhere (for example in Documents) and
   double-click **`1-create-wallet.cmd`**.
-- **Linux:** `tar xzf zoka-cli-miner-4.0.0-linux-x64.tar.gz`, `cd` into the
+- **Linux:** `tar xzf zoka-cli-miner-4.0.1-linux-x64.tar.gz`, `cd` into the
   folder and run `./zoka-miner.sh create-wallet`.
 
 Choose a password (at least 8 characters). Then you will see **24 words**:
