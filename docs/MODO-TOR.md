@@ -104,13 +104,31 @@ chico.
   - con las IP de la semilla en el descriptor, iroh intentaba cerrar la única
     ruta ("failed closing path: LastOpenPath") y la sesión se trababa a los
     2,5 minutos.
-- [ ] **E4b. Semilla .onion de verdad** (necesita el OK del usuario):
-  - un `tor.exe` permanente en la PC, con un servicio .onion hacia el nodo
-    del explorador (`--stream-listen` y `--stream-address`);
-  - su `stream_address` en `docs/quantic-testnet-v2-network.v1.json`;
-  - un nodo nuevo publicado.
-- [ ] **E5.** ZSilent: interruptor, estado y textos. Release, con el OK del
-  usuario.
+- [x] **E4b. Semilla .onion de verdad (30/10, autorizado por el usuario).**
+  - `%APPDATA%\Zoka\.zoka	or-seed\` tiene `tor.exe` 0.4.9.14, un `torrc` sin
+    SOCKS y la .onion `u2soz3q63237afuccfxf3jzytpljpbxpvyzt3jumrr45ukzowdakayqd.onion:9444`.
+    Se abre sin ventana con `tor-seed-oculto.vbs`.
+  - El nodo del explorador corre con `--stream-listen 127.0.0.1:9444` y
+    `--stream-address`.
+  - Es seed2 en el manifiesto.
+  - Probado con `scripts/probar-modo-tor-testnet.ps1 -Seeds builtin`: un nodo
+    nuevo bajó la testnet real (1097 bloques) en 6 minutos, solo por Tor.
+  - Antes hubo que arreglar dos cosas:
+    - la descarga, con pedidos en tubería y el atajo del ancestro común (por
+      Tor pasó de 0,5 a 3 bloques/s);
+    - una pausa de 7 minutos: la semilla registró "failed closing path:
+      LastOpenPath" porque un circuito cortado dejaba a QUIC respondiendo a un
+      flujo muerto. La solución fue la ficha estable en el saludo, con prueba
+      de corte, más el corte por 60 s de silencio.
+- [x] **E5. ZSilent 4.0.5.**
+  - Interruptor "Reach the network only through Tor" en Settings > Network,
+    apagado por defecto.
+  - Tor cliente (solo SOCKS) desde `TorSupervisor`, y el nodo con `--tor`. Si
+    Tor no arranca, el nodo tampoco.
+  - Bloqueado en una PC con las claves de autoridad.
+  - El MSI trae Tor otra vez.
+  - Prueba `TorModeE2ETest`, contra la testnet real: altura 50 en 202 s.
+  - El minero CLI 4.0.3 suma `-Tor` / `--tor`.
 
 ## Registro
 
