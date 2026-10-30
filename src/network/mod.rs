@@ -18,6 +18,8 @@ pub mod p2p;
 pub mod peer_store;
 #[cfg(feature = "pq-experimental")]
 pub mod pq_tls;
+#[cfg(feature = "pq-experimental")]
+pub mod stream_transport;
 pub mod private_tx_request_response;
 pub mod quantic_light_request_response;
 pub mod snapshot_request_response;

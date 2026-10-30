@@ -63,8 +63,11 @@ chico.
 
 ## Etapas
 
-- [ ] **E1.** `stream_transport` con marcador TCP; prueba de eco entre dos
-  endpoints iroh, solo con este transporte y TLS híbrido obligatorio.
+- [x] **E1.** `stream_transport` con marcador TCP; prueba de eco entre dos
+  endpoints iroh, solo con este transporte y TLS híbrido obligatorio. Pasó:
+  200 KB de eco en ambos sentidos en 0,18 s (rama `modo-tor`). Del lado que
+  escucha, cada flujo entrante recibe una dirección al azar (ignora lo que
+  diga el que marca), así nadie desvía las respuestas de otro.
 - [ ] **E2.** Descriptor y manifiesto con dirección propia. Prueba de punta a
   punta en regtest: un nodo sincroniza bloques de otro solo por el
   transporte de flujos.
