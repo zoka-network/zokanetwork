@@ -11,11 +11,11 @@
 # En la testnet el nodo no mina solo: mina XMRig a través de su Stratum. Si
 # XMRig está al lado de este script, "mine" lo arranca.
 #
-# Uso: zoka-miner.ps1 <create-wallet | restore-wallet | address | mine | balance | status> [-Wallet nombre] [-Threads n] [-StratumPort n] [-Xmrig ruta]
+# Uso: zoka-miner.ps1 <create-wallet | restore-wallet | address | view-key | mine | balance | status> [-Wallet nombre] [-Threads n] [-StratumPort n] [-Xmrig ruta]
 
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("create-wallet", "restore-wallet", "address", "mine", "balance", "status", "help")]
+    [ValidateSet("create-wallet", "restore-wallet", "address", "view-key", "mine", "balance", "status", "help")]
     [string]$Command = "help",
     [string]$Wallet = "miner",
     [int]$Threads = 0,
@@ -206,6 +206,16 @@ switch ($Command) {
         Say "Your address (share this one to get paid):" "Cyan"
         Get-Address
     }
+    "view-key" {
+        if (-not (Test-WalletExists)) { throw "There is no wallet '$Wallet' yet." }
+        $p = Read-Password "Password of wallet '$Wallet'"
+        Say "Your view key. It shows every payment and the balance of this wallet (paste it in" "Cyan"
+        Say "https://zokascan.cc/wallet, which reads it inside your browser); it cannot spend." "Cyan"
+        Say "Share it only as you would a bank statement: it cannot be revoked." "Yellow"
+        Invoke-WithPassword $p { & $Zoka quantic-pq-wallet show-view-key --network $Network --dir $V2 --name $Wallet --password-env ZOKA_CLI_PASSWORD --json } |
+            ForEach-Object { if ($_ -match '"view_key":"([^"]+)"') { $Matches[1] } else { $_ } }
+        if ($LASTEXITCODE -ne 0) { throw "Could not read the view key." }
+    }
     "mine" { Start-Mining }
     "balance" {
         if (-not (Test-WalletExists)) { throw "There is no wallet '$Wallet' yet." }
@@ -230,6 +240,7 @@ switch ($Command) {
         Say "  create-wallet   a new wallet (shows its 24 words once)"
         Say "  restore-wallet  a wallet from its 24 words"
         Say "  address         the address you share to get paid"
+        Say "  view-key        a key that shows your balance (zokascan.cc/wallet) and cannot spend"
         Say "  mine            run the node, and XMRig if it is next to this script (-Threads n)"
         Say "  balance         your balance"
         Say "  status          height, peers and miners"

@@ -11,7 +11,7 @@
 # En la testnet el nodo no mina solo: mina XMRig a través de su Stratum. Si
 # XMRig está al lado de este script, "mine" lo arranca.
 #
-# Uso: ./zoka-miner.sh <create-wallet | restore-wallet | address | mine | balance | status> [--wallet nombre] [--threads n] [--stratum-port n] [--xmrig ruta]
+# Uso: ./zoka-miner.sh <create-wallet | restore-wallet | address | view-key | mine | balance | status> [--wallet nombre] [--threads n] [--stratum-port n] [--xmrig ruta]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -204,6 +204,15 @@ case "$COMMAND" in
         address
         echo
         ;;
+    view-key)
+        wallet_exists || die "There is no wallet '$WALLET' yet."
+        p="$(read_password "Password of wallet '$WALLET'")"
+        echo "Your view key. It shows every payment and the balance of this wallet (paste it in"
+        echo "https://zokascan.cc/wallet, which reads it inside your browser); it cannot spend."
+        echo "Share it only as you would a bank statement: it cannot be revoked."
+        ZOKA_CLI_PASSWORD="$p" "$ZOKA" quantic-pq-wallet show-view-key --network "$NETWORK" --dir "$V2" \
+            --name "$WALLET" --password-env ZOKA_CLI_PASSWORD --json | sed -n 's/.*"view_key":"\([^"]*\)".*/\1/p'
+        ;;
     mine)
         mine
         ;;
@@ -234,6 +243,7 @@ Zoka Quantic Testnet v2 CLI miner. Commands:
   create-wallet   a new wallet (shows its 24 words once)
   restore-wallet  a wallet from its 24 words
   address         the address you share to get paid
+  view-key        a key that shows your balance (zokascan.cc/wallet) and cannot spend
   mine            run the node, and XMRig if it is next to this script (--threads n)
   balance         your balance
   status          height, peers and miners

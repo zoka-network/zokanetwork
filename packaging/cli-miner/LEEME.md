@@ -21,7 +21,7 @@ minar con XMRig y muestran tu saldo.
 
 | Archivo | Para qué |
 | --- | --- |
-| `zoka` / `zoka.exe` | El nodo y la wallet de Zoka Quantic (versión 4.0.1) |
+| `zoka` / `zoka.exe` | El nodo y la wallet de Zoka Quantic (versión 4.0.2) |
 | `zoka-miner.ps1` / `zoka-miner.sh` | Un script para cada paso de abajo |
 | `*.cmd` (Windows) | Accesos de doble clic a ese script |
 | `SHA256SUMS.txt` | Los hashes de todos los archivos del paquete |
@@ -43,12 +43,12 @@ Compará el SHA-256 del archivo con el que está publicado al lado, en el releas
 
 ```powershell
 # Windows (PowerShell)
-Get-FileHash .\zoka-cli-miner-4.0.1-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\zoka-cli-miner-4.0.2-windows-x64.zip -Algorithm SHA256
 ```
 
 ```bash
 # Linux
-sha256sum zoka-cli-miner-4.0.1-linux-x64.tar.gz
+sha256sum zoka-cli-miner-4.0.2-linux-x64.tar.gz
 ```
 
 Si no coinciden, no lo ejecutes: bajalo de nuevo del release oficial.
@@ -57,7 +57,7 @@ Si no coinciden, no lo ejecutes: bajalo de nuevo del release oficial.
 
 - **Windows:** descomprimí el paquete donde quieras (por ejemplo, en Documentos)
   y hacé doble clic en **`1-create-wallet.cmd`**.
-- **Linux:** `tar xzf zoka-cli-miner-4.0.1-linux-x64.tar.gz`, entrá a la carpeta
+- **Linux:** `tar xzf zoka-cli-miner-4.0.2-linux-x64.tar.gz`, entrá a la carpeta
   con `cd` y ejecutá `./zoka-miner.sh create-wallet`.
 
 Elegí una contraseña (8 caracteres como mínimo). Después vas a ver **24
@@ -119,6 +119,20 @@ wallet. Con el nodo apagado, te muestra el saldo de la última vez que anduvo.
 Otros comandos: **`show-address.cmd`** / `./zoka-miner.sh address` muestra tu
 dirección, y **`status.cmd`** / `./zoka-miner.sh status` muestra la altura, los
 pares y los mineros conectados.
+
+## 6. Tu saldo desde cualquier lado: la clave de vista
+
+**`show-view-key.cmd`** (Windows) o `./zoka-miner.sh view-key` (Linux) muestra la
+**clave de vista** de tu wallet (`zqtestview2…`). Pegala en
+[zokascan.cc/wallet](https://zokascan.cc/wallet): el explorador baja las salidas
+cifradas de la cadena y las abre adentro de tu navegador, así que te muestra el
+saldo y cada pago sin que la clave salga de la página.
+
+- **No puede gastar**: para gastar hacen falta tus 24 palabras. Una wallet de
+  Zoka Quantic no tiene una clave de gasto aparte.
+- Quien la tenga ve todos los pagos de la wallet, los de antes y los que vengan.
+  Compartila solo como compartirías un resumen del banco: no se puede revocar.
+  Si se filtra, pasá tus monedas a una wallet nueva.
 
 ## Tus datos y tus copias de seguridad
 
