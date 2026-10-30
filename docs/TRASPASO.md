@@ -127,3 +127,7 @@ Tor es **opcional** (decisión del usuario): nunca obligatorio.
   - el anuncio en Discord (lo pega el usuario);
   - una segunda semilla fuera de la PC;
   - ZKAPriv para la v2.
+- 30/10, noche: **ZKAPriv 3.0** (rediseño visual y v2 STARK), en marcha. El
+  usuario dejó la sesión en automático. Plan:
+  `zkapriv/docs/PLAN-ZKAPRIV-3.md`, rama `zkapriv-v2` del repo zkapriv. Seguir
+  por la primera etapa sin marcar de ese plan.
