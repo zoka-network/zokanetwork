@@ -74,9 +74,30 @@ navegador» y gráficos de «red y nodos». Publicación aprobada con «Sí, tod
   - **Web:** zokaweb `abc62c4`, desplegada y pusheada. ZokaScan ya no figura
     «offline», hay guía de la clave de vista y descargas 4.0.3/4.0.2.
   - **zokaexplorer:** `main` avanzó a `6c24953`, lo que está en producción.
+- **ZSilent 4.0.4** (zsilent-core `main` = `v4.0.4` = `897b766`, pusheada;
+  release en GitHub sin crear todavía). El usuario pidió: «saquemos lo de
+  Tor… copiar la dirección y truncarla… instalala, comiteá y subí».
+  - **Sin indicadores de Tor:** el nodo v2 no tiene transporte por Tor y
+    ningún control lo prendía. Salen la pastilla de la barra, la de This
+    device con su aviso, «Privacy & Tor» (ahora «Network privacy»), la
+    política de About, la pastilla y la tarjeta de Logs, y la línea de la
+    intro. La página Network explica qué se ve. `TorSupervisor` queda en el
+    código, apagado.
+  - **CopyableKeyValueRow:** corta al medio (18 + 12) y el botón de copiar
+    queda siempre a la vista; se copia el valor entero.
+  - 82 pruebas, con capturas de Ajustes y de las filas. El MSI `df5ea7ff…`
+    trae el nodo 4.0.2 y no trae Tor.
+  - **Instalada en la PC** a las 10:57: la 4.0.3 a las 10:26 y la 4.0.4
+    después. XMRig se cerró las dos veces al apagarse ZSilent y se relanzó.
+  - **Modo Tor real, planificado:** un transporte propio de iroh 1.3
+    (`unstable-custom-transports`) que lleva los paquetes de QUIC por Tor
+    hasta la .onion de la semilla. Arti embebido como cliente y `tor.exe`
+    0.4.9.14 para el servicio .onion de la semilla. El canal PQ de iroh va
+    adentro, porque Tor no es postcuántico. Nodo solo saliente, sin UDP,
+    relays ni IP publicada.
 - **Falta:**
-  - Instalar ZSilent 4.0.3 en la PC. Hay que cerrar ZSilent, que es la
-    semilla; el usuario vuelve a entrar después.
+  - Release en GitHub de ZSilent 4.0.4 (y la web a 4.0.4), con el OK del
+    usuario.
   - Los papers describen la clave de vista solo como la clave X-Wing; la
     `ViewKey` agrega la clave de salida y el dueño. Corregirlo en la próxima
     edición.
