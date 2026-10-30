@@ -94,3 +94,26 @@ Tor es **opcional** (decisión del usuario): nunca obligatorio.
   `u2soz3q63237afuccfxf3jzytpljpbxpvyzt3jumrr45ukzowdakayqd.onion:9444`, y el nodo del
   explorador con el binario de `modo-tor`, `--stream-listen 127.0.0.1:9444` y
   `--stream-address`. Respaldo: `explorer-node\zoka-4.0.2.exe` y `explorer-node-4.0.2.cmd`.
+
+- 30/10, tarde: **E4b, E5 y releases en marcha**:
+  - **Nodo 4.0.3** (rama `modo-tor`, sin merge a `main` todavía):
+    - seed2 con su .onion en el manifiesto;
+    - descarga en tubería (16 pedidos) y atajo del ancestro común: por Tor
+      pasó de 0,5 a 3 bloques/s;
+    - ficha estable en el saludo, para que un circuito cortado no trabe la
+      conexión;
+    - corte por 60 s de silencio;
+    - `.gitattributes` con `*.sh eol=lf`.
+  - Prueba contra la testnet real: `scripts/probar-modo-tor-testnet.ps1 -Seeds builtin`.
+  - **Minero CLI 4.0.3:** `-Tor` / `--tor` y guías. Paquete de Windows
+    `c37a2ceb…`; el de Linux, compilando en WSL.
+  - **ZSilent 4.0.5** (zsilent-core, rama `modo-tor`, `db9d6ca`):
+    - interruptor de Tor opcional;
+    - MSI con Tor, armándose en `target/zsilent-4.0.5`.
+  - **Web** (zokaweb `613eb92`) y caché de `/scan` (zokaexplorer `a734c88`):
+    commiteadas, sin desplegar.
+  - **Falta:**
+    - merge de las ramas `modo-tor` a `main`;
+    - etiquetas, releases, despliegues e instalación de ZSilent 4.0.5 (todo
+      autorizado);
+    - actualizar la hoja de ruta.
