@@ -879,13 +879,24 @@ impl Client {
         let heights: Vec<u64> = heights.collect();
         let mut imported = 0;
         for window in heights.chunks(PIPELINE) {
-            let result = tokio::time::timeout(REQUEST_TIMEOUT, async {
-                for height in window {
-                    self.write_request(GET_BLOCK, &height.to_be_bytes()).await?;
-                }
+            // Each answer gets the whole REQUEST_TIMEOUT, as a lone request
+            // would: a window can hold several multi-megabyte blocks, which
+            // over Tor take a while each.
+            let result = async {
+                tokio::time::timeout(REQUEST_TIMEOUT, async {
+                    for height in window {
+                        self.write_request(GET_BLOCK, &height.to_be_bytes()).await?;
+                    }
+                    Ok::<_, String>(())
+                })
+                .await
+                .map_err(|_| "STARK request timeout".to_string())??;
                 let mut fresh_blocks = 0;
                 for &height in window {
-                    let (status, bytes) = self.read_response(MAX_BLOCK_WIRE_BYTES).await?;
+                    let (status, bytes) =
+                        tokio::time::timeout(REQUEST_TIMEOUT, self.read_response(MAX_BLOCK_WIRE_BYTES))
+                            .await
+                            .map_err(|_| "STARK request timeout".to_string())??;
                     if status != 0 {
                         return Err(format!(
                             "STARK peer rejected request: {}",
@@ -911,16 +922,13 @@ impl Client {
                     }
                 }
                 Ok::<_, String>(fresh_blocks)
-            })
+            }
             .await;
             match result {
-                Ok(Ok(fresh)) => imported += fresh,
-                other => {
+                Ok(fresh) => imported += fresh,
+                Err(reason) => {
                     self.connection.close(1u32.into(), b"STARK pipelined fetch failed");
-                    return Err(match other {
-                        Ok(Err(reason)) => reason,
-                        _ => "STARK request timeout".into(),
-                    });
+                    return Err(reason);
                 }
             }
         }

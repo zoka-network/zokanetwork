@@ -3,19 +3,23 @@
 //!
 //! Every QUIC datagram travels as one frame, a big-endian `u16` length and its
 //! bytes, on a stream between two nodes. Whoever dials sends a hello first
-//! (magic and version) and then frames both ways; the listener answers on that
-//! same stream. Iroh's hybrid post-quantum TLS runs inside, unchanged: the
-//! stream only carries its packets.
+//! (magic, version and its token) and then frames both ways; the listener
+//! answers on that same stream. Iroh's hybrid post-quantum TLS runs inside,
+//! unchanged: the stream only carries its packets.
 //!
 //! Addresses are [`CustomAddr`]s with [`STREAM_TRANSPORT_ID`]:
 //! - **dialable**: `host:port` (with Tor, `xxxx.onion:port`), what a listener
 //!   publishes;
-//! - **inbound**: a random token the listener gives each stream it accepts.
-//!   It is never published and nobody can dial it; the dialer's claims about
-//!   itself are ignored, so no one can redirect another node's replies.
+//! - **inbound**: what the listener calls a dialer, from the 16 random bytes
+//!   the dialer sends in every hello. It is never published and nobody can
+//!   dial it. A dialer whose stream breaks (a Tor circuit dies) dials again
+//!   with the same token and the listener's QUIC keeps its path, instead of
+//!   answering into a stream that no longer exists. Guessing another dialer's
+//!   token, to take its replies, means guessing 128 random bits.
 //!
 //! A full queue drops the frame, as a full socket drops a UDP datagram: QUIC
-//! sends it again.
+//! sends it again. A stream that stays silent for [`LINK_IDLE`] is closed: QUIC
+//! keeps every live path busier than that, so silence means a dead circuit.
 
 use std::{
     collections::HashMap,
@@ -45,6 +49,7 @@ use tokio::{
 /// "ZQST": the custom transport id of Zoka's stream transport.
 pub const STREAM_TRANSPORT_ID: u64 = 0x5a51_5354;
 const HELLO: &[u8] = b"ZQSTREAM1";
+const TOKEN_BYTES: usize = 16;
 const KIND_DIAL: u8 = 1;
 const KIND_INBOUND: u8 = 2;
 /// Per-stream queue of frames waiting to be written.
@@ -55,6 +60,8 @@ const INCOMING_QUEUE: usize = 1024;
 const MAX_INBOUND: usize = 64;
 const MAX_TARGET: usize = 255;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
+/// A link that receives nothing for this long is dropped (and redialed).
+const LINK_IDLE: Duration = Duration::from_secs(60);
 
 /// The address a listener publishes: `host:port`, or `xxxx.onion:port`.
 pub fn dial_addr(target: &str) -> io::Result<CustomAddr> {
@@ -79,11 +86,21 @@ pub fn dial_target(addr: &CustomAddr) -> Option<String> {
         .filter(|target| !target.is_empty() && target.len() <= MAX_TARGET)
 }
 
-fn inbound_addr() -> CustomAddr {
-    let mut data = [0u8; 17];
+/// What a listener calls the dialer that says hello with `token`.
+fn inbound_addr(token: &[u8; TOKEN_BYTES]) -> CustomAddr {
+    let mut data = [0u8; 1 + TOKEN_BYTES];
     data[0] = KIND_INBOUND;
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut data[1..]);
+    data[1..].copy_from_slice(token);
     CustomAddr::from_parts(STREAM_TRANSPORT_ID, &data)
+}
+
+fn hello(token: &[u8; TOKEN_BYTES]) -> Vec<u8> {
+    [HELLO, token.as_slice()].concat()
+}
+
+/// The token of a well-formed hello.
+fn hello_token(frame: &[u8]) -> Option<[u8; TOKEN_BYTES]> {
+    frame.strip_prefix(HELLO)?.try_into().ok()
 }
 
 /// A byte stream in both directions.
@@ -137,6 +154,8 @@ impl Dialer for SocksDialer {
 struct Shared {
     /// What this transport publishes: its dialable address, if it listens.
     published: Option<CustomAddr>,
+    /// Sent in every hello, the same for the life of the transport.
+    token: [u8; TOKEN_BYTES],
     dialer: Arc<dyn Dialer>,
     /// Open streams by the remote address frames for it are sent to.
     links: Mutex<HashMap<CustomAddr, mpsc::Sender<Bytes>>>,
@@ -164,9 +183,12 @@ impl StreamTransport {
     /// onion service, its `.onion:port`); `None` for a node that only dials.
     pub fn new(published: Option<&str>, dialer: Arc<dyn Dialer>) -> io::Result<Self> {
         let (incoming, receiver) = mpsc::channel(INCOMING_QUEUE);
+        let mut token = [0u8; TOKEN_BYTES];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut token);
         Ok(Self {
             shared: Arc::new(Shared {
                 published: published.map(dial_addr).transpose()?,
+                token,
                 dialer,
                 links: Mutex::new(HashMap::new()),
                 incoming,
@@ -196,10 +218,17 @@ impl StreamTransport {
                 tokio::spawn(async move {
                     let (mut reader, writer) = tokio::io::split(stream);
                     let hello = tokio::time::timeout(HELLO_TIMEOUT, read_frame(&mut reader)).await;
-                    if !matches!(hello, Ok(Ok(Some(ref bytes))) if bytes.as_ref() == HELLO) {
+                    let Some(token) = hello
+                        .ok()
+                        .and_then(Result::ok)
+                        .flatten()
+                        .and_then(|frame| hello_token(&frame))
+                    else {
                         return;
-                    }
-                    let peer = inbound_addr();
+                    };
+                    // A redial with the same token replaces the old stream:
+                    // frames for this dialer go to the newest one.
+                    let peer = inbound_addr(&token);
                     let (sender, queue) = mpsc::channel(LINK_QUEUE);
                     if let Ok(mut links) = shared.links.lock() {
                         links.insert(peer.clone(), sender.clone());
@@ -385,7 +414,10 @@ impl StreamSender {
         tokio::spawn(async move {
             if let Ok(stream) = shared.dialer.dial(target).await {
                 let (reader, mut writer) = tokio::io::split(stream);
-                if write_frame(&mut writer, HELLO).await.is_ok() {
+                if write_frame(&mut writer, &hello(&shared.token))
+                    .await
+                    .is_ok()
+                {
                     run_link(&shared, peer.clone(), reader, writer, queue).await;
                 }
             }
@@ -421,7 +453,9 @@ async fn run_link<R, W>(
 {
     let incoming = shared.incoming.clone();
     let inbound = async {
-        while let Ok(Some(frame)) = read_frame(&mut reader).await {
+        while let Ok(Ok(Some(frame))) =
+            tokio::time::timeout(LINK_IDLE, read_frame(&mut reader)).await
+        {
             // A full queue drops the datagram, as a full UDP socket would.
             if let Err(mpsc::error::TrySendError::Closed(_)) =
                 incoming.try_send((peer.clone(), frame))
@@ -482,10 +516,11 @@ mod tests {
     struct Echo;
     impl ProtocolHandler for Echo {
         async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-            let (mut send, mut recv) = connection.accept_bi().await?;
-            tokio::io::copy(&mut recv, &mut send).await?;
-            send.finish()?;
-            connection.closed().await;
+            // Every stream the client opens, until it closes the connection.
+            while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+                tokio::io::copy(&mut recv, &mut send).await?;
+                send.finish()?;
+            }
             Ok(())
         }
     }
@@ -500,7 +535,14 @@ mod tests {
         assert!(dial_addr("no-port").is_err());
         assert!(dial_addr(&"a".repeat(300)).is_err());
         // An inbound token is never dialable, and other transports are not ours.
-        assert_eq!(dial_target(&inbound_addr()), None);
+        assert_eq!(dial_target(&inbound_addr(&[9; TOKEN_BYTES])), None);
+        // A hello carries its token; anything else is not a hello.
+        assert_eq!(
+            hello_token(&hello(&[7; TOKEN_BYTES])),
+            Some([7; TOKEN_BYTES])
+        );
+        assert_eq!(hello_token(HELLO), None);
+        assert_eq!(hello_token(b"ZQSTREAM2xxxxxxxxxxxxxxxx"), None);
         assert_eq!(dial_target(&CustomAddr::from_parts(7, b"\x01x:1")), None);
     }
 
@@ -559,6 +601,81 @@ mod tests {
         assert_eq!(echoed, message);
         assert_eq!(client_transport.link_count(), 1);
         assert_eq!(server_transport.link_count(), 1);
+
+        connection.close(0u32.into(), b"done");
+        router.shutdown().await.unwrap();
+        client.close().await;
+    }
+
+    /// A Tor circuit that dies mid-connection: a relay between the two cuts
+    /// every TCP stream it carries. The dialer dials again with its token, the
+    /// listener keeps calling it the same address, and the same QUIC
+    /// connection goes on working.
+    #[tokio::test]
+    async fn a_broken_stream_is_redialed_and_the_connection_survives() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_target = listener.local_addr().unwrap().to_string();
+        let server_transport =
+            StreamTransport::new(Some(&server_target), Arc::new(TcpDialer)).unwrap();
+        let server = Endpoint::builder(RequiredPostQuantumTls(presets::Minimal))
+            .preset(StreamOnly(server_transport.clone()))
+            .bind()
+            .await
+            .unwrap();
+        let _listening = server_transport.listen(listener);
+        let router = Router::builder(server.clone()).accept(ALPN, Echo).spawn();
+
+        // The relay: forwards each stream to the server until `cut` changes.
+        let relay = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_target = relay.local_addr().unwrap().to_string();
+        let (cut, cuts) = tokio::sync::watch::channel(0u32);
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = relay.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let target = server_target.clone();
+                let mut cuts = cuts.clone();
+                let generation = *cuts.borrow();
+                tokio::spawn(async move {
+                    let Ok(mut outbound) = TcpStream::connect(target).await else {
+                        return;
+                    };
+                    tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
+                        _ = cuts.wait_for(|g| *g != generation) => {}
+                    }
+                });
+            }
+        });
+
+        let client_transport = StreamTransport::new(None, Arc::new(TcpDialer)).unwrap();
+        let client = Endpoint::builder(RequiredPostQuantumTls(presets::Minimal))
+            .preset(StreamOnly(client_transport.clone()))
+            .bind()
+            .await
+            .unwrap();
+        let to = EndpointAddr::from_parts(
+            server.id(),
+            [TransportAddr::Custom(dial_addr(&relay_target).unwrap())],
+        );
+        let connection = client.connect(to, ALPN).await.unwrap();
+        let echo = |connection: Connection, message: Vec<u8>| async move {
+            let (mut send, mut recv) = connection.open_bi().await.unwrap();
+            send.write_all(&message).await.unwrap();
+            send.finish().unwrap();
+            let echoed = tokio::time::timeout(Duration::from_secs(30), recv.read_to_end(1 << 20))
+                .await
+                .expect("no echo within 30 s")
+                .unwrap();
+            assert_eq!(echoed, message);
+        };
+        echo(connection.clone(), vec![1u8; 50_000]).await;
+
+        cut.send(1).unwrap();
+        echo(connection.clone(), vec![2u8; 50_000]).await;
+        // The second echo went over a new stream on the same connection.
+        assert!(accepted.load(std::sync::atomic::Ordering::SeqCst) >= 2);
 
         connection.close(0u32.into(), b"done");
         router.shutdown().await.unwrap();
