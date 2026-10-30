@@ -108,6 +108,32 @@ impl Dialer for TcpDialer {
     }
 }
 
+/// Through a SOCKS5 proxy, Tor's above all (`tor.exe` with a `SocksPort`):
+/// the proxy resolves the target, `xxxx.onion:port`, so the name never
+/// reaches this machine's resolver. Desktop nodes use the system's `tor.exe`;
+/// only the phone embeds Tor (Arti, in ZKAPriv).
+#[derive(Debug, Clone, Copy)]
+pub struct SocksDialer {
+    pub proxy: std::net::SocketAddr,
+}
+impl Dialer for SocksDialer {
+    fn dial(&self, target: String) -> DialFuture {
+        let proxy = self.proxy;
+        Box::pin(async move {
+            let (host, port) = target.rsplit_once(':').ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "a stream address is host:port")
+            })?;
+            let port: u16 = port
+                .parse()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad port"))?;
+            let stream = tokio_socks::tcp::Socks5Stream::connect(proxy, (host, port))
+                .await
+                .map_err(io::Error::other)?;
+            Ok(Box::new(stream) as Box<dyn ByteStream>)
+        })
+    }
+}
+
 struct Shared {
     /// What this transport publishes: its dialable address, if it listens.
     published: Option<CustomAddr>,

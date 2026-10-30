@@ -76,8 +76,16 @@ chico.
   justo después de levantar, el endpoint todavía no reporta su dirección
   propia, así que el nodo tiene que agregarla al descriptor a mano (E4,
   `--stream-address`), como ya hace con las IP locales.
-- [ ] **E3.** Marcador Tor con Arti (feature `tor`). Prueba con una .onion
-  local (`tor.exe` con servicio oculto hacia el puerto del transporte).
+- [x] **E3.** Marcador Tor. **Pasó contra la red Tor real (30/10):** se conectó
+  a una .onion recién creada a los 28 s (lo que tarda en publicarse) y a los
+  39 s había sincronizado 2 bloques y entregado 1. **Cambio de diseño (30/10):** en escritorio va
+  por SOCKS5 hacia `tor.exe` (`SocksDialer`, con `tokio-socks`), no con Arti.
+  Así lo había decidido el proyecto: el `Cargo.toml` de ZKAPriv dice que Arti
+  queda solo en el teléfono y que el nodo de escritorio habla Tor por un
+  proxy externo. ZSilent conserva su `TorSupervisor`. El mismo `tor.exe` hace
+  de cliente y aloja la .onion de la semilla. Prueba (ignorada por defecto,
+  pide `ZOKA_TEST_TOR_EXE` y la red Tor): un nodo sincroniza por Tor desde una
+  .onion local.
 - [ ] **E4.** Opciones `--tor`, `--stream-listen` y `--stream-address`. La
   semilla .onion en el nodo del explorador. Manifiesto.
 - [ ] **E5.** ZSilent: interruptor, estado y textos. Release, con el OK del

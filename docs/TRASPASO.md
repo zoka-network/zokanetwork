@@ -53,8 +53,15 @@ publica solo con el OK del usuario.
    exige que `zoka.exe` sea la versión de `Cargo.toml`. **Falta** que alguien
    ofrezca un nodo siempre prendido; lo pide el anuncio.
 5. [ ] **Modo Tor:** diseño en [docs/MODO-TOR.md](MODO-TOR.md), con sus etapas
-   E1 a E5 y su registro. Código en la rama `modo-tor`. Seguir por la primera
-   etapa sin marcar.
+   E1 a E5 y su registro. Código en la rama `modo-tor` (pusheada). Seguir por
+   la primera etapa sin marcar.
+   - E1 y E2 hechas (`644b3e9f`, `85e5be88`).
+   - E3 hecha: `SocksDialer` (por `tor.exe`), probado contra la red Tor real
+     (conexión a una .onion nueva en 28 s, 2 bloques y 1 entregado en 39 s).
+     La prueba ignorada
+     `a_node_syncs_through_tor_from_an_onion_seed`. Se corre con
+     `ZOKA_TEST_TOR_EXE=.../third_party/tor/windows-x86_64-0.4.9.14/tor.exe`
+     y `cargo test --release --features quantic-pq --lib tor_from_an_onion -- --ignored --nocapture`.
 6. [ ] **Caché de /scan en el borde** (opcional): una Pages Function en
    zokascan.cc, para que la PC no sirva cada página de escaneo.
 

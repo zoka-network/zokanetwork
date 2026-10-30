@@ -1135,6 +1135,112 @@ mod tests {
         server.close().await;
     }
 
+    /// E3 for real: the server listens on loopback behind an onion service of
+    /// a local `tor.exe`, and a node with no UDP socket dials its `.onion`
+    /// through that Tor's SOCKS port, syncs and hands back a mined block.
+    /// Needs `ZOKA_TEST_TOR_EXE` (third_party/tor/.../tor.exe) and the Tor
+    /// network: `cargo test --features quantic-pq --lib tor_from_an_onion -- --ignored`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs tor.exe (ZOKA_TEST_TOR_EXE) and the Tor network"]
+    async fn a_node_syncs_through_tor_from_an_onion_seed() {
+        use crate::network::stream_transport::{
+            dial_addr, SocksDialer, StreamOnly, StreamTransport, TcpDialer,
+        };
+        use tokio::io::AsyncBufReadExt;
+        let tor = std::env::var("ZOKA_TEST_TOR_EXE").expect("set ZOKA_TEST_TOR_EXE");
+        let (remote, _remote_dir) = state();
+        let (local, _local_dir) = state();
+        let genesis = mine_on(&remote, Profile::REGTEST.genesis_parent(), vec![], 1_700_000_000).await;
+        let second = mine_on(&remote, genesis, vec![], 1_700_000_120).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let service_port = listener.local_addr().unwrap().port();
+        let socks_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let tor_dir = tempfile::tempdir().unwrap();
+        let slashes = |path: std::path::PathBuf| path.display().to_string().replace('\\', "/");
+        let hidden = tor_dir.path().join("hs");
+        let torrc = tor_dir.path().join("torrc");
+        std::fs::write(
+            &torrc,
+            format!(
+                "SocksPort 127.0.0.1:{socks_port}\nDataDirectory {}\nHiddenServiceDir {}\n\
+                 HiddenServicePort 9444 127.0.0.1:{service_port}\nLog notice stdout\n",
+                slashes(tor_dir.path().join("data")),
+                slashes(hidden.clone()),
+            ),
+        )
+        .unwrap();
+        let mut child = tokio::process::Command::new(&tor)
+            .arg("-f")
+            .arg(&torrc)
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        tokio::time::timeout(std::time::Duration::from_secs(240), async {
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if line.contains("Bootstrapped 100%") {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("Tor did not bootstrap in 4 minutes");
+        tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+        let onion = std::fs::read_to_string(hidden.join("hostname")).unwrap().trim().to_string();
+        let target = format!("{onion}:9444");
+
+        let transport = StreamTransport::new(Some(&target), Arc::new(TcpDialer)).unwrap();
+        let server = serve(
+            remote.clone(),
+            ServerIdentity::from_seed(&[74; 32]).unwrap(),
+            StreamOnly(transport.clone()),
+        )
+        .await
+        .unwrap();
+        let _listening = transport.listen(listener);
+        let mut descriptor = server.descriptor.clone();
+        descriptor.endpoint_addr = EndpointAddr::new(server.endpoint.id())
+            .with_addrs([TransportAddr::Custom(dial_addr(&target).unwrap())]);
+
+        // A new onion service takes a while to be reachable: keep trying.
+        let proxy = std::net::SocketAddr::from(([127, 0, 0, 1], socks_port));
+        let started = std::time::Instant::now();
+        let mut client = loop {
+            let dialer = StreamTransport::new(None, Arc::new(SocksDialer { proxy })).unwrap();
+            let attempt = tokio::time::timeout(
+                std::time::Duration::from_secs(90),
+                Client::connect(&descriptor, StreamOnly(dialer)),
+            )
+            .await;
+            match attempt {
+                Ok(Ok(client)) => break client,
+                other => {
+                    assert!(
+                        started.elapsed() < std::time::Duration::from_secs(420),
+                        "no connection over Tor after 7 minutes: {:?}",
+                        other.map(|r| r.err())
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        };
+        eprintln!("connected over Tor to {target} after {:?}", started.elapsed());
+        assert_eq!(client.head().await.unwrap().height, 2);
+        assert_eq!(client.pull(&local).await.unwrap(), 2);
+        assert_eq!(local.storage.get_last_block_hash().unwrap(), second.header.hash);
+        let third = mine_on(&local, second, vec![], 1_700_000_240).await;
+        assert_eq!(client.submit_block(&third).await.unwrap().hash, third.header.hash);
+        assert_eq!(remote.storage.get_last_block_hash().unwrap(), third.header.hash);
+        eprintln!("synced 2 blocks and submitted 1 over Tor in {:?}", started.elapsed());
+        server.close().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pq_pinned_localhost_sync_private_tx_invalid_proof_and_bounded_fork_recovery() {
         let (remote, _remote_dir) = state();
