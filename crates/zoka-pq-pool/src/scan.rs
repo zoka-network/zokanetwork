@@ -88,6 +88,106 @@ impl ScanPage {
     }
 }
 
+/// A transaction as a wallet that spends needs it: also the nullifiers it
+/// publishes, which tell the wallet that a note of its own is gone (spent
+/// here or by another copy of the wallet).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ScanTransaction2 {
+    pub txid: [u8; 32],
+    pub nullifiers: Vec<Digest>,
+    pub fee: u64,
+    pub outputs: Vec<ScanOutput>,
+}
+impl ScanTransaction2 {
+    pub fn of(tx: &Transaction) -> Self {
+        let ScanTransaction {
+            txid, fee, outputs, ..
+        } = ScanTransaction::of(tx);
+        Self {
+            txid,
+            nullifiers: tx.statement.nullifiers.clone(),
+            fee,
+            outputs,
+        }
+    }
+    pub fn coinbase(&self) -> bool {
+        self.nullifiers.is_empty()
+    }
+    /// What a view key reads of it.
+    pub fn view(&self) -> ScanTransaction {
+        ScanTransaction {
+            txid: self.txid,
+            coinbase: self.coinbase(),
+            inputs: self.nullifiers.len() as u32,
+            fee: self.fee,
+            outputs: self.outputs.clone(),
+        }
+    }
+}
+
+/// A block's coinbase first, then its transfers, in block order: the order
+/// in which the ledger adds their notes to the tree.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ScanBlock2 {
+    pub height: u32,
+    pub hash: String,
+    /// What a wallet checks the block against the last one it read with, to
+    /// notice that the chain moved to another branch.
+    pub prev_hash: String,
+    pub timestamp: u64,
+    pub transactions: Vec<ScanTransaction2>,
+}
+impl ScanBlock2 {
+    pub fn view(&self) -> ScanBlock {
+        ScanBlock {
+            height: self.height,
+            hash: self.hash.clone(),
+            timestamp: self.timestamp,
+            transactions: self
+                .transactions
+                .iter()
+                .map(ScanTransaction2::view)
+                .collect(),
+        }
+    }
+}
+
+/// The page a node serves at `/scan2`: a [`ScanPage`] with each block's
+/// parent and each transaction's nullifiers. Enough for a light wallet
+/// ([`crate::light::LightWallet`]) to rebuild the note tree and spend, and
+/// still nothing that says whose wallet asks.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ScanPage2 {
+    pub network: u8,
+    pub tip: u32,
+    pub from: u32,
+    pub blocks: Vec<ScanBlock2>,
+}
+impl ScanPage2 {
+    pub fn encode(&self) -> Result<Vec<u8>, Error> {
+        postcard::to_allocvec(self).map_err(|_| Error::Encoding)
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() > MAX_SCAN_PAGE_BYTES {
+            return Err(Error::Encoding);
+        }
+        let (page, rest): (Self, _) =
+            postcard::take_from_bytes(bytes).map_err(|_| Error::Encoding)?;
+        if !rest.is_empty() || page.blocks.len() > MAX_SCAN_BLOCKS as usize {
+            return Err(Error::Encoding);
+        }
+        Ok(page)
+    }
+    pub fn view(&self) -> ScanPage {
+        ScanPage {
+            network: self.network,
+            tip: self.tip,
+            from: self.from,
+            blocks: self.blocks.iter().map(ScanBlock2::view).collect(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Received {
     pub height: u32,
@@ -237,7 +337,7 @@ impl Viewer {
 
 /// The memo up to its first zero byte, as text (lossy: it is whatever the
 /// sender typed).
-fn memo_text(memo: &[u8; MEMO_BYTES]) -> String {
+pub(crate) fn memo_text(memo: &[u8; MEMO_BYTES]) -> String {
     let end = memo.iter().position(|&b| b == 0).unwrap_or(MEMO_BYTES);
     String::from_utf8_lossy(&memo[..end]).into_owned()
 }

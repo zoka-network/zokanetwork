@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 pub mod crypto;
 pub mod ledger;
+pub mod light;
 pub mod model;
 pub mod scan;
 pub mod transaction;

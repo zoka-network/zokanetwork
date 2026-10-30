@@ -27,7 +27,10 @@ use super::stark::{
     Profile,
     protocol::{
         ledger::{subsidy, ATOMS, MAX_SUPPLY, PREMINE},
-        scan::{ScanBlock, ScanPage, ScanTransaction, MAX_SCAN_BLOCKS},
+        scan::{
+            ScanBlock, ScanBlock2, ScanPage, ScanPage2, ScanTransaction, ScanTransaction2,
+            MAX_SCAN_BLOCKS,
+        },
         transaction::{Transaction, MAX_TRANSACTION_BYTES},
         wallet::{Address, ShortAddress},
     },
@@ -340,6 +343,7 @@ pub fn router(state: NodeState) -> Router {
         .route("/blocks/recent", get(recent_blocks))
         .route("/blocks/stats", get(block_stats))
         .route("/scan", get(scan_page))
+        .route("/scan2", get(scan_page2))
         .route("/supply", get(supply))
         .route("/supply/total", get(supply_total))
         .route("/network/history", get(network_history))
@@ -433,7 +437,7 @@ impl PublicGate {
     /// One token for `path`: from the shared bucket and, for a scan page,
     /// from the scans' own.
     fn take(&self, path: &str) -> bool {
-        self.bucket.take() && (path != "/scan" || self.scans.take())
+        self.bucket.take() && (!matches!(path, "/scan" | "/scan2") || self.scans.take())
     }
 }
 
@@ -508,6 +512,7 @@ pub fn public_router(state: NodeState) -> Router {
         .route("/blocks/:height/summary", get(block_summary))
         .route("/blocks/hash/:hash/summary", get(block_summary_by_hash))
         .route("/scan", get(scan_page))
+        .route("/scan2", get(scan_page2))
         .route("/supply", get(supply))
         .route("/supply/total", get(supply_total))
         .route("/network/history", get(network_history))
@@ -849,6 +854,7 @@ async fn public_index(State(state): State<NodeState>) -> ApiResult<Response> {
             "/blocks/hash/{hash}/summary":"one stored block by hash",
             "/blocks/stats?count=N&before=H":"time, interval, difficulty and size of up to 720 blocks, for charts",
             "/scan?from=H&count=N":"up to 100 blocks of encrypted outputs (postcard), for view-key scanners",
+            "/scan2?from=H&count=N":"the same with block parents and nullifiers (postcard), for light wallets that spend",
             "/supply":"issued and maximum supply (JSON)",
             "/supply/total":"issued supply in ZKA (plain text)",
             "/network/history":"this node's peers and the network's work, every 5 minutes for 24 hours",
@@ -924,6 +930,42 @@ struct ScanQuery {
     count: Option<u32>,
 }
 
+/// Up to [`MAX_SCAN_BLOCKS`] canonical blocks from `from`, the tip, and
+/// whether they can never change: a full page under the latest checkpoint.
+fn scan_blocks(state: &NodeState, query: &ScanQuery) -> ApiResult<(u32, u32, Vec<Block>, bool)> {
+    let from = query.from.unwrap_or(1).max(1);
+    let count = query.count.unwrap_or(MAX_SCAN_BLOCKS).clamp(1, MAX_SCAN_BLOCKS);
+    let _gate = state.gate.lock().map_err(|_| ApiError::internal("node gate poisoned"))?;
+    let tip = state.storage.get_chain_height().map_err(ApiError::internal)?;
+    let last = (u64::from(from) + u64::from(count) - 1).min(tip);
+    let mut blocks = Vec::new();
+    for height in u64::from(from)..=last {
+        blocks.push(
+            state
+                .storage
+                .get_canonical_block_by_height(height)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::internal("a canonical block is missing"))?,
+        );
+    }
+    let checkpoint = state.latest_checkpoint().map_err(ApiError::internal)?.map(|cp| cp.height);
+    let settled = blocks.len() == count as usize
+        && checkpoint.is_some_and(|cp| u64::from(from) + u64::from(count) - 1 <= cp);
+    Ok((u32::try_from(tip).map_err(ApiError::internal)?, from, blocks, settled))
+}
+
+fn scan_response(body: Vec<u8>, settled: bool) -> Response {
+    let mut response = (StatusCode::OK, body).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    cached(
+        response,
+        if settled { "public, max-age=31536000, immutable" } else { "public, max-age=10" },
+    )
+}
+
 /// Every output of up to [`MAX_SCAN_BLOCKS`] canonical blocks from `from`, as a
 /// postcard [`ScanPage`]: what a view key opens where it is kept (in a
 /// browser, say), so this node never learns whose wallet is being read. A
@@ -933,29 +975,11 @@ async fn scan_page(
     Query(query): Query<ScanQuery>,
     Extension(permit): Extension<WorkPermit>,
 ) -> ApiResult<Response> {
-    let from = query.from.unwrap_or(1).max(1);
-    let count = query.count.unwrap_or(MAX_SCAN_BLOCKS).clamp(1, MAX_SCAN_BLOCKS);
     blocking(permit, move || {
-        let (tip, blocks, checkpoint) = {
-            let _gate = state.gate.lock().map_err(|_| ApiError::internal("node gate poisoned"))?;
-            let tip = state.storage.get_chain_height().map_err(ApiError::internal)?;
-            let last = (u64::from(from) + u64::from(count) - 1).min(tip);
-            let mut blocks = Vec::new();
-            for height in u64::from(from)..=last {
-                blocks.push(
-                    state
-                        .storage
-                        .get_canonical_block_by_height(height)
-                        .map_err(ApiError::internal)?
-                        .ok_or_else(|| ApiError::internal("a canonical block is missing"))?,
-                );
-            }
-            let checkpoint = state.latest_checkpoint().map_err(ApiError::internal)?.map(|cp| cp.height);
-            (tip, blocks, checkpoint)
-        };
+        let (tip, from, blocks, settled) = scan_blocks(&state, &query)?;
         let page = ScanPage {
             network: state.profile.network,
-            tip: u32::try_from(tip).map_err(ApiError::internal)?,
+            tip,
             from,
             blocks: blocks
                 .iter()
@@ -973,18 +997,44 @@ async fn scan_page(
                 })
                 .collect::<ApiResult<_>>()?,
         };
-        let settled = page.blocks.len() == count as usize
-            && checkpoint.is_some_and(|cp| u64::from(from) + u64::from(count) - 1 <= cp);
-        let body = page.encode().map_err(ApiError::internal)?;
-        let mut response = (StatusCode::OK, body).into_response();
-        response.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/octet-stream"),
-        );
-        Ok(cached(
-            response,
-            if settled { "public, max-age=31536000, immutable" } else { "public, max-age=10" },
-        ))
+        Ok(scan_response(page.encode().map_err(ApiError::internal)?, settled))
+    })
+    .await
+}
+
+/// [`scan_page`] for a wallet that also spends: a postcard [`ScanPage2`],
+/// with each block's parent and each transaction's nullifiers. A light
+/// wallet (ZKAPriv) rebuilds the note tree from it and builds its payments
+/// on the phone; the node still learns nothing about whose wallet reads.
+async fn scan_page2(
+    State(state): State<NodeState>,
+    Query(query): Query<ScanQuery>,
+    Extension(permit): Extension<WorkPermit>,
+) -> ApiResult<Response> {
+    blocking(permit, move || {
+        let (tip, from, blocks, settled) = scan_blocks(&state, &query)?;
+        let page = ScanPage2 {
+            network: state.profile.network,
+            tip,
+            from,
+            blocks: blocks
+                .iter()
+                .map(|block| {
+                    Ok(ScanBlock2 {
+                        height: u32::try_from(block.header.block_height).map_err(ApiError::internal)?,
+                        hash: block.header.hash.clone(),
+                        prev_hash: block.header.prev_hash.clone(),
+                        timestamp: block.header.timestamp,
+                        transactions: stark::decode(block)
+                            .map_err(ApiError::internal)?
+                            .iter()
+                            .map(ScanTransaction2::of)
+                            .collect(),
+                    })
+                })
+                .collect::<ApiResult<_>>()?,
+        };
+        Ok(scan_response(page.encode().map_err(ApiError::internal)?, settled))
     })
     .await
 }
@@ -1979,4 +2029,80 @@ mod tests {
         assert_eq!(history["samples"][0]["height"], 3);
         assert!(json(get_from(&public, "/", "GET").await).await["endpoints"]["/scan?from=H&count=N"].is_string());
     }
+    async fn page2(public: &Router, from: u32) -> ScanPage2 {
+        let response = get_from(public, &format!("/scan2?from={from}"), "GET").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        ScanPage2::decode(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_light_wallet_reads_scan2_and_the_node_mines_its_payment() {
+        use stark::protocol::light::LightWallet;
+        let (_dir, state) = test_state();
+        let alice = Arc::new(Account::from_seed(&[65; 32], 3, 0).unwrap());
+        let bob = Account::from_seed(&[66; 32], 3, 0).unwrap();
+        for _ in 0..3 {
+            super::super::stark_node::mine_once(&state, alice.address()).await.unwrap();
+        }
+        let public = public_router(state.clone());
+        let app = router(state.clone());
+
+        // The phone's wallet: pages of outputs and nullifiers, nothing that
+        // names it.
+        let mut light = LightWallet::new(3, 1).unwrap();
+        light.add_page(&alice, &page2(&public, 1).await).unwrap();
+        assert_eq!((light.height(), light.tip()), (3, 3));
+        let tip = state.tip().unwrap();
+        let ledger = stark::full_ledger(&state.storage, Profile::REGTEST, &tip).unwrap();
+        assert_eq!(light.anchor(), ledger.tree.root(), "the same tree as the node's");
+        assert_eq!(light.balance().spendable_atoms, PREMINE);
+
+        // It builds and proves the payment where the keys are, and the node
+        // takes it like any other.
+        let plan = light
+            .plan(&alice, bob.address(), 7 * ATOMS, b"from the phone")
+            .unwrap();
+        let prover = alice.clone();
+        let payment = tokio::task::spawn_blocking(move || plan.prove(&prover).unwrap())
+            .await
+            .unwrap();
+        light.reserve(&payment).unwrap();
+        let response = post(
+            &app,
+            "/transactions",
+            "application/octet-stream",
+            payment.encode().unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let (block, canonical) = super::super::stark_node::mine_once(&state, alice.address())
+            .await
+            .unwrap();
+        assert!(canonical);
+        assert_eq!(block.quantic_transactions.len(), 2);
+
+        light.add_page(&alice, &page2(&public, light.next()).await).unwrap();
+        let seen = light.balance();
+        assert!(!seen.pending);
+        assert_eq!(light.history().last().unwrap().paid(), 7 * ATOMS);
+        // Block 2's coinbase joined the tree at 4 (regtest waits two blocks).
+        assert_eq!(
+            seen.spendable_atoms,
+            PREMINE - 7 * ATOMS - payment.statement.fee + subsidy(2)
+        );
+        let tip = state.tip().unwrap();
+        let ledger = stark::full_ledger(&state.storage, Profile::REGTEST, &tip).unwrap();
+        assert_eq!(light.anchor(), ledger.tree.root());
+
+        // Bob's copy finds the payment and its memo.
+        let mut bobs = LightWallet::new(3, 1).unwrap();
+        bobs.add_page(&bob, &page2(&public, 1).await).unwrap();
+        let got = bobs.history().last().unwrap();
+        assert_eq!((got.received, got.memo.as_str()), (7 * ATOMS, "from the phone"));
+        assert!(json(get_from(&public, "/", "GET").await).await["endpoints"]
+            ["/scan2?from=H&count=N"]
+            .is_string());
+    }
 }
+

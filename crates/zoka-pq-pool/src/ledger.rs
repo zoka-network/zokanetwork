@@ -289,7 +289,14 @@ pub fn apply<S: LedgerState + ?Sized>(
     if state.notes() + inserts as u64 > MAX_NOTES {
         return Err(Error::Ledger("note tree full"));
     }
-    commit(state, height, issued, coinbase, transfers, nullifiers)
+    commit(
+        state,
+        height,
+        issued,
+        &coinbase.statement.commitments,
+        transfers.iter().flat_map(|tx| &tx.statement.commitments),
+        nullifiers,
+    )
 }
 
 /// Re-applies an already validated block (a node's own canonical chain)
@@ -311,36 +318,66 @@ pub fn replay<S: LedgerState + ?Sized>(
         .iter()
         .flat_map(|tx| tx.statement.nullifiers.iter().copied())
         .collect();
-    commit(state, height, issued, coinbase, transfers, nullifiers)
+    commit(
+        state,
+        height,
+        issued,
+        &coinbase.statement.commitments,
+        transfers.iter().flat_map(|tx| &tx.statement.commitments),
+        nullifiers,
+    )
+}
+
+/// [`replay`] from a block's effects alone, without its proofs: how a light
+/// wallet that reads pages of outputs (see [`crate::scan::ScanPage2`])
+/// rebuilds the very tree a node has, to spend from it.
+pub fn replay_effects<'a, S: LedgerState + ?Sized>(
+    state: &mut S,
+    coinbase: &[Digest],
+    transfers: impl IntoIterator<Item = (&'a [Digest], &'a [Digest])>,
+) -> Result<(), Error> {
+    let height = state
+        .height()
+        .checked_add(1)
+        .ok_or(Error::Ledger("height overflow"))?;
+    let issued = state
+        .issued()
+        .checked_add(subsidy(height))
+        .ok_or(Error::Ledger("supply"))?;
+    let mut outputs = Vec::new();
+    let mut nullifiers = BTreeSet::new();
+    for (commitments, spent) in transfers {
+        outputs.extend_from_slice(commitments);
+        nullifiers.extend(spent.iter().copied());
+    }
+    commit(state, height, issued, coinbase, outputs.iter(), nullifiers)
 }
 
 // Every digest was checked by validation. Matured digests came from earlier
 // verified coinbases; capacity was checked, so these appends cannot fail.
-fn commit<S: LedgerState + ?Sized>(
+fn commit<'a, S: LedgerState + ?Sized>(
     state: &mut S,
     height: u32,
     issued: u64,
-    coinbase: &Transaction,
-    transfers: &[Transaction],
+    coinbase: &[Digest],
+    outputs: impl Iterator<Item = &'a Digest>,
     nullifiers: BTreeSet<Digest>,
 ) -> Result<(), Error> {
     for note in state.take_matured(height) {
         state.append(note)?;
     }
     if height == 1 {
-        for note in &coinbase.statement.commitments {
+        for note in coinbase {
             state.append(*note)?;
         }
     } else {
         let at = height
             .checked_add(maturity(state.network()))
             .ok_or(Error::Ledger("maturity overflow"))?;
-        state.defer(at, coinbase.statement.commitments.clone());
+        state.defer(at, coinbase.to_vec());
     }
-    for tx in transfers {
-        for note in &tx.statement.commitments {
-            state.append(*note)?;
-        }
+    for note in outputs {
+        state.append(*note)?;
     }
     state.spend(nullifiers);
     state.close(height, issued)
