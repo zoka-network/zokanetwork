@@ -74,8 +74,10 @@ navegador» y gráficos de «red y nodos». Publicación aprobada con «Sí, tod
   - **Web:** zokaweb `abc62c4`, desplegada y pusheada. ZokaScan ya no figura
     «offline», hay guía de la clave de vista y descargas 4.0.3/4.0.2.
   - **zokaexplorer:** `main` avanzó a `6c24953`, lo que está en producción.
-- **ZSilent 4.0.4** (zsilent-core `main` = `v4.0.4` = `897b766`, pusheada;
-  release en GitHub sin crear todavía). El usuario pidió: «saquemos lo de
+- **ZSilent 4.0.4** (zsilent-core `main` = `v4.0.4` = `897b766`, pusheada).
+  **PUBLICADA el 30/10** (el usuario: «sí, todo ahora»): release en GitHub
+  con el MSI bajado de vuelta (hash OK), la 4.0.3 marcada como reemplazada
+  y la web en la 4.0.4 (zokaweb `7da253c`, desplegada y pusheada). El usuario pidió: «saquemos lo de
   Tor… copiar la dirección y truncarla… instalala, comiteá y subí».
   - **Sin indicadores de Tor:** el nodo v2 no tiene transporte por Tor y
     ningún control lo prendía. Salen la pastilla de la barra, la de This
@@ -96,8 +98,7 @@ navegador» y gráficos de «red y nodos». Publicación aprobada con «Sí, tod
     adentro, porque Tor no es postcuántico. Nodo solo saliente, sin UDP,
     relays ni IP publicada.
 - **Falta:**
-  - Release en GitHub de ZSilent 4.0.4 (y la web a 4.0.4), con el OK del
-    usuario.
+  - El Modo Tor (planificado arriba), cuando el usuario lo pida.
   - Los papers describen la clave de vista solo como la clave X-Wing; la
     `ViewKey` agrega la clave de salida y el dueño. Corregirlo en la próxima
     edición.
