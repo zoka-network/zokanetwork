@@ -105,7 +105,7 @@ chico.
     ruta ("failed closing path: LastOpenPath") y la sesión se trababa a los
     2,5 minutos.
 - [x] **E4b. Semilla .onion de verdad (30/10, autorizado por el usuario).**
-  - `%APPDATA%\Zoka\.zoka	or-seed\` tiene `tor.exe` 0.4.9.14, un `torrc` sin
+  - `%APPDATA%\Zoka\.zoka\tor-seed\` tiene `tor.exe` 0.4.9.14, un `torrc` sin
     SOCKS y la .onion `u2soz3q63237afuccfxf3jzytpljpbxpvyzt3jumrr45ukzowdakayqd.onion:9444`.
     Se abre sin ventana con `tor-seed-oculto.vbs`.
   - El nodo del explorador corre con `--stream-listen 127.0.0.1:9444` y
