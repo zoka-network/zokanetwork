@@ -1,0 +1,30 @@
+# In-browser view-key scanner for the explorer: the key never leaves the page.
+# The explorer fetches the node's public /scan pages and opens them here with
+# the same code the node and the wallets use (zoka-pq-pool). Standalone, so it
+# targets wasm32 without the node's dependencies.
+[package]
+name = "zoka-pq-scan-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+zoka-pq-pool = { path = "../zoka-pq-pool" }
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize = "1.8.2"
+
+# The pool's key encapsulation draws randomness through getrandom; a view key
+# never encapsulates, but the crate has to build: in a browser it is
+# crypto.getRandomValues.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

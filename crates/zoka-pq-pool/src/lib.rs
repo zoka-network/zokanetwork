@@ -4,6 +4,7 @@
 pub mod crypto;
 pub mod ledger;
 pub mod model;
+pub mod scan;
 pub mod transaction;
 mod transfer;
 pub mod wallet;

@@ -40,7 +40,7 @@ use super::{
 };
 use crate::economics::{format_zka_amount, parse_zka_amount};
 
-const USAGE: &str = "usage: zoka quantic-pq-wallet <new|generate-phrase|restore|address|publish-address|list|balance|history|estimate-fee|send|show-phrase|change-password|backup|import-backup> --network testnet|regtest --dir DIR [--name WALLET | --address ITS_ADDRESS] [--password-env VAR | --password-stdin] [--peer NODE_DESCRIPTOR] [--api http://127.0.0.1:9140] [history: --limit N] [restore: --phrase-env VAR or the phrase on stdin] [estimate-fee and send: --amount ZKA] [send: --to FULL_OR_SHORT [--memo TEXT]] [change-password: --new-password-env VAR] [backup: --out FILE] [import-backup: --file FILE] [--json]";
+const USAGE: &str = "usage: zoka quantic-pq-wallet <new|generate-phrase|restore|address|publish-address|list|balance|history|estimate-fee|send|show-phrase|show-view-key|change-password|backup|import-backup> --network testnet|regtest --dir DIR [--name WALLET | --address ITS_ADDRESS] [--password-env VAR | --password-stdin] [--peer NODE_DESCRIPTOR] [--api http://127.0.0.1:9140] [history: --limit N] [restore: --phrase-env VAR or the phrase on stdin] [estimate-fee and send: --amount ZKA] [send: --to FULL_OR_SHORT [--memo TEXT]] [change-password: --new-password-env VAR] [backup: --out FILE] [import-backup: --file FILE] [--json]";
 const DEFAULT_API: &str = "http://127.0.0.1:9140";
 /// Blocks one call imports into the mirror before it answers.
 const MIRROR_BUDGET: usize = 4096;
@@ -556,6 +556,17 @@ async fn act(action: &str, args: &[String]) -> Result<Value, String> {
                 blocking(move || Ok(stark_cli::open_wallet_seed(&path, &password)?.2)).await?;
             Ok(json!({"name":name,"recovery_phrase":phrase_of(&seed)?.as_str()}))
         }
+        "show-view-key" => {
+            let (name, path) = store.select(args)?;
+            let password = required_password(args)?;
+            let key = blocking(move || {
+                let (account, _) = stark_cli::open_wallet(&path, &password)?;
+                Ok(Zeroizing::new(account.view_key().map_err(error)?.encode()))
+            })
+            .await?;
+            Ok(json!({"name":name,"view_key":key.as_str(),
+                "note":"whoever holds this key sees every payment and the balance of this wallet; it cannot spend"}))
+        }
         "change-password" => {
             let (name, path) = store.select(args)?;
             let password = required_password(args)?;
@@ -803,6 +814,7 @@ fn human(action: &str, reply: &Value) -> String {
             })
             .unwrap_or_default(),
         "show-phrase" => field("recovery_phrase"),
+        "show-view-key" => format!("{}\n{}", field("view_key"), field("note")),
         "send" => format!("Sent. Transaction {}", field("txid")),
         _ => reply.to_string(),
     }
@@ -885,6 +897,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(shown["recovery_phrase"], phrase.as_str());
+        // Its view key names the same wallet and opens nothing else.
+        let viewed = act("show-view-key", &with(dir.path(), &["--name", "copy"]))
+            .await
+            .unwrap();
+        let key =
+            zoka_pq_pool::wallet::ViewKey::decode(viewed["view_key"].as_str().unwrap(), 3).unwrap();
+        assert_eq!(key.address().encode().unwrap(), address);
         let listed = act("list", &base(dir.path())).await.unwrap();
         assert_eq!(listed["wallets"], json!(["alice", "copy"]));
         assert_eq!(listed["details"][0]["unlocked"], true);

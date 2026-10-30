@@ -26,6 +26,8 @@ use super::stark::{
     self,
     Profile,
     protocol::{
+        ledger::{subsidy, ATOMS, MAX_SUPPLY, PREMINE},
+        scan::{ScanBlock, ScanPage, ScanTransaction, MAX_SCAN_BLOCKS},
         transaction::{Transaction, MAX_TRANSACTION_BYTES},
         wallet::{Address, ShortAddress},
     },
@@ -59,6 +61,12 @@ const PUBLIC_BURST: f64 = 40.0;
 /// How long a public request waits for a worker, and runs at most.
 const PUBLIC_QUEUE: Duration = Duration::from_secs(5);
 const PUBLIC_TIMEOUT: Duration = Duration::from_secs(20);
+/// One day of blocks at the ideal pace: what a chart asks for at most.
+const MAX_STATS_BLOCKS: u64 = 720;
+const HISTORY_KEY: &str = "quantic:stark:network-history";
+/// A sample of the network every five minutes, for one day.
+pub const HISTORY_EVERY: Duration = Duration::from_secs(300);
+const HISTORY_SAMPLES: usize = 288;
 
 #[derive(Clone)]
 pub struct NodeState {
@@ -325,6 +333,11 @@ pub fn router(state: NodeState) -> Router {
         .route("/blocks/:height/summary", get(block_summary))
         .route("/blocks/hash/:hash/summary", get(block_summary_by_hash))
         .route("/blocks/recent", get(recent_blocks))
+        .route("/blocks/stats", get(block_stats))
+        .route("/scan", get(scan_page))
+        .route("/supply", get(supply))
+        .route("/supply/total", get(supply_total))
+        .route("/network/history", get(network_history))
         .route(
             "/transactions",
             post(submit_transaction).layer(DefaultBodyLimit::max(MAX_TRANSACTION_BYTES)),
@@ -458,10 +471,16 @@ async fn admit_public(State(gate): State<PublicGate>, mut request: Request, next
 /// and rate. Nothing here sends, mines, signs or asks the peers.
 pub fn public_router(state: NodeState) -> Router {
     Router::new()
+        .route("/", get(public_index))
         .route("/status", get(public_status))
         .route("/blocks/recent", get(recent_blocks))
+        .route("/blocks/stats", get(block_stats))
         .route("/blocks/:height/summary", get(block_summary))
         .route("/blocks/hash/:hash/summary", get(block_summary_by_hash))
+        .route("/scan", get(scan_page))
+        .route("/supply", get(supply))
+        .route("/supply/total", get(supply_total))
+        .route("/network/history", get(network_history))
         .route("/address/:short", get(public_address_of))
         .route("/checkpoint", get(latest_checkpoint))
         .layer(middleware::from_fn_with_state(PublicGate::new(), admit_public))
@@ -761,15 +780,281 @@ fn child_target(state: &NodeState, parent: &Block) -> ApiResult<num_bigint::BigU
     let genesis_time = if parent.header.block_height < super::GENESIS_HEIGHT {
         0
     } else {
-        state
-            .storage
-            .get_canonical_block_by_height(super::GENESIS_HEIGHT)
-            .map_err(ApiError::internal)?
-            .ok_or_else(|| ApiError::internal("block 1 is missing"))?
-            .header
-            .timestamp
+        genesis_time(state)?
     };
-    super::target_for_child_after(state.profile.chain_id, parent, genesis_time).map_err(ApiError::internal)
+    target_after(state, parent, genesis_time)
+}
+
+fn genesis_time(state: &NodeState) -> ApiResult<u64> {
+    Ok(state
+        .storage
+        .get_canonical_block_by_height(super::GENESIS_HEIGHT)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::internal("block 1 is missing"))?
+        .header
+        .timestamp)
+}
+
+/// [`child_target`] with block 1's time already read.
+fn target_after(state: &NodeState, parent: &Block, genesis_time: u64) -> ApiResult<num_bigint::BigUint> {
+    let anchor = if parent.header.block_height < super::GENESIS_HEIGHT { 0 } else { genesis_time };
+    super::target_for_child_after(state.profile.chain_id, parent, anchor).map_err(ApiError::internal)
+}
+
+fn cached(mut response: Response, policy: &'static str) -> Response {
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static(policy));
+    response
+}
+
+/// What the public API answers, so that a client finds its way without docs.
+async fn public_index(State(state): State<NodeState>) -> ApiResult<Response> {
+    let response = json_response(StatusCode::OK, &serde_json::json!({
+        "chain_id":state.profile.chain_id,"node_version":env!("CARGO_PKG_VERSION"),
+        "endpoints":{
+            "/status":"chain tip, supply, difficulty, peers",
+            "/blocks/recent?count=N":"the latest N block summaries (N <= 25)",
+            "/blocks/{height}/summary":"one canonical block and its transactions, without proofs",
+            "/blocks/hash/{hash}/summary":"one stored block by hash",
+            "/blocks/stats?count=N&before=H":"time, interval, difficulty and size of up to 720 blocks, for charts",
+            "/scan?from=H&count=N":"up to 100 blocks of encrypted outputs (postcard), for view-key scanners",
+            "/supply":"issued and maximum supply (JSON)",
+            "/supply/total":"issued supply in ZKA (plain text)",
+            "/network/history":"this node's peers and the network's work, every 5 minutes for 24 hours",
+            "/address/{short}":"the full address behind a short one, if this node knows it",
+            "/checkpoint":"the latest checkpoint signed by the network's authority"
+        }
+    }))?;
+    Ok(cached(response, "public, max-age=300"))
+}
+
+#[derive(Deserialize)]
+struct StatsQuery {
+    count: Option<u64>,
+    before: Option<u64>,
+}
+
+/// Per-block figures for charts, oldest first: time, interval since the
+/// parent, the difficulty the block met (and the hashrate it implies),
+/// transactions and size. Nothing is decoded: headers and lengths only.
+async fn block_stats(
+    State(state): State<NodeState>,
+    Query(query): Query<StatsQuery>,
+    Extension(permit): Extension<WorkPermit>,
+) -> ApiResult<Response> {
+    let count = query.count.unwrap_or(180).clamp(1, MAX_STATS_BLOCKS);
+    blocking(permit, move || {
+        let _gate = state.gate.lock().map_err(|_| ApiError::internal("node gate poisoned"))?;
+        let tip = state.storage.get_chain_height().map_err(ApiError::internal)?;
+        let end = query.before.map_or(tip, |before| before.saturating_sub(1)).min(tip);
+        if end < super::GENESIS_HEIGHT {
+            let body = serde_json::json!({"height":tip,"blocks":[]});
+            return Ok(cached(json_response(StatusCode::OK, &body)?, "public, max-age=30"));
+        }
+        let start = end.saturating_sub(count - 1).max(super::GENESIS_HEIGHT);
+        let genesis = genesis_time(&state)?;
+        let mut parent = if start == super::GENESIS_HEIGHT {
+            state.profile.genesis_parent()
+        } else {
+            state
+                .storage
+                .get_canonical_block_by_height(start - 1)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::internal("a canonical block is missing"))?
+        };
+        let mut entries = Vec::with_capacity((end - start + 1) as usize);
+        for height in start..=end {
+            let block = state
+                .storage
+                .get_canonical_block_by_height(height)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::internal("a canonical block is missing"))?;
+            let target = target_after(&state, &parent, genesis)?;
+            let interval = (height > super::GENESIS_HEIGHT)
+                .then(|| block.header.timestamp.saturating_sub(parent.header.timestamp));
+            entries.push(serde_json::json!({
+                "height":height,"timestamp":block.header.timestamp,"interval_secs":interval,
+                "difficulty_bits":difficulty::bits_of_target(&target),
+                "hashrate_estimate_hps":difficulty::network_hashrate_for_target(&target),
+                "transactions":block.quantic_transactions.len(),
+                "size_bytes":block.quantic_transactions.iter().map(Vec::len).sum::<usize>(),
+            }));
+            parent = block;
+        }
+        let body = serde_json::json!({"height":tip,"blocks":entries});
+        Ok(cached(json_response(StatusCode::OK, &body)?, "public, max-age=30"))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct ScanQuery {
+    from: Option<u32>,
+    count: Option<u32>,
+}
+
+/// Every output of up to [`MAX_SCAN_BLOCKS`] canonical blocks from `from`, as a
+/// postcard [`ScanPage`]: what a view key opens where it is kept (in a
+/// browser, say), so this node never learns whose wallet is being read. A
+/// full page under the latest checkpoint never changes.
+async fn scan_page(
+    State(state): State<NodeState>,
+    Query(query): Query<ScanQuery>,
+    Extension(permit): Extension<WorkPermit>,
+) -> ApiResult<Response> {
+    let from = query.from.unwrap_or(1).max(1);
+    let count = query.count.unwrap_or(MAX_SCAN_BLOCKS).clamp(1, MAX_SCAN_BLOCKS);
+    blocking(permit, move || {
+        let (tip, blocks, checkpoint) = {
+            let _gate = state.gate.lock().map_err(|_| ApiError::internal("node gate poisoned"))?;
+            let tip = state.storage.get_chain_height().map_err(ApiError::internal)?;
+            let last = (u64::from(from) + u64::from(count) - 1).min(tip);
+            let mut blocks = Vec::new();
+            for height in u64::from(from)..=last {
+                blocks.push(
+                    state
+                        .storage
+                        .get_canonical_block_by_height(height)
+                        .map_err(ApiError::internal)?
+                        .ok_or_else(|| ApiError::internal("a canonical block is missing"))?,
+                );
+            }
+            let checkpoint = state.latest_checkpoint().map_err(ApiError::internal)?.map(|cp| cp.height);
+            (tip, blocks, checkpoint)
+        };
+        let page = ScanPage {
+            network: state.profile.network,
+            tip: u32::try_from(tip).map_err(ApiError::internal)?,
+            from,
+            blocks: blocks
+                .iter()
+                .map(|block| {
+                    Ok(ScanBlock {
+                        height: u32::try_from(block.header.block_height).map_err(ApiError::internal)?,
+                        hash: block.header.hash.clone(),
+                        timestamp: block.header.timestamp,
+                        transactions: stark::decode(block)
+                            .map_err(ApiError::internal)?
+                            .iter()
+                            .map(ScanTransaction::of)
+                            .collect(),
+                    })
+                })
+                .collect::<ApiResult<_>>()?,
+        };
+        let settled = page.blocks.len() == count as usize
+            && checkpoint.is_some_and(|cp| u64::from(from) + u64::from(count) - 1 <= cp);
+        let body = page.encode().map_err(ApiError::internal)?;
+        let mut response = (StatusCode::OK, body).into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        Ok(cached(
+            response,
+            if settled { "public, max-age=31536000, immutable" } else { "public, max-age=10" },
+        ))
+    })
+    .await
+}
+
+fn zka(atoms: u64) -> String {
+    format!("{}.{:06}", atoms / ATOMS, atoms % ATOMS)
+}
+
+fn issued(state: &NodeState) -> ApiResult<(u64, u64)> {
+    let _gate = state.gate.lock().map_err(|_| ApiError::internal("node gate poisoned"))?;
+    let tip = current_tip(state.profile, &state.storage)?;
+    let branch = stark::branch(&state.storage, state.profile, &tip).map_err(ApiError::internal)?;
+    let ledger = branch.state();
+    Ok((u64::from(ledger.height), ledger.issued))
+}
+
+/// Issued and maximum supply. Block 1 issued the premine; every later block
+/// issues its subsidy (fees go back to the miner, they issue nothing).
+async fn supply(
+    State(state): State<NodeState>,
+    Extension(permit): Extension<WorkPermit>,
+) -> ApiResult<Response> {
+    blocking(permit, move || {
+        let (height, issued) = issued(&state)?;
+        let next = subsidy(u32::try_from(height + 1).unwrap_or(u32::MAX));
+        let body = serde_json::json!({
+            "height":height,"issued_atoms":issued,"issued_zka":zka(issued),
+            "max_supply_atoms":MAX_SUPPLY,"max_supply_zka":zka(MAX_SUPPLY),
+            "premine_atoms":PREMINE,"next_block_subsidy_atoms":next,
+            "atoms_per_zka":ATOMS,
+        });
+        Ok(cached(json_response(StatusCode::OK, &body)?, "public, max-age=30"))
+    })
+    .await
+}
+
+/// The issued supply in ZKA, as plain text, for listing sites.
+async fn supply_total(
+    State(state): State<NodeState>,
+    Extension(permit): Extension<WorkPermit>,
+) -> ApiResult<Response> {
+    blocking(permit, move || {
+        let (_, issued) = issued(&state)?;
+        let mut response = (StatusCode::OK, zka(issued)).into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        Ok(cached(response, "public, max-age=30"))
+    })
+    .await
+}
+
+/// One look at the network: this node's sessions and the work the next block
+/// needs. Kept for [`HISTORY_SAMPLES`] samples in the database, so a restart
+/// does not empty the chart. Hold `gate`.
+pub fn record_network_sample(state: &NodeState) -> Result<(), String> {
+    let tip = state.tip()?;
+    let next = child_target(state, &tip).map_err(|e| e.message)?;
+    let peers = state.peers.status();
+    let mempool = state.mempool.lock().map_err(|_| "mempool poisoned")?.len();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+    let mut samples = history(state)?;
+    samples.push(serde_json::json!({
+        "time":now,"height":tip.header.block_height,
+        "outbound":peers["outbound"],"inbound":peers["inbound"],"known":peers["known"],
+        "difficulty_bits":difficulty::bits_of_target(&next),
+        "hashrate_estimate_hps":difficulty::network_hashrate_for_target(&next),
+        "mempool_transactions":mempool,
+    }));
+    let excess = samples.len().saturating_sub(HISTORY_SAMPLES);
+    samples.drain(..excess);
+    let bytes = serde_json::to_vec(&samples).map_err(|e| e.to_string())?;
+    state.storage.put_raw(HISTORY_KEY, bytes).map_err(|e| e.to_string())
+}
+
+fn history(state: &NodeState) -> Result<Vec<serde_json::Value>, String> {
+    Ok(state
+        .storage
+        .get_raw(HISTORY_KEY)
+        .map_err(|e| e.to_string())?
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default())
+}
+
+/// The samples of [`record_network_sample`], oldest first. Empty on a node
+/// that does not serve the public API (only that one samples).
+async fn network_history(
+    State(state): State<NodeState>,
+    Extension(permit): Extension<WorkPermit>,
+) -> ApiResult<Response> {
+    blocking(permit, move || {
+        let samples = history(&state).map_err(ApiError::internal)?;
+        let body = serde_json::json!({"every_secs":HISTORY_EVERY.as_secs(),"samples":samples});
+        Ok(cached(json_response(StatusCode::OK, &body)?, "public, max-age=60"))
+    })
+    .await
 }
 
 async fn submit_transaction(
@@ -1597,5 +1882,64 @@ mod tests {
         assert!(!gate.take());
         std::thread::sleep(Duration::from_millis(200));
         assert!(gate.take());
+    }
+
+    #[tokio::test]
+    async fn the_public_api_serves_what_a_view_key_and_a_chart_need() {
+        let (_dir, state) = test_state();
+        let alice = Account::from_seed(&[64; 32], 3, 0).unwrap();
+        for _ in 0..3 {
+            super::super::stark_node::mine_once(&state, alice.address()).await.unwrap();
+        }
+        let public = public_router(state.clone());
+
+        // The view key finds every coin of its wallet in the scan pages, and
+        // only there: the node is never told which wallet is being read.
+        let response = get_from(&public, "/scan?from=1&count=2", "GET").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/octet-stream");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "public, max-age=10");
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let first = ScanPage::decode(&bytes).unwrap();
+        assert_eq!((first.from, first.tip, first.blocks.len()), (1, 3, 2));
+        let mut viewer = zoka_pq_pool::scan::Viewer::new(alice.view_key().unwrap());
+        viewer.add_page(&first).unwrap();
+        let bytes = to_bytes(
+            get_from(&public, "/scan?from=3", "GET").await.into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+        viewer.add_page(&ScanPage::decode(&bytes).unwrap()).unwrap();
+        let seen = viewer.balance();
+        let supply = json(get_from(&public, "/supply", "GET").await).await;
+        assert_eq!(supply["height"], 3);
+        assert_eq!(seen.received_atoms, supply["issued_atoms"].as_u64().unwrap());
+        assert_eq!(supply["max_supply_atoms"], MAX_SUPPLY);
+        // On regtest a coinbase joins the note tree two blocks later: those of
+        // blocks 2 and 3 still wait, block 1's counts at once.
+        assert_eq!(seen.immature_atoms, subsidy(2) + subsidy(3));
+        let total = get_from(&public, "/supply/total", "GET").await;
+        assert_eq!(total.headers()[header::CONTENT_TYPE], "text/plain; charset=utf-8");
+        let text = to_bytes(total.into_body(), 64).await.unwrap();
+        assert_eq!(std::str::from_utf8(&text).unwrap(), zka(supply["issued_atoms"].as_u64().unwrap()));
+
+        let stats = json(get_from(&public, "/blocks/stats?count=2", "GET").await).await;
+        let blocks = stats["blocks"].as_array().unwrap();
+        assert_eq!((blocks.len(), &blocks[0]["height"], &blocks[1]["height"]), (2, &serde_json::json!(2), &serde_json::json!(3)));
+        assert!(blocks[1]["interval_secs"].is_u64());
+        assert_eq!(blocks[1]["transactions"], 1);
+        let first = json(get_from(&public, "/blocks/stats?before=2", "GET").await).await;
+        assert_eq!(first["blocks"][0]["height"], 1);
+        assert!(first["blocks"][0]["interval_secs"].is_null());
+
+        assert_eq!(json(get_from(&public, "/network/history", "GET").await).await["samples"], serde_json::json!([]));
+        {
+            let _gate = state.gate.lock().unwrap();
+            record_network_sample(&state).unwrap();
+        }
+        let history = json(get_from(&public, "/network/history", "GET").await).await;
+        assert_eq!(history["samples"][0]["height"], 3);
+        assert!(json(get_from(&public, "/", "GET").await).await["endpoints"]["/scan?from=H&count=N"].is_string());
     }
 }

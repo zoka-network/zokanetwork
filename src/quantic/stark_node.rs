@@ -941,6 +941,17 @@ async fn authority_loop(state: NodeState, signer: Arc<CheckpointSigner>, mut sto
     }
 }
 
+/// The explorer's chart of the network: a sample every `HISTORY_EVERY` while
+/// the public API is served (the first after one interval, once peers are up).
+async fn history_loop(state: NodeState, mut stop: watch::Receiver<bool>) {
+    loop {
+        tokio::select! { _ = stopped(&mut stop) => return, _ = tokio::time::sleep(stark_api::HISTORY_EVERY) => {} }
+        if let Err(reason) = with_state(&state, stark_api::record_network_sample).await {
+            eprintln!("STARK network history: {reason}");
+        }
+    }
+}
+
 async fn new_state(path: PathBuf, wanted: Option<Profile>) -> Result<NodeState, String> {
     tokio::task::spawn_blocking(move || NodeState::new(Arc::new(open_db(&path, wanted)?.0)))
         .await
@@ -1168,6 +1179,7 @@ async fn serve(options: Options) -> Result<(), String> {
                 eprintln!("STARK public API: {reason}");
             }
         }));
+        workers.push(tokio::spawn(history_loop(state.clone(), stop.clone())));
     }
     for peer in pinned {
         workers.push(tokio::spawn(pinned_loop(net.clone(), peer, stop.clone())));
