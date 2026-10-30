@@ -21,7 +21,7 @@ mine through it, and show your balance.
 
 | File | What for |
 | --- | --- |
-| `zoka` / `zoka.exe` | The Zoka Quantic node and wallet (version 4.0.2) |
+| `zoka` / `zoka.exe` | The Zoka Quantic node and wallet (version 4.0.3) |
 | `zoka-miner.ps1` / `zoka-miner.sh` | One script for every step below |
 | `*.cmd` (Windows) | Double-click shortcuts to that script |
 | `SHA256SUMS.txt` | The hashes of every file in the package |
@@ -42,12 +42,12 @@ Compare the file's SHA-256 with the one published next to it in the release:
 
 ```powershell
 # Windows (PowerShell)
-Get-FileHash .\zoka-cli-miner-4.0.2-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\zoka-cli-miner-4.0.3-windows-x64.zip -Algorithm SHA256
 ```
 
 ```bash
 # Linux
-sha256sum zoka-cli-miner-4.0.2-linux-x64.tar.gz
+sha256sum zoka-cli-miner-4.0.3-linux-x64.tar.gz
 ```
 
 If they do not match, do not run it: download it again from the official
@@ -57,7 +57,7 @@ release.
 
 - **Windows:** unzip the package anywhere (for example in Documents) and
   double-click **`1-create-wallet.cmd`**.
-- **Linux:** `tar xzf zoka-cli-miner-4.0.2-linux-x64.tar.gz`, `cd` into the
+- **Linux:** `tar xzf zoka-cli-miner-4.0.3-linux-x64.tar.gz`, `cd` into the
   folder and run `./zoka-miner.sh create-wallet`.
 
 Choose a password (at least 8 characters). Then you will see **24 words**:
@@ -133,6 +133,23 @@ balance and every payment without the key ever leaving the page.
 - Whoever holds it sees every payment of the wallet, past and future. Share it
   only as you would a bank statement: it cannot be revoked. If it leaks, send
   your coins to a new wallet.
+
+## Tor mode (optional)
+
+By default the node connects to its peers directly or through n0's relays, and
+they see your IP address (your payments stay private either way). With **Tor
+mode** the node reaches the network only through Tor, to the network's onion
+seeds: peers and relays no longer see your IP, and your internet provider does
+not see that you use Zoka. It is slower to sync, and a block you mine takes a
+few seconds longer to reach the network.
+
+1. Have Tor running: Tor Browser open (its port is `127.0.0.1:9150`), or the
+   Tor service (`127.0.0.1:9050` on Linux).
+2. Start mining with the port: `zoka-miner.ps1 mine -Tor 127.0.0.1:9150`
+   (Windows) or `./zoka-miner.sh mine --tor 127.0.0.1:9050` (Linux).
+
+If Tor is not running, the node does not start: it never falls back to a
+direct connection.
 
 ## Help the network: keep a node running
 

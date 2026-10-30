@@ -21,7 +21,7 @@ minar con XMRig y muestran tu saldo.
 
 | Archivo | Para qué |
 | --- | --- |
-| `zoka` / `zoka.exe` | El nodo y la wallet de Zoka Quantic (versión 4.0.2) |
+| `zoka` / `zoka.exe` | El nodo y la wallet de Zoka Quantic (versión 4.0.3) |
 | `zoka-miner.ps1` / `zoka-miner.sh` | Un script para cada paso de abajo |
 | `*.cmd` (Windows) | Accesos de doble clic a ese script |
 | `SHA256SUMS.txt` | Los hashes de todos los archivos del paquete |
@@ -43,12 +43,12 @@ Compará el SHA-256 del archivo con el que está publicado al lado, en el releas
 
 ```powershell
 # Windows (PowerShell)
-Get-FileHash .\zoka-cli-miner-4.0.2-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\zoka-cli-miner-4.0.3-windows-x64.zip -Algorithm SHA256
 ```
 
 ```bash
 # Linux
-sha256sum zoka-cli-miner-4.0.2-linux-x64.tar.gz
+sha256sum zoka-cli-miner-4.0.3-linux-x64.tar.gz
 ```
 
 Si no coinciden, no lo ejecutes: bajalo de nuevo del release oficial.
@@ -57,7 +57,7 @@ Si no coinciden, no lo ejecutes: bajalo de nuevo del release oficial.
 
 - **Windows:** descomprimí el paquete donde quieras (por ejemplo, en Documentos)
   y hacé doble clic en **`1-create-wallet.cmd`**.
-- **Linux:** `tar xzf zoka-cli-miner-4.0.2-linux-x64.tar.gz`, entrá a la carpeta
+- **Linux:** `tar xzf zoka-cli-miner-4.0.3-linux-x64.tar.gz`, entrá a la carpeta
   con `cd` y ejecutá `./zoka-miner.sh create-wallet`.
 
 Elegí una contraseña (8 caracteres como mínimo). Después vas a ver **24
@@ -133,6 +133,23 @@ saldo y cada pago sin que la clave salga de la página.
 - Quien la tenga ve todos los pagos de la wallet, los de antes y los que vengan.
   Compartila solo como compartirías un resumen del banco: no se puede revocar.
   Si se filtra, pasá tus monedas a una wallet nueva.
+
+## Modo Tor (opcional)
+
+Normalmente el nodo se conecta a sus pares directo o por los relays de n0, y
+ellos ven tu IP (tus pagos son privados igual). Con el **Modo Tor**, el nodo
+llega a la red solo por Tor, a las semillas .onion de la red: los pares y los
+relays dejan de ver tu IP, y tu proveedor de internet no ve que usás Zoka.
+Sincroniza más lento, y un bloque que minás tarda unos segundos más en llegar a
+la red.
+
+1. Tené Tor corriendo: Tor Browser abierto (su puerto es `127.0.0.1:9150`) o
+   el servicio de Tor (`127.0.0.1:9050` en Linux).
+2. Mina con ese puerto: `zoka-miner.ps1 mine -Tor 127.0.0.1:9150` (Windows) o
+   `./zoka-miner.sh mine --tor 127.0.0.1:9050` (Linux).
+
+Si Tor no está corriendo, el nodo no arranca: nunca se conecta directo en su
+lugar.
 
 ## Ayudá a la red: dejá un nodo prendido
 

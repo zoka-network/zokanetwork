@@ -24,6 +24,9 @@ API_PORT=9180
 API="http://127.0.0.1:$API_PORT"
 STRATUM_PORT=3333
 XMRIG=""
+# Modo Tor (opcional): el SOCKS de un Tor que ya corre (127.0.0.1:9050 el del
+# sistema, 127.0.0.1:9150 el de Tor Browser).
+TOR=""
 
 COMMAND="${1:-help}"
 shift || true
@@ -35,6 +38,7 @@ while [ $# -gt 0 ]; do
         --threads) THREADS="$2"; shift 2 ;;
         --stratum-port) STRATUM_PORT="$2"; shift 2 ;;
         --xmrig) XMRIG="$2"; shift 2 ;;
+        --tor) TOR="$2"; shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -135,7 +139,7 @@ mine() {
     ZOKA_PQ_PASSWORD="$secret" \
         "$ZOKA" quantic-pq-node serve --network "$NETWORK" --db "$NODE_DIR/db" \
         --identity "$NODE_DIR/node.identity" --api "127.0.0.1:$API_PORT" --descriptor-out "$DESCRIPTOR" \
-        --stratum "$STRATUM" --mine-to "$full" > "$log" 2> "$err_log" &
+        --stratum "$STRATUM" --mine-to "$full" ${TOR:+--tor "$TOR"} > "$log" 2> "$err_log" &
     NODE_PID=$!
     trap stop_node EXIT
     trap 'exit 130' INT TERM
@@ -260,7 +264,7 @@ Zoka Quantic Testnet v2 CLI miner. Commands:
   status          height, peers and miners
   node-id         this node's public ids, to offer it as a seed
 Options: --wallet <name> (default: miner), --threads n, --stratum-port n (default: 3333),
---xmrig <path to xmrig>.
+--xmrig <path to xmrig>, --tor 127.0.0.1:9050 (optional Tor mode, through a running Tor).
 Data lives in ./data next to this script.
 EOF
         ;;

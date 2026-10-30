@@ -20,7 +20,10 @@ param(
     [string]$Wallet = "miner",
     [int]$Threads = 0,
     [int]$StratumPort = 3333,
-    [string]$Xmrig = ""
+    [string]$Xmrig = "",
+    # Modo Tor (opcional): el SOCKS de un Tor que ya corre, 127.0.0.1:9150 el
+    # de Tor Browser o 127.0.0.1:9050 el de tor.exe.
+    [string]$Tor = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -122,6 +125,10 @@ function Start-Mining {
     $argv = @("quantic-pq-node", "serve", "--network", $Network,
         "--db", (Join-Path $NodeDir "db"), "--identity", (Join-Path $NodeDir "node.identity"),
         "--api", $ApiBind, "--descriptor-out", $Descriptor, "--stratum", $Stratum, "--mine-to", $address)
+    if ($Tor) {
+        $argv += @("--tor", $Tor)
+        Say "Tor mode: the node connects only through Tor at $Tor, to the network's onion seeds." "Cyan"
+    }
 
     $env:ZOKA_PQ_PASSWORD = Get-NodeSecret
     try {
@@ -261,7 +268,8 @@ switch ($Command) {
         Say "  balance         your balance"
         Say "  status          height, peers and miners"
         Say "  node-id         this node's public ids, to offer it as a seed"
-        Say "Options: -Wallet <name> (default: miner), -Threads n, -StratumPort n (default: 3333), -Xmrig <path to xmrig.exe>."
+        Say "Options: -Wallet <name> (default: miner), -Threads n, -StratumPort n (default: 3333), -Xmrig <path to xmrig.exe>,"
+        Say "  -Tor 127.0.0.1:9150 (optional Tor mode, through a running Tor such as Tor Browser's)."
         Say "Data lives in .\data next to this script."
     }
 }
