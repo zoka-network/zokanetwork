@@ -52,8 +52,9 @@ publica solo con el OK del usuario.
    Sale en el próximo paquete CLI: necesita un nodo 4.0.3, porque el armado
    exige que `zoka.exe` sea la versión de `Cargo.toml`. **Falta** que alguien
    ofrezca un nodo siempre prendido; lo pide el anuncio.
-5. [ ] **Modo Tor:** documento de diseño y prototipo en una red de prueba
-   local, en una rama aparte.
+5. [ ] **Modo Tor:** diseño en [docs/MODO-TOR.md](MODO-TOR.md), con sus etapas
+   E1 a E5 y su registro. Código en la rama `modo-tor`. Seguir por la primera
+   etapa sin marcar.
 6. [ ] **Caché de /scan en el borde** (opcional): una Pages Function en
    zokascan.cc, para que la PC no sirva cada página de escaneo.
 
