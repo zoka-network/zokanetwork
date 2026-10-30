@@ -52,7 +52,7 @@ publica solo con el OK del usuario.
    Sale en el próximo paquete CLI: necesita un nodo 4.0.3, porque el armado
    exige que `zoka.exe` sea la versión de `Cargo.toml`. **Falta** que alguien
    ofrezca un nodo siempre prendido; lo pide el anuncio.
-5. [ ] **Modo Tor:** diseño en [docs/MODO-TOR.md](MODO-TOR.md), con sus etapas
+5. [x] **Modo Tor (publicado el 30/10):** diseño en [docs/MODO-TOR.md](MODO-TOR.md), con sus etapas
    E1 a E5 y su registro. Código en la rama `modo-tor` (pusheada). Seguir por
    la primera etapa sin marcar.
    - E1 y E2 hechas (`644b3e9f`, `85e5be88`).
@@ -66,7 +66,7 @@ publica solo con el OK del usuario.
      con `scripts/probar-modo-tor.ps1` (6 minutos siguiendo a la semilla solo por
      Tor). Siguen E4b (semilla .onion real y manifiesto, con OK del usuario) y
      E5 (ZSilent).
-6. [ ] **Caché de /scan en el borde** (opcional): una Pages Function en
+6. [x] **Caché de /scan en el borde** (desplegada el 30/10): una Pages Function en
    zokascan.cc, para que la PC no sirva cada página de escaneo.
 
 ## Autorizaciones del usuario (30/10, 14:00, antes de irse un rato)
@@ -117,3 +117,13 @@ Tor es **opcional** (decisión del usuario): nunca obligatorio.
     - etiquetas, releases, despliegues e instalación de ZSilent 4.0.5 (todo
       autorizado);
     - actualizar la hoja de ruta.
+- 30/10, 16:15: **todo lo autorizado está hecho**:
+  - releases v4.0.3 (nodo y CLI) y v4.0.5 (ZSilent), con hashes
+    verificados; la 4.0.2 y la 4.0.4 quedaron marcadas como reemplazadas;
+  - zoka.network y zokascan.cc desplegados;
+  - ZSilent 4.0.5 instalada en la PC; la cadena está frenada en 1110 hasta
+    que el usuario entre.
+  **Pendiente:**
+  - el anuncio en Discord (lo pega el usuario);
+  - una segunda semilla fuera de la PC;
+  - ZKAPriv para la v2.

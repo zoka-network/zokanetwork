@@ -3,6 +3,56 @@
 Actualizada: **30 de octubre de 2026**, Argentina (**testnet v2 lanzada**: bloque 1 fijado y la PC como seed1; nodo, minero CLI y ZSilent 4.0.x publicados; **ZokaScan nuevo en línea** en zokascan.cc con su API en api.zokascan.cc).
 Proyecto: `C:\Users\mderramus\ZOKA`.
 
+## 30/10, tarde: Modo Tor opcional publicado (nodo 4.0.3, ZSilent 4.0.5)
+
+Decisión del usuario: **Tor opcional, nunca obligatorio**. Lo autorizó todo
+antes de irse un rato: publicar, desplegar e instalar en la PC aunque la
+cadena quede frenada hasta que vuelva a entrar.
+
+- **Diseño y registro:** [docs/MODO-TOR.md](docs/MODO-TOR.md), etapas E1 a
+  E5, todas hechas. El estado vivo para otros agentes está en
+  [docs/TRASPASO.md](docs/TRASPASO.md) y [AGENTS.md](AGENTS.md).
+- **Nodo 4.0.3** (`main` = `v4.0.3`, en GitHub y GitLab):
+  - transporte de flujos para iroh (`src/network/stream_transport.rs`);
+  - `--tor` (por el SOCKS de `tor.exe`), `--stream-listen` y
+    `--stream-address`;
+  - seed2 con su .onion en el manifiesto;
+  - descarga en tubería y atajo del ancestro común: por Tor, 0,5 a 3
+    bloques/s;
+  - ficha estable en el saludo, para que un circuito cortado no trabe la
+    conexión.
+  - Un nodo nuevo bajó la testnet real por Tor en 6 minutos.
+- **Minero CLI 4.0.3:** `-Tor` / `--tor` y `node-id`. Paquetes Windows
+  `c37a2ceb…` y Linux `43e35044…`, probados.
+- **ZSilent 4.0.5** (zsilent-core `main` = `v4.0.5`):
+  - interruptor de Tor en Settings > Network, apagado por defecto y
+    bloqueado en una PC con las claves de autoridad (como esta);
+  - si Tor no arranca, el nodo tampoco;
+  - el MSI `1a20472f…` trae Tor 0.4.9.14;
+  - prueba `TorModeE2ETest` contra la testnet real.
+- **Semilla .onion en la PC:** `%APPDATA%\Zoka\.zoka\tor-seed` (sin ventana,
+  `tor-seed-oculto.vbs`). El nodo del explorador corre la 4.0.3 con la .onion
+  `u2soz3q6….onion:9444`.
+- **Publicado y verificado** (hashes OK al bajar de vuelta):
+  - releases 4.0.3 y 4.0.5; la 4.0.2 y la ZSilent 4.0.4 marcadas como
+    reemplazadas;
+  - zoka.network (guía del Modo Tor y papers 2.6);
+  - zokascan.cc (caché de `/scan` en `functions/scan.js`).
+- **Instalado:** ZSilent 4.0.5 en la PC a las 16:09. La X manda la app a la
+  bandeja y no la cierra; para instalar se detuvieron el nodo y la app (el
+  nodo, como lo detiene ZSilent).
+- **Otros:**
+  - XMRig vigilado y sin ventana;
+  - borrador del anuncio para Discord en
+    `docs/ANUNCIO-testnet-v2-zokascan-BORRADOR.md`;
+  - guía de semillas en `docs/SEMILLAS.md`;
+  - `.gitattributes` con `*.sh eol=lf`.
+- **Falta:**
+  - que el usuario entre a ZSilent: hasta entonces no hay Stratum y la cadena
+    está frenada en el bloque 1110;
+  - que pegue el anuncio en Discord (conviene sumarle el Modo Tor);
+  - una segunda semilla que no esté en la PC.
+
 ## 30/10: ZokaScan en línea, con saldo por clave de vista (el usuario: «que se puedan buscar los balances con privacidad… API mínima… online… charts»)
 
 Decisiones del usuario: túnel desde la PC, nodo 4.0.2, «clave de vista en el
