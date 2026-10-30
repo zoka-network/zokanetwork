@@ -69,6 +69,28 @@ publica solo con el OK del usuario.
 6. [ ] **Caché de /scan en el borde** (opcional): una Pages Function en
    zokascan.cc, para que la PC no sirva cada página de escaneo.
 
+## Autorizaciones del usuario (30/10, 14:00, antes de irse un rato)
+
+Dadas por escrito en la conversación; valen para este trabajo:
+
+1. **Nodo y minero CLI 4.0.3:** Modo Tor por CLI (`--tor`), semilla .onion en el
+   manifiesto y `node-id`. **Publicar** (release, merge a `main`, web) cuando
+   pase la prueba contra la testnet real por Tor.
+2. **ZSilent 4.0.5:** interruptor "Tor" opcional y apagado por defecto en
+   Network privacy, con `tor.exe` de vuelta en el MSI. **Armar y publicar**
+   cuando esté probado.
+3. **Instalar ZSilent nueva en la PC aunque el usuario no esté.** Se cierra
+   ZSilent (semilla y Stratum) y la cadena queda frenada hasta que el usuario
+   vuelva a entrar.
+4. **Desplegar** los papers 2.6 en zoka.network y la caché de las páginas de
+   `/scan` en zokascan.cc.
+
+Tor es **opcional** (decisión del usuario): nunca obligatorio.
+
 ## Bitácora
 
 - 30/10: se crean `AGENTS.md` y este archivo.
+- 30/10, 13:58: semilla .onion en marcha. `tor-seed` (sin ventana) con la .onion
+  `u2soz3q63237afuccfxf3jzytpljpbxpvyzt3jumrr45ukzowdakayqd.onion:9444`, y el nodo del
+  explorador con el binario de `modo-tor`, `--stream-listen 127.0.0.1:9444` y
+  `--stream-address`. Respaldo: `explorer-node\zoka-4.0.2.exe` y `explorer-node-4.0.2.cmd`.
