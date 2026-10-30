@@ -55,12 +55,31 @@ navegador» y gráficos de «red y nodos». Publicación aprobada con «Sí, tod
     `config.yml`, `zokascan-api.json` con las credenciales, que son secretas,
     y `tunnel-zokascan.cmd`);
   - `cert.pem` del login de Cloudflare, en `~/.cloudflared/`.
+- **PUBLICADO el 30/10, a la tarde** (el usuario: «sí, todo ahora»). Antes
+  el usuario vio en ZSilent 4.0.2 los renglones «Scan private key» y «Spend
+  private key» vacíos. Eran las dos claves hex de Zenith: `exportSecrets` de
+  Quantic solo pedía la frase.
+  - **Nodo 4.0.2:** `main` = `v4.0.2` = `6ccc0c96`, en GitHub y GitLab. Trae
+    el minero CLI con `view-key` y `show-view-key.cmd`, y las guías con la
+    sección 6. Paquetes: Windows `9f113091…` y Linux `051079ab…` (Debian 11
+    en WSL). Los dos probados con `view-key`.
+  - **ZSilent 4.0.3** (zsilent-core `main` = `v4.0.3` = `9c89406`):
+    - «Show view key» pide `show-view-key` y explica que no gasta, y que en
+      Quantic no hay clave de gasto aparte: gastar pide la frase;
+    - las 81 pruebas pasan, incluida la de punta a punta contra el nodo v2
+      real;
+    - MSI `e2e8ea7d…`; extraído, trae el `zoka.exe` 4.0.2 y no trae Tor.
+  - **Releases en GitHub:** las dos, bajadas de vuelta y con `sha256sum -c`
+    OK. La 4.0.1 y la ZSilent 4.0.2 quedaron marcadas como reemplazadas.
+  - **Web:** zokaweb `abc62c4`, desplegada y pusheada. ZokaScan ya no figura
+    «offline», hay guía de la clave de vista y descargas 4.0.3/4.0.2.
+  - **zokaexplorer:** `main` avanzó a `6c24953`, lo que está en producción.
 - **Falta:**
-  - **Publicar el nodo/CLI 4.0.2 con `show-view-key`.** Hoy nadie puede sacar
-    su clave de vista con un binario publicado, y la página dice «Zoka 4.0.2 or
-    later».
-  - Un botón en ZSilent para copiar la clave de vista.
-  - Que la web zoka.network vuelva a enlazar ZokaScan.
+  - Instalar ZSilent 4.0.3 en la PC. Hay que cerrar ZSilent, que es la
+    semilla; el usuario vuelve a entrar después.
+  - Los papers describen la clave de vista solo como la clave X-Wing; la
+    `ViewKey` agrega la clave de salida y el dueño. Corregirlo en la próxima
+    edición.
   - El beacon de Cloudflare Web Analytics queda bloqueado por la CSP. Es a
     propósito: no conviene un script de terceros en una página que recibe
     claves. Apagar Web Analytics en el panel o dejarlo así.
