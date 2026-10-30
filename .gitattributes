@@ -1,0 +1,3 @@
+# Los scripts de shell corren en Linux (WSL, Debian 11): siempre LF, aunque
+# core.autocrlf los pase a CRLF al cambiar de rama.
+*.sh text eol=lf
