@@ -1,7 +1,71 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
-Actualizada: **29 de octubre de 2026**, Argentina (**testnet v2 lanzada**: bloque 1 fijado y la PC como seed1; nodo, minero CLI y ZSilent 4.0.0 publicados, web al día y la 4.0.0 instalada en la PC).
+Actualizada: **30 de octubre de 2026**, Argentina (**testnet v2 lanzada**: bloque 1 fijado y la PC como seed1; nodo, minero CLI y ZSilent 4.0.x publicados; **ZokaScan nuevo en línea** en zokascan.cc con su API en api.zokascan.cc).
 Proyecto: `C:\Users\mderramus\ZOKA`.
+
+## 30/10: ZokaScan en línea, con saldo por clave de vista (el usuario: «que se puedan buscar los balances con privacidad… API mínima… online… charts»)
+
+Decisiones del usuario: túnel desde la PC, nodo 4.0.2, «clave de vista en el
+navegador» y gráficos de «red y nodos». Publicación aprobada con «Sí, todo».
+
+- **Clave de vista** (`cbd59770`, rama `quantic-v2-explorer-api`, pusheada a
+  GitHub y GitLab):
+  - `zoka-pq-pool`: `ViewKey` (`zqtestview2…`, 130 bytes y suma de control)
+    con la semilla X-Wing, la clave de salida y el dueño. Abre lo recibido y
+    reconoce las transferencias propias, porque toda salida de una
+    transferencia va sellada también con la clave de salida del que envía.
+    Por eso da el saldo exacto: recibido − (salidas + comisión) de las
+    propias. No puede gastar: el nulificador necesita la clave de gasto.
+  - Módulo `scan`: `ScanPage` (postcard) y `Viewer` (saldo, gastable,
+    inmaduro y la regla de madurez del libro mayor).
+  - CLI: `quantic-pq-wallet show-view-key`.
+- **API pública nueva:**
+  - `/scan?from=H&count=N`: 100 bloques de salidas cifradas, unos 280 KB.
+    Inmutable bajo el checkpoint, y con un balde propio (`fa73edb0`, 1 por
+    segundo, ráfaga de 10) para no saturar la subida de la PC.
+  - `/supply` y `/supply/total` (texto plano).
+  - `/blocks/stats`: hasta 720 bloques.
+  - `/network/history`: una muestra cada 5 minutos durante 24 h, guardada en
+    la base.
+  - `/`: la lista de endpoints.
+- **`crates/zoka-pq-scan-wasm`:** el mismo código compilado con wasm-pack
+  (`--target web`, 145 KB). El explorador lo lleva copiado en
+  `src/lib/scan-wasm/`; hay que recopiarlo si cambia el formato.
+- **Explorador** (zokaexplorer `explorer-quantic-v2`, `9ab7a89` y `6c24953`,
+  pusheada):
+  - páginas `/wallet` (Mi billetera), gráficos en `/network` (cada uno con
+    vista de tabla) y `/api`;
+  - CSP en `public/_headers`: solo scripts propios y WebAssembly, y
+    conexiones solo a api.zokascan.cc;
+  - el buscador entrega la clave en memoria, nunca en la URL.
+- **Pruebas:**
+  - 43 pruebas STARK, incluida una de la API pública con saldo por escaneo, y
+    17 del pool;
+  - el WASM en Node contra la cadena real: 531 bloques en 0,5 s;
+  - Mi billetera en Edge, por DevTools, con la CSP, en local y en
+    zokascan.cc: escanea hasta la punta, sin errores y sin la clave en la URL.
+- **En producción:**
+  - Pages `zokaexplorer`, rama `main`, despliegue `d7df94df`;
+  - el túnel `zokascan-api` (`0eefc2be-759a-45c5-a2fc-1062407752c0`), con el
+    CNAME `api.zokascan.cc` creado por `cloudflared tunnel route dns`.
+- **En la PC, en `%APPDATA%\Zoka\.zoka\`** (todo abierto con explorer.exe):
+  - `explorer-node\` (el `zoka.exe` de esta rama y `explorer-node.cmd`, API
+    pública 127.0.0.1:9181);
+  - `cloudflared\` (cloudflared 2026.10.1, con hash y firma verificados,
+    `config.yml`, `zokascan-api.json` con las credenciales, que son secretas,
+    y `tunnel-zokascan.cmd`);
+  - `cert.pem` del login de Cloudflare, en `~/.cloudflared/`.
+- **Falta:**
+  - **Publicar el nodo/CLI 4.0.2 con `show-view-key`.** Hoy nadie puede sacar
+    su clave de vista con un binario publicado, y la página dice «Zoka 4.0.2 or
+    later».
+  - Un botón en ZSilent para copiar la clave de vista.
+  - Que la web zoka.network vuelva a enlazar ZokaScan.
+  - El beacon de Cloudflare Web Analytics queda bloqueado por la CSP. Es a
+    propósito: no conviene un script de terceros en una página que recibe
+    claves. Apagar Web Analytics en el panel o dejarlo así.
+  - Si /scan crece mucho: una regla de caché de Cloudflare (pide permiso de
+    zona) o un proxy con Cache API en Pages.
 
 ## 29/10, tarde (2): revisión de ZSilent y 4.0.2 (el usuario: «controlá si zsilent está funcionando bien»)
 
