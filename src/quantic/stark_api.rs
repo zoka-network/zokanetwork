@@ -61,6 +61,11 @@ const PUBLIC_BURST: f64 = 40.0;
 /// How long a public request waits for a worker, and runs at most.
 const PUBLIC_QUEUE: Duration = Duration::from_secs(5);
 const PUBLIC_TIMEOUT: Duration = Duration::from_secs(20);
+/// A scan page is some 3 KB per output, all of it sent from the node's own
+/// uplink: a slower bucket of its own keeps one client from filling it, and
+/// its burst still reads 1,000 blocks at once.
+const SCAN_RATE: f64 = 1.0;
+const SCAN_BURST: f64 = 10.0;
 /// One day of blocks at the ideal pace: what a chart asks for at most.
 const MAX_STATS_BLOCKS: u64 = 720;
 const HISTORY_KEY: &str = "quantic:stark:network-history";
@@ -380,30 +385,55 @@ pub async fn serve(state: NodeState, bind: SocketAddr) -> Result<(), String> {
 #[derive(Clone)]
 pub struct PublicGate {
     permits: Arc<Semaphore>,
-    bucket: Arc<Mutex<(f64, std::time::Instant)>>,
+    bucket: Bucket,
+    scans: Bucket,
+}
+
+/// Tokens that refill at `rate` a second, up to `burst`.
+#[derive(Clone)]
+struct Bucket {
+    rate: f64,
+    burst: f64,
+    level: Arc<Mutex<(f64, std::time::Instant)>>,
+}
+
+impl Bucket {
+    fn new(rate: f64, burst: f64) -> Self {
+        Self {
+            rate,
+            burst,
+            level: Arc::new(Mutex::new((burst, std::time::Instant::now()))),
+        }
+    }
+
+    fn take(&self) -> bool {
+        let Ok(mut level) = self.level.lock() else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        let refilled = level.0 + now.duration_since(level.1).as_secs_f64() * self.rate;
+        *level = (refilled.min(self.burst), now);
+        if level.0 < 1.0 {
+            return false;
+        }
+        level.0 -= 1.0;
+        true
+    }
 }
 
 impl PublicGate {
     pub fn new() -> Self {
         Self {
             permits: Arc::new(Semaphore::new(PUBLIC_WORKERS)),
-            bucket: Arc::new(Mutex::new((PUBLIC_BURST, std::time::Instant::now()))),
+            bucket: Bucket::new(PUBLIC_RATE, PUBLIC_BURST),
+            scans: Bucket::new(SCAN_RATE, SCAN_BURST),
         }
     }
 
-    /// One token from the bucket, which refills at `PUBLIC_RATE` a second.
-    fn take(&self) -> bool {
-        let Ok(mut bucket) = self.bucket.lock() else {
-            return false;
-        };
-        let now = std::time::Instant::now();
-        let refilled = bucket.0 + now.duration_since(bucket.1).as_secs_f64() * PUBLIC_RATE;
-        *bucket = (refilled.min(PUBLIC_BURST), now);
-        if bucket.0 < 1.0 {
-            return false;
-        }
-        bucket.0 -= 1.0;
-        true
+    /// One token for `path`: from the shared bucket and, for a scan page,
+    /// from the scans' own.
+    fn take(&self, path: &str) -> bool {
+        self.bucket.take() && (path != "/scan" || self.scans.take())
     }
 }
 
@@ -432,7 +462,7 @@ async fn admit_public(State(gate): State<PublicGate>, mut request: Request, next
             ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "the public API is read-only").into_response(),
         );
     }
-    if !gate.take() {
+    if !gate.take(request.uri().path()) {
         let mut response = with_cors(
             ApiError::new(StatusCode::TOO_MANY_REQUESTS, "too many requests; retry in a second")
                 .into_response(),
@@ -1877,11 +1907,18 @@ mod tests {
         // The rate is shared: the bucket runs dry and then refills.
         let gate = PublicGate::new();
         for _ in 0..PUBLIC_BURST as usize {
-            assert!(gate.take());
+            assert!(gate.take("/status"));
         }
-        assert!(!gate.take());
+        assert!(!gate.take("/status"));
         std::thread::sleep(Duration::from_millis(200));
-        assert!(gate.take());
+        assert!(gate.take("/status"));
+        // Scan pages have a slower bucket of their own.
+        let gate = PublicGate::new();
+        for _ in 0..SCAN_BURST as usize {
+            assert!(gate.take("/scan"));
+        }
+        assert!(!gate.take("/scan"));
+        assert!(gate.take("/status"));
     }
 
     #[tokio::test]
