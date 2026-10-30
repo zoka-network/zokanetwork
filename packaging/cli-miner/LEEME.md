@@ -134,6 +134,23 @@ saldo y cada pago sin que la clave salga de la página.
   Compartila solo como compartirías un resumen del banco: no se puede revocar.
   Si se filtra, pasá tus monedas a una wallet nueva.
 
+## Ayudá a la red: dejá un nodo prendido
+
+Hoy la testnet v2 depende de un solo nodo semilla, el del equipo. Cada nodo que
+queda prendido todo el día hace más firme la red, y un nodo que nunca se apaga
+puede ser una **semilla**: uno de los nodos que vienen dentro de Zoka para que
+los nodos nuevos encuentren la red.
+
+- Dejá corriendo **`2-start-mining.cmd`** / `./zoka-miner.sh mine`. Sin XMRig
+  el nodo igual corre y sirve la cadena; con XMRig, además mina.
+- Para ofrecerlo como semilla, ejecutá **`show-node-id.cmd`** /
+  `./zoka-miner.sh node-id` y mandale los dos identificadores al equipo de Zoka
+  por Discord. Son públicos: nunca dan acceso a tu wallet ni a tu nodo. El
+  equipo los agrega al documento de la red en la próxima versión.
+- La IP de una semilla la ven los nodos que se conectan a ella, como la de
+  cualquier nodo. Conservá la carpeta `node`: los identificadores viven ahí, y
+  una carpeta nueva es una identidad nueva.
+
 ## Tus datos y tus copias de seguridad
 
 - Todo está en **`data\quantic-testnet-v2`**, al lado de los scripts:

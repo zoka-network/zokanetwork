@@ -35,12 +35,23 @@ publica solo con el OK del usuario.
    y ZSilent 4.0.4: [docs/ANUNCIO-testnet-v2-zokascan-BORRADOR.md](ANUNCIO-testnet-v2-zokascan-BORRADOR.md),
    en castellano y en inglés, cada uno de menos de 2.000 caracteres. Lo pega
    el usuario.
-3. [ ] **Papers:** la clave de vista se describe como solo la clave X-Wing; la
-   `ViewKey` de la 4.0.2 agrega la clave de salida y el dueño. Hay que
-   corregirla y rearmar los PDF.
-4. [ ] **Segunda semilla:** la red depende de la PC. Guía para que alguien de
-   la comunidad corra un nodo permanente, y cómo se suma una semilla al
-   manifiesto.
+3. [x] **Papers 2.6** (zokaweb `45170ee`, pusheado, **sin desplegar**): la
+   clave de vista exportada (semilla de vista, clave de salida y dueño), el
+   escaneo en el navegador, sin Tor (y el modo planificado) y la API pública.
+   El litepaper ya no dice que ZokaScan está fuera de línea. PDF rearmados.
+   Para publicar: `npm run build` y
+   `npx wrangler pages deploy dist --project-name zokaweb --branch main`, con
+   el OK del usuario.
+4. [x] **Segunda semilla** (lo que se puede hacer sin un operador):
+   - [docs/SEMILLAS.md](SEMILLAS.md): por qué, cómo se prueba un manifiesto
+     con `--seeds` y cómo se fija y se publica;
+   - minero CLI: comando `node-id` (`show-node-id.cmd`), que muestra los dos
+     ids públicos; probado en Windows y en Linux (WSL), y da la misma
+     identidad en cada corrida;
+   - guías README/LEEME: «Help the network» / «Ayudá a la red».
+   Sale en el próximo paquete CLI: necesita un nodo 4.0.3, porque el armado
+   exige que `zoka.exe` sea la versión de `Cargo.toml`. **Falta** que alguien
+   ofrezca un nodo siempre prendido; lo pide el anuncio.
 5. [ ] **Modo Tor:** documento de diseño y prototipo en una red de prueba
    local, en una rama aparte.
 6. [ ] **Caché de /scan en el borde** (opcional): una Pages Function en

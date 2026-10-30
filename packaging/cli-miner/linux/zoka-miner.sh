@@ -11,7 +11,7 @@
 # En la testnet el nodo no mina solo: mina XMRig a través de su Stratum. Si
 # XMRig está al lado de este script, "mine" lo arranca.
 #
-# Uso: ./zoka-miner.sh <create-wallet | restore-wallet | address | view-key | mine | balance | status> [--wallet nombre] [--threads n] [--stratum-port n] [--xmrig ruta]
+# Uso: ./zoka-miner.sh <create-wallet | restore-wallet | address | view-key | mine | balance | status | node-id> [--wallet nombre] [--threads n] [--stratum-port n] [--xmrig ruta]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -237,6 +237,17 @@ case "$COMMAND" in
         echo "Height ${height:-?} | peers $(status_number outbound "$s") out, $(status_number inbound "$s") in" \
             "| XMRig miners $(status_number miners "$s") | blocks found this session $(status_number blocks_found "$s")"
         ;;
+    node-id)
+        # Los dos identificadores públicos que fija el manifiesto de una semilla.
+        # Crea la identidad del nodo si todavía no existe; no muestra secretos.
+        mkdir -p "$NODE_DIR"
+        secret="$(node_secret)"
+        out="$(ZOKA_PQ_PASSWORD="$secret" "$ZOKA" quantic-pq-node identity --network "$NETWORK" \
+            --identity "$NODE_DIR/node.identity")" || die "Could not read the node's identity: $out"
+        echo "Endpoint id:   $(sed -n 's/.*"endpoint_id": *"\([0-9a-f]*\)".*/\1/p' <<< "$out")"
+        echo "ML-DSA key id: $(sed -n 's/.*"ml_dsa_key_id": *"\([0-9a-f]*\)".*/\1/p' <<< "$out")"
+        echo "Both are public. To offer this node as a seed, keep it running all day and send them to the Zoka team."
+        ;;
     *)
         cat << 'EOF'
 Zoka Quantic Testnet v2 CLI miner. Commands:
@@ -247,6 +258,7 @@ Zoka Quantic Testnet v2 CLI miner. Commands:
   mine            run the node, and XMRig if it is next to this script (--threads n)
   balance         your balance
   status          height, peers and miners
+  node-id         this node's public ids, to offer it as a seed
 Options: --wallet <name> (default: miner), --threads n, --stratum-port n (default: 3333),
 --xmrig <path to xmrig>.
 Data lives in ./data next to this script.

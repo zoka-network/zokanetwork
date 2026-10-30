@@ -134,6 +134,22 @@ balance and every payment without the key ever leaving the page.
   only as you would a bank statement: it cannot be revoked. If it leaks, send
   your coins to a new wallet.
 
+## Help the network: keep a node running
+
+Testnet v2 relies today on a single seed node, the team's. Every node that stays
+online all day makes the network sturdier, and an always-on node can become a
+**seed**, one of the nodes compiled into Zoka so new nodes find the network.
+
+- Leave **`2-start-mining.cmd`** / `./zoka-miner.sh mine` running. Without XMRig
+  the node still runs and serves the chain; with it, it also mines.
+- To offer it as a seed, run **`show-node-id.cmd`** / `./zoka-miner.sh node-id`
+  and send both ids to the Zoka team on Discord. They are public; they never
+  give access to your wallet or your node. The team adds them to the network
+  document of the next release.
+- A seed's IP address is visible to the nodes that connect to it, like any
+  node's. Keep the `node` folder: the ids live in it, and a new folder means a
+  new identity.
+
 ## Your data and your backups
 
 - Everything is in **`data/quantic-testnet-v2`**, next to the scripts:

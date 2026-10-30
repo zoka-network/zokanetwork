@@ -11,11 +11,11 @@
 # En la testnet el nodo no mina solo: mina XMRig a través de su Stratum. Si
 # XMRig está al lado de este script, "mine" lo arranca.
 #
-# Uso: zoka-miner.ps1 <create-wallet | restore-wallet | address | view-key | mine | balance | status> [-Wallet nombre] [-Threads n] [-StratumPort n] [-Xmrig ruta]
+# Uso: zoka-miner.ps1 <create-wallet | restore-wallet | address | view-key | mine | balance | status | node-id> [-Wallet nombre] [-Threads n] [-StratumPort n] [-Xmrig ruta]
 
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("create-wallet", "restore-wallet", "address", "view-key", "mine", "balance", "status", "help")]
+    [ValidateSet("create-wallet", "restore-wallet", "address", "view-key", "mine", "balance", "status", "node-id", "help")]
     [string]$Command = "help",
     [string]$Wallet = "miner",
     [int]$Threads = 0,
@@ -235,6 +235,22 @@ switch ($Command) {
         Say ("Height {0} | peers {1} out, {2} in | XMRig miners {3} | blocks found this session {4}" -f
             $s.height, $s.peers.outbound, $s.peers.inbound, $s.stratum.miners, $s.stratum.blocks_found)
     }
+    "node-id" {
+        # Los dos identificadores públicos que fija el manifiesto de una semilla.
+        # Crea la identidad del nodo si todavía no existe; no muestra secretos.
+        New-Item -ItemType Directory -Force -Path $NodeDir | Out-Null
+        $env:ZOKA_PQ_PASSWORD = Get-NodeSecret
+        try {
+            $out = (& $Zoka quantic-pq-node identity --network $Network --identity (Join-Path $NodeDir "node.identity") 2>&1 | Out-String)
+        } finally {
+            Remove-Item Env:ZOKA_PQ_PASSWORD -ErrorAction SilentlyContinue
+        }
+        if ($LASTEXITCODE -ne 0) { throw "Could not read the node's identity: $out" }
+        $entry = ($out | ConvertFrom-Json).seed_entry
+        Say "Endpoint id:   $($entry.endpoint_id)"
+        Say "ML-DSA key id: $($entry.ml_dsa_key_id)"
+        Say "Both are public. To offer this node as a seed, keep it running all day and send them to the Zoka team." "Cyan"
+    }
     default {
         Say "Zoka Quantic Testnet v2 CLI miner. Commands:"
         Say "  create-wallet   a new wallet (shows its 24 words once)"
@@ -244,6 +260,7 @@ switch ($Command) {
         Say "  mine            run the node, and XMRig if it is next to this script (-Threads n)"
         Say "  balance         your balance"
         Say "  status          height, peers and miners"
+        Say "  node-id         this node's public ids, to offer it as a seed"
         Say "Options: -Wallet <name> (default: miner), -Threads n, -StratumPort n (default: 3333), -Xmrig <path to xmrig.exe>."
         Say "Data lives in .\data next to this script."
     }
