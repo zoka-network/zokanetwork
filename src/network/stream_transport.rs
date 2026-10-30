@@ -233,6 +233,16 @@ impl Preset for StreamOnly {
     }
 }
 
+/// An iroh preset: `inner` (IP, relays) plus this transport, for a seed that
+/// also listens behind an onion service.
+#[derive(Debug, Clone)]
+pub struct AlsoStream<P>(pub P, pub StreamTransport);
+impl<P: Preset> Preset for AlsoStream<P> {
+    fn apply(self, builder: Builder) -> Builder {
+        self.0.apply(builder).add_custom_transport(Arc::new(self.1))
+    }
+}
+
 impl CustomTransport for StreamTransport {
     fn bind(&self) -> io::Result<Box<dyn CustomEndpoint>> {
         let receiver = self

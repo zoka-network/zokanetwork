@@ -86,8 +86,29 @@ chico.
   de cliente y aloja la .onion de la semilla. Prueba (ignorada por defecto,
   pide `ZOKA_TEST_TOR_EXE` y la red Tor): un nodo sincroniza por Tor desde una
   .onion local.
-- [ ] **E4.** Opciones `--tor`, `--stream-listen` y `--stream-address`. La
-  semilla .onion en el nodo del explorador. Manifiesto.
+- [x] **E4a. Opciones del nodo (30/10).** `--tor 127.0.0.1:PUERTO`, que solo
+  sale por el SOCKS de Tor:
+  - sin UDP, sin relays y sin anunciarse;
+  - una identidad de transporte nueva en cada arranque;
+  - solo pares con .onion, y de ellos solo la dirección .onion;
+  - no corre el bucle de pares aprendidos.
+  `--stream-listen` y `--stream-address` son para la semilla: `AlsoStream`
+  suma el transporte al de siempre y el descriptor declara la .onion. El
+  handshake STARK tiene 90 s, en vez de 15, por la ruta de flujo (de los dos
+  lados).
+  **Probado** con `scripts/probar-modo-tor.ps1`: dos nodos reales en regtest y
+  un `tor.exe` propio. El nodo en Modo Tor siguió a la semilla 6 minutos solo
+  por Tor (a 2 bloques, con bloques cada 10 s).
+  Hallazgos en el camino:
+  - con 15 s, el primer handshake por Tor se agotaba;
+  - con las IP de la semilla en el descriptor, iroh intentaba cerrar la única
+    ruta ("failed closing path: LastOpenPath") y la sesión se trababa a los
+    2,5 minutos.
+- [ ] **E4b. Semilla .onion de verdad** (necesita el OK del usuario):
+  - un `tor.exe` permanente en la PC, con un servicio .onion hacia el nodo
+    del explorador (`--stream-listen` y `--stream-address`);
+  - su `stream_address` en `docs/quantic-testnet-v2-network.v1.json`;
+  - un nodo nuevo publicado.
 - [ ] **E5.** ZSilent: interruptor, estado y textos. Release, con el OK del
   usuario.
 

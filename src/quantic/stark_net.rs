@@ -53,6 +53,9 @@ const MAGIC: &[u8; 4] = b"ZQS2";
 const AUTH_CONTEXT: &[u8] = b"zoka-quantic-stark-server-v2";
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-ZOKA-QUANTIC-STARK-v2";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Over Tor (an endpoint with no IP socket, `docs/MODO-TOR.md`) building the
+/// circuit to an onion alone can take longer than a whole direct handshake.
+const TOR_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// Inbound sessions. Each one holds at most one stream, and verification
 /// work shares the node's two crypto permits whatever this number is.
@@ -245,7 +248,13 @@ pub async fn serve(
             tokio::spawn(async move {
                 let _permit = permit;
                 let _inbound = state.peers.inbound();
-                let connected = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+                // A node in Tor mode arrives on the stream transport, whose
+                // circuit adds seconds to every round trip.
+                let limit = match incoming.remote_addr() {
+                    iroh::endpoint::IncomingAddr::Custom(_) => TOR_HANDSHAKE_TIMEOUT,
+                    _ => HANDSHAKE_TIMEOUT,
+                };
+                let connected = tokio::time::timeout(limit, async {
                     let connection = incoming.await.map_err(err)?;
                     let (send, recv) =
                         authenticate_server(&connection, server_id, &identity, &state).await?;
@@ -668,7 +677,12 @@ impl Client {
         owned: bool,
         descriptor: &NodeDescriptor,
     ) -> Result<Self, String> {
-        let authenticated = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        let limit = if endpoint.bound_sockets().is_empty() {
+            TOR_HANDSHAKE_TIMEOUT
+        } else {
+            HANDSHAKE_TIMEOUT
+        };
+        let authenticated = tokio::time::timeout(limit, async {
             let connection = endpoint
                 .connect(descriptor.endpoint_addr.clone(), ALPN)
                 .await

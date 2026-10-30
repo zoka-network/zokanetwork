@@ -120,6 +120,38 @@ impl Options {
             _ => Err("--relay must be none or N0".into()),
         }
     }
+    /// Tor mode (`docs/MODO-TOR.md`): the SOCKS port of a local `tor.exe`.
+    fn tor(&self) -> Result<Option<std::net::SocketAddr>, String> {
+        let Some(text) = self.get("--tor") else {
+            return Ok(None);
+        };
+        let proxy: std::net::SocketAddr = text
+            .parse()
+            .map_err(|_| format!("--tor is the host:port of Tor's SOCKS port, not {text}"))?;
+        if !proxy.ip().is_loopback() {
+            return Err("--tor must be a loopback SOCKS port (a local tor.exe)".into());
+        }
+        Ok(Some(proxy))
+    }
+    /// A seed behind an onion service: the loopback port the service forwards
+    /// to, and the `xxxx.onion:port` it publishes. Both or neither.
+    fn stream_listen(&self) -> Result<Option<(std::net::SocketAddr, String)>, String> {
+        match (self.get("--stream-listen"), self.get("--stream-address")) {
+            (None, None) => Ok(None),
+            (Some(listen), Some(address)) => {
+                let listen: std::net::SocketAddr = listen
+                    .parse()
+                    .map_err(|_| format!("--stream-listen must be host:port, not {listen}"))?;
+                if !listen.ip().is_loopback() {
+                    return Err("--stream-listen must be a loopback port (an onion service forwards to it)".into());
+                }
+                crate::network::stream_transport::dial_addr(address)
+                    .map_err(|e| format!("--stream-address: {e}"))?;
+                Ok(Some((listen, address.to_string())))
+            }
+            _ => Err("--stream-listen and --stream-address go together".into()),
+        }
+    }
     /// `builtin` (the manifest compiled in for a public chain), `none`, or
     /// the path of a manifest file.
     fn seeds(&self, profile: Profile) -> Result<Vec<NodeDescriptor>, String> {
@@ -1016,11 +1048,50 @@ async fn serve(options: Options) -> Result<(), String> {
         std::env::var("ZOKA_PQ_PASSWORD")
             .map_err(|_| "set ZOKA_PQ_PASSWORD for the encrypted node identity")?,
     );
+    let tor = options.tor()?;
+    let stream_listen = options.stream_listen()?;
+    if tor.is_some() && (stream_listen.is_some() || options.get("--relay") == Some("N0")) {
+        return Err("--tor runs the node over Tor alone: no --stream-listen and no relays".into());
+    }
     let state = new_state(db, network).await?;
     let profile = state.profile;
-    let relay = options.relay(profile)?;
+    let relay = tor.is_none() && options.relay(profile)?;
     let seeds = options.seeds(profile)?;
     same_chain(&peers, profile)?;
+    // Over Tor a node reaches only peers with a stream address (an onion),
+    // and it says nothing about itself.
+    let (peers, seeds) = if tor.is_some() {
+        let reachable = |peer: &NodeDescriptor| {
+            peer.endpoint_addr.addrs.iter().any(|a| {
+                matches!(a, iroh::TransportAddr::Custom(c)
+                    if crate::network::stream_transport::dial_target(c).is_some())
+            })
+        };
+        // Keep only their stream addresses: iroh would otherwise weigh IP
+        // paths this endpoint cannot use against the one it has.
+        let onion_only = |mut peer: NodeDescriptor| {
+            let streams: Vec<_> = peer
+                .endpoint_addr
+                .addrs
+                .iter()
+                .filter(|a| matches!(a, iroh::TransportAddr::Custom(_)))
+                .cloned()
+                .collect();
+            peer.endpoint_addr = EndpointAddr::new(peer.endpoint_addr.id).with_addrs(streams);
+            peer
+        };
+        let (peers, seeds): (Vec<_>, Vec<_>) = (
+            peers.into_iter().filter(|p| reachable(p)).map(onion_only).collect(),
+            seeds.into_iter().filter(|p| reachable(p)).map(onion_only).collect(),
+        );
+        if peers.is_empty() && seeds.is_empty() {
+            return Err("--tor needs a peer with an onion address: a --peer descriptor or a seed with stream_address".into());
+        }
+        (peers, seeds)
+    } else {
+        (peers, seeds)
+    };
+    let announce = announce && tor.is_none();
     let miner = options
         .get("--mine-to")
         .map(|v| Address::decode(v, profile.network).map_err(err))
@@ -1083,10 +1154,37 @@ async fn serve(options: Options) -> Result<(), String> {
         Some(listener) => Some(listener.local_addr().map_err(err)?),
         None => None,
     };
-    let mut server = if relay {
+    let stream_listener = match &stream_listen {
+        Some((listen, _)) => Some(tokio::net::TcpListener::bind(listen).await.map_err(err)?),
+        None => None,
+    };
+    let mut stream_transport = None;
+    let mut server = if let Some(proxy) = tor {
+        use crate::network::stream_transport::{SocksDialer, StreamOnly, StreamTransport};
+        // A fresh transport identity each run: the seed cannot link this
+        // node's sessions to each other. Peers never pin a client's key.
+        let mut ephemeral = Zeroizing::new([0u8; 32]);
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, ephemeral.as_mut());
+        let identity = ServerIdentity::from_seed(&ephemeral)?;
+        let transport = StreamTransport::new(None, Arc::new(SocksDialer { proxy })).map_err(err)?;
+        stark_net::serve(state.clone(), identity, StreamOnly(transport)).await?
+    } else if let Some((_, address)) = &stream_listen {
+        use crate::network::stream_transport::{AlsoStream, StreamTransport, TcpDialer};
+        let transport = StreamTransport::new(Some(address), Arc::new(TcpDialer)).map_err(err)?;
+        stream_transport = Some(transport.clone());
+        if relay {
+            stark_net::serve(state.clone(), identity, AlsoStream(presets::N0, transport)).await?
+        } else {
+            stark_net::serve(state.clone(), identity, AlsoStream(presets::Minimal, transport)).await?
+        }
+    } else if relay {
         stark_net::serve(state.clone(), identity, presets::N0).await?
     } else {
         stark_net::serve(state.clone(), identity, presets::Minimal).await?
+    };
+    let stream_task = match (stream_transport, stream_listener) {
+        (Some(transport), Some(listener)) => Some(transport.listen(listener)),
+        _ => None,
     };
     if relay
         && tokio::time::timeout(Duration::from_secs(45), server.endpoint.online())
@@ -1112,6 +1210,15 @@ async fn serve(options: Options) -> Result<(), String> {
             .endpoint_addr
             .clone()
             .with_ip_addr(address);
+    }
+    // Like the local sockets: the stream address is stated, not waited for.
+    if let Some((_, address)) = &stream_listen {
+        let custom = crate::network::stream_transport::dial_addr(address).map_err(err)?;
+        server.descriptor.endpoint_addr = server
+            .descriptor
+            .endpoint_addr
+            .clone()
+            .with_addrs([iroh::TransportAddr::Custom(custom)]);
     }
     if let Some(path) = options.get("--descriptor-out") {
         if let Err(reason) = serde_json::to_vec_pretty(&server.descriptor)
@@ -1152,6 +1259,8 @@ async fn serve(options: Options) -> Result<(), String> {
         "pow_algorithm":profile.pow_algorithm(),"xmrig_compatible":profile.xmrig_compatible(),
         "stratum":options.get("--stratum"),"relay":relay,"pinned_peers":pinned.len(),
         "public_api":public_actual.map(|addr| format!("http://{addr}")),
+        "tor":tor.map(|proxy| proxy.to_string()),
+        "stream_address":stream_listen.as_ref().map(|(_, address)| address.clone()),
         "announce":announce,"checkpoint_authority":signer.is_some(),"descriptor":server.descriptor})
     );
     let (shutdown, stop) = watch::channel(false);
@@ -1184,7 +1293,11 @@ async fn serve(options: Options) -> Result<(), String> {
     for peer in pinned {
         workers.push(tokio::spawn(pinned_loop(net.clone(), peer, stop.clone())));
     }
-    workers.push(tokio::spawn(manager_loop(net, stop.clone())));
+    // Learned peers have IP and relay addresses, which Tor mode cannot reach:
+    // over Tor the node keeps to its onion seeds and peers.
+    if tor.is_none() {
+        workers.push(tokio::spawn(manager_loop(net, stop.clone())));
+    }
     if let Some(signer) = signer {
         workers.push(tokio::spawn(authority_loop(state.clone(), signer, stop.clone())));
     }
@@ -1213,6 +1326,9 @@ async fn serve(options: Options) -> Result<(), String> {
     };
     let _ = shutdown.send(true);
     if let Some(task) = stratum_task {
+        task.abort();
+    }
+    if let Some(task) = stream_task {
         task.abort();
     }
     server.close().await;
@@ -1440,6 +1556,9 @@ pub async fn run(args: &[String]) -> Result<(), String> {
                     "--announce",
                     "--authority",
                     "--public-api",
+                    "--tor",
+                    "--stream-listen",
+                    "--stream-address",
                 ],
             )?)
             .await
@@ -1482,6 +1601,10 @@ or testnet (zoka-quantic-testnet-v2: RandomX, ASERT). An existing --db keeps its
         [--stratum 127.0.0.1:3333]   (testnet: XMRig logs in with its v2 address, full or a\n\
         short one the node knows; --mine-to pays logins that are not addresses. Regtest:\n\
         built-in miner.)\n\
+        [--tor 127.0.0.1:9050]   (Tor mode: only through a local tor.exe's SOCKS port, to\n\
+        peers with an onion address; no UDP, no relays, a new transport id each run)\n\
+        [--stream-listen 127.0.0.1:PORT --stream-address XXXX.onion:PORT]   (a seed behind an\n\
+        onion service: also listen there for Tor-mode nodes)\n\
         [--public-api 127.0.0.1:9181]   (an explorer's read-only API on its own loopback\n\
         port, for a tunnel to publish: GET only, any origin, its own rate; also\n\
         ZOKA_PQ_PUBLIC_API)\n\

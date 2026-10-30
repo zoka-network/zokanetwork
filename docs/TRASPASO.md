@@ -62,6 +62,10 @@ publica solo con el OK del usuario.
      `a_node_syncs_through_tor_from_an_onion_seed`. Se corre con
      `ZOKA_TEST_TOR_EXE=.../third_party/tor/windows-x86_64-0.4.9.14/tor.exe`
      y `cargo test --release --features quantic-pq --lib tor_from_an_onion -- --ignored --nocapture`.
+   - E4a hecha: opciones `--tor`, `--stream-listen` y `--stream-address`, probadas
+     con `scripts/probar-modo-tor.ps1` (6 minutos siguiendo a la semilla solo por
+     Tor). Siguen E4b (semilla .onion real y manifiesto, con OK del usuario) y
+     E5 (ZSilent).
 6. [ ] **Caché de /scan en el borde** (opcional): una Pages Function en
    zokascan.cc, para que la PC no sirva cada página de escaneo.
 
