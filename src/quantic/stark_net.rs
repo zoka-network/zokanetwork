@@ -109,11 +109,17 @@ impl NodeDescriptor {
         if pin.len() != 32 || self.ml_dsa_key_id != hex::encode(&pin) {
             return Err("STARK descriptor ML-DSA key id".into());
         }
+        // IP, relay or a dialable address of the stream transport (the
+        // `.onion:port` of a Tor seed); no other custom transport.
         let addresses = &self.endpoint_addr.addrs;
         if addresses.len() > MAX_ADDRESSES
-            || addresses
-                .iter()
-                .any(|a| !matches!(a, TransportAddr::Ip(_) | TransportAddr::Relay(_)))
+            || addresses.iter().any(|a| match a {
+                TransportAddr::Ip(_) | TransportAddr::Relay(_) => false,
+                TransportAddr::Custom(custom) => {
+                    crate::network::stream_transport::dial_target(custom).is_none()
+                }
+                _ => true,
+            })
         {
             return Err("STARK descriptor addresses".into());
         }
@@ -1070,6 +1076,63 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    /// Tor mode's transport without Tor: a node that has no UDP socket and no
+    /// relay syncs from a server that listens only on the stream transport,
+    /// with the same pinned ML-DSA identity and hybrid TLS, and gets a mined
+    /// block back to it (`docs/MODO-TOR.md`, E2).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_syncs_and_submits_over_the_stream_transport_alone() {
+        use crate::network::stream_transport::{StreamOnly, StreamTransport, TcpDialer};
+        let (remote, _remote_dir) = state();
+        let (local, _local_dir) = state();
+        let genesis = mine_on(&remote, Profile::REGTEST.genesis_parent(), vec![], 1_700_000_000).await;
+        let second = mine_on(&remote, genesis, vec![], 1_700_000_120).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap().to_string();
+        let transport = StreamTransport::new(Some(&target), Arc::new(TcpDialer)).unwrap();
+        let server = serve(
+            remote.clone(),
+            ServerIdentity::from_seed(&[73; 32]).unwrap(),
+            StreamOnly(transport.clone()),
+        )
+        .await
+        .unwrap();
+        let _listening = transport.listen(listener);
+        // Like `localhost` for IP: the endpoint has not reported its custom
+        // address yet when the descriptor is built, so the node states it
+        // (`--stream-address` in Tor mode). It validates.
+        let mut descriptor = server.descriptor.clone();
+        descriptor.endpoint_addr = EndpointAddr::new(server.endpoint.id()).with_addrs([
+            TransportAddr::Custom(crate::network::stream_transport::dial_addr(&target).unwrap()),
+        ]);
+        descriptor.validate().unwrap();
+        let encoded = serde_json::to_vec(&descriptor).unwrap();
+        let descriptor: NodeDescriptor = serde_json::from_slice(&encoded).unwrap();
+
+        let dialer = StreamTransport::new(None, Arc::new(TcpDialer)).unwrap();
+        let mut client = Client::connect(&descriptor, StreamOnly(dialer.clone()))
+            .await
+            .unwrap();
+        assert_eq!(client.head().await.unwrap().height, 2);
+        assert_eq!(client.pull(&local).await.unwrap(), 2);
+        assert_eq!(
+            local.storage.get_last_block_hash().unwrap(),
+            second.header.hash
+        );
+        let third = mine_on(&local, second, vec![], 1_700_000_240).await;
+        assert_eq!(
+            client.submit_block(&third).await.unwrap().hash,
+            third.header.hash
+        );
+        assert_eq!(
+            remote.storage.get_last_block_hash().unwrap(),
+            third.header.hash
+        );
+        assert_eq!(dialer.link_count(), 1);
+        server.close().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

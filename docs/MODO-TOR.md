@@ -68,9 +68,14 @@ chico.
   200 KB de eco en ambos sentidos en 0,18 s (rama `modo-tor`). Del lado que
   escucha, cada flujo entrante recibe una dirección al azar (ignora lo que
   diga el que marca), así nadie desvía las respuestas de otro.
-- [ ] **E2.** Descriptor y manifiesto con dirección propia. Prueba de punta a
+- [x] **E2.** Descriptor y manifiesto con dirección propia. Prueba de punta a
   punta en regtest: un nodo sincroniza bloques de otro solo por el
-  transporte de flujos.
+  transporte de flujos. Pasó: sincronizó 2 bloques y devolvió uno minado,
+  sin UDP ni relays. `NodeDescriptor::validate` acepta solo direcciones
+  marcables de este transporte; el manifiesto suma `stream_address`. Ojo:
+  justo después de levantar, el endpoint todavía no reporta su dirección
+  propia, así que el nodo tiene que agregarla al descriptor a mano (E4,
+  `--stream-address`), como ya hace con las IP locales.
 - [ ] **E3.** Marcador Tor con Arti (feature `tor`). Prueba con una .onion
   local (`tor.exe` con servicio oculto hacia el puerto del transporte).
 - [ ] **E4.** Opciones `--tor`, `--stream-listen` y `--stream-address`. La

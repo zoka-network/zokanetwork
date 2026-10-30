@@ -418,6 +418,10 @@ pub struct SeedNode {
     /// For nodes without relays (local networks and tests).
     #[serde(default)]
     pub direct_addresses: Vec<SocketAddr>,
+    /// Where the seed's stream transport listens, `xxxx.onion:port` behind an
+    /// onion service: what a node in Tor mode dials (`docs/MODO-TOR.md`).
+    #[serde(default)]
+    pub stream_address: Option<String>,
     pub status: String,
     #[serde(default)]
     pub note: Option<String>,
@@ -478,6 +482,11 @@ impl Manifest {
             }
             for socket in &seed.direct_addresses {
                 address = address.with_ip_addr(*socket);
+            }
+            if let Some(target) = &seed.stream_address {
+                let custom = crate::network::stream_transport::dial_addr(target)
+                    .map_err(|e| format!("seed {}: stream address: {e}", seed.label))?;
+                address = address.with_addrs([iroh::TransportAddr::Custom(custom)]);
             }
             let descriptor = NodeDescriptor {
                 version: DESCRIPTOR_VERSION,
@@ -673,5 +682,32 @@ mod tests {
         assert!(Manifest::parse(json("active", "00").as_bytes(), P).is_err());
         assert!(Manifest::parse(json("maybe", &seed.ml_dsa_key_id).as_bytes(), P).is_err());
         assert!(Manifest::parse(json("active", &seed.ml_dsa_key_id).as_bytes(), Profile::REGTEST).is_err());
+
+        // A seed behind an onion service: its stream address joins the
+        // descriptor, which Tor mode dials; a malformed one is refused.
+        let onion = |address: &str| {
+            serde_json::json!({
+                "schema": MANIFEST_SCHEMA, "status": "active", "chain_id": P.chain_id,
+                "alpn": std::str::from_utf8(ALPN).unwrap(),
+                "seed_nodes": [{"label": "seed2", "operator": "test",
+                    "endpoint_id": seed.endpoint_addr.id.to_string(),
+                    "ml_dsa_key_id": seed.ml_dsa_key_id, "status": "active",
+                    "stream_address": address}]
+            })
+            .to_string()
+        };
+        let target = "zokaseedabcdefghijklmnopqrstuvwxyz234567abcdefghijklmnop.onion:9444";
+        let seeds = Manifest::parse(onion(target).as_bytes(), P).unwrap().seeds().unwrap();
+        let custom: Vec<_> = seeds[0]
+            .endpoint_addr
+            .addrs
+            .iter()
+            .filter_map(|a| match a {
+                iroh::TransportAddr::Custom(c) => crate::network::stream_transport::dial_target(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(custom, vec![target.to_string()]);
+        assert!(Manifest::parse(onion("no-port").as_bytes(), P).is_err());
     }
 }

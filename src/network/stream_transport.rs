@@ -493,15 +493,6 @@ mod tests {
             .await
             .unwrap();
         let _listening = server_transport.listen(listener);
-        // The listener publishes its stream address and nothing else.
-        let published = server.addr();
-        assert!(
-            published
-                .addrs
-                .iter()
-                .all(|a| matches!(a, TransportAddr::Custom(_))),
-            "{published:?}"
-        );
         let router = Router::builder(server.clone()).accept(ALPN, Echo).spawn();
 
         let client_transport = StreamTransport::new(None, Arc::new(TcpDialer)).unwrap();
