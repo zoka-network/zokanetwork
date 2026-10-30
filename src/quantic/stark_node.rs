@@ -958,6 +958,29 @@ async fn serve(options: Options) -> Result<(), String> {
     if !bind.ip().is_loopback() {
         return Err("--api must bind a loopback address".into());
     }
+    // The explorer's read-only API. ZOKA_PQ_PUBLIC_API lets the node a wallet
+    // starts (ZSilent) serve it without a flag of its own.
+    let public_bind = match options
+        .get("--public-api")
+        .map(str::to_string)
+        .or_else(|| std::env::var("ZOKA_PQ_PUBLIC_API").ok().filter(|v| !v.trim().is_empty()))
+    {
+        Some(text) => {
+            let public: std::net::SocketAddr = text.trim().parse().map_err(|_| {
+                format!("--public-api (or ZOKA_PQ_PUBLIC_API) must be host:port, not {text}")
+            })?;
+            if !public.ip().is_loopback() {
+                return Err(
+                    "--public-api must bind a loopback address; a tunnel publishes it".into(),
+                );
+            }
+            if public.port() == bind.port() {
+                return Err("--public-api needs a port of its own, not the --api one".into());
+            }
+            Some(public)
+        }
+        None => None,
+    };
     let interval: u64 = options
         .get("--interval")
         .unwrap_or("120")
@@ -1041,6 +1064,14 @@ async fn serve(options: Options) -> Result<(), String> {
             .map_err(err)??;
     let listener = tokio::net::TcpListener::bind(bind).await.map_err(err)?;
     let actual_bind = listener.local_addr().map_err(err)?;
+    let public_listener = match public_bind {
+        Some(public) => Some(tokio::net::TcpListener::bind(public).await.map_err(err)?),
+        None => None,
+    };
+    let public_actual = match &public_listener {
+        Some(listener) => Some(listener.local_addr().map_err(err)?),
+        None => None,
+    };
     let mut server = if relay {
         stark_net::serve(state.clone(), identity, presets::N0).await?
     } else {
@@ -1109,6 +1140,7 @@ async fn serve(options: Options) -> Result<(), String> {
         serde_json::json!({"chain_id":profile.chain_id,"api":format!("http://{actual_bind}"),
         "pow_algorithm":profile.pow_algorithm(),"xmrig_compatible":profile.xmrig_compatible(),
         "stratum":options.get("--stratum"),"relay":relay,"pinned_peers":pinned.len(),
+        "public_api":public_actual.map(|addr| format!("http://{addr}")),
         "announce":announce,"checkpoint_authority":signer.is_some(),"descriptor":server.descriptor})
     );
     let (shutdown, stop) = watch::channel(false);
@@ -1123,6 +1155,20 @@ async fn serve(options: Options) -> Result<(), String> {
             .map_err(err)
     });
     let mut workers = Vec::new();
+    if let Some(listener) = public_listener {
+        let public_router = stark_api::public_router(state.clone());
+        let mut public_stop = stop.clone();
+        workers.push(tokio::spawn(async move {
+            let served = axum::serve(listener, public_router)
+                .with_graceful_shutdown(async move {
+                    stopped(&mut public_stop).await;
+                })
+                .await;
+            if let Err(reason) = served {
+                eprintln!("STARK public API: {reason}");
+            }
+        }));
+    }
     for peer in pinned {
         workers.push(tokio::spawn(pinned_loop(net.clone(), peer, stop.clone())));
     }
@@ -1381,6 +1427,7 @@ pub async fn run(args: &[String]) -> Result<(), String> {
                     "--seeds",
                     "--announce",
                     "--authority",
+                    "--public-api",
                 ],
             )?)
             .await
@@ -1423,6 +1470,9 @@ or testnet (zoka-quantic-testnet-v2: RandomX, ASERT). An existing --db keeps its
         [--stratum 127.0.0.1:3333]   (testnet: XMRig logs in with its v2 address, full or a\n\
         short one the node knows; --mine-to pays logins that are not addresses. Regtest:\n\
         built-in miner.)\n\
+        [--public-api 127.0.0.1:9181]   (an explorer's read-only API on its own loopback\n\
+        port, for a tunnel to publish: GET only, any origin, its own rate; also\n\
+        ZOKA_PQ_PUBLIC_API)\n\
   sync --db MIRROR_DIR [--peer DESCRIPTOR] [--network NAME] [--max-blocks 8192] [--relay N0|none]\n\
   broadcast --tx FILE [--peer DESCRIPTOR | --network NAME] [--relay N0|none]\n\
   identity --identity FILE [--network NAME]   (prints the endpoint id and ML-DSA key id a\n\

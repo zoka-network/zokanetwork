@@ -13,7 +13,7 @@ use std::{
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Extension, Path, Query, Request, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -30,6 +30,7 @@ use super::stark::{
         wallet::{Address, ShortAddress},
     },
 };
+use super::difficulty;
 use super::stark_directory::{self, AddressRecord, Directory, DirectoryError};
 use super::stark_peers::{PeerBook, Peers};
 use crate::{
@@ -48,6 +49,16 @@ pub const MAX_CRYPTO_WORKERS: usize = 2;
 /// A hybrid checkpoint is about 7 KB of JSON (the ML-DSA half is 6,618 hex).
 pub const MAX_CHECKPOINT_BYTES: usize = 16 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Summaries per `/blocks/recent` request.
+pub const MAX_RECENT_BLOCKS: usize = 25;
+/// The public API's own workers: summaries decode blocks, nothing proves.
+const PUBLIC_WORKERS: usize = 2;
+/// Requests a second across every public client, and the burst above it.
+const PUBLIC_RATE: f64 = 20.0;
+const PUBLIC_BURST: f64 = 40.0;
+/// How long a public request waits for a worker, and runs at most.
+const PUBLIC_QUEUE: Duration = Duration::from_secs(5);
+const PUBLIC_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone)]
 pub struct NodeState {
@@ -312,6 +323,8 @@ pub fn router(state: NodeState) -> Router {
         .route("/status", get(status))
         .route("/blocks/:height", get(block_at))
         .route("/blocks/:height/summary", get(block_summary))
+        .route("/blocks/hash/:hash/summary", get(block_summary_by_hash))
+        .route("/blocks/recent", get(recent_blocks))
         .route(
             "/transactions",
             post(submit_transaction).layer(DefaultBodyLimit::max(MAX_TRANSACTION_BYTES)),
@@ -346,6 +359,167 @@ pub async fn serve(state: NodeState, bind: SocketAddr) -> Result<(), String> {
     axum::serve(listener, router(state))
         .await
         .map_err(|e| e.to_string())
+}
+
+/// What the public API admits: every client arrives through the tunnel from
+/// loopback, so the rate is global, and the requests take turns on permits of
+/// their own (never the wallet's crypto workers).
+#[derive(Clone)]
+pub struct PublicGate {
+    permits: Arc<Semaphore>,
+    bucket: Arc<Mutex<(f64, std::time::Instant)>>,
+}
+
+impl PublicGate {
+    pub fn new() -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(PUBLIC_WORKERS)),
+            bucket: Arc::new(Mutex::new((PUBLIC_BURST, std::time::Instant::now()))),
+        }
+    }
+
+    /// One token from the bucket, which refills at `PUBLIC_RATE` a second.
+    fn take(&self) -> bool {
+        let Ok(mut bucket) = self.bucket.lock() else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        let refilled = bucket.0 + now.duration_since(bucket.1).as_secs_f64() * PUBLIC_RATE;
+        *bucket = (refilled.min(PUBLIC_BURST), now);
+        if bucket.0 < 1.0 {
+            return false;
+        }
+        bucket.0 -= 1.0;
+        true
+    }
+}
+
+impl Default for PublicGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn with_cors(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, HEAD, OPTIONS"),
+    );
+    response
+}
+
+async fn admit_public(State(gate): State<PublicGate>, mut request: Request, next: Next) -> Response {
+    if request.method() == axum::http::Method::OPTIONS {
+        return with_cors(StatusCode::NO_CONTENT.into_response());
+    }
+    if request.method() != axum::http::Method::GET && request.method() != axum::http::Method::HEAD {
+        return with_cors(
+            ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "the public API is read-only").into_response(),
+        );
+    }
+    if !gate.take() {
+        let mut response = with_cors(
+            ApiError::new(StatusCode::TOO_MANY_REQUESTS, "too many requests; retry in a second")
+                .into_response(),
+        );
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        return response;
+    }
+    let permit = match tokio::time::timeout(PUBLIC_QUEUE, gate.permits.clone().acquire_owned()).await {
+        Ok(Ok(permit)) => permit,
+        _ => {
+            return with_cors(
+                ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "the explorer API is busy; retry later")
+                    .into_response(),
+            )
+        }
+    };
+    request
+        .extensions_mut()
+        .insert(WorkPermit(Arc::new(Mutex::new(Some(permit)))));
+    let mut response = match tokio::time::timeout(PUBLIC_TIMEOUT, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => ApiError::new(StatusCode::REQUEST_TIMEOUT, "request deadline exceeded").into_response(),
+    };
+    if !response.headers().contains_key(header::CACHE_CONTROL) {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=5"));
+    }
+    with_cors(response)
+}
+
+/// The explorer's read-only API (`--public-api`), for a public front such as
+/// the tunnel behind api.zokascan.cc: GET only, any origin, its own permits
+/// and rate. Nothing here sends, mines, signs or asks the peers.
+pub fn public_router(state: NodeState) -> Router {
+    Router::new()
+        .route("/status", get(public_status))
+        .route("/blocks/recent", get(recent_blocks))
+        .route("/blocks/:height/summary", get(block_summary))
+        .route("/blocks/hash/:hash/summary", get(block_summary_by_hash))
+        .route("/address/:short", get(public_address_of))
+        .route("/checkpoint", get(latest_checkpoint))
+        .layer(middleware::from_fn_with_state(PublicGate::new(), admit_public))
+        .with_state(state)
+}
+
+/// The network as the public explorer shows it: the chain and its work, the
+/// latest checkpoint and how many peers this node has, without this node's own
+/// services (its Stratum, its authority keys, its wallets).
+async fn public_status(
+    State(state): State<NodeState>,
+    Extension(permit): Extension<WorkPermit>,
+) -> ApiResult<Response> {
+    blocking(permit, move || {
+        let _gate = state.gate.lock().map_err(|_| ApiError::internal("node gate poisoned"))?;
+        let tip = current_tip(state.profile, &state.storage)?;
+        let branch = stark::branch(&state.storage, state.profile, &tip).map_err(ApiError::internal)?;
+        let ledger = branch.state();
+        let count = state.mempool.lock().map_err(|_| ApiError::internal("mempool poisoned"))?.len();
+        let next = child_target(&state, &tip)?;
+        let checkpoint = state
+            .latest_checkpoint()
+            .map_err(ApiError::internal)?
+            .map(|cp| serde_json::json!({"height":cp.height,"block_hash":cp.block_hash}));
+        let peers = state.peers.status();
+        let addresses = stark_directory::count(&state.storage).map_err(directory_error)?;
+        json_response(StatusCode::OK, &serde_json::json!({
+            "chain_id":state.profile.chain_id,"node_version":env!("CARGO_PKG_VERSION"),"pool_version":2,
+            "height":ledger.height,"hash":tip.header.hash,"tip_timestamp":tip.header.timestamp,
+            "issued_atoms":ledger.issued,"notes":ledger.notes,"mempool_transactions":count,
+            "pow_algorithm":state.profile.pow_algorithm(),
+            "target_block_secs":difficulty::IDEAL_BLOCK_SECS,
+            "next_difficulty_bits":difficulty::bits_of_target(&next),
+            "hashrate_estimate_hps":difficulty::network_hashrate_for_target(&next),
+            "checkpoint":checkpoint,
+            "peers":{"outbound":peers["outbound"],"inbound":peers["inbound"]},
+            "directory":{"addresses":addresses},
+        }))
+    })
+    .await
+}
+
+/// A short address from this node's directory only: a public request never
+/// makes the node ask its peers.
+async fn public_address_of(
+    state: State<NodeState>,
+    short: Path<String>,
+    permit: Extension<WorkPermit>,
+) -> ApiResult<Response> {
+    address_of(
+        state,
+        short,
+        Query(AddressQuery {
+            local: Some("1".into()),
+        }),
+        permit,
+    )
+    .await
 }
 
 async fn status(
@@ -416,26 +590,186 @@ async fn block_summary(
                 .map_err(ApiError::internal)?
                 .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "unknown block height"))?
         };
-        let transactions = stark::decode(&block).map_err(ApiError::internal)?;
-        let coinbase = transactions
-            .first()
-            .filter(|tx| tx.statement.nullifiers.is_empty());
-        let reward = coinbase
-            .map(|tx| tx.openings.iter().fold(0u64, |sum, o| sum.saturating_add(o.value)))
-            .unwrap_or(0);
-        let size: usize = block.quantic_transactions.iter().map(Vec::len).sum();
-        let nullifiers: usize = transactions.iter().map(|tx| tx.statement.nullifiers.len()).sum();
-        json_response(StatusCode::OK, &serde_json::json!({
-            "hash":block.header.hash,"height":block.header.block_height,"timestamp":block.header.timestamp,
-            "state_root":block.header.state_root,"previous_hash":block.header.prev_hash,"nonce":block.header.nonce,
-            "size_bytes":size,"reward_atoms":reward,
-            "reward_zka_display":crate::economics::format_zka_amount(reward),
-            "transactions_count":transactions.len(),
-            "private_tx_count":transactions.len() - usize::from(coinbase.is_some()),
-            "private_nullifier_count":nullifiers,"private_coinbase":coinbase.is_some(),
-        }))
+        summary_response(&state, &block)
     })
     .await
+}
+
+/// A stored block by its hash, canonical or on a side branch.
+async fn block_summary_by_hash(
+    State(state): State<NodeState>,
+    Path(hash): Path<String>,
+    Extension(permit): Extension<WorkPermit>,
+) -> ApiResult<Response> {
+    let hash = hash.trim().to_ascii_lowercase();
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "a block hash is 64 hex characters"));
+    }
+    blocking(permit, move || {
+        let block = {
+            let _gate = state.gate.lock().map_err(|_| ApiError::internal("node gate poisoned"))?;
+            state
+                .storage
+                .get_block(&hash)
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "unknown block hash"))?
+        };
+        summary_response(&state, &block)
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct RecentQuery {
+    count: Option<usize>,
+}
+
+/// The summaries of the latest canonical blocks, newest first: an explorer's
+/// front page in one request.
+async fn recent_blocks(
+    State(state): State<NodeState>,
+    Query(query): Query<RecentQuery>,
+    Extension(permit): Extension<WorkPermit>,
+) -> ApiResult<Response> {
+    let count = query.count.unwrap_or(10).clamp(1, MAX_RECENT_BLOCKS);
+    blocking(permit, move || {
+        let (tip, blocks) = {
+            let _gate = state.gate.lock().map_err(|_| ApiError::internal("node gate poisoned"))?;
+            let tip = state.storage.get_chain_height().map_err(ApiError::internal)?;
+            let mut blocks = Vec::with_capacity(count);
+            for height in (super::GENESIS_HEIGHT..=tip).rev().take(count) {
+                if let Some(block) = state
+                    .storage
+                    .get_canonical_block_by_height(height)
+                    .map_err(ApiError::internal)?
+                {
+                    blocks.push(block);
+                }
+            }
+            (tip, blocks)
+        };
+        let summaries = blocks
+            .iter()
+            .map(|block| summary_of(&state, block))
+            .collect::<ApiResult<Vec<_>>>()?;
+        let mut response = json_response(
+            StatusCode::OK,
+            &serde_json::json!({"height":tip,"blocks":summaries}),
+        )?;
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=5"));
+        Ok(response)
+    })
+    .await
+}
+
+/// What an explorer shows of a stored block: its header, the work it had to
+/// meet and, for every transaction, its id, shape and size, without the
+/// proofs. The coinbase's outputs are public, so is its total.
+fn summary_of(state: &NodeState, block: &Block) -> ApiResult<serde_json::Value> {
+    let transactions = stark::decode(block).map_err(ApiError::internal)?;
+    let coinbase = transactions
+        .first()
+        .filter(|tx| tx.statement.nullifiers.is_empty());
+    let reward = coinbase
+        .map(|tx| tx.openings.iter().fold(0u64, |sum, o| sum.saturating_add(o.value)))
+        .unwrap_or(0);
+    let size: usize = block.quantic_transactions.iter().map(Vec::len).sum();
+    let nullifiers: usize = transactions.iter().map(|tx| tx.statement.nullifiers.len()).sum();
+    let fees = transactions
+        .iter()
+        .fold(0u64, |sum, tx| sum.saturating_add(tx.statement.fee));
+    let entries: Vec<_> = transactions
+        .iter()
+        .zip(&block.quantic_transactions)
+        .enumerate()
+        .map(|(index, (tx, bytes))| {
+            let kind = if index == 0 && coinbase.is_some() {
+                "coinbase"
+            } else {
+                "transfer"
+            };
+            serde_json::json!({"txid":hex::encode(tx.txid()),"kind":kind,
+                "inputs":tx.statement.nullifiers.len(),"outputs":tx.statement.commitments.len(),
+                "fee_atoms":tx.statement.fee,"size_bytes":bytes.len(),"proof_bytes":tx.proof.proof.len()})
+        })
+        .collect();
+    let height = block.header.block_height;
+    let canonical = state
+        .storage
+        .get_canonical_block_hash_at_height(height)
+        .map_err(ApiError::internal)?
+        .is_some_and(|hash| hash == block.header.hash);
+    let tip = state.storage.get_chain_height().map_err(ApiError::internal)?;
+    let target = target_of(state, block)?;
+    Ok(serde_json::json!({
+        "hash":block.header.hash,"height":height,"timestamp":block.header.timestamp,
+        "state_root":block.header.state_root,"previous_hash":block.header.prev_hash,"nonce":block.header.nonce,
+        "size_bytes":size,"reward_atoms":reward,
+        "reward_zka_display":crate::economics::format_zka_amount(reward),
+        "transactions_count":transactions.len(),
+        "private_tx_count":transactions.len() - usize::from(coinbase.is_some()),
+        "private_nullifier_count":nullifiers,"private_coinbase":coinbase.is_some(),
+        "canonical":canonical,
+        "confirmations":if canonical { tip.saturating_sub(height) + 1 } else { 0 },
+        "difficulty_bits":difficulty::bits_of_target(&target),
+        "target_compact":difficulty::to_compact(&target),
+        "hashrate_estimate_hps":difficulty::network_hashrate_for_target(&target),
+        "fees_atoms":fees,"transactions":entries,
+    }))
+}
+
+/// A summary that a public front can cache: for ever once the block sits under
+/// the latest checkpoint (nodes never reorganize below it), briefly before.
+fn summary_response(state: &NodeState, block: &Block) -> ApiResult<Response> {
+    let summary = summary_of(state, block)?;
+    let settled = summary["canonical"] == true
+        && state
+            .latest_checkpoint()
+            .map_err(ApiError::internal)?
+            .is_some_and(|cp| block.header.block_height <= cp.height);
+    let mut response = json_response(StatusCode::OK, &summary)?;
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(if settled {
+            "public, max-age=31536000, immutable"
+        } else {
+            "public, max-age=10"
+        }),
+    );
+    Ok(response)
+}
+
+/// The target `block` had to meet: [`super::target_for_child`] of its parent,
+/// reading block 1 directly instead of walking back to it (a public chain has
+/// a single block 1, fixed in the binary).
+fn target_of(state: &NodeState, block: &Block) -> ApiResult<num_bigint::BigUint> {
+    if block.header.block_height <= super::GENESIS_HEIGHT {
+        return child_target(state, &state.profile.genesis_parent());
+    }
+    let parent = state
+        .storage
+        .get_block(&block.header.prev_hash)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::internal("the block's parent is missing"))?;
+    child_target(state, &parent)
+}
+
+/// The target of the block after `parent`.
+fn child_target(state: &NodeState, parent: &Block) -> ApiResult<num_bigint::BigUint> {
+    let genesis_time = if parent.header.block_height < super::GENESIS_HEIGHT {
+        0
+    } else {
+        state
+            .storage
+            .get_canonical_block_by_height(super::GENESIS_HEIGHT)
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::internal("block 1 is missing"))?
+            .header
+            .timestamp
+    };
+    super::target_for_child_after(state.profile.chain_id, parent, genesis_time).map_err(ApiError::internal)
 }
 
 async fn submit_transaction(
@@ -1147,8 +1481,121 @@ mod tests {
         assert_eq!(summary["private_tx_count"], 0);
         assert_eq!(summary["private_coinbase"], true);
         assert!(summary["size_bytes"].as_u64().unwrap() > 0);
+        // What an explorer lists of each transaction, and the block's work.
+        assert_eq!(summary["canonical"], true);
+        assert_eq!(summary["confirmations"], 1);
+        assert_eq!(
+            summary["difficulty_bits"],
+            crate::economics::QUANTIC_REGTEST_DIFFICULTY_BITS
+        );
+        assert_eq!(summary["fees_atoms"], 0);
+        let coinbase = &summary["transactions"][0];
+        assert_eq!(summary["transactions"].as_array().unwrap().len(), 1);
+        assert_eq!(coinbase["kind"], "coinbase");
+        assert_eq!(coinbase["inputs"], 0);
+        assert!(coinbase["outputs"].as_u64().unwrap() >= 1);
+        assert_eq!(coinbase["txid"].as_str().unwrap().len(), 64);
+        assert_eq!(coinbase["size_bytes"], summary["size_bytes"]);
+        let by_hash = json(get(&app, &format!("/blocks/hash/{}/summary", block.header.hash)).await).await;
+        assert_eq!(by_hash, summary);
+        assert_eq!(
+            get(&app, "/blocks/hash/xyz/summary").await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            get(&app, &format!("/blocks/hash/{}/summary", "0".repeat(64))).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        let recent = json(get(&app, "/blocks/recent?count=5").await).await;
+        assert_eq!(recent["height"], 1);
+        assert_eq!(recent["blocks"].as_array().unwrap().len(), 1);
+        assert_eq!(recent["blocks"][0]["hash"], block.header.hash);
         let status = json(get(&app, "/status").await).await;
         assert_eq!(status["tip_timestamp"], block.header.timestamp);
         assert_eq!(status["peers"]["best_height"], 0);
+    }
+
+    async fn get_from(app: &Router, uri: &str, method: &str) -> Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::HOST, "api.zokascan.cc")
+                    .header(header::ORIGIN, "https://zokascan.cc")
+                    .header("sec-fetch-site", "cross-site")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_public_api_reads_the_chain_for_any_origin_and_nothing_else() {
+        let (_dir, state) = test_state();
+        let alice = Account::from_seed(&[64; 32], 3, 0).unwrap().address();
+        super::super::stark_node::mine_once(&state, alice).await.unwrap();
+        let public = public_router(state.clone());
+
+        let response = get_from(&public, "/status", "GET").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "public, max-age=5");
+        let status = json(response).await;
+        assert_eq!(status["chain_id"], CHAIN);
+        assert_eq!(status["height"], 1);
+        assert_eq!(status["node_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            status["next_difficulty_bits"],
+            crate::economics::QUANTIC_REGTEST_DIFFICULTY_BITS
+        );
+        // Not this node's own services.
+        assert!(status.get("stratum").is_none());
+        assert!(status.get("checkpoint_authority").is_none());
+
+        let summary = get_from(&public, "/blocks/1/summary", "GET").await;
+        assert_eq!(summary.status(), StatusCode::OK);
+        assert_eq!(summary.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        assert_eq!(json(get_from(&public, "/blocks/recent", "GET").await).await["height"], 1);
+        assert_eq!(
+            get_from(&public, "/address/zqregtest2abc", "GET").await.status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+
+        // Nothing that writes, mines, signs or hands out whole blocks.
+        for (uri, method) in [
+            ("/transactions", "POST"),
+            ("/blocks", "POST"),
+            ("/checkpoint", "POST"),
+            ("/address", "POST"),
+        ] {
+            assert_eq!(
+                get_from(&public, uri, method).await.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {uri}"
+            );
+        }
+        for uri in ["/mining/template", "/blocks/1"] {
+            assert_eq!(get_from(&public, uri, "GET").await.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+        let preflight = get_from(&public, "/status", "OPTIONS").await;
+        assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+        assert_eq!(preflight.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+
+        // The local API still refuses the same request.
+        assert_eq!(
+            get_from(&router(state), "/status", "GET").await.status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // The rate is shared: the bucket runs dry and then refills.
+        let gate = PublicGate::new();
+        for _ in 0..PUBLIC_BURST as usize {
+            assert!(gate.take());
+        }
+        assert!(!gate.take());
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(gate.take());
     }
 }

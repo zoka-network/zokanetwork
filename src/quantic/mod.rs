@@ -515,7 +515,25 @@ pub fn target_for_child(
         }
     }
     let genesis = genesis.ok_or_else(|| QuanticBlockError::MissingAncestor("genesis".to_string()))?;
-    let time_delta = parent.header.timestamp as i64 - genesis.timestamp as i64;
+    target_for_child_after(chain_id, parent, genesis.timestamp)
+}
+
+/// [`target_for_child`] cuando ya se sabe la hora del génesis de la rama (el
+/// bloque 1 canónico, por ejemplo): sin recorrer los ancestros para buscarlo.
+pub fn target_for_child_after(
+    chain_id: &str,
+    parent: &Block,
+    genesis_timestamp: u64,
+) -> Result<num_bigint::BigUint, QuanticBlockError> {
+    let network = difficulty_network(chain_id).ok_or_else(|| QuanticBlockError::NotQuantic(chain_id.to_string()))?;
+    if network == Network::Regtest {
+        return Ok(difficulty::target_for_bits(crate::economics::QUANTIC_REGTEST_DIFFICULTY_BITS));
+    }
+    let initial = difficulty::target_for_bits(difficulty::initial_difficulty_bits(network));
+    if parent.header.block_height < GENESIS_HEIGHT {
+        return Ok(initial);
+    }
+    let time_delta = parent.header.timestamp as i64 - genesis_timestamp as i64;
     let height_delta = (parent.header.block_height - GENESIS_HEIGHT) as i64;
     Ok(difficulty::asert_target(&initial, time_delta, height_delta))
 }
