@@ -650,14 +650,28 @@ mod tests {
         let builtin = Manifest::builtin(P).unwrap().unwrap();
         assert_eq!(builtin.chain_id, P.chain_id);
         // Launched: the team's PC is seed1, pinned by id and key alone (n0
-        // address lookup finds the rest).
+        // address lookup finds the rest); seed2, the explorer node, also
+        // carries the onion address that Tor mode dials.
         let seeds = builtin.seeds().unwrap();
-        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds.len(), 2);
         assert_eq!(
             seeds[0].endpoint_addr.id.to_string(),
             "e3bf05e22b0f491d74e07028ffa02db833bc9d06f441acb820cbf723c7eb70c4"
         );
         assert!(seeds[0].endpoint_addr.addrs.is_empty());
+        let onion: Vec<_> = seeds[1]
+            .endpoint_addr
+            .addrs
+            .iter()
+            .filter_map(|a| match a {
+                iroh::TransportAddr::Custom(c) => crate::network::stream_transport::dial_target(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            onion,
+            vec!["u2soz3q63237afuccfxf3jzytpljpbxpvyzt3jumrr45ukzowdakayqd.onion:9444".to_string()]
+        );
         assert!(Manifest::builtin(Profile::REGTEST).unwrap().is_none());
 
         let seed = peer(9);

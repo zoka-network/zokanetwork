@@ -53,6 +53,8 @@ const MAGIC: &[u8; 4] = b"ZQS2";
 const AUTH_CONTEXT: &[u8] = b"zoka-quantic-stark-server-v2";
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-ZOKA-QUANTIC-STARK-v2";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Block requests sent before their answers are read (see `fetch_and_import`).
+const PIPELINE: usize = 16;
 /// Over Tor (an endpoint with no IP socket, `docs/MODO-TOR.md`) building the
 /// circuit to an onion alone can take longer than a whole direct handshake.
 const TOR_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -817,26 +819,8 @@ impl Client {
             return Err("STARK request size limit".into());
         }
         let response = tokio::time::timeout(REQUEST_TIMEOUT, async {
-            self.send.write_all(&[tag]).await.map_err(err)?;
-            self.send
-                .write_all(&(body.len() as u32).to_be_bytes())
-                .await
-                .map_err(err)?;
-            self.send.write_all(body).await.map_err(err)?;
-            let mut header = [0u8; 5];
-            self.recv.read_exact(&mut header).await.map_err(err)?;
-            let len = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
-            let limit = match header[0] {
-                0 => max_response,
-                1 => MAX_ERROR_BYTES,
-                _ => return Err("STARK response status".into()),
-            };
-            if len > limit {
-                return Err("STARK response size limit".into());
-            }
-            let mut bytes = vec![0; len];
-            self.recv.read_exact(&mut bytes).await.map_err(err)?;
-            Ok::<_, String>((header[0], bytes))
+            self.write_request(tag, body).await?;
+            self.read_response(max_response).await
         })
         .await;
         match response {
@@ -853,6 +837,94 @@ impl Client {
                 })
             }
         }
+    }
+
+    async fn write_request(&mut self, tag: u8, body: &[u8]) -> Result<(), String> {
+        self.send.write_all(&[tag]).await.map_err(err)?;
+        self.send
+            .write_all(&(body.len() as u32).to_be_bytes())
+            .await
+            .map_err(err)?;
+        self.send.write_all(body).await.map_err(err)
+    }
+
+    /// The next response on the stream: its status (0 ok, 1 refused) and body.
+    async fn read_response(&mut self, max_response: usize) -> Result<(u8, Vec<u8>), String> {
+        let mut header = [0u8; 5];
+        self.recv.read_exact(&mut header).await.map_err(err)?;
+        let len = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
+        let limit = match header[0] {
+            0 => max_response,
+            1 => MAX_ERROR_BYTES,
+            _ => return Err("STARK response status".into()),
+        };
+        if len > limit {
+            return Err("STARK response size limit".into());
+        }
+        let mut bytes = vec![0; len];
+        self.recv.read_exact(&mut bytes).await.map_err(err)?;
+        Ok((header[0], bytes))
+    }
+
+    /// Blocks `heights`, asked for up to [`PIPELINE`] at a time before reading
+    /// the answers, which the peer sends back in order: one round trip per
+    /// window instead of one per block (over Tor, a second or more each).
+    /// Imports each as it arrives; any failure closes the connection, since
+    /// answers to requests already sent would still be on the stream.
+    async fn fetch_and_import(
+        &mut self,
+        state: &NodeState,
+        heights: std::ops::RangeInclusive<u64>,
+    ) -> Result<usize, String> {
+        let heights: Vec<u64> = heights.collect();
+        let mut imported = 0;
+        for window in heights.chunks(PIPELINE) {
+            let result = tokio::time::timeout(REQUEST_TIMEOUT, async {
+                for height in window {
+                    self.write_request(GET_BLOCK, &height.to_be_bytes()).await?;
+                }
+                let mut fresh_blocks = 0;
+                for &height in window {
+                    let (status, bytes) = self.read_response(MAX_BLOCK_WIRE_BYTES).await?;
+                    if status != 0 {
+                        return Err(format!(
+                            "STARK peer rejected request: {}",
+                            String::from_utf8_lossy(&bytes)
+                        ));
+                    }
+                    if bytes.is_empty() {
+                        return Err("STARK remote block unavailable".into());
+                    }
+                    let permit = client_work().acquire_owned().await.map_err(err)?;
+                    let block = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        let block: Block = serde_json::from_slice(&bytes).map_err(err)?;
+                        if block.header.block_height != height {
+                            return Err("STARK response block height".into());
+                        }
+                        Ok::<_, String>(block)
+                    })
+                    .await
+                    .map_err(err)??;
+                    if with_state(state, move |state| import_block_locked(state, &block)).await? {
+                        fresh_blocks += 1;
+                    }
+                }
+                Ok::<_, String>(fresh_blocks)
+            })
+            .await;
+            match result {
+                Ok(Ok(fresh)) => imported += fresh,
+                other => {
+                    self.connection.close(1u32.into(), b"STARK pipelined fetch failed");
+                    return Err(match other {
+                        Ok(Err(reason)) => reason,
+                        _ => "STARK request timeout".into(),
+                    });
+                }
+            }
+        }
+        Ok(imported)
     }
 
     pub async fn head(&mut self) -> Result<Head, String> {
@@ -934,6 +1006,15 @@ impl Client {
         if remote.height == 0 || (remote.height == local.height && remote.hash == local.hash) {
             return Ok(0);
         }
+        // The usual case, the peer extends this node's tip: one question
+        // instead of two binary searches (about 20 round trips at a thousand
+        // blocks, which over Tor dominate the sync).
+        if local.height > 0 && remote.height > local.height {
+            if self.block_hash(local.height).await?.as_deref() == Some(local.hash.as_str()) {
+                let last = remote.height.min(local.height.saturating_add(max_blocks as u64));
+                return self.fetch_and_import(state, local.height + 1..=last).await;
+            }
+        }
         let mut low = 0;
         let mut high = local.height.min(remote.height) + 1;
         while low + 1 < high {
@@ -980,18 +1061,10 @@ impl Client {
             }
         }
         let last = remote.height.min(low.saturating_add(max_blocks as u64));
-        let mut imported = 0;
-        for height in low + 1..=last {
-            let block = self
-                .get_block(height)
-                .await?
-                .ok_or("STARK remote block unavailable")?;
-            let fresh = with_state(state, move |state| import_block_locked(state, &block)).await?;
-            if fresh {
-                imported += 1;
-            }
+        if last <= low {
+            return Ok(0);
         }
-        Ok(imported)
+        self.fetch_and_import(state, low + 1..=last).await
     }
 }
 impl Drop for Client {

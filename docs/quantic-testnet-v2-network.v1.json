@@ -12,6 +12,15 @@
       "ml_dsa_key_id": "2a29953c90132b1067d1325d45534132b8acac43805479b33cfd1841afe822f9",
       "status": "active",
       "note": "The team's PC: the first seed and the checkpoint authority."
+    },
+    {
+      "label": "seed2",
+      "operator": "Zoka Network",
+      "endpoint_id": "8aa55aa80f94d0c87b9e5afa46286b22fd5c7f81299dc405cb23758a9393d54c",
+      "ml_dsa_key_id": "99f5cabd3528a7ee966bd16de3004b34054b36b0db59f2098c0915646f15b729",
+      "stream_address": "u2soz3q63237afuccfxf3jzytpljpbxpvyzt3jumrr45ukzowdakayqd.onion:9444",
+      "status": "active",
+      "note": "The explorer node, on the team's PC, also behind an onion service: the seed that nodes in Tor mode (--tor) dial."
     }
   ],
   "notes": [
