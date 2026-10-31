@@ -1061,29 +1061,7 @@ async fn serve(options: Options) -> Result<(), String> {
     // Over Tor a node reaches only peers with a stream address (an onion),
     // and it says nothing about itself.
     let (peers, seeds) = if tor.is_some() {
-        let reachable = |peer: &NodeDescriptor| {
-            peer.endpoint_addr.addrs.iter().any(|a| {
-                matches!(a, iroh::TransportAddr::Custom(c)
-                    if crate::network::stream_transport::dial_target(c).is_some())
-            })
-        };
-        // Keep only their stream addresses: iroh would otherwise weigh IP
-        // paths this endpoint cannot use against the one it has.
-        let onion_only = |mut peer: NodeDescriptor| {
-            let streams: Vec<_> = peer
-                .endpoint_addr
-                .addrs
-                .iter()
-                .filter(|a| matches!(a, iroh::TransportAddr::Custom(_)))
-                .cloned()
-                .collect();
-            peer.endpoint_addr = EndpointAddr::new(peer.endpoint_addr.id).with_addrs(streams);
-            peer
-        };
-        let (peers, seeds): (Vec<_>, Vec<_>) = (
-            peers.into_iter().filter(|p| reachable(p)).map(onion_only).collect(),
-            seeds.into_iter().filter(|p| reachable(p)).map(onion_only).collect(),
-        );
+        let (peers, seeds) = (stark_net::over_tor(peers), stark_net::over_tor(seeds));
         if peers.is_empty() && seeds.is_empty() {
             return Err("--tor needs a peer with an onion address: a --peer descriptor or a seed with stream_address".into());
         }

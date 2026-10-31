@@ -44,7 +44,10 @@ use crate::{
     state::chain::apply_block,
     types::Block,
 };
-use stark::protocol::transaction::{Transaction, MAX_TRANSACTION_BYTES};
+use stark::protocol::{
+    scan::{ScanPage2, MAX_SCAN_BLOCKS, MAX_SCAN_PAGE_BYTES},
+    transaction::{Transaction, MAX_TRANSACTION_BYTES},
+};
 
 pub const ALPN: &[u8] = b"/zoka/quantic-stark/2";
 pub const DESCRIPTOR_VERSION: u8 = 3;
@@ -73,6 +76,9 @@ const CHECKPOINT: u8 = 8;
 const SUBMIT_CHECKPOINT: u8 = 9;
 const GET_ADDRESS: u8 = 10;
 const SUBMIT_ADDRESS: u8 = 11;
+/// A page of the chain for a light wallet (`ScanPage2`): `from` and `count`,
+/// big-endian `u32`s. Older nodes close the connection on it.
+const SCAN_PAGE: u8 = 12;
 const MAX_ERROR_BYTES: usize = 2048;
 const MAX_ANNOUNCE_BYTES: usize = 4096;
 /// Endpoints answered per `PEERS` request.
@@ -130,6 +136,32 @@ impl NodeDescriptor {
         }
         Ok(())
     }
+}
+
+/// The peers a node in Tor mode can reach, those with a stream address (an
+/// onion), each keeping only that: iroh would otherwise weigh IP paths an
+/// endpoint without sockets cannot use against the one it has.
+pub fn over_tor(peers: Vec<NodeDescriptor>) -> Vec<NodeDescriptor> {
+    peers
+        .into_iter()
+        .filter_map(|mut peer| {
+            let streams: Vec<_> = peer
+                .endpoint_addr
+                .addrs
+                .iter()
+                .filter(|a| {
+                    matches!(a, TransportAddr::Custom(c)
+                        if crate::network::stream_transport::dial_target(c).is_some())
+                })
+                .cloned()
+                .collect();
+            if streams.is_empty() {
+                return None;
+            }
+            peer.endpoint_addr = EndpointAddr::new(peer.endpoint_addr.id).with_addrs(streams);
+            Some(peer)
+        })
+        .collect()
 }
 
 /// Root seed persistence belongs to the caller's encrypted key store.
@@ -315,7 +347,7 @@ async fn authenticate_server(
 fn request_limit(tag: u8) -> Result<usize, String> {
     match tag {
         HEAD | PEERS | CHECKPOINT => Ok(0),
-        GET_BLOCK | GET_HASH => Ok(8),
+        GET_BLOCK | GET_HASH | SCAN_PAGE => Ok(8),
         SUBMIT_BLOCK => Ok(MAX_BLOCK_WIRE_BYTES),
         SUBMIT_TX => Ok(MAX_TRANSACTION_BYTES),
         ANNOUNCE => Ok(MAX_ANNOUNCE_BYTES),
@@ -332,7 +364,7 @@ async fn read_request_header(recv: &mut RecvStream) -> Result<(u8, usize), Strin
     let tag = header[0];
     let len = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
     if len > request_limit(tag)?
-        || (matches!(tag, GET_BLOCK | GET_HASH) && len != 8)
+        || (matches!(tag, GET_BLOCK | GET_HASH | SCAN_PAGE) && len != 8)
         || (tag == GET_ADDRESS && len != 32)
     {
         return Err("STARK request length".into());
@@ -473,6 +505,23 @@ async fn serve_requests(
                 let response = tokio::task::spawn_blocking(move || address_answer(&shared, digest))
                     .await
                     .map_err(err)?;
+                return write_response(&mut send, response).await;
+            }
+            if tag == SCAN_PAGE {
+                let mut body = [0u8; 8];
+                recv.read_exact(&mut body).await.map_err(err)?;
+                let from = u32::from_be_bytes(body[..4].try_into().unwrap());
+                let count = u32::from_be_bytes(body[4..].try_into().unwrap());
+                let shared = state.clone();
+                let permit = shared.work.clone().acquire_owned().await.map_err(err)?;
+                // `page2` takes the gate itself, so this is not `handle_request`.
+                let response = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    let (page, _) = super::stark_api::page2(&shared, Some(from), Some(count))?;
+                    page.encode().map_err(err)
+                })
+                .await
+                .map_err(err)?;
                 return write_response(&mut send, response).await;
             }
             if tag == SUBMIT_ADDRESS {
@@ -971,6 +1020,35 @@ impl Client {
             return Err("STARK block hash encoding".into());
         }
         Ok(Some(hash))
+    }
+
+    /// Up to `count` blocks from `from` as a [`ScanPage2`]: how a light
+    /// wallet (ZKAPriv) reads the chain from a peer, an onion seed in Tor
+    /// mode. Like `/scan2` of the public API, without the web in between.
+    pub async fn scan_page(&mut self, from: u32, count: u32) -> Result<ScanPage2, String> {
+        let mut body = [0u8; 8];
+        body[..4].copy_from_slice(&from.to_be_bytes());
+        body[4..].copy_from_slice(&count.to_be_bytes());
+        let bytes = self.request(SCAN_PAGE, &body, MAX_SCAN_PAGE_BYTES).await?;
+        let network = Profile::for_chain(&self.chain_id)
+            .ok_or("STARK descriptor network")?
+            .network;
+        let page = tokio::task::spawn_blocking(move || ScanPage2::decode(&bytes))
+            .await
+            .map_err(err)?
+            .map_err(err)?;
+        if page.network != network
+            || page.from != from.max(1)
+            || page.blocks.len() > count.clamp(1, MAX_SCAN_BLOCKS) as usize
+            || page
+                .blocks
+                .iter()
+                .zip(page.from..)
+                .any(|(block, height)| block.height != height)
+        {
+            return Err("STARK scan page does not answer the request".into());
+        }
+        Ok(page)
     }
 
     pub async fn submit_tx(&mut self, tx: &Transaction) -> Result<[u8; 32], String> {

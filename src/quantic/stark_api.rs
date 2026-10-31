@@ -1012,31 +1012,45 @@ async fn scan_page2(
     Extension(permit): Extension<WorkPermit>,
 ) -> ApiResult<Response> {
     blocking(permit, move || {
-        let (tip, from, blocks, settled) = scan_blocks(&state, &query)?;
-        let page = ScanPage2 {
-            network: state.profile.network,
-            tip,
-            from,
-            blocks: blocks
-                .iter()
-                .map(|block| {
-                    Ok(ScanBlock2 {
-                        height: u32::try_from(block.header.block_height).map_err(ApiError::internal)?,
-                        hash: block.header.hash.clone(),
-                        prev_hash: block.header.prev_hash.clone(),
-                        timestamp: block.header.timestamp,
-                        transactions: stark::decode(block)
-                            .map_err(ApiError::internal)?
-                            .iter()
-                            .map(ScanTransaction2::of)
-                            .collect(),
-                    })
-                })
-                .collect::<ApiResult<_>>()?,
-        };
+        let (page, settled) =
+            page2(&state, query.from, query.count).map_err(ApiError::internal)?;
         Ok(scan_response(page.encode().map_err(ApiError::internal)?, settled))
     })
     .await
+}
+
+/// The [`ScanPage2`] from `from` (1 by default) of up to `count` blocks, and
+/// whether it can never change. Takes the gate. Also what a peer asks for
+/// over P2P (`stark_net`), which is how a phone in Tor mode reads the chain
+/// from an onion seed.
+pub(crate) fn page2(
+    state: &NodeState,
+    from: Option<u32>,
+    count: Option<u32>,
+) -> Result<(ScanPage2, bool), String> {
+    let (tip, from, blocks, settled) =
+        scan_blocks(state, &ScanQuery { from, count }).map_err(|e| e.message)?;
+    let page = ScanPage2 {
+        network: state.profile.network,
+        tip,
+        from,
+        blocks: blocks
+            .iter()
+            .map(|block| {
+                Ok(ScanBlock2 {
+                    height: u32::try_from(block.header.block_height).map_err(|e| e.to_string())?,
+                    hash: block.header.hash.clone(),
+                    prev_hash: block.header.prev_hash.clone(),
+                    timestamp: block.header.timestamp,
+                    transactions: stark::decode(block)?
+                        .iter()
+                        .map(ScanTransaction2::of)
+                        .collect(),
+                })
+            })
+            .collect::<Result<_, String>>()?,
+    };
+    Ok((page, settled))
 }
 
 fn zka(atoms: u64) -> String {
