@@ -76,10 +76,10 @@ En el servidor, con un usuario común (no root):
 
 ```bash
 # 1. Bajar el minero CLI y verificarlo (el hash está en las notas de la release).
-wget https://github.com/zoka-network/zokanetwork/releases/download/v4.0.4/zoka-cli-miner-4.0.4-linux-x64.tar.gz
-sha256sum zoka-cli-miner-4.0.4-linux-x64.tar.gz
-tar xzf zoka-cli-miner-4.0.4-linux-x64.tar.gz
-cd zoka-cli-miner-4.0.4-linux-x64
+wget https://github.com/zoka-network/zokanetwork/releases/download/v4.0.5/zoka-cli-miner-4.0.5-linux-x64.tar.gz
+sha256sum zoka-cli-miner-4.0.5-linux-x64.tar.gz
+tar xzf zoka-cli-miner-4.0.5-linux-x64.tar.gz
+cd zoka-cli-miner-4.0.5-linux-x64
 
 # 2. Una wallet (cobra lo que mine, si mina). Anotar las 24 palabras.
 ./zoka-miner.sh create-wallet
