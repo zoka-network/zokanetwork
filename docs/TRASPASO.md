@@ -131,3 +131,50 @@ Tor es **opcional** (decisión del usuario): nunca obligatorio.
   usuario dejó la sesión en automático. Plan:
   `zkapriv/docs/PLAN-ZKAPRIV-3.md`, rama `zkapriv-v2` del repo zkapriv. Seguir
   por la primera etapa sin marcar de ese plan.
+- 30/10 a 31/10: **ZKAPriv 3 avanzó en dos sesiones.** En la rama
+  `zkapriv-v2` de zkapriv:
+  - E0 (inventario) y E1 (diseño de ZSilent, ícono Z-Q);
+  - E2: el motor v2 (`native/src/stark.rs`, compilado para los dos ABI);
+  - las pantallas nuevas en `ui/quantic/`.
+
+  El 31/10, otra sesión dejó **sin commitear** el envío entre la PC y el
+  teléfono, que según el usuario ya funciona:
+  - `native/src/lib.rs` inicializa el contexto de Android para el DNS de
+    hickory; sin eso la app se cerraba;
+  - cambios en `Cargo.toml`/`Cargo.lock` nativos, `QuanticWallet`,
+    `QuanticVault`, `WalletViewModel`, `Receive` y el `.so` de
+    armeabi-v7a.
+
+  **Revisarlos con el usuario antes de commitearlos.**
+- 3/11: **la red estuvo parada 4 h.**
+  - Qué pasó: el Tor de la semilla .onion murió el 31/10 y XMRig el 1/11 a
+    las 10:46. Un minero externo sostuvo la cadena hasta las 03:19 del 3/11.
+  - Ya está arriba: XMRig vigilado y Tor relanzados.
+  - Arranque automático (con el OK del usuario): cuatro accesos "Zoka - …" en
+    `shell:startup` (explorador, túnel, Tor de la semilla, XMRig). Además,
+    `tor-seed.cmd` ahora también es vigilado.
+- 3/11: **4.0.4 en la rama `zkapriv-v2-motor` del nodo, sin publicar:**
+  - `f7153fd8`: el minero CLI se vigila solo (XMRig y nodo) y tiene
+    `autostart`, en Windows y Linux. Probado en Windows.
+  - `63c4c6e6`: la billetera liviana verifica cada página contra la cabecera
+    de su bloque (`zoka_pq_pool::commitment`, igual al consenso por prueba) y
+    confirma la cadena contra el checkpoint híbrido (`verify_checkpoint`).
+    Probado con el checkpoint real del bloque 3651; pasan 51 pruebas STARK.
+  - `docs/SEMILLAS.md` al día: hoy las dos semillas están en la PC; tiene una
+    guía para una semilla en un VPS.
+
+  **Pendiente:**
+  - el usuario consigue una semilla externa (el 3/11, a la tarde): meterla
+    como seed3 en el manifiesto de esta misma 4.0.4;
+  - compilar Linux (WSL: `MSYS_NO_PATHCONV=1 wsl -d Debian-D -u root -- bash
+    /mnt/c/.../scripts/build-linux-bullseye.sh /mnt/c/Users/mderramus/ZOKA`);
+  - armar los paquetes y publicar con OK;
+  - instalar la 4.0.4 en las semillas de la PC. ZSilent necesita una 4.0.6
+    con el nodo nuevo.
+- 3/11: **análisis general** (red, privacidad, poscuántico).
+  - La v2 ya es poscuántica en el gasto, las notas, el TLS del P2P (exige
+    X25519MLKEM768) y los checkpoints híbridos.
+  - Falta para la mainnet: un análisis de solidez cuántica de la prueba STARK
+    y una auditoría (hoy la estimación es de 100 bits clásicos o más, y no es
+    una auditoría PQ); firmar las releases con ML-DSA; y ocultar el origen
+    del envío (sin Tor, la semilla ve la IP de quien manda).
