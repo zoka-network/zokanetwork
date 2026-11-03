@@ -15,7 +15,11 @@
 # nodo se rearman los dos. "autostart" lo instala como servicio de usuario de
 # systemd para que arranque con el sistema.
 #
-# Uso: ./zoka-miner.sh <create-wallet | restore-wallet | address | view-key | mine | autostart [--off] | balance | status | node-id> [--wallet nombre] [--threads n] [--stratum-port n] [--xmrig ruta]
+# Una semilla con IP pública (un VPS) fija su puerto UDP con --bind 0.0.0.0:PUERTO
+# y lo abre en su firewall: así se la alcanza directo, sin el servicio de
+# direcciones ni los relays de n0 (docs/SEMILLAS.md).
+#
+# Uso: ./zoka-miner.sh <create-wallet | restore-wallet | address | view-key | mine | autostart [--off] | balance | status | node-id> [--wallet nombre] [--threads n] [--stratum-port n] [--xmrig ruta] [--tor host:puerto] [--bind ip:puerto]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,6 +35,8 @@ XMRIG=""
 # Modo Tor (opcional): el SOCKS de un Tor que ya corre (127.0.0.1:9050 el del
 # sistema, 127.0.0.1:9150 el de Tor Browser).
 TOR=""
+# Puerto UDP fijo del nodo (opcional), para una semilla con IP pública.
+BIND=""
 
 COMMAND="${1:-help}"
 shift || true
@@ -44,6 +50,7 @@ while [ $# -gt 0 ]; do
         --stratum-port) STRATUM_PORT="$2"; shift 2 ;;
         --xmrig) XMRIG="$2"; shift 2 ;;
         --tor) TOR="$2"; shift 2 ;;
+        --bind) BIND="$2"; shift 2 ;;
         --off) AUTOSTART_OFF=1; shift ;;
         *) echo "Unknown option: $1" >&2; exit 2 ;;
     esac
@@ -146,7 +153,7 @@ start_node() {
     ZOKA_PQ_PASSWORD="$1" \
         "$ZOKA" quantic-pq-node serve --network "$NETWORK" --db "$NODE_DIR/db" \
         --identity "$NODE_DIR/node.identity" --api "127.0.0.1:$API_PORT" --descriptor-out "$DESCRIPTOR" \
-        --stratum "$STRATUM" --mine-to "$2" ${TOR:+--tor "$TOR"} > "$NODE_LOG" 2> "$NODE_ERR_LOG" &
+        --stratum "$STRATUM" --mine-to "$2" ${TOR:+--tor "$TOR"} ${BIND:+--bind "$BIND"} > "$NODE_LOG" 2> "$NODE_ERR_LOG" &
     NODE_PID=$!
 }
 
@@ -252,6 +259,7 @@ autostart() {
     [ "$STRATUM_PORT" != 3333 ] && args="$args --stratum-port $STRATUM_PORT"
     [ -n "$XMRIG" ] && args="$args --xmrig $(cd "$(dirname "$XMRIG")" && pwd)/$(basename "$XMRIG")"
     [ -n "$TOR" ] && args="$args --tor $TOR"
+    [ -n "$BIND" ] && args="$args --bind $BIND"
     mkdir -p "$dir"
     cat > "$dir/$unit" << UNIT
 [Unit]

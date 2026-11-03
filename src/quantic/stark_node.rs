@@ -133,6 +133,16 @@ impl Options {
         }
         Ok(Some(proxy))
     }
+    /// `--bind IP:PORT`: the UDP socket of the P2P endpoint, for a seed with a
+    /// public IP whose manifest entry lists that port (`direct_addresses`).
+    fn bind(&self) -> Result<Option<std::net::SocketAddr>, String> {
+        self.get("--bind")
+            .map(|text| {
+                text.parse()
+                    .map_err(|_| format!("--bind must be IP:PORT, not {text}"))
+            })
+            .transpose()
+    }
     /// A seed behind an onion service: the loopback port the service forwards
     /// to, and the `xxxx.onion:port` it publishes. Both or neither.
     fn stream_listen(&self) -> Result<Option<(std::net::SocketAddr, String)>, String> {
@@ -1049,6 +1059,10 @@ async fn serve(options: Options) -> Result<(), String> {
             .map_err(|_| "set ZOKA_PQ_PASSWORD for the encrypted node identity")?,
     );
     let tor = options.tor()?;
+    let p2p_bind = options.bind()?;
+    if tor.is_some() && p2p_bind.is_some() {
+        return Err("--tor runs the node over Tor alone: it binds no UDP port, so no --bind".into());
+    }
     let stream_listen = options.stream_listen()?;
     if tor.is_some() && (stream_listen.is_some() || options.get("--relay") == Some("N0")) {
         return Err("--tor runs the node over Tor alone: no --stream-listen and no relays".into());
@@ -1151,14 +1165,15 @@ async fn serve(options: Options) -> Result<(), String> {
         let transport = StreamTransport::new(Some(address), Arc::new(TcpDialer)).map_err(err)?;
         stream_transport = Some(transport.clone());
         if relay {
-            stark_net::serve(state.clone(), identity, AlsoStream(presets::N0, transport)).await?
+            stark_net::serve_bound(state.clone(), identity, AlsoStream(presets::N0, transport), p2p_bind).await?
         } else {
-            stark_net::serve(state.clone(), identity, AlsoStream(presets::Minimal, transport)).await?
+            stark_net::serve_bound(state.clone(), identity, AlsoStream(presets::Minimal, transport), p2p_bind)
+                .await?
         }
     } else if relay {
-        stark_net::serve(state.clone(), identity, presets::N0).await?
+        stark_net::serve_bound(state.clone(), identity, presets::N0, p2p_bind).await?
     } else {
-        stark_net::serve(state.clone(), identity, presets::Minimal).await?
+        stark_net::serve_bound(state.clone(), identity, presets::Minimal, p2p_bind).await?
     };
     let stream_task = match (stream_transport, stream_listener) {
         (Some(transport), Some(listener)) => Some(transport.listen(listener)),
@@ -1537,6 +1552,7 @@ pub async fn run(args: &[String]) -> Result<(), String> {
                     "--tor",
                     "--stream-listen",
                     "--stream-address",
+                    "--bind",
                 ],
             )?)
             .await
@@ -1583,6 +1599,8 @@ or testnet (zoka-quantic-testnet-v2: RandomX, ASERT). An existing --db keeps its
         peers with an onion address; no UDP, no relays, a new transport id each run)\n\
         [--stream-listen 127.0.0.1:PORT --stream-address XXXX.onion:PORT]   (a seed behind an\n\
         onion service: also listen there for Tor-mode nodes)\n\
+        [--bind 0.0.0.0:PORT]   (a fixed UDP port, for a seed with a public IP whose\n\
+        manifest entry lists it in direct_addresses: reached without lookup or relays)\n\
         [--public-api 127.0.0.1:9181]   (an explorer's read-only API on its own loopback\n\
         port, for a tunnel to publish: GET only, any origin, its own rate; also\n\
         ZOKA_PQ_PUBLIC_API)\n\

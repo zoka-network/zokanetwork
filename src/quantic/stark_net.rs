@@ -255,13 +255,26 @@ pub async fn serve(
     identity: ServerIdentity,
     preset: impl Preset,
 ) -> Result<Server, String> {
-    let endpoint = Endpoint::builder(RequiredPostQuantumTls(preset))
+    serve_bound(state, identity, preset, None).await
+}
+
+/// [`serve`] with the UDP socket of `bind`'s family on that address: a fixed
+/// port a seed with a public IP lists in the manifest, so nodes reach it
+/// directly, without address lookup or relays.
+pub async fn serve_bound(
+    state: NodeState,
+    identity: ServerIdentity,
+    preset: impl Preset,
+    bind: Option<std::net::SocketAddr>,
+) -> Result<Server, String> {
+    let mut builder = Endpoint::builder(RequiredPostQuantumTls(preset))
         .secret_key(identity.transport.clone())
         .transport_config(transport_config())
-        .alpns(vec![ALPN.to_vec()])
-        .bind()
-        .await
-        .map_err(err)?;
+        .alpns(vec![ALPN.to_vec()]);
+    if let Some(address) = bind {
+        builder = builder.bind_addr(address).map_err(err)?;
+    }
+    let endpoint = builder.bind().await.map_err(err)?;
     let descriptor = NodeDescriptor {
         version: DESCRIPTOR_VERSION,
         chain_id: state.profile.chain_id.into(),
@@ -1215,6 +1228,31 @@ mod tests {
             .unwrap();
         (NodeState::new(storage).unwrap(), dir)
     }
+    /// A seed with `--bind`: the port it was given, reached by that address
+    /// alone, without address lookup or relays.
+    #[tokio::test]
+    async fn a_bound_seed_is_reached_at_the_port_it_lists() {
+        let (remote, _dir) = state();
+        let free = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = free.local_addr().unwrap();
+        drop(free);
+        let server = serve_bound(
+            remote,
+            ServerIdentity::from_seed(&[74; 32]).unwrap(),
+            presets::Minimal,
+            Some(address),
+        )
+        .await
+        .unwrap();
+        assert!(server.endpoint.bound_sockets().contains(&address));
+        let mut listed = server.descriptor.clone();
+        listed.endpoint_addr = EndpointAddr::new(server.endpoint.id()).with_ip_addr(address);
+        let mut client = Client::connect(&listed, presets::Minimal).await.unwrap();
+        assert_eq!(client.head().await.unwrap().height, 0);
+        client.close().await;
+        server.close().await;
+    }
+
     fn localhost(server: &Server) -> NodeDescriptor {
         let mut descriptor = server.descriptor.clone();
         let socket = server
