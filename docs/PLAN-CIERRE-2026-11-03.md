@@ -17,6 +17,8 @@ respuestas del usuario. El avance efectivo está en [TRASPASO.md](TRASPASO.md).
 
 ## 1. Versiones de escritorio y web
 
+**Terminada y publicada el 3/11:** nodo/minero 4.0.4, ZSilent 4.0.6 y web.
+
 Ver [RELEASE-4.0.4.md](RELEASE-4.0.4.md) para pruebas y hashes.
 Completar paquetes Windows/Linux y MSI, probar sin tocar billeteras del
 usuario, integrar las ramas sin reescribir historial, etiquetar, subir a
@@ -37,6 +39,7 @@ El informe del agente que terminó al cerrarse Claude se recuperó en
    para inicializar el contexto Android del DNS. Hay que recompilar ambos.
 3. El motor usa el nodo por `path = "../.."`: necesita los cambios de
    `red-sin-dependencias`, incluidos `PhonePeers` y el manifiesto con seed3.
+   Desde el cierre de la etapa 1 estos cambios están integrados en `main`.
 
 Revisar los cambios locales; conectar `/checkpoint` con `confirmCheckpoint`
 después de leer por HTTPS; pasar `stateDir` al publicar/resolver; mostrar la

@@ -1,7 +1,44 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
-Actualizada: **30 de octubre de 2026**, Argentina (**testnet v2 lanzada**: bloque 1 fijado y la PC como seed1; nodo, minero CLI y ZSilent 4.0.x publicados; **ZokaScan nuevo en línea** en zokascan.cc con su API en api.zokascan.cc).
+Actualizada: **3 de noviembre de 2026**, Argentina. Testnet v2 con dos semillas permanentes en VPS; nodo/minero 4.0.4, ZSilent 4.0.6 y web publicados. Sigue ZKAPriv 3.0.
 Proyecto: `C:\Users\mderramus\ZOKA`.
+
+## 3/11, tarde: retomado el trabajo de Claude y publicada la primera etapa
+
+El usuario pidió continuar el plan que quedó al agotarse la sesión de Claude.
+Se recuperaron el plan y el informe del agente de Android. Las decisiones
+quedaron conservadas en [docs/PLAN-CIERRE-2026-11-03.md](docs/PLAN-CIERRE-2026-11-03.md):
+Windows en la PC, Linux/Android en VPS, publicación directa si pasan las pruebas
+y coinciden los hashes, anuncios revisados antes, archivos sueltos afuera.
+
+- **Infraestructura previa, verificada:** seed2, explorador, túnel y .onion
+  en `13.140.206.10`; seed3 en `13.140.206.11`. La PC se usa cuando el usuario
+  quiere y conserva la autoridad de checkpoints. No se abrió WSL, no se
+  inició minería y los procesos de prueba se cerraron.
+- **Nodo/minero 4.0.4**, `v4.0.4` = `50588833`: rama `red-sin-dependencias`
+  integrada en `main`; seed3 e IP fijas, `--bind`, minero vigilado y mejoras
+  del motor móvil verificadas contra checkpoints. Se corrigieron las guías
+  de semillas y el empaquetador Linux, que rechazaba una versión con CRLF.
+- **ZSilent 4.0.6**, `v4.0.6` = `162743d`: MSI con nodo 4.0.4 y manifiesto
+  de tres semillas. Armado en `target/zsilent-4.0.6`, sin tocar el
+  `ZSilentAppState.kt` modificado de la copia habitual. **No instalado.**
+- **Pruebas:** 55 del nodo STARK, 22 del pool y 84 de ZSilent sin fallas;
+  v2 local y Tor real habilitados. Paquetes extraídos y verificados. Linux
+  sincronizó 3958 bloques en 453 s sin relay ni minería, con el checkpoint
+  3923 y el mismo hash que el explorador. MSI: nodo, zokahd, Tor y manifiesto
+  coinciden con los hashes declarados.
+- **Publicado:** ambos releases en GitHub, descargados otra vez y con hashes
+  idénticos; versiones anteriores marcadas como reemplazadas. Código y
+  etiquetas en GitHub y GitLab. Web `89bef6a`, despliegue
+  `https://b328a0cf.zokaweb.pages.dev`: enlaces nuevos y guía de semillas;
+  siete pruebas, build y verificación en vivo de JS/CSS y descargas.
+- **Sigue:** ZKAPriv 3.0. El informe detectó un error de `isActive` y motores
+  `.so` anteriores al formato actual de `/scan2`; faltan conectar el
+  checkpoint HTTPS, recompilar ambos ABI y probar con el teléfono y los
+  envíos del usuario. Después, vigilante y trabajo técnico del plan.
+
+Hashes, límites de validación y archivos:
+[docs/RELEASE-4.0.4.md](docs/RELEASE-4.0.4.md).
 
 ## 30/10, tarde: Modo Tor opcional publicado (nodo 4.0.3, ZSilent 4.0.5)
 

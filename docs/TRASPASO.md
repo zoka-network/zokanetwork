@@ -20,32 +20,42 @@ antes. No instalar ZSilent sin que lo pida.
 - **PC libre:** nada de WSL ni servicios/minería iniciados en segundo plano.
   Windows se compila acá por autorización del usuario; Linux y el motor
   Android en VPS. No levantar el explorador local: comparte identidad con seed2.
-- **Etapa 1 en curso:** rama `red-sin-dependencias`, desde `1af3e9af`.
-  Guías y notas corregidas en `ced0cfce`; ver [RELEASE-4.0.4.md](RELEASE-4.0.4.md).
-  Se integró el registro de `main` sin perder su historial.
+- **Etapa 1 cerrada y publicada (3/11, 17:44, Argentina):** nodo y minero
+  `v4.0.4` = `50588833`, ZSilent `v4.0.6` = `162743d`; etiquetas y código en
+  GitHub y GitLab. La rama del nodo se integró a `main` sin reescribir historia.
+  Los releases anteriores quedaron marcados como reemplazados. Pruebas y
+  hashes en [RELEASE-4.0.4.md](RELEASE-4.0.4.md).
 - El ZIP anterior quedó conservado en
   `target/cli-miner/4.0.4-descartado-sin-seed3`.
 - **Linux:** fuente archivada de `ced0cfce` en `/root/release404-src` del VPS 2;
   servicio temporal `zoka-release404-build`, registro `/root/release404-build.log`,
-  salida `/root/release404-artifacts`. Usa Debian 11 aislado para compatibilidad
-  glibc. No modifica el servicio semilla.
-- **ZSilent:** worktree `target/zsilent-4.0.6`, rama `release-4.0.6` desde
-  `90e9a6e`. El `ZSilentAppState.kt` modificado en la copia habitual queda intacto.
-  **Avance:** versión en `162743d`, etiqueta `v4.0.6` y ramas `main`/`quantic-v2`
-  subidas a ambos remotos. El worktree pasó a `main`. MSI armado y extraído;
-  84 pruebas sin fallas, incluidas v2 y Tor real. Release de GitHub todavía
-  **borrador**, con sus tres archivos descargados y verificados por hash.
+  salida `/root/release404-artifacts`. Compiló en Debian 11 aislado en 24 min
+  31 s; requiere glibc 2.30. El servicio terminó con un error del empaquetador
+  al leer CRLF: corregido en `6043b5e`, copiado al VPS y reempaquetado sin
+  recompilar. No quedan compilaciones en marcha.
+- **ZSilent:** worktree `target/zsilent-4.0.6`, ahora en `main` (`162743d`).
+  El `ZSilentAppState.kt` modificado en la copia habitual queda intacto.
+  MSI armado y extraído; 84 pruebas sin fallas, incluidas v2 y Tor real.
+  Release público, con sus tres archivos descargados y verificados por hash.
   Archivos en `target/zsilent-4.0.6/build/release/4.0.6`; copia descargada en
   `target/release-verify/zsilent-4.0.6`. No se instaló.
-- **Windows listo:** ZIP en `target/cli-miner/4.0.4`; comprobados hashes,
-  semillas nuevas y comandos en una ruta con espacios. Linux sigue compilando.
-  Pruebas en VPS: 55 del nodo y 22 del pool aprobadas.
-- **Web:** versiones preparadas 4.0.6/4.0.4; las siete pruebas y el build pasan.
-  Todavía sin desplegar.
-- **ZKAPriv:** recuperado el informe del agente de Claude en
+- **Paquetes publicados:** ZIP y tar.gz en `target/cli-miner/4.0.4`; copia
+  descargada en `target/release-verify/node-4.0.4`. Windows: hashes, semillas
+  nuevas y comandos en una ruta con espacios. Linux: sincronizó desde cero
+  hasta el bloque 3958 en 453 s, mismo hash que el explorador, dos pares,
+  sin relay ni minería, checkpoint 3923 seguido. Pruebas: 55 del nodo y 22
+  del pool aprobadas. Los procesos de prueba se cerraron.
+- **Web publicada:** `zokaweb` `89bef6a`, en ambos remotos; despliegue
+  `https://b328a0cf.zokaweb.pages.dev`. Versiones 4.0.6/4.0.4 y guía con las
+  semillas permanentes. Siete pruebas y build aprobados; JS/CSS de zoka.network
+  coinciden por SHA-256 y las tres descargas públicas responden HTTP 200.
+- **Sigue ZKAPriv 3.0:** recuperado el informe del agente de Claude en
   `target/zkapriv-informe-claude-3nov.json`. Antes del APK faltan conectar la
   confirmación HTTPS del checkpoint, mostrar verificación/pares, revisar los
-  cambios locales y recompilar ambos ABI. La prueba de envíos la hace el usuario.
+  cambios locales (incluido el `isActive` que no compila) y recompilar ambos
+  ABI. El nodo en `main` ya incluye todo lo que necesita el motor móvil.
+  La prueba de envíos la hace el usuario. Después siguen vigilante y etapas
+  técnicas del plan; no se publicaron anuncios de Discord.
 
 ## Estado histórico al 30/10/2026, mediodía (Claude)
 

@@ -1,6 +1,6 @@
 # Nodo y minero CLI 4.0.4
 
-Preparación del 3/11/2026. Estado: **verificado; publicación en curso**.
+Preparación del 3/11/2026. Estado: **publicado y verificado**.
 
 La testnet v2 conserva su cadena y sus reglas de consenso. Esta versión agrega
 seed3 y las direcciones IP fijas de seed2 y seed3 al manifiesto incorporado en
@@ -26,8 +26,8 @@ el soporte móvil del nodo no significa que el APK ya esté publicado.
 - [x] Ejecutar las pruebas del nodo STARK y del pool privado: 55 + 22 pasan.
 - [x] Probar los dos paquetes con datos temporales, sin minería.
 - [x] Verificar el nodo y el manifiesto dentro del MSI de ZSilent 4.0.6.
-- [ ] Publicar y descargar otra vez los archivos para verificar sus hashes.
-- [ ] Actualizar y comprobar los enlaces de zoka.network.
+- [x] Publicar y descargar otra vez los archivos para verificar sus hashes.
+- [x] Actualizar y comprobar los enlaces de zoka.network.
 
 ## Resultados del 3/11
 
@@ -50,6 +50,19 @@ el soporte móvil del nodo no significa que el APK ya esté publicado.
   ejecutó. MSI extraído por `msiexec /a`: coinciden nodo, zokahd, manifiesto de
   tres semillas y Tor con `release-manifest.json`. No se instaló en la PC.
 - Web: siete pruebas y armado de producción aprobados.
+
+## Publicación
+
+- [Nodo/minero v4.0.4](https://github.com/zoka-network/zokanetwork/releases/tag/v4.0.4):
+  etiqueta anotada en `50588833`, Windows, Linux y `SHA256SUMS.txt`.
+- [ZSilent v4.0.6](https://github.com/zoka-network/zsilent-core/releases/tag/v4.0.6):
+  etiqueta anotada en `162743d`, MSI, manifiesto y `SHA256SUMS.txt`.
+- Todos los archivos se descargaron de GitHub y coinciden con los originales.
+  Las versiones 4.0.3 del nodo y 4.0.5 de ZSilent conservan sus archivos y
+  ahora indican que fueron reemplazadas.
+- Web `89bef6a`, desplegada en `https://b328a0cf.zokaweb.pages.dev` y
+  zoka.network. JS/CSS públicos verificados por SHA-256; las tres descargas
+  responden HTTP 200. Código y etiquetas en GitHub y GitLab.
 
 | Archivo | SHA-256 |
 | --- | --- |
