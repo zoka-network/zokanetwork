@@ -30,6 +30,15 @@ antes. No instalar ZSilent sin que lo pida.
   glibc. No modifica el servicio semilla.
 - **ZSilent:** worktree `target/zsilent-4.0.6`, rama `release-4.0.6` desde
   `90e9a6e`. El `ZSilentAppState.kt` modificado en la copia habitual queda intacto.
+  **Avance:** versión en `162743d`, etiqueta `v4.0.6` y ramas `main`/`quantic-v2`
+  subidas a ambos remotos. El worktree pasó a `main`. MSI armado y extraído;
+  84 pruebas sin fallas, incluidas v2 y Tor real. Release de GitHub todavía
+  **borrador**, con sus tres archivos descargados y verificados por hash.
+  Archivos en `target/zsilent-4.0.6/build/release/4.0.6`; copia descargada en
+  `target/release-verify/zsilent-4.0.6`. No se instaló.
+- **Windows listo:** ZIP en `target/cli-miner/4.0.4`; comprobados hashes,
+  semillas nuevas y comandos en una ruta con espacios. Linux sigue compilando.
+  Pruebas en VPS: 55 del nodo y 22 del pool aprobadas.
 - **Web:** versiones preparadas 4.0.6/4.0.4; las siete pruebas y el build pasan.
   Todavía sin desplegar.
 - **ZKAPriv:** recuperado el informe del agente de Claude en
