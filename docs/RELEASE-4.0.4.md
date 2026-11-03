@@ -1,6 +1,6 @@
 # Nodo y minero CLI 4.0.4
 
-Preparación del 3/11/2026. Estado: **en verificación, sin publicar**.
+Preparación del 3/11/2026. Estado: **verificado; publicación en curso**.
 
 La testnet v2 conserva su cadena y sus reglas de consenso. Esta versión agrega
 seed3 y las direcciones IP fijas de seed2 y seed3 al manifiesto incorporado en
@@ -24,7 +24,7 @@ el soporte móvil del nodo no significa que el APK ya esté publicado.
 - [x] Compilar Windows desde la fuente actual con `randomx,quantic-pq`.
 - [x] Compilar Linux en el VPS con Debian 11 y comprobar el límite de glibc.
 - [x] Ejecutar las pruebas del nodo STARK y del pool privado: 55 + 22 pasan.
-- [ ] Probar los dos paquetes con datos temporales, sin minería.
+- [x] Probar los dos paquetes con datos temporales, sin minería.
 - [x] Verificar el nodo y el manifiesto dentro del MSI de ZSilent 4.0.6.
 - [ ] Publicar y descargar otra vez los archivos para verificar sus hashes.
 - [ ] Actualizar y comprobar los enlaces de zoka.network.
@@ -38,6 +38,10 @@ el soporte móvil del nodo no significa que el APK ya esté publicado.
 - Linux: compilado en Debian 11 dentro del VPS 2, sin WSL (24 min 31 s).
   El binario requiere glibc 2.30. Se corrigió el empaquetador para aceptar
   `Cargo.toml` con finales CRLF; no cambió la fuente del ejecutable.
+  En el VPS 1, el paquete extraído verifica todos sus hashes y conserva su
+  identidad. Un nodo nuevo llegó al bloque 3958 en 453 s, con dos pares
+  salientes, `relay: false`, sin Stratum ni minería, y checkpoint 3923
+  seguido. Datos de prueba: `/tmp/zoka404-smoke-ts9jlxos`.
 - Nodo STARK: 55 pruebas pasan, una prueba con Tor externo queda ignorada.
   Pool privado: 22 pruebas pasan. Registro local: `target/release404-tests.log`.
 - ZSilent: 84 pruebas sin fallas. Se habilitaron la prueba v2 contra un nodo
