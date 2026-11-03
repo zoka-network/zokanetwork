@@ -490,20 +490,34 @@ async fn push_blocks(
     Ok(())
 }
 
+/// What one outbound session relayed of the two mempools, by txid.
+#[derive(Default)]
+struct TxRelay {
+    /// Ours that the peer already holds.
+    sent: BTreeSet<[u8; 32]>,
+    /// The peer's that this node refused: not fetched again while the peer
+    /// still offers them.
+    refused: BTreeSet<[u8; 32]>,
+}
+
+/// Payments fetched from a peer's mempool per cycle (each one carries a
+/// STARK proof of about 2 MB and is verified before it is kept).
+const MEMPOOL_PULL_BATCH: usize = 4;
+
 async fn peer_cycle(
     client: &mut Client,
     state: &NodeState,
     cursor: &mut Option<PushCursor>,
-    sent: &mut BTreeSet<[u8; 32]>,
+    relay: &mut TxRelay,
 ) -> Result<(), String> {
-    peer_cycle_limited(client, state, cursor, sent, PEER_BATCH).await
+    peer_cycle_limited(client, state, cursor, relay, PEER_BATCH).await
 }
 
 async fn peer_cycle_limited(
     client: &mut Client,
     state: &NodeState,
     cursor: &mut Option<PushCursor>,
-    sent: &mut BTreeSet<[u8; 32]>,
+    relay: &mut TxRelay,
     batch: usize,
 ) -> Result<(), String> {
     if batch == 0 || batch > PEER_BATCH {
@@ -514,9 +528,80 @@ async fn peer_cycle_limited(
     // A partially sent fork has not necessarily become the peer's canonical
     // chain yet. Its mempool cannot validate our anchors until tips agree.
     // Keep this connection/cursor so forks longer than one batch make progress.
-    if client.head().await?.hash != head(state).await?.hash {
+    let remote = client.head().await?;
+    if remote.hash != head(state).await?.hash {
         return Ok(());
     }
+    push_mempool(client, state, &mut relay.sent).await?;
+    if remote.mempool {
+        pull_mempool(client, state, &mut relay.refused).await?;
+    }
+    Ok(())
+}
+
+/// Payments in the peer's mempool that this node lacks, a few per cycle.
+/// Without this a payment travels only from the side that dials: a miner
+/// behind NAT dials the seeds and gets a payment only when a seed manages to
+/// dial it back (3/11/2026: one waited 11 blocks in every seed's mempool, the
+/// seed's pushes of its 2 MB timing out, while the only miner mined empty
+/// blocks). Caller checked that both tips agree, so the payment's anchor is
+/// judged on the same chain.
+async fn pull_mempool(
+    client: &mut Client,
+    state: &NodeState,
+    refused: &mut BTreeSet<[u8; 32]>,
+) -> Result<(), String> {
+    let offered = match client.mempool_ids().await {
+        Ok(offered) => offered,
+        Err(reason) if rejected(&reason) => return Ok(()),
+        Err(reason) => return Err(reason),
+    };
+    refused.retain(|id| offered.contains(id));
+    let wanted: Vec<_> = {
+        let pool = state.mempool.lock().map_err(|_| "mempool poisoned")?;
+        offered
+            .into_iter()
+            .filter(|id| !pool.contains(id) && !refused.contains(id))
+            .take(MEMPOOL_PULL_BATCH)
+            .collect()
+    };
+    for id in wanted {
+        let tx = match client.get_tx(&id).await {
+            Ok(Some(tx)) => tx,
+            // Mined or dropped since the list: nothing to fetch.
+            Ok(None) => continue,
+            Err(reason) if rejected(&reason) => continue,
+            Err(reason) => return Err(reason),
+        };
+        let accepted = with_state(state, move |state| {
+            let ledger = stark::branch(&state.storage, state.profile, &tip(state)?)?;
+            state
+                .mempool
+                .lock()
+                .map_err(|_| "mempool poisoned")?
+                .insert(&ledger, tx)
+        })
+        .await;
+        match accepted {
+            Ok(()) => {}
+            Err(reason) if reason.contains("already in mempool") => {}
+            // Full for now: ask again in a later cycle.
+            Err(reason) if reason.contains("mempool full") => break,
+            Err(reason) => {
+                eprintln!("STARK mempool pull: {reason}");
+                refused.insert(id);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Our mempool to a peer whose tip agrees with ours.
+async fn push_mempool(
+    client: &mut Client,
+    state: &NodeState,
+    sent: &mut BTreeSet<[u8; 32]>,
+) -> Result<(), String> {
     let transactions = with_state(state, |state| {
         Ok(state
             .mempool
@@ -726,7 +811,7 @@ async fn session(
     }
     let id = client.remote_id();
     let mut cursor = None;
-    let mut sent = BTreeSet::new();
+    let mut relay = TxRelay::default();
     let mut refused = None;
     let mut addresses = AddressExchange::default();
     let mut asked = net.state.directory.asked();
@@ -739,7 +824,7 @@ async fn session(
                 let remote = exchange_checkpoint(client, &net.state, true, &mut refused).await?;
                 net.state.peers.book().observe(id, remote.height);
                 exchange_addresses(client, &net.state, &mut addresses).await?;
-                peer_cycle(client, &net.state, &mut cursor, &mut sent).await
+                peer_cycle(client, &net.state, &mut cursor, &mut relay).await
             } => result?,
         }
         if exchange <= tokio::time::Instant::now() {
@@ -1795,11 +1880,11 @@ mod tests {
         }
         let mut client = Client::connect(&peer, presets::Minimal).await.unwrap();
         let mut cursor = None;
-        let mut sent = BTreeSet::new();
+        let mut relay = TxRelay::default();
 
         // Only fork block 2 fits in this cycle. It remains a side branch and
         // the transaction must not be sent or cause a connection/cursor reset.
-        peer_cycle_limited(&mut client, &local, &mut cursor, &mut sent, 1)
+        peer_cycle_limited(&mut client, &local, &mut cursor, &mut relay, 1)
             .await
             .unwrap();
         assert_eq!(head(&remote).await.unwrap().hash, remote_branch.header.hash);
@@ -1810,22 +1895,134 @@ mod tests {
         assert_eq!(cursor.as_ref().unwrap().last_height, 2);
         assert_eq!(cursor.as_ref().unwrap().last_hash, local_second.header.hash);
         assert!(remote.mempool.lock().unwrap().is_empty());
-        assert!(sent.is_empty());
+        assert!(relay.sent.is_empty());
 
         // The same connection/cursor resumes at block 3. Once the peer switches
         // to this complete fork, its anchored payment enters the remote mempool.
-        peer_cycle_limited(&mut client, &local, &mut cursor, &mut sent, 1)
+        peer_cycle_limited(&mut client, &local, &mut cursor, &mut relay, 1)
             .await
             .unwrap();
         assert_eq!(head(&remote).await.unwrap().hash, local_third.header.hash);
         assert_eq!(cursor.as_ref().unwrap().last_height, 3);
-        assert!(sent.contains(&payment_id));
+        assert!(relay.sent.contains(&payment_id));
         assert_eq!(
             remote.mempool.lock().unwrap().select()[0].txid(),
             payment_id
         );
         client.close().await;
         server.close().await;
+    }
+
+    /// The case of 3/11/2026: the payment sits in the mempool of the node
+    /// that is dialed (a seed) and the only miner is the node that dials. A
+    /// push-only relay never carried it to the miner; the dialer now asks.
+    #[tokio::test]
+    async fn the_node_that_dials_pulls_the_payment_its_peer_holds() {
+        use stark::protocol::{
+            ledger::{ATOMS, PREMINE},
+            model::Input,
+            transaction::{transfer, Payment},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let miner = new_state(dir.path().join("miner"), None).await.unwrap();
+        let seed = new_state(dir.path().join("seed"), None).await.unwrap();
+        let alice = Account::from_seed(&[94; 32], 3, 0).unwrap();
+        let bob = Account::from_seed(&[95; 32], 3, 0).unwrap().address();
+        let alice_to = alice.address();
+        let (genesis, _) = mine_once(&seed, alice.address()).await.unwrap();
+        let shared = genesis.clone();
+        with_state(&miner, move |state| import_mined_locked(state, &shared))
+            .await
+            .unwrap();
+
+        let payment_id = with_state(&seed, move |state| {
+            let ledger = stark::full_ledger(&state.storage, state.profile, &tip(state)?)?;
+            let reward = stark::decode(&genesis)?.remove(0);
+            let (note, _) = alice
+                .receive(reward.statement.commitments[0], &reward.envelopes[0])
+                .map_err(err)?;
+            let payment = transfer(
+                &alice,
+                ledger.tree.root(),
+                vec![Input {
+                    key: alice.spend.clone(),
+                    note,
+                    path: ledger.tree.path(0).map_err(err)?,
+                }],
+                vec![
+                    Payment::new(bob, ATOMS),
+                    Payment::new(alice.address(), PREMINE - ATOMS - 200),
+                ],
+                200,
+                20,
+            )
+            .map_err(err)?;
+            let id = payment.txid();
+            state
+                .mempool
+                .lock()
+                .map_err(|_| "mempool poisoned")?
+                .insert(&ledger, payment)?;
+            Ok(id)
+        })
+        .await
+        .unwrap();
+
+        let server = stark_net::serve(
+            seed.clone(),
+            ServerIdentity::from_seed(&[96; 32]).unwrap(),
+            presets::Minimal,
+        )
+        .await
+        .unwrap();
+        let mut peer = server.descriptor.clone();
+        for mut socket in server.endpoint.bound_sockets() {
+            socket.set_ip(if socket.is_ipv4() {
+                std::net::Ipv4Addr::LOCALHOST.into()
+            } else {
+                std::net::Ipv6Addr::LOCALHOST.into()
+            });
+            peer.endpoint_addr = peer.endpoint_addr.with_ip_addr(socket);
+        }
+        let mut client = Client::connect(&peer, presets::Minimal).await.unwrap();
+        assert!(client.head().await.unwrap().mempool);
+        assert_eq!(client.mempool_ids().await.unwrap(), vec![payment_id]);
+        let mut cursor = None;
+        let mut relay = TxRelay::default();
+        assert!(miner.mempool.lock().unwrap().is_empty());
+
+        peer_cycle_limited(&mut client, &miner, &mut cursor, &mut relay, 1)
+            .await
+            .unwrap();
+        assert!(miner.mempool.lock().unwrap().contains(&payment_id));
+        assert!(relay.refused.is_empty());
+        // Its next template carries the payment.
+        let (block, canonical) = mine_once(&miner, alice_to).await.unwrap();
+        assert!(canonical);
+        assert!(stark::decode(&block)
+            .unwrap()
+            .iter()
+            .any(|tx| tx.txid() == payment_id));
+
+        // Once mined it leaves both pools and nothing is fetched again.
+        peer_cycle_limited(&mut client, &miner, &mut cursor, &mut relay, 1)
+            .await
+            .unwrap();
+        assert!(seed.mempool.lock().unwrap().is_empty());
+        assert!(client.mempool_ids().await.unwrap().is_empty());
+        assert_eq!(client.get_tx(&payment_id).await.unwrap().map(|t| t.txid()), None);
+        client.close().await;
+        server.close().await;
+    }
+
+    /// An older node's head has no `mempool`: the new requests stay unsent.
+    #[test]
+    fn a_head_without_the_mempool_field_is_an_older_node() {
+        let old: stark_net::Head = serde_json::from_str(
+            r#"{"chain_id":"zoka-quantic-testnet-v2","height":4009,"hash":"fcdeb7d8da1e9e36095f85bfd8e74dfd1370e9b411a019d83840137fbe8f39cc","checkpoint":3992}"#,
+        )
+        .unwrap();
+        assert!(!old.mempool);
     }
 
     #[tokio::test]

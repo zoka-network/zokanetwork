@@ -79,6 +79,15 @@ const SUBMIT_ADDRESS: u8 = 11;
 /// A page of the chain for a light wallet (`ScanPage2`): `from` and `count`,
 /// big-endian `u32`s. Older nodes close the connection on it.
 const SCAN_PAGE: u8 = 12;
+/// The txids in the peer's mempool, 32 bytes each, at most
+/// [`MAX_MEMPOOL_IDS`]. Older nodes close the connection on it: ask only a
+/// peer whose [`Head`] says `mempool`.
+const MEMPOOL: u8 = 13;
+/// One mempool transaction by its txid (32 bytes); empty once it is gone.
+/// Same rule as [`MEMPOOL`].
+const GET_TX: u8 = 14;
+/// Txids answered per `MEMPOOL` request: a block holds far fewer payments.
+pub const MAX_MEMPOOL_IDS: usize = 256;
 const MAX_ERROR_BYTES: usize = 2048;
 const MAX_ANNOUNCE_BYTES: usize = 4096;
 /// Endpoints answered per `PEERS` request.
@@ -359,8 +368,9 @@ async fn authenticate_server(
 
 fn request_limit(tag: u8) -> Result<usize, String> {
     match tag {
-        HEAD | PEERS | CHECKPOINT => Ok(0),
+        HEAD | PEERS | CHECKPOINT | MEMPOOL => Ok(0),
         GET_BLOCK | GET_HASH | SCAN_PAGE => Ok(8),
+        GET_TX => Ok(32),
         SUBMIT_BLOCK => Ok(MAX_BLOCK_WIRE_BYTES),
         SUBMIT_TX => Ok(MAX_TRANSACTION_BYTES),
         ANNOUNCE => Ok(MAX_ANNOUNCE_BYTES),
@@ -378,7 +388,7 @@ async fn read_request_header(recv: &mut RecvStream) -> Result<(u8, usize), Strin
     let len = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
     if len > request_limit(tag)?
         || (matches!(tag, GET_BLOCK | GET_HASH | SCAN_PAGE) && len != 8)
-        || (tag == GET_ADDRESS && len != 32)
+        || (matches!(tag, GET_ADDRESS | GET_TX) && len != 32)
     {
         return Err("STARK request length".into());
     }
@@ -591,6 +601,10 @@ pub struct Head {
     /// Height of the latest accepted checkpoint.
     #[serde(default)]
     pub checkpoint: Option<u64>,
+    /// The node answers `MEMPOOL` and `GET_TX`. Older nodes leave it out (and
+    /// close the connection on those requests); older clients ignore it.
+    #[serde(default)]
+    pub mempool: bool,
 }
 
 fn tip(state: &NodeState) -> Result<Block, String> {
@@ -612,6 +626,7 @@ pub(crate) fn head(state: &NodeState) -> Result<Head, String> {
         height: block.header.block_height,
         hash: block.header.hash,
         checkpoint: state.latest_checkpoint()?.map(|cp| cp.height),
+        mempool: true,
     })
 }
 
@@ -654,6 +669,24 @@ fn handle_request(state: &NodeState, tag: u8, body: &[u8]) -> Result<Vec<u8>, St
                 .map_err(|_| "STARK mempool lock poisoned")?
                 .insert(&ledger, tx)?;
             Ok(txid.to_vec())
+        }
+        MEMPOOL => Ok(state
+            .mempool
+            .lock()
+            .map_err(|_| "STARK mempool lock poisoned")?
+            .txids(MAX_MEMPOOL_IDS)
+            .concat()),
+        GET_TX => {
+            let txid: [u8; 32] = body.try_into().map_err(|_| "STARK txid length")?;
+            match state
+                .mempool
+                .lock()
+                .map_err(|_| "STARK mempool lock poisoned")?
+                .get(&txid)
+            {
+                Some(tx) => tx.encode().map_err(err),
+                None => Ok(Vec::new()),
+            }
         }
         SUBMIT_BLOCK => {
             let block: Block = serde_json::from_slice(body).map_err(err)?;
@@ -1075,6 +1108,34 @@ impl Client {
             return Err("STARK tx acknowledgement mismatch".into());
         }
         Ok(id)
+    }
+
+    /// The txids in the peer's mempool. Only for a peer whose head says
+    /// `mempool`: an older node closes the connection on this request.
+    pub async fn mempool_ids(&mut self) -> Result<Vec<[u8; 32]>, String> {
+        let bytes = self.request(MEMPOOL, &[], MAX_MEMPOOL_IDS * 32).await?;
+        if bytes.len() % 32 != 0 {
+            return Err("STARK mempool txids length".into());
+        }
+        Ok(bytes
+            .chunks_exact(32)
+            .map(|id| id.try_into().expect("32-byte chunk"))
+            .collect())
+    }
+
+    /// One transaction of the peer's mempool; none once it left. Transport
+    /// authentication is not validation: the caller checks it before keeping
+    /// it, as with blocks.
+    pub async fn get_tx(&mut self, txid: &[u8; 32]) -> Result<Option<Transaction>, String> {
+        let bytes = self.request(GET_TX, txid, MAX_TRANSACTION_BYTES).await?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        let tx = Transaction::decode(&bytes).map_err(err)?;
+        if tx.txid() != *txid {
+            return Err("STARK transaction does not match its txid".into());
+        }
+        Ok(Some(tx))
     }
 
     pub async fn submit_block(&mut self, block: &Block) -> Result<Head, String> {

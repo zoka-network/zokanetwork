@@ -532,6 +532,16 @@ impl Mempool {
     pub fn is_empty(&self) -> bool {
         self.transactions.is_empty()
     }
+    pub fn contains(&self, txid: &[u8; 32]) -> bool {
+        self.transactions.contains_key(txid)
+    }
+    /// The txids it holds, at most `limit`: what a peer asks with `MEMPOOL`.
+    pub fn txids(&self, limit: usize) -> Vec<[u8; 32]> {
+        self.transactions.keys().take(limit).copied().collect()
+    }
+    pub fn get(&self, txid: &[u8; 32]) -> Option<&Transaction> {
+        self.transactions.get(txid)
+    }
     pub fn insert(&mut self, state: &impl LedgerState, tx: Transaction) -> Result<(), String> {
         let size = tx.encode().map_err(err)?.len();
         if self.transactions.contains_key(&tx.txid()) {

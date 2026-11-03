@@ -351,6 +351,7 @@ pub fn router(state: NodeState) -> Router {
             "/transactions",
             post(submit_transaction).layer(DefaultBodyLimit::max(MAX_TRANSACTION_BYTES)),
         )
+        .route("/transactions/:txid", get(transaction_status))
         .route("/mining/template", get(mining_template))
         .route(
             "/blocks",
@@ -434,10 +435,12 @@ impl PublicGate {
         }
     }
 
-    /// One token for `path`: from the shared bucket and, for a scan page,
-    /// from the scans' own.
+    /// One token for `path`: from the shared bucket and, for a scan page or a
+    /// transaction lookup (up to `TX_LOOKUP_BLOCKS` blocks read), from the
+    /// scans' own.
     fn take(&self, path: &str) -> bool {
-        self.bucket.take() && (!matches!(path, "/scan" | "/scan2") || self.scans.take())
+        let heavy = matches!(path, "/scan" | "/scan2") || path.starts_with("/transactions/");
+        self.bucket.take() && (!heavy || self.scans.take())
     }
 }
 
@@ -518,6 +521,7 @@ pub fn public_router(state: NodeState) -> Router {
         .route("/network/history", get(network_history))
         .route("/address/:short", get(public_address_of))
         .route("/checkpoint", get(latest_checkpoint))
+        .route("/transactions/:txid", get(transaction_status))
         .layer(middleware::from_fn_with_state(PublicGate::new(), admit_public))
         .with_state(state)
 }
@@ -645,6 +649,75 @@ async fn block_summary(
                 .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "unknown block height"))?
         };
         summary_response(&state, &block)
+    })
+    .await
+}
+
+/// Canonical blocks searched back from the tip for a confirmed txid: the node
+/// keeps no index of transaction ids. A day of blocks at 120 s.
+pub const TX_LOOKUP_BLOCKS: usize = 720;
+
+/// Where a payment is: in this node's mempool or in one of the last
+/// [`TX_LOOKUP_BLOCKS`] canonical blocks. Nothing about who paid whom. Before
+/// it, a wallet that had just sent could not find its own payment anywhere
+/// (3/11/2026: "not found" for a payment that was waiting in the mempool).
+async fn transaction_status(
+    State(state): State<NodeState>,
+    Path(txid): Path<String>,
+    Extension(permit): Extension<WorkPermit>,
+) -> ApiResult<Response> {
+    let txid = txid.trim().to_ascii_lowercase();
+    let id: [u8; 32] = hex::decode(&txid)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| {
+            ApiError::new(StatusCode::BAD_REQUEST, "a transaction id is 64 hex characters")
+        })?;
+    blocking(permit, move || {
+        let tip = {
+            let _gate = state.gate.lock().map_err(|_| ApiError::internal("node gate poisoned"))?;
+            if state
+                .mempool
+                .lock()
+                .map_err(|_| ApiError::internal("mempool poisoned"))?
+                .contains(&id)
+            {
+                return json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({"txid":txid,"status":"pending"}),
+                );
+            }
+            state.storage.get_chain_height().map_err(ApiError::internal)?
+        };
+        // Block by block, without holding the gate for the whole search: a
+        // reorganization meanwhile can only make this answer stale.
+        for height in (super::GENESIS_HEIGHT..=tip).rev().take(TX_LOOKUP_BLOCKS) {
+            let block = {
+                let _gate = state.gate.lock().map_err(|_| ApiError::internal("node gate poisoned"))?;
+                state
+                    .storage
+                    .get_canonical_block_by_height(height)
+                    .map_err(ApiError::internal)?
+            };
+            let Some(block) = block else { continue };
+            if stark::decode(&block)
+                .map_err(ApiError::internal)?
+                .iter()
+                .any(|tx| tx.txid() == id)
+            {
+                return json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({
+                        "txid":txid,"status":"confirmed","height":height,
+                        "block_hash":block.header.hash,"confirmations":tip - height + 1,
+                    }),
+                );
+            }
+        }
+        Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("not in this node's mempool nor in its last {TX_LOOKUP_BLOCKS} blocks"),
+        ))
     })
     .await
 }
@@ -1752,6 +1825,8 @@ mod tests {
         .await
         .unwrap();
         let encoded_payment = payment.encode().unwrap();
+        let lookup = format!("/transactions/{}", hex::encode(payment.txid()));
+        assert_eq!(get(&app, &lookup).await.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             post(
                 &app,
@@ -1764,6 +1839,8 @@ mod tests {
             StatusCode::ACCEPTED
         );
         assert_eq!(state.mempool.lock().unwrap().len(), 1);
+        // The wallet that just sent finds its payment, waiting for a block.
+        assert_eq!(json(get(&app, &lookup).await).await["status"], "pending");
         assert_eq!(
             post(
                 &app,
@@ -1787,6 +1864,16 @@ mod tests {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert!(state.mempool.lock().unwrap().is_empty());
         assert_eq!(json(get(&app, "/status").await).await["height"], 2);
+        // Mined: found in its block, without an index of transaction ids.
+        let found = json(get(&app, &lookup).await).await;
+        assert_eq!(found["status"], "confirmed");
+        assert_eq!(found["height"], 2);
+        assert_eq!(found["block_hash"], paid.header.hash.as_str());
+        assert_eq!(found["confirmations"], 1);
+        assert_eq!(
+            get(&app, "/transactions/not-a-txid").await.status(),
+            StatusCode::BAD_REQUEST
+        );
         assert_eq!(
             post(
                 &app,
