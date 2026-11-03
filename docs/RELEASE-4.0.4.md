@@ -21,10 +21,31 @@ el soporte móvil del nodo no significa que el APK ya esté publicado.
 
 ## Verificación requerida
 
-- [ ] Compilar Windows desde la fuente actual con `randomx,quantic-pq`.
+- [x] Compilar Windows desde la fuente actual con `randomx,quantic-pq`.
 - [ ] Compilar Linux en el VPS con Debian 11 y comprobar el límite de glibc.
-- [ ] Ejecutar las pruebas del nodo STARK y del pool privado.
+- [x] Ejecutar las pruebas del nodo STARK y del pool privado: 55 + 22 pasan.
 - [ ] Probar los dos paquetes con datos temporales, sin minería.
-- [ ] Verificar el nodo y el manifiesto dentro del MSI de ZSilent 4.0.6.
+- [x] Verificar el nodo y el manifiesto dentro del MSI de ZSilent 4.0.6.
 - [ ] Publicar y descargar otra vez los archivos para verificar sus hashes.
 - [ ] Actualizar y comprobar los enlaces de zoka.network.
+
+## Resultados del 3/11
+
+- Windows: `cargo build --release --offline --locked --features randomx,quantic-pq --bins`.
+  El ZIP extraído pasa todos sus hashes; `status` y `node-id` funcionan en una
+  ruta con espacios; los identificadores se conservan entre corridas. El
+  ejecutable contiene seed3 y las dos IP fijas.
+- Nodo STARK: 55 pruebas pasan, una prueba con Tor externo queda ignorada.
+  Pool privado: 22 pruebas pasan. Registro local: `target/release404-tests.log`.
+- ZSilent: 84 pruebas sin fallas. Se habilitaron la prueba v2 contra un nodo
+  real (3,1 s) y la de Tor contra la testnet (47,8 s, al menos 50 bloques).
+  La prueba heredada de la wallet v1, condicionada a un RPC externo, no se
+  ejecutó. MSI extraído por `msiexec /a`: coinciden nodo, zokahd, manifiesto de
+  tres semillas y Tor con `release-manifest.json`. No se instaló en la PC.
+- Web: siete pruebas y armado de producción aprobados.
+
+| Archivo | SHA-256 |
+| --- | --- |
+| `zoka.exe` | `1351c8e00af1d8cdeb95432345e7e4e09dda162061a461cb3756f5b70454cc87` |
+| `zoka-cli-miner-4.0.4-windows-x64.zip` | `879a95f20c67add9356a5ecd79ad70c17345df7e30a93b194e1703730e888d59` |
+| `ZSilent-Core-4.0.6.msi` | `8e55e5438b2be5b609d8cdf2826e8293b0b9c66493d40d99c100cde43b06a763` |
