@@ -22,7 +22,7 @@ el soporte móvil del nodo no significa que el APK ya esté publicado.
 ## Verificación requerida
 
 - [x] Compilar Windows desde la fuente actual con `randomx,quantic-pq`.
-- [ ] Compilar Linux en el VPS con Debian 11 y comprobar el límite de glibc.
+- [x] Compilar Linux en el VPS con Debian 11 y comprobar el límite de glibc.
 - [x] Ejecutar las pruebas del nodo STARK y del pool privado: 55 + 22 pasan.
 - [ ] Probar los dos paquetes con datos temporales, sin minería.
 - [x] Verificar el nodo y el manifiesto dentro del MSI de ZSilent 4.0.6.
@@ -35,6 +35,9 @@ el soporte móvil del nodo no significa que el APK ya esté publicado.
   El ZIP extraído pasa todos sus hashes; `status` y `node-id` funcionan en una
   ruta con espacios; los identificadores se conservan entre corridas. El
   ejecutable contiene seed3 y las dos IP fijas.
+- Linux: compilado en Debian 11 dentro del VPS 2, sin WSL (24 min 31 s).
+  El binario requiere glibc 2.30. Se corrigió el empaquetador para aceptar
+  `Cargo.toml` con finales CRLF; no cambió la fuente del ejecutable.
 - Nodo STARK: 55 pruebas pasan, una prueba con Tor externo queda ignorada.
   Pool privado: 22 pruebas pasan. Registro local: `target/release404-tests.log`.
 - ZSilent: 84 pruebas sin fallas. Se habilitaron la prueba v2 contra un nodo
@@ -48,4 +51,5 @@ el soporte móvil del nodo no significa que el APK ya esté publicado.
 | --- | --- |
 | `zoka.exe` | `1351c8e00af1d8cdeb95432345e7e4e09dda162061a461cb3756f5b70454cc87` |
 | `zoka-cli-miner-4.0.4-windows-x64.zip` | `879a95f20c67add9356a5ecd79ad70c17345df7e30a93b194e1703730e888d59` |
+| `zoka-cli-miner-4.0.4-linux-x64.tar.gz` | `94373ee629ae9aa4492ae35ffecd1130e284e4120934b8a3c135953d9fced645` |
 | `ZSilent-Core-4.0.6.msi` | `8e55e5438b2be5b609d8cdf2826e8293b0b9c66493d40d99c100cde43b06a763` |
