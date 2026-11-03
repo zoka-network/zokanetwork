@@ -17,7 +17,9 @@ ZOKA="$2"
 OUT="$3"
 MAX_GLIBC="2.31"
 
-version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$REPO/Cargo.toml" | head -1)"
+# Un archivo exportado desde Windows puede conservar CRLF. La versión no
+# incluye ese CR, igual que al leerla en el empaquetador de PowerShell.
+version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$REPO/Cargo.toml" | tr -d '\r' | head -1)"
 [ -n "$version" ] || { echo "Could not read the version from Cargo.toml" >&2; exit 1; }
 
 reported="$("$ZOKA" --version)"
