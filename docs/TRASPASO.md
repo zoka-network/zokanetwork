@@ -4,7 +4,40 @@ Registro vivo para que otro agente (Codex, Claude) siga donde quedó este. Cada
 paso se marca al terminarlo, con su commit; lo que queda a medias dice en qué
 punto exacto está. Lo histórico está en [HOJA-DE-RUTA-CLAUDE.md](../HOJA-DE-RUTA-CLAUDE.md).
 
-## Estado al 30/10/2026, mediodía (Claude)
+## Estado al 3/11/2026, retomado por Codex
+
+El plan vigente es `C:/Users/mderramus/.claude/plans/sprightly-swimming-papert.md`.
+Orden acordado: nodo/minero 4.0.4 y ZSilent 4.0.6, ZKAPriv 3.0, vigilante y
+mejoras de red/privacidad. El usuario autorizó publicar las versiones cuando
+pasen las pruebas y los hashes coincidan; los anuncios de Discord se muestran
+antes. No instalar ZSilent sin que lo pida.
+
+- **Infraestructura:** seed2, explorador, túnel y .onion en `13.140.206.10`;
+  seed3 y compilación Linux en `13.140.206.11`. SSH por 443 con la identidad
+  `~/.ssh/zoka_vps` y `~/.ssh/known_hosts_zoka_vps`. No leer claves ni archivos
+  de credenciales. Las claves de checkpoints siguen únicamente en la PC.
+- **PC libre:** nada de WSL ni servicios/minería iniciados en segundo plano.
+  Windows se compila acá por autorización del usuario; Linux y el motor
+  Android en VPS. No levantar el explorador local: comparte identidad con seed2.
+- **Etapa 1 en curso:** rama `red-sin-dependencias`, desde `1af3e9af`.
+  Guías y notas corregidas en `ced0cfce`; ver [RELEASE-4.0.4.md](RELEASE-4.0.4.md).
+  Se integró el registro de `main` sin perder su historial.
+- El ZIP anterior quedó conservado en
+  `target/cli-miner/4.0.4-descartado-sin-seed3`.
+- **Linux:** fuente archivada de `ced0cfce` en `/root/release404-src` del VPS 2;
+  servicio temporal `zoka-release404-build`, registro `/root/release404-build.log`,
+  salida `/root/release404-artifacts`. Usa Debian 11 aislado para compatibilidad
+  glibc. No modifica el servicio semilla.
+- **ZSilent:** worktree `target/zsilent-4.0.6`, rama `release-4.0.6` desde
+  `90e9a6e`. El `ZSilentAppState.kt` modificado en la copia habitual queda intacto.
+- **Web:** versiones preparadas 4.0.6/4.0.4; las siete pruebas y el build pasan.
+  Todavía sin desplegar.
+- **ZKAPriv:** recuperado el informe del agente de Claude en
+  `target/zkapriv-informe-claude-3nov.json`. Antes del APK faltan conectar la
+  confirmación HTTPS del checkpoint, mostrar verificación/pares, revisar los
+  cambios locales y recompilar ambos ABI. La prueba de envíos la hace el usuario.
+
+## Estado histórico al 30/10/2026, mediodía (Claude)
 
 - **Testnet v2 en marcha.** Bloque 1 `69249437…`, cadena `zoka-quantic-testnet-v2`.
   La semilla es la PC del usuario: ZSilent 4.0.4 (nodo 4.0.2, API 127.0.0.1:9140,
