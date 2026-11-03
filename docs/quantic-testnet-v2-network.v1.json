@@ -3,7 +3,7 @@
   "status": "active",
   "chain_id": "zoka-quantic-testnet-v2",
   "alpn": "/zoka/quantic-stark/2",
-  "transport": "iroh QUIC with mandatory X25519MLKEM768 TLS and an ML-DSA-65 server signature bound to each connection. Relays and address lookup by n0, so no node needs an open port.",
+  "transport": "iroh QUIC with mandatory X25519MLKEM768 TLS and an ML-DSA-65 server signature bound to each connection. Relays and address lookup by n0, so no node needs an open port; seeds with a public IP and a fixed UDP port (--bind) also list it, and are reached without n0.",
   "seed_nodes": [
     {
       "label": "seed1",
@@ -11,16 +11,26 @@
       "endpoint_id": "e3bf05e22b0f491d74e07028ffa02db833bc9d06f441acb820cbf723c7eb70c4",
       "ml_dsa_key_id": "2a29953c90132b1067d1325d45534132b8acac43805479b33cfd1841afe822f9",
       "status": "active",
-      "note": "The team's PC: the first seed and the checkpoint authority."
+      "note": "The team's PC: the first seed and the checkpoint authority. Online only while ZSilent runs there."
     },
     {
       "label": "seed2",
       "operator": "Zoka Network",
       "endpoint_id": "8aa55aa80f94d0c87b9e5afa46286b22fd5c7f81299dc405cb23758a9393d54c",
       "ml_dsa_key_id": "99f5cabd3528a7ee966bd16de3004b34054b36b0db59f2098c0915646f15b729",
+      "direct_addresses": ["13.140.206.10:4433"],
       "stream_address": "u2soz3q63237afuccfxf3jzytpljpbxpvyzt3jumrr45ukzowdakayqd.onion:9444",
       "status": "active",
-      "note": "The explorer node, on the team's PC, also behind an onion service: the seed that nodes in Tor mode (--tor) dial."
+      "note": "The explorer node, on a server (Contabo, EU) since 2026-11-03, also behind an onion service: the seed that nodes in Tor mode (--tor) dial."
+    },
+    {
+      "label": "seed3",
+      "operator": "Zoka Network",
+      "endpoint_id": "ce70a5606d0307edf2d9528192b6e316217ecedf5ce00dcea585767240c5dd8d",
+      "ml_dsa_key_id": "83b4dd369c89b73359c69e54345c6d052ad1d63527730b0ae7ca091ce263d3e8",
+      "direct_addresses": ["13.140.206.11:4433"],
+      "status": "active",
+      "note": "A server (Contabo, EU) since 2026-11-03: a seed that serves the chain without mining."
     }
   ],
   "notes": [

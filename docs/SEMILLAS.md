@@ -20,20 +20,33 @@ Sin `direct_addresses`, la IP la resuelve el servicio de direcciones de n0 y,
 si el nodo está detrás de un router, se llega por los relays de n0. Una
 semilla con IP pública y `--bind` (ver abajo) se alcanza directo, sin n0.
 
-## Por qué hace falta una fuera de la PC
+## Dónde están (3/11/2026)
 
-Al 3/11/2026 hay dos semillas y **las dos están en la PC del usuario**:
+- `seed1`: el nodo de ZSilent en la PC del usuario, que además firma los
+  checkpoints. Solo está en línea mientras ZSilent corre.
+- `seed2`: el nodo del explorador, mudado el 3/11 de la PC a un VPS de Contabo
+  (13.140.206.10:4433) con la misma identidad y la misma .onion
+  (`stream_address`, la del Modo Tor). En el mismo VPS corre el túnel de
+  api.zokascan.cc.
+- `seed3`: VPS de Contabo (13.140.206.11:4433), identidad nueva.
 
-- `seed1`: el nodo de ZSilent, que además firma los checkpoints;
-- `seed2`: el nodo del explorador, también detrás de la .onion
-  (`stream_address`), la del Modo Tor.
+Las dos de VPS corren `scripts/vps/semilla-vps.sh` y no minan (Contabo no lo
+permite). Probado el 3/11: un nodo sin n0 (`--relay none`) con un manifiesto
+que solo tiene una de ellas por su IP se conecta y baja la cadena, y un nodo en
+Modo Tor llega a `seed2` por la .onion. Los dos VPS están en el mismo centro de
+datos: una semilla de otro operador y otra red sigue haciendo falta.
 
-Si la PC se apaga, un nodo **nuevo** no encuentra la red, y en Modo Tor no hay
-a dónde llegar. Los nodos que ya corrieron recuerdan sus pares (el `PeerBook`
-se guarda en su base) y se reconectan entre ellos. El 1/11 se cayó XMRig de la
-PC y la cadena siguió dos días gracias a un minero de afuera; cuando ese minero
-paró, quedó 4 horas sin bloques. Una semilla de otro operador, en otra red,
-es lo que hace que la testnet no dependa de una sola computadora.
+Sin mineros, la testnet no produce bloques: desde el 3/11 la PC mina solo
+cuando el usuario quiere.
+
+## Por qué hacía falta una fuera de la PC
+
+Hasta el 3/11 las dos semillas estaban en la PC. Si la PC se apagaba, un nodo
+**nuevo** no encontraba la red, y en Modo Tor no había a dónde llegar. Los
+nodos que ya corrieron recuerdan sus pares (el `PeerBook` se guarda en su base)
+y se reconectan entre ellos. El 1/11 se cayó XMRig de la PC y la cadena siguió
+dos días gracias a un minero de afuera; cuando ese minero paró, quedó 4 horas
+sin bloques.
 
 Una semilla no puede inventar bloques, porque cada nodo valida todo. Lo que sí
 podría hacer es aislar a un nodo nuevo, sin pasarle otros pares. Por eso

@@ -651,14 +651,21 @@ mod tests {
         assert_eq!(builtin.chain_id, P.chain_id);
         // Launched: the team's PC is seed1, pinned by id and key alone (n0
         // address lookup finds the rest); seed2, the explorer node, also
-        // carries the onion address that Tor mode dials.
+        // carries the onion address that Tor mode dials. seed2 and seed3 are
+        // servers with a fixed UDP port, reached by IP without n0.
         let seeds = builtin.seeds().unwrap();
-        assert_eq!(seeds.len(), 2);
+        assert_eq!(seeds.len(), 3);
         assert_eq!(
             seeds[0].endpoint_addr.id.to_string(),
             "e3bf05e22b0f491d74e07028ffa02db833bc9d06f441acb820cbf723c7eb70c4"
         );
         assert!(seeds[0].endpoint_addr.addrs.is_empty());
+        for (seed, ip) in [(&seeds[1], "13.140.206.10:4433"), (&seeds[2], "13.140.206.11:4433")] {
+            assert!(seed
+                .endpoint_addr
+                .addrs
+                .contains(&iroh::TransportAddr::Ip(ip.parse().unwrap())));
+        }
         let onion: Vec<_> = seeds[1]
             .endpoint_addr
             .addrs
