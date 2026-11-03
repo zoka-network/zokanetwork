@@ -21,7 +21,7 @@ minar con XMRig y muestran tu saldo.
 
 | Archivo | Para qué |
 | --- | --- |
-| `zoka` / `zoka.exe` | El nodo y la wallet de Zoka Quantic (versión 4.0.3) |
+| `zoka` / `zoka.exe` | El nodo y la wallet de Zoka Quantic (versión 4.0.4) |
 | `zoka-miner.ps1` / `zoka-miner.sh` | Un script para cada paso de abajo |
 | `*.cmd` (Windows) | Accesos de doble clic a ese script |
 | `SHA256SUMS.txt` | Los hashes de todos los archivos del paquete |
@@ -43,12 +43,12 @@ Compará el SHA-256 del archivo con el que está publicado al lado, en el releas
 
 ```powershell
 # Windows (PowerShell)
-Get-FileHash .\zoka-cli-miner-4.0.3-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\zoka-cli-miner-4.0.4-windows-x64.zip -Algorithm SHA256
 ```
 
 ```bash
 # Linux
-sha256sum zoka-cli-miner-4.0.3-linux-x64.tar.gz
+sha256sum zoka-cli-miner-4.0.4-linux-x64.tar.gz
 ```
 
 Si no coinciden, no lo ejecutes: bajalo de nuevo del release oficial.
@@ -57,7 +57,7 @@ Si no coinciden, no lo ejecutes: bajalo de nuevo del release oficial.
 
 - **Windows:** descomprimí el paquete donde quieras (por ejemplo, en Documentos)
   y hacé doble clic en **`1-create-wallet.cmd`**.
-- **Linux:** `tar xzf zoka-cli-miner-4.0.3-linux-x64.tar.gz`, entrá a la carpeta
+- **Linux:** `tar xzf zoka-cli-miner-4.0.4-linux-x64.tar.gz`, entrá a la carpeta
   con `cd` y ejecutá `./zoka-miner.sh create-wallet`.
 
 Elegí una contraseña (8 caracteres como mínimo). Después vas a ver **24
@@ -99,6 +99,10 @@ publica tu dirección corta, así cualquiera puede pagarte con ella, y arranca
 XMRig. XMRig usa todos los hilos del procesador menos uno. Para cambiarlo:
 `zoka-miner.ps1 mine -Threads 2` (Windows) o `./zoka-miner.sh mine --threads 2`
 (Linux). **Ctrl+C** detiene los dos.
+
+El script vigila lo que arrancó: si XMRig se cierra, lo vuelve a abrir a los 10
+segundos, y si el nodo se detiene, levanta los dos a los 15 segundos. Solo
+Ctrl+C (o cerrar la ventana) detiene la minería.
 
 Si el script no encuentra XMRig, deja el nodo esperando y te muestra el comando
 para arrancarlo vos en otra ventana:
@@ -150,6 +154,23 @@ la red.
 
 Si Tor no está corriendo, el nodo no arranca: nunca se conecta directo en su
 lugar.
+
+## Que mine al prender la computadora
+
+Para que la minería vuelva sola después de un reinicio:
+
+- **Windows:** doble clic en **`start-with-windows.cmd`**. Agrega un acceso
+  directo a tu carpeta Inicio que abre la minería minimizada cada vez que
+  iniciás sesión, sin pedir contraseña. **`dont-start-with-windows.cmd`** lo
+  saca.
+- **Linux:** `./zoka-miner.sh autostart` instala un servicio de usuario de
+  systemd que arranca con el sistema y se reinicia si se detiene.
+  `./zoka-miner.sh autostart --off` lo saca, y
+  `journalctl --user -u zoka-miner-miner.service -f` muestra lo que hace. En un
+  servidor donde nadie inicia sesión, corré una vez
+  `sudo loginctl enable-linger $USER` para que funcione desde el arranque.
+
+Los dos guardan las opciones que les pases (`-Threads 2`, `--threads 2`, `-Tor …`).
 
 ## Ayudá a la red: dejá un nodo prendido
 

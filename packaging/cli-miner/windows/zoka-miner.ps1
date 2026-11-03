@@ -11,11 +11,14 @@
 # En la testnet el nodo no mina solo: mina XMRig a través de su Stratum. Si
 # XMRig está al lado de este script, "mine" lo arranca.
 #
-# Uso: zoka-miner.ps1 <create-wallet | restore-wallet | address | view-key | mine | balance | status | node-id> [-Wallet nombre] [-Threads n] [-StratumPort n] [-Xmrig ruta]
+# "mine" queda vigilado: si XMRig se cierra vuelve a los 10 s, y si se cae el
+# nodo se rearman los dos. "autostart" lo hace arrancar al iniciar sesión.
+#
+# Uso: zoka-miner.ps1 <create-wallet | restore-wallet | address | view-key | mine | autostart [-Off] | balance | status | node-id> [-Wallet nombre] [-Threads n] [-StratumPort n] [-Xmrig ruta]
 
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("create-wallet", "restore-wallet", "address", "view-key", "mine", "balance", "status", "node-id", "help")]
+    [ValidateSet("create-wallet", "restore-wallet", "address", "view-key", "mine", "autostart", "balance", "status", "node-id", "help")]
     [string]$Command = "help",
     [string]$Wallet = "miner",
     [int]$Threads = 0,
@@ -23,7 +26,9 @@ param(
     [string]$Xmrig = "",
     # Modo Tor (opcional): el SOCKS de un Tor que ya corre, 127.0.0.1:9150 el
     # de Tor Browser o 127.0.0.1:9050 el de tor.exe.
-    [string]$Tor = ""
+    [string]$Tor = "",
+    # Con "autostart": deja de arrancar con Windows.
+    [switch]$Off
 )
 
 $ErrorActionPreference = "Stop"
@@ -36,6 +41,8 @@ $Descriptor = Join-Path $NodeDir "peer.json"
 $ApiBind = "127.0.0.1:9180"
 $Api = "http://$ApiBind"
 $Stratum = "127.0.0.1:$StratumPort"
+$NodeLog = Join-Path $V2 "node.log"
+$NodeErrLog = Join-Path $V2 "node-errors.log"
 
 New-Item -ItemType Directory -Force -Path $NodeDir | Out-Null
 
@@ -107,6 +114,31 @@ function Join-Arguments([string[]]$Values) {
     return ($Values | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join " "
 }
 
+function Start-NodeProcess([string]$address) {
+    # El nodo nunca pisa un archivo: el descriptor de la corrida anterior se borra.
+    if (Test-Path -LiteralPath $Descriptor) { Remove-Item -LiteralPath $Descriptor }
+    $argv = @("quantic-pq-node", "serve", "--network", $Network,
+        "--db", (Join-Path $NodeDir "db"), "--identity", (Join-Path $NodeDir "node.identity"),
+        "--api", $ApiBind, "--descriptor-out", $Descriptor, "--stratum", $Stratum, "--mine-to", $address)
+    if ($Tor) { $argv += @("--tor", $Tor) }
+    $env:ZOKA_PQ_PASSWORD = Get-NodeSecret
+    try {
+        return Start-Process -FilePath $Zoka -ArgumentList (Join-Arguments $argv) -NoNewWindow -PassThru `
+            -RedirectStandardOutput $NodeLog -RedirectStandardError $NodeErrLog
+    } finally {
+        Remove-Item Env:ZOKA_PQ_PASSWORD -ErrorAction SilentlyContinue
+    }
+}
+
+function Stop-NodeProcess($node) {
+    # Ctrl+C también le llega al nodo, que cierra su base solo; si no termina, se corta.
+    if ($node -and -not $node.HasExited -and -not $node.WaitForExit(15000)) {
+        Stop-Process -Id $node.Id -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Mina vigilado: si XMRig se cierra, vuelve a los 10 s; si se cae el nodo, se
+# rearman los dos a los 15 s. Solo Ctrl+C (o cerrar la ventana) lo para.
 function Start-Mining {
     if (-not (Test-WalletExists)) {
         throw "There is no wallet '$Wallet' yet. Run 1-create-wallet.cmd (or restore-wallet.cmd) first."
@@ -117,66 +149,113 @@ function Start-Mining {
     $cores = [Environment]::ProcessorCount
     if ($Threads -le 0) { $Threads = [Math]::Max(1, $cores - 1) }
     $miner = Find-Xmrig
+    if ($Tor) { Say "Tor mode: the node connects only through Tor at $Tor, to the network's onion seeds." "Cyan" }
 
-    # El nodo nunca pisa un archivo: el descriptor de la corrida anterior se borra.
-    if (Test-Path -LiteralPath $Descriptor) { Remove-Item -LiteralPath $Descriptor }
-    $log = Join-Path $V2 "node.log"
-    $errLog = Join-Path $V2 "node-errors.log"
-    $argv = @("quantic-pq-node", "serve", "--network", $Network,
-        "--db", (Join-Path $NodeDir "db"), "--identity", (Join-Path $NodeDir "node.identity"),
-        "--api", $ApiBind, "--descriptor-out", $Descriptor, "--stratum", $Stratum, "--mine-to", $address)
-    if ($Tor) {
-        $argv += @("--tor", $Tor)
-        Say "Tor mode: the node connects only through Tor at $Tor, to the network's onion seeds." "Cyan"
-    }
-
-    $env:ZOKA_PQ_PASSWORD = Get-NodeSecret
-    try {
-        $node = Start-Process -FilePath $Zoka -ArgumentList (Join-Arguments $argv) -NoNewWindow -PassThru `
-            -RedirectStandardOutput $log -RedirectStandardError $errLog
-    } finally {
-        Remove-Item Env:ZOKA_PQ_PASSWORD -ErrorAction SilentlyContinue
-    }
-    try {
-        Say "Starting the node and joining the network..."
-        $deadline = (Get-Date).AddMinutes(3)
-        while (-not (Test-NodeOnline)) {
-            if ($node.HasExited) { throw "The node stopped. Details in $errLog" }
-            if ((Get-Date) -gt $deadline) { throw "The node did not start in 3 minutes. Details in $errLog" }
-            Start-Sleep -Seconds 2
-        }
-        # Publica la dirección corta en la red, así cualquiera puede pagarte con ella.
-        & $Zoka quantic-pq-wallet publish-address --network $Network --dir $V2 --name $Wallet --api $Api 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { Say "Your short address could not be published yet; the full one always works." "Yellow" }
-
-        Say ""
-        Say "Mining rewards go to wallet '$Wallet': $short" "Cyan"
-        Say "The node's log is $log" "Cyan"
-        if ($miner) {
-            Say "Mining with XMRig, $Threads of $cores CPU threads (-Threads n changes it). Ctrl+C stops both." "Cyan"
-            Say ""
-            & $miner -o $Stratum -u $Wallet -p x -a rx/0 -t $Threads
-            Say "XMRig stopped (exit code $LASTEXITCODE)." "Yellow"
-        } else {
-            Say "XMRig was not found next to this script, so the node is waiting for miners. Start it with:" "Yellow"
-            Say "  xmrig -o $Stratum -u $Wallet -p x -a rx/0 -t $Threads" "Yellow"
-            Say "Ctrl+C stops the node." "Cyan"
-            Say ""
-            $shown = 0
-            while (-not $node.HasExited) {
+    $round = 0
+    $xmrigProcess = $null
+    while ($true) {
+        $round++
+        $node = Start-NodeProcess $address
+        try {
+            Say "Starting the node and joining the network..."
+            $deadline = (Get-Date).AddMinutes(3)
+            $online = $false
+            while (-not $online) {
+                $online = Test-NodeOnline
+                if ($online) { break }
+                if ($node.HasExited -or (Get-Date) -gt $deadline) {
+                    # La primera vez es un error para ver; después, se reintenta solo.
+                    if ($round -eq 1) { throw "The node did not start. Details in $NodeErrLog" }
+                    break
+                }
                 Start-Sleep -Seconds 2
-                $lines = @(Get-Content -LiteralPath $log -ErrorAction SilentlyContinue)
-                if ($lines.Count -gt $shown) { $lines[$shown..($lines.Count - 1)] | ForEach-Object { Say $_ }; $shown = $lines.Count }
             }
-            Say "The node stopped. Details in $errLog" "Yellow"
+            if ($online) {
+                # Publica la dirección corta en la red, así cualquiera puede pagarte con ella.
+                & $Zoka quantic-pq-wallet publish-address --network $Network --dir $V2 --name $Wallet --api $Api 2>&1 | Out-Null
+                if ($LASTEXITCODE -ne 0 -and $round -eq 1) { Say "Your short address could not be published yet; the full one always works." "Yellow" }
+                if ($round -eq 1) {
+                    Say ""
+                    Say "Mining rewards go to wallet '$Wallet': $short" "Cyan"
+                    Say "The node's log is $NodeLog" "Cyan"
+                }
+                if ($miner) {
+                    if ($round -eq 1) {
+                        Say "Mining with XMRig, $Threads of $cores CPU threads (-Threads n changes it). Ctrl+C stops both." "Cyan"
+                        Say ""
+                    }
+                    # XMRig no termina si el nodo se cae (reintenta el Stratum
+                    # para siempre): corre aparte, en esta misma consola, y se
+                    # vigilan los dos.
+                    while (-not $node.HasExited) {
+                        $xmrigProcess = Start-Process -FilePath $miner -NoNewWindow -PassThru `
+                            -ArgumentList (Join-Arguments @("-o", $Stratum, "-u", $Wallet, "-p", "x", "-a", "rx/0", "-t", "$Threads"))
+                        $null = $xmrigProcess.Handle  # sin esto, ExitCode queda vacío
+                        while (-not $node.HasExited -and -not $xmrigProcess.HasExited) { Start-Sleep -Seconds 2 }
+                        if ($node.HasExited) { break }
+                        Say "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') XMRig stopped (exit code $($xmrigProcess.ExitCode)). Starting it again in 10 s; Ctrl+C stops everything." "Yellow"
+                        Start-Sleep -Seconds 10
+                    }
+                } else {
+                    if ($round -eq 1) {
+                        Say "XMRig was not found next to this script, so the node is waiting for miners. Start it with:" "Yellow"
+                        Say "  xmrig -o $Stratum -u $Wallet -p x -a rx/0 -t $Threads" "Yellow"
+                        Say "Ctrl+C stops the node." "Cyan"
+                        Say ""
+                    }
+                    $shown = 0
+                    while (-not $node.HasExited) {
+                        Start-Sleep -Seconds 2
+                        $lines = @(Get-Content -LiteralPath $NodeLog -ErrorAction SilentlyContinue)
+                        if ($lines.Count -gt $shown) { $lines[$shown..($lines.Count - 1)] | ForEach-Object { Say $_ }; $shown = $lines.Count }
+                    }
+                }
+            }
+            Say "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') The node stopped. Details in $NodeErrLog. Starting it again in 15 s; Ctrl+C stops." "Yellow"
+        } finally {
+            if ($xmrigProcess -and -not $xmrigProcess.HasExited) {
+                Stop-Process -Id $xmrigProcess.Id -Force -ErrorAction SilentlyContinue
+            }
+            $xmrigProcess = $null
+            Stop-NodeProcess $node
         }
-    } finally {
-        # Ctrl+C también le llega al nodo, que cierra su base solo; si no termina, se corta.
-        if (-not $node.HasExited -and -not $node.WaitForExit(15000)) {
-            Stop-Process -Id $node.Id -Force -ErrorAction SilentlyContinue
-        }
-        Say "Node stopped."
+        Start-Sleep -Seconds 15
     }
+}
+
+# Arranque con Windows: un acceso directo en la carpeta Inicio de este usuario
+# que abre "mine" minimizado al iniciar sesión, con las mismas opciones.
+function Set-Autostart([bool]$On) {
+    $startup = [Environment]::GetFolderPath("Startup")
+    $link = Join-Path $startup "Zoka CLI miner ($Wallet).lnk"
+    if (-not $On) {
+        if (Test-Path -LiteralPath $link) {
+            Remove-Item -LiteralPath $link
+            Say "Mining no longer starts with Windows (wallet '$Wallet')." "Cyan"
+        } else {
+            Say "Mining was not set to start with Windows for wallet '$Wallet'." "Cyan"
+        }
+        return
+    }
+    if (-not (Test-WalletExists)) {
+        throw "There is no wallet '$Wallet' yet. Run 1-create-wallet.cmd (or restore-wallet.cmd) first."
+    }
+    $mineArgs = @("mine", "-Wallet", $Wallet)
+    if ($Threads -gt 0) { $mineArgs += @("-Threads", "$Threads") }
+    if ($StratumPort -ne 3333) { $mineArgs += @("-StratumPort", "$StratumPort") }
+    if ($Xmrig) { $mineArgs += @("-Xmrig", (Resolve-Path -LiteralPath $Xmrig).Path) }
+    if ($Tor) { $mineArgs += @("-Tor", $Tor) }
+    $shell = New-Object -ComObject WScript.Shell
+    $lnk = $shell.CreateShortcut($link)
+    $lnk.TargetPath = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $lnk.Arguments = "-NoProfile -ExecutionPolicy Bypass -File " + (Join-Arguments (@($PSCommandPath) + $mineArgs))
+    $lnk.WorkingDirectory = $Root
+    $lnk.WindowStyle = 7  # minimizada
+    $lnk.Description = "Zoka Quantic CLI miner: mine with wallet '$Wallet'"
+    $lnk.Save()
+    Say "Mining now starts with Windows, minimized, when you sign in (wallet '$Wallet')." "Cyan"
+    Say "It needs no password. To stop it from starting: dont-start-with-windows.cmd" "Cyan"
+    Say "Shortcut: $link"
 }
 
 switch ($Command) {
@@ -224,6 +303,7 @@ switch ($Command) {
         if ($LASTEXITCODE -ne 0) { throw "Could not read the view key." }
     }
     "mine" { Start-Mining }
+    "autostart" { Set-Autostart (-not $Off) }
     "balance" {
         if (-not (Test-WalletExists)) { throw "There is no wallet '$Wallet' yet." }
         # Con el nodo andando, la copia de la wallet se pone al día con él antes de contar.
@@ -264,7 +344,8 @@ switch ($Command) {
         Say "  restore-wallet  a wallet from its 24 words"
         Say "  address         the address you share to get paid"
         Say "  view-key        a key that shows your balance (zokascan.cc/wallet) and cannot spend"
-        Say "  mine            run the node, and XMRig if it is next to this script (-Threads n)"
+        Say "  mine            run the node, and XMRig if it is next to this script (-Threads n); restarts them if they stop"
+        Say "  autostart       start mining when you sign in to Windows (autostart -Off undoes it)"
         Say "  balance         your balance"
         Say "  status          height, peers and miners"
         Say "  node-id         this node's public ids, to offer it as a seed"
