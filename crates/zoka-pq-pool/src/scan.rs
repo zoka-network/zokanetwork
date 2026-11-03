@@ -134,6 +134,12 @@ pub struct ScanBlock2 {
     /// What a wallet checks the block against the last one it read with, to
     /// notice that the chain moved to another branch.
     pub prev_hash: String,
+    /// The rest of the header: with these a wallet recomputes the block's
+    /// hash ([`crate::commitment::block_hash`]) and checks the state it
+    /// rebuilt against `state_root` ([`crate::commitment::state_root`]).
+    pub merkle_root: String,
+    pub state_root: String,
+    pub nonce: u64,
     pub timestamp: u64,
     pub transactions: Vec<ScanTransaction2>,
 }
@@ -153,9 +159,9 @@ impl ScanBlock2 {
 }
 
 /// The page a node serves at `/scan2`: a [`ScanPage`] with each block's
-/// parent and each transaction's nullifiers. Enough for a light wallet
-/// ([`crate::light::LightWallet`]) to rebuild the note tree and spend, and
-/// still nothing that says whose wallet asks.
+/// header and each transaction's nullifiers. Enough for a light wallet
+/// ([`crate::light::LightWallet`]) to rebuild the note tree, check it against
+/// every header and spend, and still nothing that says whose wallet asks.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScanPage2 {
     pub network: u8,

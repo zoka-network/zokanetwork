@@ -1,6 +1,7 @@
 //! Private, hash-based transfer proofs. The public statement is verified along
 //! with the proof; no host-side witness check substitutes for AIR constraints.
 #![forbid(unsafe_code)]
+pub mod commitment;
 pub mod crypto;
 pub mod ledger;
 pub mod light;

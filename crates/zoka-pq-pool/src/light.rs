@@ -8,6 +8,7 @@
 //! does; a payment built on a wrong tree is refused by the network, never
 //! accepted.
 use crate::{
+    commitment::{accumulate, block_hash, state_root, Committed},
     crypto::Digest,
     ledger::{conventional_fee, replay_effects, Ledger, LedgerState, MAX_BLOCK_TRANSACTIONS},
     model::{Input, MerklePath, Note, MAX_INPUTS},
@@ -17,7 +18,7 @@ use crate::{
     Error,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// Blocks this far under the tip are taken as final: the wallet keeps a copy
 /// of its state there to go back to if the chain moves to another branch.
@@ -26,6 +27,8 @@ pub const SETTLE_DEPTH: u32 = 100;
 const SETTLE_STEP: u32 = 100;
 /// A payment can be mined for this many blocks after the one it was built on.
 pub const PAYMENT_LIFETIME: u32 = 20;
+/// Hashes of the last blocks read, to confirm a checkpoint at any of them.
+const RECENT_HASHES: usize = 1024;
 
 /// A note the wallet received, spent or not.
 #[derive(Clone, Serialize, Deserialize)]
@@ -85,6 +88,9 @@ pub struct LightBalance {
     pub max_sendable_atoms: u64,
     pub notes: usize,
     pub pending: bool,
+    /// The highest block confirmed by a checkpoint the team signed (0 if
+    /// none yet): up to there, what the wallet read is the chain.
+    pub verified: u32,
 }
 
 /// What a block left: the part a reorganisation takes back.
@@ -93,6 +99,10 @@ struct State {
     ledger: Ledger,
     /// The hash of the last block read.
     hash: String,
+    /// The nullifier accumulator its header commits to.
+    accumulator: [u8; 32],
+    /// The last blocks' hashes, oldest first.
+    hashes: VecDeque<(u32, String)>,
     notes: Vec<OwnedNote>,
     history: Vec<Movement>,
 }
@@ -101,6 +111,8 @@ impl State {
         Ok(Self {
             ledger: Ledger::new(network)?,
             hash: String::new(),
+            accumulator: [0; 32],
+            hashes: VecDeque::new(),
             notes: Vec::new(),
             history: Vec::new(),
         })
@@ -124,6 +136,8 @@ pub struct LightWallet {
     /// A copy taken near the tip, waiting to become the settled one.
     recent: Option<State>,
     pending: Option<Pending>,
+    /// See [`LightBalance::verified`].
+    verified: u32,
 }
 
 impl LightWallet {
@@ -136,6 +150,7 @@ impl LightWallet {
             settled: None,
             recent: None,
             pending: None,
+            verified: 0,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
@@ -182,6 +197,11 @@ impl LightWallet {
     /// Read a page that starts at [`Self::next`]. If the chain moved to
     /// another branch, the wallet goes back to its last settled copy and
     /// the rest of the page is dropped: read again from [`Self::next`].
+    ///
+    /// Every block is checked against its header (the state it commits to
+    /// and its hash): a page that drops or forges an output is refused. A
+    /// coinbase output joins the tree only when it matures, so hiding one is
+    /// noticed then; until then it cannot be spent anyway.
     pub fn add_page(&mut self, account: &Account, page: &ScanPage2) -> Result<(), Error> {
         if page.network != self.network || account.network != self.network {
             return Err(Error::Network);
@@ -235,7 +255,34 @@ impl LightWallet {
             Some(settled) => settled.clone(),
             None => State::new(self.network)?,
         };
+        self.verified = self.verified.min(self.height());
         Ok(())
+    }
+
+    /// Check a checkpoint, whose signature the caller verified, against the
+    /// blocks read: `Ok(true)` if the wallet has that block with that hash,
+    /// `Ok(false)` if it cannot tell yet (above what it read, or too old),
+    /// and an error if it read another block there: whoever served the pages
+    /// served a chain the team did not sign. The wallet then starts over.
+    pub fn confirm_checkpoint(&mut self, height: u32, hash: &str) -> Result<bool, Error> {
+        let Some((_, read)) = self.current.hashes.iter().find(|(h, _)| *h == height) else {
+            return Ok(false);
+        };
+        if read != hash {
+            self.settled = None;
+            self.rewind()?;
+            self.verified = 0;
+            return Err(Error::Ledger(
+                "the pages do not match the chain the team signed: read again from another source",
+            ));
+        }
+        self.verified = self.verified.max(height);
+        Ok(true)
+    }
+
+    /// See [`LightBalance::verified`].
+    pub fn verified(&self) -> u32 {
+        self.verified
     }
 
     /// `block` passed [`check_shape`].
@@ -337,6 +384,43 @@ impl LightWallet {
         for (at, index) in tracking.found {
             state.notes[at].index = Some(index);
         }
+        // The page has to be its block: the state rebuilt from it is the
+        // one the header commits to, and the header is the one hashed.
+        let spent: BTreeSet<Digest> = transfers
+            .iter()
+            .flat_map(|tx| tx.nullifiers.iter().copied())
+            .collect();
+        state.accumulator = accumulate(&state.accumulator, &spent);
+        let committed = Committed {
+            network,
+            height,
+            issued: state.ledger.issued,
+            notes: state.ledger.tree.len(),
+            root: state.ledger.tree.root(),
+            nullifiers: state.accumulator,
+        };
+        if state_root(&committed) != block.state_root {
+            return Err(Error::Ledger(
+                "a page does not match the state its block commits to",
+            ));
+        }
+        let hash = block_hash(
+            &block.prev_hash,
+            &block.merkle_root,
+            &block.state_root,
+            block.timestamp,
+            block.nonce,
+            u64::from(height),
+        );
+        if hash != block.hash {
+            return Err(Error::Ledger(
+                "a page's block hash does not match its header",
+            ));
+        }
+        state.hashes.push_back((height, block.hash.clone()));
+        if state.hashes.len() > RECENT_HASHES {
+            state.hashes.pop_front();
+        }
         state.hash = block.hash.clone();
         let ledger = &state.ledger;
         if self.pending.as_ref().is_some_and(|p| {
@@ -369,6 +453,7 @@ impl LightWallet {
             height: self.height(),
             tip: self.tip,
             pending: self.pending.is_some(),
+            verified: self.verified,
             ..LightBalance::default()
         };
         for owned in self.current.unspent() {
@@ -601,19 +686,23 @@ mod tests {
         ledger::{subsidy, ATOMS, PREMINE},
         scan::MAX_SCAN_BLOCKS,
     };
+    use std::collections::BTreeSet;
 
     const NET: u8 = 3;
 
-    /// A chain kept by a full ledger, served as pages.
+    /// A chain kept by a full ledger, served as pages with real headers.
+    #[derive(Clone)]
     struct Chain {
         ledger: Ledger,
         blocks: Vec<ScanBlock2>,
+        accumulator: [u8; 32],
     }
     impl Chain {
         fn new() -> Self {
             Self {
                 ledger: Ledger::new(NET).unwrap(),
                 blocks: Vec::new(),
+                accumulator: [0; 32],
             }
         }
         fn mine(&mut self, miner: &Account, transfers: Vec<Transaction>, branch: u8) {
@@ -626,12 +715,39 @@ mod tests {
                 .blocks
                 .last()
                 .map(|b| b.hash.clone())
-                .unwrap_or_default();
+                .unwrap_or_else(|| "0".repeat(64));
+            let spent: BTreeSet<Digest> = transfers
+                .iter()
+                .flat_map(|tx| tx.statement.nullifiers.iter().copied())
+                .collect();
+            self.accumulator = accumulate(&self.accumulator, &spent);
+            let state_root = state_root(&Committed {
+                network: NET,
+                height,
+                issued: self.ledger.issued,
+                notes: self.ledger.tree.len(),
+                root: self.ledger.tree.root(),
+                nullifiers: self.accumulator,
+            });
+            let merkle_root = format!("{height:064x}");
+            let timestamp = 1_000 + u64::from(height) * 120;
+            let nonce = u64::from(branch);
+            let hash = block_hash(
+                &prev_hash,
+                &merkle_root,
+                &state_root,
+                timestamp,
+                nonce,
+                u64::from(height),
+            );
             self.blocks.push(ScanBlock2 {
                 height,
-                hash: format!("{branch:02x}{height:062x}"),
+                hash,
                 prev_hash,
-                timestamp: 1_000 + u64::from(height) * 120,
+                merkle_root,
+                state_root,
+                nonce,
+                timestamp,
                 transactions: std::iter::once(&cb)
                     .chain(&transfers)
                     .map(ScanTransaction2::of)
@@ -763,10 +879,7 @@ mod tests {
             chain.mine(&miner, vec![], 0);
         }
         // Two branches share the first 129 blocks.
-        let mut fork = Chain {
-            ledger: chain.ledger.clone(),
-            blocks: chain.blocks.clone(),
-        };
+        let mut fork = chain.clone();
         chain.mine(&miner, vec![], 0);
         let mut light = LightWallet::new(NET, 1).unwrap();
         chain.sync(&mut light, &miner);
@@ -817,5 +930,62 @@ mod tests {
         assert_eq!(late.anchor(), chain.ledger.tree.root());
         assert_eq!(late.history().len(), 2);
         assert_eq!(late.balance().immature_atoms, 2 * 12 * ATOMS);
+    }
+
+    #[test]
+    fn a_page_that_is_not_its_block_is_refused() {
+        let alice = Account::from_seed(&[15; 32], NET, 0).unwrap();
+        let bob = Account::from_seed(&[16; 32], NET, 0).unwrap();
+        let mut chain = Chain::new();
+        chain.mine(&alice, vec![], 0);
+        chain.mine(&bob, vec![], 0);
+        chain.mine(&bob, vec![], 0);
+        chain.mine(&bob, vec![], 0);
+
+        // A server that hides an output breaks the tree root the header
+        // commits to: at once for block 1's (it joins the tree there), and
+        // when it matures for a later reward (block 2's joins at 4 here).
+        let mut light = LightWallet::new(NET, 1).unwrap();
+        let mut hidden = chain.page(1);
+        hidden.blocks[0].transactions[0].outputs.clear();
+        assert!(light.add_page(&alice, &hidden).is_err());
+        assert_eq!(light.height(), 0, "nothing of a refused page is kept");
+        let mut hidden = chain.page(1);
+        hidden.blocks[1].transactions[0].outputs.clear();
+        assert!(light.add_page(&bob, &hidden).is_err());
+        assert_eq!(light.height(), 0);
+
+        // So does one that keeps the outputs and rewrites the header.
+        let mut forged = chain.page(1);
+        forged.blocks[2].state_root = forged.blocks[1].state_root.clone();
+        assert!(light.add_page(&bob, &forged).is_err());
+        let mut forged = chain.page(1);
+        forged.blocks[2].nonce += 1;
+        assert!(light.add_page(&bob, &forged).is_err());
+
+        light.add_page(&bob, &chain.page(1)).unwrap();
+        assert_eq!(light.height(), 4);
+    }
+
+    #[test]
+    fn a_signed_checkpoint_confirms_what_the_wallet_read() {
+        let miner = Account::from_seed(&[17; 32], NET, 0).unwrap();
+        let mut chain = Chain::new();
+        for _ in 0..5 {
+            chain.mine(&miner, vec![], 0);
+        }
+        let mut light = LightWallet::new(NET, 1).unwrap();
+        light.add_page(&miner, &chain.page(1)).unwrap();
+        assert_eq!(light.verified(), 0);
+
+        // Above what it read: it cannot tell yet.
+        assert!(!light.confirm_checkpoint(9, &"0".repeat(64)).unwrap());
+        let at4 = chain.blocks[3].hash.clone();
+        assert!(light.confirm_checkpoint(4, &at4).unwrap());
+        assert_eq!(light.balance().verified, 4);
+
+        // A checkpoint for another block there: the pages were another chain.
+        assert!(light.confirm_checkpoint(5, &at4).is_err());
+        assert_eq!((light.height(), light.verified()), (0, 0));
     }
 }

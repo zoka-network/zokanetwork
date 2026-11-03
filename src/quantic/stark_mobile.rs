@@ -6,7 +6,10 @@
 //! is no other way out: if no onion seed answers, nothing is sent.
 //!
 //! The proof is built on the phone (`zoka_pq_pool::light`); the seed only
-//! gets the finished transaction, as from any peer.
+//! gets the finished transaction, as from any peer. What the phone reads is
+//! checked against every block header, and the chain of headers against the
+//! latest checkpoint, signed by the team with Ed25519 and ML-DSA-65: no seed
+//! or web cache can show the wallet another chain.
 use std::{net::SocketAddr, sync::Arc};
 
 use iroh::endpoint::presets;
@@ -24,6 +27,7 @@ use super::{
     stark_net::{self, Client, NodeDescriptor},
     stark_peers::Manifest,
 };
+use crate::checkpoint_authority::SignedCheckpoint;
 use crate::network::stream_transport::{SocksDialer, StreamOnly, StreamTransport};
 
 /// How the phone reaches the network.
@@ -75,6 +79,27 @@ pub async fn page(client: &mut Client, from: u32) -> Result<ScanPage2, String> {
     client.scan_page(from, MAX_SCAN_BLOCKS).await
 }
 
+/// A checkpoint of `profile`'s chain whose signature holds: its height and
+/// block hash, to confirm what a light wallet read
+/// (`LightWallet::confirm_checkpoint`). On testnet v2 the signature has to be
+/// the hybrid one (Ed25519 and ML-DSA-65).
+pub fn verify_checkpoint(checkpoint: &SignedCheckpoint, profile: Profile) -> Result<(u32, String), String> {
+    if checkpoint.chain_id != profile.chain_id {
+        return Err("a checkpoint of another chain".into());
+    }
+    checkpoint.verify_for_declared_chain().map_err(|e| e.to_string())?;
+    let height = u32::try_from(checkpoint.height).map_err(|e| e.to_string())?;
+    Ok((height, checkpoint.block_hash.clone()))
+}
+
+/// The latest checkpoint the seed has, verified ([`verify_checkpoint`]).
+pub async fn checkpoint(client: &mut Client, profile: Profile) -> Result<Option<(u32, String)>, String> {
+    match client.checkpoint().await? {
+        Some(checkpoint) => verify_checkpoint(&checkpoint, profile).map(Some),
+        None => Ok(None),
+    }
+}
+
 /// Hand a payment to the network. The answer is its id once the seed's
 /// mempool took it; a refusal says why (an expired anchor, say).
 pub async fn submit(client: &mut Client, tx: &Transaction) -> Result<[u8; 32], String> {
@@ -114,6 +139,23 @@ mod tests {
         stark_net::{serve, ServerIdentity},
     };
     use iroh::{EndpointAddr, TransportAddr};
+
+    #[test]
+    fn a_checkpoint_counts_only_with_the_team_hybrid_signature() {
+        let real: SignedCheckpoint =
+            serde_json::from_str(include_str!("testdata/checkpoint-v2-3651.json")).unwrap();
+        let (height, hash) = verify_checkpoint(&real, Profile::TESTNET).unwrap();
+        assert_eq!(height, 3651);
+        assert_eq!(hash, real.block_hash);
+        // Another block, a missing ML-DSA half or another chain: refused.
+        let mut other = real.clone();
+        other.block_hash = "0".repeat(64);
+        assert!(verify_checkpoint(&other, Profile::TESTNET).is_err());
+        let mut classical_only = real.clone();
+        classical_only.mldsa_signature = None;
+        assert!(verify_checkpoint(&classical_only, Profile::TESTNET).is_err());
+        assert!(verify_checkpoint(&real, Profile::REGTEST).is_err());
+    }
 
     #[test]
     fn the_testnet_seeds_include_one_reachable_over_tor() {

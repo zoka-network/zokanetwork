@@ -1041,6 +1041,9 @@ pub(crate) fn page2(
                     height: u32::try_from(block.header.block_height).map_err(|e| e.to_string())?,
                     hash: block.header.hash.clone(),
                     prev_hash: block.header.prev_hash.clone(),
+                    merkle_root: block.header.merkle_root.clone(),
+                    state_root: block.header.state_root.clone(),
+                    nonce: block.header.nonce,
                     timestamp: block.header.timestamp,
                     transactions: stark::decode(block)?
                         .iter()

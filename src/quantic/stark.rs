@@ -787,4 +787,53 @@ mod tests {
         let err = validate(&db, Profile::TESTNET, &block, &parent).err().unwrap();
         assert!(err.contains("genesis"), "{err}");
     }
+
+    /// Light wallets recompute what a header commits to with
+    /// `protocol::commitment`; it has to be byte for byte this consensus code.
+    #[test]
+    fn the_light_wallet_commitment_is_the_consensus_one() {
+        use protocol::commitment;
+        for seed in 0u32..20 {
+            let digest = |k: u32| protocol::crypto::Digest(std::array::from_fn(|i| (seed * 7919 + k * 31 + i as u32) % 2_000_000_000));
+            let state = Committed {
+                network: 2 + (seed % 2) as u8,
+                height: seed * 101,
+                issued: u64::from(seed) * 12 * ATOMS + PREMINE,
+                notes: u64::from(seed) * 3,
+                root: digest(1),
+                nullifiers: [seed as u8; 32],
+            };
+            let light = commitment::Committed {
+                network: state.network,
+                height: state.height,
+                issued: state.issued,
+                notes: state.notes,
+                root: state.root,
+                nullifiers: state.nullifiers,
+            };
+            assert_eq!(commitment::state_root(&light), state_root(&state).unwrap());
+            let spent: BTreeSet<_> = (0..seed % 4).map(|k| digest(10 + k)).collect();
+            assert_eq!(commitment::accumulate(&state.nullifiers, &spent), accumulate(&state.nullifiers, &spent));
+        }
+        let parent = P.genesis_parent();
+        let mut block = parent.clone();
+        block.header.prev_hash = parent.header.hash.clone();
+        block.header.merkle_root = "ab".repeat(32);
+        block.header.state_root = format!("{PREFIX}{}", "cd".repeat(64));
+        block.header.timestamp = 1_793_686_770;
+        block.header.nonce = 424_242;
+        block.header.block_height = 3_518;
+        assert_eq!(
+            commitment::block_hash(
+                &block.header.prev_hash,
+                &block.header.merkle_root,
+                &block.header.state_root,
+                block.header.timestamp,
+                block.header.nonce,
+                block.header.block_height,
+            ),
+            block.compute_hash()
+        );
+        assert_eq!(commitment::STATE_PREFIX, PREFIX);
+    }
 }

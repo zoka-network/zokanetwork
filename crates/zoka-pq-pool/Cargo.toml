@@ -28,6 +28,9 @@ zeroize = "1.8.2"
 zoka-pq = { path = "../zoka-pq" }
 chacha20poly1305 = { version = "0.11", default-features = false }
 bs58 = "0.5"
+# What a block header commits to (commitment.rs): the same hashes as the node.
+blake3 = "1.5"
+sha2 = "0.10"
 
 [profile.release]
 debug = false
