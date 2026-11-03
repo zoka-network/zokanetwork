@@ -172,8 +172,10 @@ Both keep the options you give them (`-Threads 2`, `--threads 2`, `-Tor …`).
 
 ## Help the network: keep a node running
 
-Testnet v2 relies today on a single seed node, the team's. Every node that stays
-online all day makes the network sturdier, and an always-on node can become a
+Testnet v2 has two always-on seed nodes on servers and the team's PC when it is
+online. The two servers share a provider and data center, so independent nodes
+still matter. Every node that stays online all day makes the network sturdier,
+and an always-on node can become a
 **seed**, one of the nodes compiled into Zoka so new nodes find the network.
 
 - Leave **`2-start-mining.cmd`** / `./zoka-miner.sh mine` running. Without XMRig

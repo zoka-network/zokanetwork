@@ -174,7 +174,9 @@ Los dos guardan las opciones que les pases (`-Threads 2`, `--threads 2`, `-Tor �
 
 ## Ayudá a la red: dejá un nodo prendido
 
-Hoy la testnet v2 depende de un solo nodo semilla, el del equipo. Cada nodo que
+La testnet v2 tiene dos semillas permanentes en servidores y la PC del equipo
+cuando está prendida. Los dos servidores comparten proveedor y centro de datos,
+así que sigue siendo importante sumar nodos independientes. Cada nodo que
 queda prendido todo el día hace más firme la red, y un nodo que nunca se apaga
 puede ser una **semilla**: uno de los nodos que vienen dentro de Zoka para que
 los nodos nuevos encuentren la red.
