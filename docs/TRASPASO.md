@@ -6,7 +6,8 @@ punto exacto está. Lo histórico está en [HOJA-DE-RUTA-CLAUDE.md](../HOJA-DE-R
 
 ## Estado al 3/11/2026, retomado por Codex
 
-El plan vigente es `C:/Users/mderramus/.claude/plans/sprightly-swimming-papert.md`.
+El plan vigente está conservado en [PLAN-CIERRE-2026-11-03.md](PLAN-CIERRE-2026-11-03.md),
+recuperado de `C:/Users/mderramus/.claude/plans/sprightly-swimming-papert.md`.
 Orden acordado: nodo/minero 4.0.4 y ZSilent 4.0.6, ZKAPriv 3.0, vigilante y
 mejoras de red/privacidad. El usuario autorizó publicar las versiones cuando
 pasen las pruebas y los hashes coincidan; los anuncios de Discord se muestran
