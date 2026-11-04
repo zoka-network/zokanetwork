@@ -1,0 +1,5 @@
+# La prueba STARK recurre hondo: en el teléfono corre en un hilo con 64 MiB de
+# pila (zkapriv/native/src/stark.rs, PROVER_STACK). En WebAssembly la pila se
+# fija al enlazar.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=-zstack-size=67108864"]

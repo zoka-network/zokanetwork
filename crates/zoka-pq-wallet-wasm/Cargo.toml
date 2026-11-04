@@ -1,0 +1,33 @@
+# La billetera web de Zoka Quantic (wallet.zoka.network), dentro del navegador.
+# La frase y las claves no salen de esta memoria: la página baja las páginas
+# públicas /scan2 y el checkpoint firmado, y acá se verifican, se lee el saldo
+# y se prueba cada pago (STARK) con el mismo código que el nodo y el teléfono
+# (zoka-pq-pool, zoka-light). Independiente del nodo: compila para wasm32.
+[package]
+name = "zoka-pq-wallet-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+zoka-pq-pool = { path = "../zoka-pq-pool" }
+zoka-light = { path = "../zoka-light" }
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+bip39 = "2"
+zeroize = "1.8.2"
+getrandom = "0.4"
+
+# En el navegador, la aleatoriedad es crypto.getRandomValues.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

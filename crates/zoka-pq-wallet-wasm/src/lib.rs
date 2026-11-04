@@ -1,0 +1,335 @@
+//! La billetera web de Zoka Quantic, dentro del navegador.
+//!
+//! La página baja las páginas públicas `/scan2` y el checkpoint firmado de
+//! `api.zokascan.cc` y se los pasa a un [`WebWallet`]. Acá se verifica cada
+//! página contra su cabecera y lo leído contra el checkpoint (Ed25519 +
+//! ML-DSA-65), se calcula el saldo y se prueba cada pago (STARK). La frase y
+//! las claves quedan en esta memoria; el servidor solo ve pedidos de páginas
+//! iguales para todos y el pago ya probado. Es el flujo del teléfono
+//! (`zkapriv/native/src/stark.rs`) con HTTPS en vez de P2P.
+#![forbid(unsafe_code)]
+
+use bip39::{Language, Mnemonic};
+use serde_json::{json, Value};
+use wasm_bindgen::prelude::*;
+use zeroize::Zeroizing;
+use zoka_light::{checkpoint::SignedCheckpoint, directory::AddressRecord};
+use zoka_pq_pool::{
+    light::{LightWallet, Movement},
+    scan::ScanPage2,
+    transaction::Transaction,
+    wallet::{Account, Address, ShortAddress},
+};
+
+fn js(error: impl std::fmt::Display) -> JsError {
+    JsError::new(&error.to_string())
+}
+
+/// La cadena de cada red que una billetera web sigue: 2 es la testnet v2.
+fn chain_id(network: u8) -> Option<&'static str> {
+    match network {
+        2 => Some(zoka_light::checkpoint::QUANTIC_PQ_TESTNET_CHAIN_ID),
+        _ => None,
+    }
+}
+
+/// La semilla de 24 palabras BIP-39 en inglés: sus 256 bits de entropía, como
+/// en ZSilent y en ZKAPriv (`Account::from_seed(semilla, red, 0)`).
+fn seed_of(phrase: &str) -> Result<Zeroizing<[u8; 32]>, &'static str> {
+    let normalized = phrase
+        .trim()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mnemonic = Mnemonic::parse_in_normalized(Language::English, &normalized)
+        .map_err(|_| "those are not valid recovery words")?;
+    let entropy = Zeroizing::new(mnemonic.to_entropy());
+    if entropy.len() != 32 {
+        return Err("Zoka Quantic recovery phrases have 24 words");
+    }
+    let mut seed = Zeroizing::new([0u8; 32]);
+    seed.copy_from_slice(&entropy);
+    Ok(seed)
+}
+
+/// 24 palabras nuevas, de 256 bits del generador del navegador.
+#[wasm_bindgen(js_name = newPhrase)]
+pub fn new_phrase() -> Result<String, JsError> {
+    let mut entropy = Zeroizing::new([0u8; 32]);
+    getrandom::fill(entropy.as_mut()).map_err(js)?;
+    let mnemonic = Mnemonic::from_entropy_in(Language::English, entropy.as_ref()).map_err(js)?;
+    Ok(mnemonic.to_string())
+}
+
+#[wasm_bindgen(js_name = validPhrase)]
+pub fn valid_phrase(phrase: &str) -> bool {
+    seed_of(phrase).is_ok()
+}
+
+/// `"full"`, `"short"` o `""` si no es una dirección de `network`.
+#[wasm_bindgen(js_name = addressKind)]
+pub fn address_kind(text: &str, network: u8) -> String {
+    let text = text.trim();
+    if Address::decode(text, network).is_ok() {
+        "full".into()
+    } else if ShortAddress::decode(text, network).is_ok() {
+        "short".into()
+    } else {
+        String::new()
+    }
+}
+
+/// Si la dirección completa `full` (la que devuelve `/address/<corta>`) es la
+/// de la corta `short`: un servidor no puede cambiar el destinatario.
+#[wasm_bindgen(js_name = matchesShort)]
+pub fn matches_short(full: &str, short: &str, network: u8) -> bool {
+    let (Ok(full), Ok(short)) = (
+        Address::decode(full.trim(), network),
+        ShortAddress::decode(short.trim(), network),
+    ) else {
+        return false;
+    };
+    full.short_address()
+        .map(|own| own.encode() == short.encode())
+        .unwrap_or(false)
+}
+
+#[wasm_bindgen]
+pub struct WebWallet {
+    network: u8,
+    account: Account,
+    wallet: LightWallet,
+    last: Option<Transaction>,
+}
+
+fn movement(m: &Movement, tip: u32) -> Value {
+    let kind = if m.coinbase {
+        "mined"
+    } else if m.spent > 0 {
+        "sent"
+    } else {
+        "received"
+    };
+    let amount = if m.spent > 0 { m.paid() } else { m.received };
+    json!({
+        "txid": hex::encode(m.txid),
+        "height": m.height,
+        "timestamp": m.timestamp,
+        "kind": kind,
+        "amount_atoms": amount,
+        "fee_atoms": m.fee,
+        "memo": m.memo,
+        "confirmations": tip.saturating_sub(m.height) + 1,
+    })
+}
+
+#[wasm_bindgen]
+impl WebWallet {
+    /// `state`: lo que devolvió [`WebWallet::encode_state`] la última vez, o
+    /// vacío para leer la cadena desde el bloque 1.
+    #[wasm_bindgen(constructor)]
+    pub fn new(phrase: &str, network: u8, state: &[u8]) -> Result<WebWallet, JsError> {
+        chain_id(network).ok_or_else(|| JsError::new("this network has no web wallet"))?;
+        let seed = seed_of(phrase).map_err(JsError::new)?;
+        let account = Account::from_seed(&seed, network, 0).map_err(js)?;
+        let wallet = if state.is_empty() {
+            LightWallet::new(network, 1).map_err(js)?
+        } else {
+            let wallet = LightWallet::decode(state)
+                .map_err(|_| JsError::new("the saved wallet state is unreadable"))?;
+            if wallet.network() != network {
+                return Err(JsError::new("the saved wallet state is of another network"));
+            }
+            wallet
+        };
+        Ok(Self {
+            network,
+            account,
+            wallet,
+            last: None,
+        })
+    }
+
+    /// La dirección completa (unos 1.760 caracteres).
+    pub fn address(&self) -> Result<String, JsError> {
+        self.account.address().encode().map_err(js)
+    }
+
+    /// La dirección corta: la que se comparte y va en el QR.
+    #[wasm_bindgen(js_name = shortAddress)]
+    pub fn short_address(&self) -> Result<String, JsError> {
+        self.account.address().short().map_err(js)
+    }
+
+    /// Muestra el saldo a quien la tenga, sin poder gastar.
+    #[wasm_bindgen(js_name = viewKey)]
+    pub fn view_key(&self) -> Result<String, JsError> {
+        Ok(self.account.view_key().map_err(js)?.encode())
+    }
+
+    /// La altura del próximo bloque que necesita: pedir `/scan2?from=<next>`.
+    pub fn next(&self) -> u32 {
+        self.wallet.next()
+    }
+
+    #[wasm_bindgen(js_name = inSync)]
+    pub fn in_sync(&self) -> bool {
+        self.wallet.in_sync()
+    }
+
+    /// Lee una página de `/scan2` (tiene que empezar en [`WebWallet::next`]);
+    /// devuelve la punta que tenía el servidor. Cada bloque se compara con su
+    /// cabecera: una página que esconde o inventa una salida se rechaza.
+    #[wasm_bindgen(js_name = addPage)]
+    pub fn add_page(&mut self, bytes: &[u8]) -> Result<u32, JsError> {
+        let page = ScanPage2::decode(bytes)
+            .map_err(|_| JsError::new("the server sent an unreadable page"))?;
+        self.wallet.add_page(&self.account, &page).map_err(js)?;
+        Ok(page.tip)
+    }
+
+    /// Verifica la firma del checkpoint (el JSON de `/checkpoint`) y confirma
+    /// lo leído contra él. `true` si esa altura ya se leyó.
+    #[wasm_bindgen(js_name = confirmCheckpoint)]
+    pub fn confirm_checkpoint(&mut self, json: &str) -> Result<bool, JsError> {
+        let checkpoint = SignedCheckpoint::from_json(json).map_err(js)?;
+        if Some(checkpoint.chain_id.as_str()) != chain_id(self.network) {
+            return Err(JsError::new("a checkpoint of another chain"));
+        }
+        checkpoint.verify_for_declared_chain().map_err(js)?;
+        let height = u32::try_from(checkpoint.height).map_err(js)?;
+        self.wallet
+            .confirm_checkpoint(height, &checkpoint.block_hash)
+            .map_err(js)
+    }
+
+    /// Saldo, punta, verificación, pago pendiente e historial, en JSON
+    /// (montos en átomos: 1 ZKA = 1.000.000).
+    pub fn status(&self) -> String {
+        let balance = self.wallet.balance();
+        let history: Vec<Value> = self
+            .wallet
+            .history()
+            .iter()
+            .rev()
+            .take(500)
+            .map(|m| movement(m, balance.height))
+            .collect();
+        json!({
+            "height": balance.height,
+            "tip": balance.tip,
+            "next": self.wallet.next(),
+            "in_sync": self.wallet.in_sync(),
+            "spendable_atoms": balance.spendable_atoms,
+            "immature_atoms": balance.immature_atoms,
+            "reserved_atoms": balance.reserved_atoms,
+            "max_sendable_atoms": balance.max_sendable_atoms,
+            "notes": balance.notes,
+            "verified": balance.verified,
+            "pending": self.wallet.pending().map(|p| json!({
+                "txid": hex::encode(p.txid),
+                "expiry": p.expiry,
+            })),
+            "history": history,
+        })
+        .to_string()
+    }
+
+    /// La comisión de un pago de `amount_atoms`, o por qué no alcanza.
+    pub fn quote(&self, amount_atoms: u64) -> String {
+        match self.wallet.quote(amount_atoms) {
+            Ok((fee, inputs)) => json!({"enough": true, "fee_atoms": fee, "inputs": inputs}),
+            Err(reason) => json!({"enough": false, "reason": reason.to_string()}),
+        }
+        .to_string()
+    }
+
+    /// Arma y prueba (STARK, segundos) un pago a la dirección completa `to`,
+    /// y reserva sus notas. Devuelve `{txid, amount_atoms, fee_atoms,
+    /// expiry}`; los bytes para `POST /transactions`, con
+    /// [`WebWallet::last_transaction`]. Si la red lo rechaza: [`WebWallet::release`].
+    pub fn prove(&mut self, to: &str, amount_atoms: u64, memo: &str) -> Result<String, JsError> {
+        let to = Address::decode(to.trim(), self.network)
+            .map_err(|_| JsError::new("that is not a full address of this network"))?;
+        let plan = self
+            .wallet
+            .plan(&self.account, to, amount_atoms, memo.as_bytes())
+            .map_err(js)?;
+        let (amount, fee, expiry) = (plan.amount(), plan.fee, plan.expiry);
+        let tx = plan.prove(&self.account).map_err(js)?;
+        self.wallet.reserve(&tx).map_err(js)?;
+        let txid = hex::encode(tx.txid());
+        self.last = Some(tx);
+        Ok(json!({"txid": txid, "amount_atoms": amount, "fee_atoms": fee, "expiry": expiry}).to_string())
+    }
+
+    /// Los bytes del último pago probado, para `POST /transactions`.
+    #[wasm_bindgen(js_name = lastTransaction)]
+    pub fn last_transaction(&self) -> Result<Vec<u8>, JsError> {
+        self.last
+            .as_ref()
+            .ok_or_else(|| JsError::new("no payment was proved"))?
+            .encode()
+            .map_err(js)
+    }
+
+    /// La red rechazó el pago: sus notas vuelven a estar disponibles.
+    pub fn release(&mut self) {
+        self.wallet.release();
+        self.last = None;
+    }
+
+    /// El estado leído, para guardarlo (cifrado) y seguir desde ahí.
+    #[wasm_bindgen(js_name = encodeState)]
+    pub fn encode_state(&self) -> Result<Vec<u8>, JsError> {
+        self.wallet.encode().map_err(js)
+    }
+
+    /// El registro de la dirección corta para `POST /address`, con su
+    /// estampilla Argon2id (unos segundos: llamarla en un Worker).
+    #[wasm_bindgen(js_name = addressRecord)]
+    pub fn address_record(&self) -> Result<String, JsError> {
+        let mut start = [0u8; 8];
+        getrandom::fill(&mut start).map_err(js)?;
+        let record = AddressRecord::new(&self.account.address(), u64::from_le_bytes(start))
+            .map_err(|e| JsError::new(&e))?;
+        serde_json::to_string(&record).map_err(js)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // El vector de BIP-39 de 24 palabras con entropía 0x00...: la misma semilla
+    // que usan ZSilent y ZKAPriv para esas palabras.
+    const ZEROS: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
+
+    #[test]
+    fn the_phrase_gives_the_seed_and_address_of_the_other_wallets() {
+        let seed = seed_of(ZEROS).unwrap();
+        assert_eq!(*seed, [0u8; 32]);
+        // Mayúsculas y espacios de más no cambian la billetera.
+        let messy = format!("  {}  ", ZEROS.to_uppercase().replace(' ', "   "));
+        assert_eq!(*seed_of(&messy).unwrap(), [0u8; 32]);
+        let account = Account::from_seed(&seed, 2, 0).unwrap();
+        let full = account.address().encode().unwrap();
+        let short = account.address().short().unwrap();
+        assert_eq!(address_kind(&full, 2), "full");
+        assert_eq!(address_kind(&short, 2), "short");
+        assert!(matches_short(&full, &short, 2));
+    }
+
+    #[test]
+    fn bad_phrases_and_foreign_addresses_are_refused() {
+        assert!(!valid_phrase("abandon abandon"));
+        assert!(!valid_phrase(&ZEROS.replace(" art", " zoo")));
+        // 12 palabras válidas en BIP-39, pero Quantic usa 24.
+        assert!(!valid_phrase("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"));
+        let other = Account::from_seed(&[1; 32], 2, 0).unwrap().address();
+        let mine = Account::from_seed(&[0; 32], 2, 0).unwrap().address();
+        assert!(!matches_short(&other.encode().unwrap(), &mine.short().unwrap(), 2));
+        assert_eq!(address_kind("zqtest2nothing", 2), "");
+    }
+}
