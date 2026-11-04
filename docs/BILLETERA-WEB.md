@@ -1,12 +1,16 @@
 # Billetera web (wallet.zoka.network)
 
-Estado al 4/11/2026. Rama `billetera-web` del nodo (W1–W4) y repo nuevo
-`zokawallet` (al lado de `zokaexplorer`, ignorado por este repo).
+Estado al 4/11/2026. W1–W4 están en `main` desde el nodo 4.0.6
+([RELEASE-4.0.6.md](RELEASE-4.0.6.md)). La interfaz es el repo `zokawallet`
+(al lado de `zokaexplorer`, ignorado por este repo), publicada en el proyecto
+`zokawallet` de Cloudflare Pages.
 
 ## Qué es
 
 Una billetera de Zoka Quantic Testnet v2 que corre entera en el navegador:
-React + Vite + TypeScript, sin otras dependencias de ejecución que React. Lo que
+React + Vite + TypeScript, sin otras dependencias de ejecución que React. El
+diseño es el de ZokaScan: barra de secciones arriba, paneles y diálogos; en el
+teléfono las secciones pasan a una segunda fila y los paneles se apilan. Lo que
 toca las claves corre en un Web Worker con el WebAssembly de este repo. El mismo
 Rust lo usan el nodo y el teléfono:
 

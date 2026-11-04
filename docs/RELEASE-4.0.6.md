@@ -29,10 +29,17 @@ corren las semillas.
   la prueba nueva de límites, CORS, estampilla y permisos de la API pública.
 - [x] Un pago probado en WebAssembly lo acepta la API pública y se mina
   (regtest, 4/11).
-- [ ] Compilar Linux en el VPS 2 con Debian 11, desde el código de la etiqueta.
-- [ ] Instalar en seed3 y después en seed2, guardar el binario anterior como
+- [x] Compilar Linux en el VPS 2 con Debian 11, desde el código de la etiqueta
+  (8 min 16 s). `zoka-4.0.6-linux-x64` =
+  `daf2e738366b942307ca63ced277a52f537be8f41f2d04063950e61a890ad76e`.
+- [x] Prueba en el VPS 2 con datos temporales, otros puertos y sin tocar la
+  semilla: arranca, toma el checkpoint 4444 de seed2 y sincroniza; el preflight
+  de `POST /address` da 204 con `Content-Type` permitido, y los dos `POST`
+  rechazan lo mal formado.
+- [ ] Instalar en seed3 y después en seed2 (el clasificador de permisos frenó
+  la escritura en los VPS: lo corre el usuario), guardar el binario anterior como
   `zoka-4.0.4`, y comprobar que siguen la cadena.
 - [ ] `api.zokascan.cc`: versión 4.0.6, preflight de `POST /address` con
   `Content-Type` permitido.
-- [ ] Crear la release (sin "Latest") y bajar otra vez los archivos para
-  verificar sus hashes.
+- [x] Release `v4.0.6` sin "Latest" (la 4.0.5 sigue siéndolo), bajada otra
+  vez y verificada.
