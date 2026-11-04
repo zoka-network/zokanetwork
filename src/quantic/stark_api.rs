@@ -2605,5 +2605,75 @@ mod tests {
             ["/scan2?from=H&count=N"]
             .is_string());
     }
+
+    /// Where the web wallet's WebAssembly test meets the node: see
+    /// `crates/zoka-pq-wallet-wasm/tests/regtest-payment.mjs`.
+    fn web_fixtures() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("crates/zoka-pq-wallet-wasm/tests/fixtures")
+    }
+
+    /// Step 1, by hand: three regtest blocks mined to the wallet of fixed
+    /// words, their `/scan2` page and the blocks themselves.
+    /// `cargo test --release --features quantic-pq --lib web_wallet_regtest_fixture -- --ignored`
+    #[tokio::test]
+    #[ignore = "writes the fixtures of the WebAssembly payment test"]
+    async fn web_wallet_regtest_fixture() {
+        let entropy = [77u8; 32];
+        let phrase = bip39::Mnemonic::from_entropy_in(bip39::Language::English, &entropy)
+            .unwrap()
+            .to_string();
+        let alice = Account::from_seed(&entropy, 3, 0).unwrap();
+        let bob = Account::from_seed(&[78; 32], 3, 0).unwrap();
+        let (_dir, state) = test_state();
+        let mut blocks = Vec::new();
+        for _ in 0..3 {
+            blocks.push(super::super::stark_node::mine_once(&state, alice.address()).await.unwrap().0);
+        }
+        let public = public_router(state.clone());
+        let response = get_from(&public, "/scan2?from=1&count=100", "GET").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let page = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let dir = web_fixtures();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("regtest-phrase.txt"), &phrase).unwrap();
+        std::fs::write(dir.join("regtest-bob.txt"), bob.address().encode().unwrap()).unwrap();
+        std::fs::write(dir.join("regtest-scan2.bin"), &page).unwrap();
+        std::fs::write(dir.join("regtest-blocks.json"), serde_json::to_vec(&blocks).unwrap()).unwrap();
+        // A payment of the run before was proved on another chain.
+        let _ = std::fs::remove_file(dir.join("regtest-web-payment.bin"));
+    }
+
+    /// Step 3: the payment the WebAssembly proved (step 2) on that chain is
+    /// taken by the public API, mined, and paid to Bob with its note.
+    /// `cargo test --release --features quantic-pq --lib a_payment_proved_in_webassembly -- --ignored`
+    #[tokio::test]
+    #[ignore = "needs the fixtures and the payment of the WebAssembly test"]
+    async fn a_payment_proved_in_webassembly_is_mined() {
+        let dir = web_fixtures();
+        let blocks: Vec<Block> =
+            serde_json::from_slice(&std::fs::read(dir.join("regtest-blocks.json")).unwrap()).unwrap();
+        let bytes = std::fs::read(dir.join("regtest-web-payment.bin"))
+            .expect("run crates/zoka-pq-wallet-wasm/tests/regtest-payment.mjs first");
+        let payment = Transaction::decode(&bytes).unwrap();
+        let (_dir, state) = test_state();
+        let app = router(state.clone());
+        for block in &blocks {
+            let response = post(&app, "/blocks", "application/json", serde_json::to_vec(block).unwrap()).await;
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        }
+        let public = public_router(state.clone());
+        let response = post_from(&public, "/transactions", "application/octet-stream", bytes, "203.0.113.20").await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED, "{}", json(response).await);
+        let alice = Account::from_seed(&[77; 32], 3, 0).unwrap();
+        let (block, canonical) = super::super::stark_node::mine_once(&state, alice.address()).await.unwrap();
+        assert!(canonical);
+        assert_eq!(block.quantic_transactions.len(), 2, "the coinbase and the web payment");
+        let bob = Account::from_seed(&[78; 32], 3, 0).unwrap();
+        let (note, memo) = bob
+            .receive(payment.statement.commitments[0], &payment.envelopes[0])
+            .unwrap();
+        assert_eq!(note.value, 7 * ATOMS);
+        assert!(memo.starts_with(b"from the web"));
+    }
 }
 

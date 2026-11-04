@@ -33,6 +33,12 @@ fn chain_id(network: u8) -> Option<&'static str> {
     }
 }
 
+/// Las redes que abre: la testnet v2 y regtest (3, la cadena local de las
+/// pruebas, sin checkpoints firmados).
+fn supported(network: u8) -> bool {
+    chain_id(network).is_some() || network == 3
+}
+
 /// La semilla de 24 palabras BIP-39 en inglés: sus 256 bits de entropía, como
 /// en ZSilent y en ZKAPriv (`Account::from_seed(semilla, red, 0)`).
 fn seed_of(phrase: &str) -> Result<Zeroizing<[u8; 32]>, &'static str> {
@@ -196,7 +202,9 @@ impl WebWallet {
     /// vacío para leer la cadena desde el bloque 1.
     #[wasm_bindgen(constructor)]
     pub fn new(phrase: &str, network: u8, state: &[u8]) -> Result<WebWallet, JsError> {
-        chain_id(network).ok_or_else(|| JsError::new("this network has no web wallet"))?;
+        if !supported(network) {
+            return Err(JsError::new("this network has no web wallet"));
+        }
         let seed = seed_of(phrase).map_err(JsError::new)?;
         let account = Account::from_seed(&seed, network, 0).map_err(js)?;
         let wallet = if state.is_empty() {
