@@ -69,6 +69,28 @@ const PUBLIC_TIMEOUT: Duration = Duration::from_secs(20);
 /// its burst still reads 1,000 blocks at once.
 const SCAN_RATE: f64 = 1.0;
 const SCAN_BURST: f64 = 10.0;
+/// The public writes (`POST /transactions`, `POST /address`, what a web
+/// wallet sends) take turns on permits of their own: an upload in progress
+/// never holds a reader's.
+const PUBLIC_WRITERS: usize = 2;
+/// A payment is about 2 MB (one input, two outputs, block 4079 of the
+/// testnet): a slow uplink takes a while to send one.
+const PUBLIC_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Payments relayed for every public client, and for each. One costs the
+/// node's gate the check of its STARK (about 15 ms).
+const SEND_RATE: f64 = 1.0 / 3.0;
+const SEND_BURST: f64 = 6.0;
+const CLIENT_SEND_RATE: f64 = 1.0 / 20.0;
+const CLIENT_SEND_BURST: f64 = 3.0;
+/// Address records: a wallet publishes its own once. A new one costs an
+/// Argon2id check and some 2 KB of the directory.
+const RECORD_RATE: f64 = 1.0 / 5.0;
+const RECORD_BURST: f64 = 6.0;
+const CLIENT_RECORD_RATE: f64 = 1.0 / 60.0;
+const CLIENT_RECORD_BURST: f64 = 2.0;
+/// Clients whose write buckets are kept at once. Past it, those whose
+/// buckets are full again are forgotten first.
+const MAX_CLIENTS: usize = 10_000;
 /// One day of blocks at the ideal pace: what a chart asks for at most.
 const MAX_STATS_BLOCKS: u64 = 720;
 const HISTORY_KEY: &str = "quantic:stark:network-history";
@@ -385,13 +407,24 @@ pub async fn serve(state: NodeState, bind: SocketAddr) -> Result<(), String> {
 }
 
 /// What the public API admits: every client arrives through the tunnel from
-/// loopback, so the rate is global, and the requests take turns on permits of
-/// their own (never the wallet's crypto workers).
+/// loopback, so the read rate is global, and the requests take turns on
+/// permits of their own (never the wallet's crypto workers). Writes also
+/// have a bucket per client (see [`client_of`]) and permits apart.
 #[derive(Clone)]
 pub struct PublicGate {
     permits: Arc<Semaphore>,
+    writes: Arc<Semaphore>,
     bucket: Bucket,
     scans: Bucket,
+    sends: Bucket,
+    records: Bucket,
+    client_sends: Clients,
+    client_records: Clients,
+}
+
+/// `level` tokens at `at`, refilled at `rate` a second up to `burst`.
+fn refill(level: (f64, std::time::Instant), rate: f64, burst: f64, now: std::time::Instant) -> f64 {
+    (level.0 + now.saturating_duration_since(level.1).as_secs_f64() * rate).min(burst)
 }
 
 /// Tokens that refill at `rate` a second, up to `burst`.
@@ -416,8 +449,7 @@ impl Bucket {
             return false;
         };
         let now = std::time::Instant::now();
-        let refilled = level.0 + now.duration_since(level.1).as_secs_f64() * self.rate;
-        *level = (refilled.min(self.burst), now);
+        *level = (refill(*level, self.rate, self.burst, now), now);
         if level.0 < 1.0 {
             return false;
         }
@@ -426,12 +458,88 @@ impl Bucket {
     }
 }
 
+/// A [`Bucket`] per client, for at most [`MAX_CLIENTS`] of them.
+#[derive(Clone)]
+struct Clients {
+    rate: f64,
+    burst: f64,
+    levels: Arc<Mutex<std::collections::HashMap<[u8; 16], (f64, std::time::Instant)>>>,
+}
+
+impl Clients {
+    fn new(rate: f64, burst: f64) -> Self {
+        Self {
+            rate,
+            burst,
+            levels: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    fn take(&self, client: [u8; 16]) -> bool {
+        let Ok(mut levels) = self.levels.lock() else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        let (rate, burst) = (self.rate, self.burst);
+        if levels.len() >= MAX_CLIENTS && !levels.contains_key(&client) {
+            // A full bucket is what a new client gets anyway.
+            levels.retain(|_, level| refill(*level, rate, burst, now) < burst);
+            if levels.len() >= MAX_CLIENTS {
+                return false;
+            }
+        }
+        let level = levels.entry(client).or_insert((burst, now));
+        *level = (refill(*level, rate, burst, now), now);
+        if level.0 < 1.0 {
+            return false;
+        }
+        level.0 -= 1.0;
+        true
+    }
+}
+
+/// Who sent a public request, for the write buckets: the address that
+/// Cloudflare's edge saw (`CF-Connecting-IP`, which the edge sets itself; the
+/// public API listens on loopback only, behind the tunnel), an IPv6 one by its
+/// /64. Requests without it share one key.
+fn client_of(headers: &HeaderMap) -> [u8; 16] {
+    let ip = headers
+        .get("cf-connecting-ip")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<std::net::IpAddr>().ok());
+    match ip {
+        Some(std::net::IpAddr::V4(v4)) => v4.to_ipv6_mapped().octets(),
+        Some(std::net::IpAddr::V6(v6)) => {
+            let mut key = v6.octets();
+            if v6.to_ipv4_mapped().is_none() {
+                key[8..].fill(0);
+            }
+            key
+        }
+        None => [0xff; 16],
+    }
+}
+
+/// The public writes and their largest bodies.
+fn public_write(path: &str) -> Option<usize> {
+    match path {
+        "/transactions" => Some(MAX_TRANSACTION_BYTES),
+        "/address" => Some(stark_directory::MAX_RECORD_BYTES),
+        _ => None,
+    }
+}
+
 impl PublicGate {
     pub fn new() -> Self {
         Self {
             permits: Arc::new(Semaphore::new(PUBLIC_WORKERS)),
+            writes: Arc::new(Semaphore::new(PUBLIC_WRITERS)),
             bucket: Bucket::new(PUBLIC_RATE, PUBLIC_BURST),
             scans: Bucket::new(SCAN_RATE, SCAN_BURST),
+            sends: Bucket::new(SEND_RATE, SEND_BURST),
+            records: Bucket::new(RECORD_RATE, RECORD_BURST),
+            client_sends: Clients::new(CLIENT_SEND_RATE, CLIENT_SEND_BURST),
+            client_records: Clients::new(CLIENT_RECORD_RATE, CLIENT_RECORD_BURST),
         }
     }
 
@@ -441,6 +549,27 @@ impl PublicGate {
     fn take(&self, path: &str) -> bool {
         let heavy = matches!(path, "/scan" | "/scan2") || path.starts_with("/transactions/");
         self.bucket.take() && (!heavy || self.scans.take())
+    }
+
+    /// One token for a write to `path` by `client`: from the shared bucket,
+    /// the client's own and then every client's. Refused: the seconds to
+    /// wait for the bucket that ran dry.
+    fn take_write(&self, path: &str, client: [u8; 16]) -> Result<(), u64> {
+        let (own, all) = match path {
+            "/transactions" => (&self.client_sends, &self.sends),
+            "/address" => (&self.client_records, &self.records),
+            _ => return Err(60),
+        };
+        if !self.bucket.take() {
+            return Err(1);
+        }
+        if !own.take(client) {
+            return Err((1.0 / own.rate).round() as u64);
+        }
+        if !all.take() {
+            return Err((1.0 / all.rate).round() as u64);
+        }
+        Ok(())
     }
 }
 
@@ -455,31 +584,82 @@ fn with_cors(mut response: Response) -> Response {
     headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
     headers.insert(
         header::ACCESS_CONTROL_ALLOW_METHODS,
-        HeaderValue::from_static("GET, HEAD, OPTIONS"),
+        HeaderValue::from_static("GET, HEAD, POST, OPTIONS"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        HeaderValue::from_static("Retry-After"),
     );
     response
 }
 
+fn too_many(retry_after: u64) -> Response {
+    let mut response = with_cors(
+        ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("too many requests; retry in {retry_after} s"),
+        )
+        .into_response(),
+    );
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(retry_after));
+    response
+}
+
 async fn admit_public(State(gate): State<PublicGate>, mut request: Request, next: Next) -> Response {
-    if request.method() == axum::http::Method::OPTIONS {
-        return with_cors(StatusCode::NO_CONTENT.into_response());
-    }
-    if request.method() != axum::http::Method::GET && request.method() != axum::http::Method::HEAD {
-        return with_cors(
-            ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "the public API is read-only").into_response(),
+    let method = request.method().clone();
+    if method == axum::http::Method::OPTIONS {
+        // The preflight of a write: its Content-Type is not a simple one.
+        let mut response = with_cors(StatusCode::NO_CONTENT.into_response());
+        let headers = response.headers_mut();
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static("Content-Type"),
         );
-    }
-    if !gate.take(request.uri().path()) {
-        let mut response = with_cors(
-            ApiError::new(StatusCode::TOO_MANY_REQUESTS, "too many requests; retry in a second")
-                .into_response(),
-        );
-        response
-            .headers_mut()
-            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        headers.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("600"));
         return response;
     }
-    let permit = match tokio::time::timeout(PUBLIC_QUEUE, gate.permits.clone().acquire_owned()).await {
+    let write = method == axum::http::Method::POST;
+    if write {
+        let Some(limit) = public_write(request.uri().path()) else {
+            return with_cors(
+                ApiError::new(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "the public API takes payments and address records only",
+                )
+                .into_response(),
+            );
+        };
+        if request
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_some_and(|size| size > limit as u64)
+        {
+            return with_cors(
+                ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "request body exceeds the endpoint limit")
+                    .into_response(),
+            );
+        }
+        if let Err(wait) = gate.take_write(request.uri().path(), client_of(request.headers())) {
+            return too_many(wait);
+        }
+    } else if method != axum::http::Method::GET && method != axum::http::Method::HEAD {
+        return with_cors(
+            ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "the public API reads, and relays payments")
+                .into_response(),
+        );
+    } else if !gate.take(request.uri().path()) {
+        return too_many(1);
+    }
+    let (permits, deadline) = if write {
+        (gate.writes.clone(), PUBLIC_WRITE_TIMEOUT)
+    } else {
+        (gate.permits.clone(), PUBLIC_TIMEOUT)
+    };
+    let permit = match tokio::time::timeout(PUBLIC_QUEUE, permits.acquire_owned()).await {
         Ok(Ok(permit)) => permit,
         _ => {
             return with_cors(
@@ -491,11 +671,15 @@ async fn admit_public(State(gate): State<PublicGate>, mut request: Request, next
     request
         .extensions_mut()
         .insert(WorkPermit(Arc::new(Mutex::new(Some(permit)))));
-    let mut response = match tokio::time::timeout(PUBLIC_TIMEOUT, next.run(request)).await {
+    let mut response = match tokio::time::timeout(deadline, next.run(request)).await {
         Ok(response) => response,
         Err(_) => ApiError::new(StatusCode::REQUEST_TIMEOUT, "request deadline exceeded").into_response(),
     };
-    if !response.headers().contains_key(header::CACHE_CONTROL) {
+    if write {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    } else if !response.headers().contains_key(header::CACHE_CONTROL) {
         response
             .headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=5"));
@@ -503,10 +687,16 @@ async fn admit_public(State(gate): State<PublicGate>, mut request: Request, next
     with_cors(response)
 }
 
-/// The explorer's read-only API (`--public-api`), for a public front such as
-/// the tunnel behind api.zokascan.cc: GET only, any origin, its own permits
-/// and rate. Nothing here sends, mines, signs or asks the peers.
+/// The explorer's API (`--public-api`), for a public front such as the tunnel
+/// behind api.zokascan.cc: any origin, its own permits and rates. It reads the
+/// chain, and takes what a web wallet sends: a proven payment, relayed like
+/// one from a peer, and its address record, with the stamp already found.
+/// Nothing here mines, signs, computes a stamp or asks the peers.
 pub fn public_router(state: NodeState) -> Router {
+    public_router_with(state, PublicGate::new())
+}
+
+fn public_router_with(state: NodeState, gate: PublicGate) -> Router {
     Router::new()
         .route("/", get(public_index))
         .route("/status", get(public_status))
@@ -522,7 +712,15 @@ pub fn public_router(state: NodeState) -> Router {
         .route("/address/:short", get(public_address_of))
         .route("/checkpoint", get(latest_checkpoint))
         .route("/transactions/:txid", get(transaction_status))
-        .layer(middleware::from_fn_with_state(PublicGate::new(), admit_public))
+        .route(
+            "/transactions",
+            post(submit_transaction).layer(DefaultBodyLimit::max(MAX_TRANSACTION_BYTES)),
+        )
+        .route(
+            "/address",
+            post(publish_record).layer(DefaultBodyLimit::max(stark_directory::MAX_RECORD_BYTES)),
+        )
+        .layer(middleware::from_fn_with_state(gate, admit_public))
         .with_state(state)
 }
 
@@ -932,7 +1130,10 @@ async fn public_index(State(state): State<NodeState>) -> ApiResult<Response> {
             "/supply/total":"issued supply in ZKA (plain text)",
             "/network/history":"this node's peers and the network's work, every 5 minutes for 24 hours",
             "/address/{short}":"the full address behind a short one, if this node knows it",
-            "/checkpoint":"the latest checkpoint signed by the network's authority"
+            "/checkpoint":"the latest checkpoint signed by the network's authority",
+            "/transactions/{txid}":"whether a payment waits in this node's mempool or in which block it is",
+            "POST /transactions":"relay a proven payment (postcard, application/octet-stream) to this node's mempool and its peers",
+            "POST /address":"publish a full address and its work stamp ({\"address\",\"stamp\"}), so its short form resolves"
         }
     }))?;
     Ok(cached(response, "public, max-age=300"))
@@ -1450,6 +1651,32 @@ async fn publish_address(
             .store(&state.storage, network, &record)
             .map_err(directory_error)?;
         stark_directory::mark_local(&state.storage, &short).map_err(directory_error)?;
+        json_response(
+            StatusCode::OK,
+            &serde_json::json!({"short_address":short.encode(),"new":new}),
+        )
+    })
+    .await
+}
+
+/// A record sent to the public API (`POST /address`), with its stamp: the
+/// public node never searches for one (seconds of Argon2id for anyone who
+/// asks). Kept like a record from a peer and relayed the same way, but not
+/// among the addresses published here, which the node pushes again forever.
+async fn publish_record(
+    State(state): State<NodeState>,
+    Extension(permit): Extension<WorkPermit>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Response> {
+    content_type(&headers, "application/json")?;
+    blocking(permit, move || {
+        let record: AddressRecord = serde_json::from_slice(&body)
+            .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+        let (short, new) = state
+            .directory
+            .store(&state.storage, state.profile.network, &record)
+            .map_err(directory_error)?;
         json_response(
             StatusCode::OK,
             &serde_json::json!({"short_address":short.encode(),"new":new}),
@@ -2000,6 +2227,158 @@ mod tests {
             .unwrap()
     }
 
+    /// A write from a web wallet, as the tunnel delivers it: Cloudflare names
+    /// the client in `CF-Connecting-IP`.
+    async fn post_from(app: &Router, uri: &str, kind: &str, body: Vec<u8>, client: &str) -> Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(header::HOST, "api.zokascan.cc")
+                    .header(header::ORIGIN, "https://wallet.zoka.network")
+                    .header("sec-fetch-site", "cross-site")
+                    .header("cf-connecting-ip", client)
+                    .header(header::CONTENT_TYPE, kind)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_public_api_takes_a_web_wallets_address_within_its_limits() {
+        let (_dir, state) = test_state();
+        let gate = PublicGate::new();
+        let public = public_router_with(state.clone(), gate.clone());
+
+        // The browser's preflight for a write.
+        let preflight = public
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/transactions")
+                    .header(header::ORIGIN, "https://wallet.zoka.network")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+        let allowed = preflight.headers();
+        assert_eq!(allowed[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        assert!(allowed[header::ACCESS_CONTROL_ALLOW_METHODS].to_str().unwrap().contains("POST"));
+        assert_eq!(allowed[header::ACCESS_CONTROL_ALLOW_HEADERS], "Content-Type");
+        assert_eq!(allowed[header::ACCESS_CONTROL_MAX_AGE], "600");
+
+        // A record with the stamp the wallet found is kept, and resolves.
+        let bob = Account::from_seed(&[67; 32], 3, 0).unwrap().address();
+        let short = bob.short().unwrap();
+        let record = serde_json::to_vec(&AddressRecord::new(&bob).unwrap()).unwrap();
+        let response = post_from(&public, "/address", "application/json", record.clone(), "203.0.113.7").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let kept = json(response).await;
+        assert_eq!((kept["short_address"].as_str().unwrap(), &kept["new"]), (short.as_str(), &serde_json::json!(true)));
+        let resolved = json(get_from(&public, &format!("/address/{short}"), "GET").await).await;
+        assert_eq!(resolved["address"], bob.encode().unwrap());
+        let again = json(post_from(&public, "/address", "application/json", record.clone(), "203.0.113.8").await).await;
+        assert_eq!(again["new"], false);
+        // Relayed like a peer's record, not republished as this node's own.
+        let status = json(router(state.clone()).oneshot(Request::builder().uri("/status").body(Body::empty()).unwrap()).await.unwrap()).await;
+        assert_eq!(status["directory"]["addresses"], 1);
+        assert_eq!(status["directory"]["published_here"], 0);
+
+        // The public node never looks for a stamp, and checks the one it gets.
+        let carol = Account::from_seed(&[68; 32], 3, 0).unwrap().address();
+        let carol_short = carol.short_address().unwrap();
+        let bad = (0u64..).find(|s| !stark_directory::stamp_is_valid(&carol_short, *s)).unwrap();
+        for (body, expected) in [
+            (serde_json::json!({ "address": carol.encode().unwrap() }), StatusCode::BAD_REQUEST),
+            (serde_json::json!({ "address": carol.encode().unwrap(), "stamp": bad }), StatusCode::UNPROCESSABLE_ENTITY),
+            (serde_json::json!({ "address": carol.short().unwrap(), "stamp": 1 }), StatusCode::UNPROCESSABLE_ENTITY),
+            (serde_json::json!({ "address": carol.encode().unwrap(), "stamp": 1, "local": true }), StatusCode::BAD_REQUEST),
+        ] {
+            let response = post_from(&public, "/address", "application/json", body.to_string().into_bytes(), "198.51.100.9").await;
+            assert_eq!(response.status(), expected, "{body}");
+            // Each try from a full bucket, the client's and every client's.
+            gate.client_records.levels.lock().unwrap().clear();
+            *gate.records.level.lock().unwrap() = (RECORD_BURST, std::time::Instant::now());
+        }
+        assert_eq!(get_from(&public, &format!("/address/{}", carol.short().unwrap()), "GET").await.status(), StatusCode::NOT_FOUND);
+
+        // A declared body over the limit is refused before it is read.
+        for (uri, maximum) in [("/transactions", MAX_TRANSACTION_BYTES), ("/address", stark_directory::MAX_RECORD_BYTES)] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::CONTENT_LENGTH, (maximum + 1).to_string())
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(public.clone().oneshot(request).await.unwrap().status(), StatusCode::PAYLOAD_TOO_LARGE, "{uri}");
+        }
+
+        // Writes and reads take turns on permits apart.
+        let readers = gate.permits.clone().acquire_many_owned(PUBLIC_WORKERS as u32).await.unwrap();
+        let response = post_from(&public, "/address", "application/json", record, "203.0.113.9").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(readers);
+        let writers = gate.writes.clone().acquire_many_owned(PUBLIC_WRITERS as u32).await.unwrap();
+        assert_eq!(get_from(&public, "/status", "GET").await.status(), StatusCode::OK);
+        drop(writers);
+
+        // A client's own bucket, then every client's.
+        let gate = PublicGate::new();
+        let one = client_of(&HeaderMap::from_iter([(header::HeaderName::from_static("cf-connecting-ip"), HeaderValue::from_static("203.0.113.1"))]));
+        for _ in 0..CLIENT_SEND_BURST as usize {
+            assert_eq!(gate.take_write("/transactions", one), Ok(()));
+        }
+        assert_eq!(gate.take_write("/transactions", one), Err(20));
+        assert_eq!(gate.take_write("/address", one), Ok(()));
+        let mut others = (2u8..).map(|n| {
+            let ip = format!("203.0.113.{n}");
+            client_of(&HeaderMap::from_iter([(header::HeaderName::from_static("cf-connecting-ip"), HeaderValue::from_str(&ip).unwrap())]))
+        });
+        for _ in CLIENT_SEND_BURST as usize..SEND_BURST as usize {
+            assert_eq!(gate.take_write("/transactions", others.next().unwrap()), Ok(()));
+        }
+        assert_eq!(gate.take_write("/transactions", others.next().unwrap()), Err(3));
+        assert_eq!(gate.take_write("/blocks", one), Err(60));
+
+        // Who a client is: the address the edge saw, an IPv6 one by its /64.
+        let of = |ip: &str| client_of(&HeaderMap::from_iter([(header::HeaderName::from_static("cf-connecting-ip"), HeaderValue::from_str(ip).unwrap())]));
+        assert_eq!(of("2001:db8::1"), of("2001:db8::2"));
+        assert_ne!(of("2001:db8::1"), of("2001:db8:0:1::1"));
+        assert_ne!(of("203.0.113.1"), of("203.0.113.2"));
+        assert_eq!(of("203.0.113.1"), of("::ffff:203.0.113.1"));
+        assert_eq!(of("not an address"), client_of(&HeaderMap::new()));
+
+        // At most MAX_CLIENTS buckets; full ones are forgotten first.
+        let slow = Clients::new(1.0 / 60.0, 2.0);
+        let key = |n: usize| {
+            let mut key = [0u8; 16];
+            key[..8].copy_from_slice(&(n as u64).to_le_bytes());
+            key
+        };
+        for n in 0..MAX_CLIENTS {
+            assert!(slow.take(key(n)));
+        }
+        assert!(!slow.take(key(MAX_CLIENTS)), "every bucket is still in use");
+        assert!(slow.take(key(0)), "a known client keeps its bucket");
+        let quick = Clients::new(1000.0, 2.0);
+        for n in 0..MAX_CLIENTS {
+            assert!(quick.take(key(n)));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(quick.take(key(MAX_CLIENTS)), "refilled buckets make room");
+        assert!(quick.levels.lock().unwrap().len() <= 2);
+    }
+
     #[tokio::test]
     async fn the_public_api_reads_the_chain_for_any_origin_and_nothing_else() {
         let (_dir, state) = test_state();
@@ -2032,17 +2411,25 @@ mod tests {
             StatusCode::UNPROCESSABLE_ENTITY
         );
 
-        // Nothing that writes, mines, signs or hands out whole blocks.
+        // Nothing that mines, signs or hands out whole blocks.
         for (uri, method) in [
-            ("/transactions", "POST"),
             ("/blocks", "POST"),
             ("/checkpoint", "POST"),
-            ("/address", "POST"),
+            ("/status", "PUT"),
+            ("/transactions", "DELETE"),
         ] {
             assert_eq!(
                 get_from(&public, uri, method).await.status(),
                 StatusCode::METHOD_NOT_ALLOWED,
                 "{method} {uri}"
+            );
+        }
+        // What a web wallet sends is routed, in its own media type.
+        for uri in ["/transactions", "/address"] {
+            assert_eq!(
+                get_from(&public, uri, "POST").await.status(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "POST {uri}"
             );
         }
         for uri in ["/mining/template", "/blocks/1"] {
@@ -2172,14 +2559,24 @@ mod tests {
             .await
             .unwrap();
         light.reserve(&payment).unwrap();
-        let response = post(
-            &app,
-            "/transactions",
-            "application/octet-stream",
-            payment.encode().unwrap(),
-        )
-        .await;
+        // A web wallet sends it to the public API, like the phone to its node.
+        let encoded = payment.encode().unwrap();
+        let response = post_from(&public, "/transactions", "application/octet-stream", encoded.clone(), "203.0.113.5").await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(json(response).await["txid"], hex::encode(payment.txid()));
+        assert_eq!(state.mempool.lock().unwrap().len(), 1);
+        let lookup = format!("/transactions/{}", hex::encode(payment.txid()));
+        assert_eq!(json(get_from(&public, &lookup, "GET").await).await["status"], "pending");
+        // Sent again, it is refused: it already waits for a block.
+        let again = post_from(&public, "/transactions", "application/octet-stream", encoded, "203.0.113.5").await;
+        assert_eq!(again.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(json(again).await["error"].as_str().unwrap().contains("already in mempool"));
+        assert_eq!(
+            post(&app, "/transactions", "application/octet-stream", payment.encode().unwrap()).await.status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
         let (block, canonical) = super::super::stark_node::mine_once(&state, alice.address())
             .await
             .unwrap();
