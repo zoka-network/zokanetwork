@@ -63,6 +63,8 @@ pub mod stark_peers;
 pub mod stark_stratum;
 #[cfg(feature = "quantic-pq")]
 pub mod stark_wallet;
+#[cfg(all(test, feature = "quantic-pq"))]
+mod zoka_light_equivalence;
 
 /// El nodo numera desde 1 (la altura 0 es el génesis sintético de cada
 /// cadena), así que el génesis de Quantic, con el premine, es el bloque 1.

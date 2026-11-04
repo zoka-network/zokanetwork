@@ -18,6 +18,8 @@ target_*/
 *.lock
 !crates/zoka-pq/Cargo.lock
 !crates/zoka-quantic/Cargo.lock
+!crates/zoka-light/Cargo.lock
+!crates/zoka-pq-wallet-wasm/Cargo.lock
 release/
 releases/
 

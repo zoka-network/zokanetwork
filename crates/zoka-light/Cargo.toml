@@ -1,0 +1,22 @@
+# Lo que una billetera liviana de Zoka Quantic necesita del nodo, sin el nodo:
+# verificar un checkpoint firmado por la autoridad (Ed25519 + ML-DSA-65) y
+# armar o verificar el registro de una dirección corta (estampilla Argon2id).
+# Sin RocksDB, iroh ni sistema de archivos: compila para wasm32 (billetera web)
+# igual que para el teléfono. El nodo prueba que se comporta como su código
+# (src/quantic/zoka_light_equivalence.rs).
+[package]
+name = "zoka-light"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Checkpoint verification and short-address records for Zoka Quantic light wallets"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+zoka-pq-pool = { path = "../zoka-pq-pool" }
+zoka-pq = { path = "../zoka-pq" }
+ed25519-dalek = "2.0"
+argon2 = "0.5"
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
