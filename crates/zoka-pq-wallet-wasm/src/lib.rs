@@ -95,6 +95,72 @@ pub fn matches_short(full: &str, short: &str, network: u8) -> bool {
         .unwrap_or(false)
 }
 
+/// La corta de una dirección completa de `network`, para mostrar a quién se
+/// paga; `""` si no lo es.
+#[wasm_bindgen(js_name = shortOf)]
+pub fn short_of(full: &str, network: u8) -> String {
+    Address::decode(full.trim(), network)
+        .ok()
+        .and_then(|full| full.short().ok())
+        .unwrap_or_default()
+}
+
+/// Lo que acepta [`derive_key`]: desde el piso de OWASP para Argon2id
+/// (19 MiB, 2 pasadas) hasta lo que un teléfono todavía aguanta.
+const MIN_KDF_KIB: u32 = 19 * 1024;
+const MAX_KDF_KIB: u32 = 256 * 1024;
+
+/// La clave AES-256 que cifra la frase y el estado en el navegador: Argon2id
+/// de la contraseña con `salt` (al azar, de cada bóveda), `memory_kib` KiB y
+/// `iterations` pasadas, en un carril. Con 64 MiB y 3 pasadas tarda alrededor
+/// de un segundo: llamarla en el Worker.
+#[wasm_bindgen(js_name = deriveKey)]
+pub fn derive_key(
+    password: &str,
+    salt: &[u8],
+    memory_kib: u32,
+    iterations: u32,
+) -> Result<Vec<u8>, JsError> {
+    derive(password, salt, memory_kib, iterations).map_err(JsError::new)
+}
+
+fn derive(password: &str, salt: &[u8], memory_kib: u32, iterations: u32) -> Result<Vec<u8>, &'static str> {
+    if password.is_empty() {
+        return Err("the password is empty");
+    }
+    if salt.len() < 16 {
+        return Err("the salt has fewer than 16 bytes");
+    }
+    if !(MIN_KDF_KIB..=MAX_KDF_KIB).contains(&memory_kib) || !(2..=10).contains(&iterations) {
+        return Err("unsupported key derivation parameters");
+    }
+    let params = argon2::Params::new(memory_kib, iterations, 1, Some(32))
+        .map_err(|_| "unsupported key derivation parameters")?;
+    let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+    let mut key = vec![0u8; 32];
+    argon
+        .hash_password_into(password.as_bytes(), salt, &mut key)
+        .map_err(|_| "the key could not be derived")?;
+    Ok(key)
+}
+
+/// El QR de `text` con corrección M, como el de ZKAPriv: `[ancho, módulos…]`,
+/// un byte por módulo (1 = oscuro), fila por fila y sin el margen.
+#[wasm_bindgen(js_name = qrMatrix)]
+pub fn qr_matrix(text: &str) -> Result<Vec<u8>, JsError> {
+    let code = qrcode::QrCode::with_error_correction_level(text.as_bytes(), qrcode::EcLevel::M)
+        .map_err(js)?;
+    let width = code.width();
+    let mut out = Vec::with_capacity(1 + width * width);
+    out.push(u8::try_from(width).map_err(js)?);
+    out.extend(
+        code.to_colors()
+            .into_iter()
+            .map(|color| u8::from(color == qrcode::Color::Dark)),
+    );
+    Ok(out)
+}
+
 #[wasm_bindgen]
 pub struct WebWallet {
     network: u8,
@@ -319,6 +385,8 @@ mod tests {
         assert_eq!(address_kind(&full, 2), "full");
         assert_eq!(address_kind(&short, 2), "short");
         assert!(matches_short(&full, &short, 2));
+        assert_eq!(short_of(&full, 2), short);
+        assert_eq!(short_of(&short, 2), "");
     }
 
     #[test]
@@ -331,5 +399,38 @@ mod tests {
         let mine = Account::from_seed(&[0; 32], 2, 0).unwrap().address();
         assert!(!matches_short(&other.encode().unwrap(), &mine.short().unwrap(), 2));
         assert_eq!(address_kind("zqtest2nothing", 2), "");
+    }
+
+    #[test]
+    fn the_password_key_depends_on_password_and_salt_and_refuses_weak_settings() {
+        let salt = [7u8; 16];
+        let key = derive("correct horse", &salt, MIN_KDF_KIB, 2).unwrap();
+        assert_eq!(key.len(), 32);
+        assert_eq!(key, derive("correct horse", &salt, MIN_KDF_KIB, 2).unwrap());
+        assert_ne!(key, derive("correct horsf", &salt, MIN_KDF_KIB, 2).unwrap());
+        assert_ne!(key, derive("correct horse", &[8u8; 16], MIN_KDF_KIB, 2).unwrap());
+        assert_ne!(key, derive("correct horse", &salt, MIN_KDF_KIB, 3).unwrap());
+        // Below OWASP's floor, a short salt or no password: refused.
+        assert!(derive("correct horse", &salt, MIN_KDF_KIB - 1, 2).is_err());
+        assert!(derive("correct horse", &salt, MIN_KDF_KIB, 1).is_err());
+        assert!(derive("correct horse", &salt, MAX_KDF_KIB + 1, 2).is_err());
+        assert!(derive("correct horse", &[7u8; 15], MIN_KDF_KIB, 2).is_err());
+        assert!(derive("", &salt, MIN_KDF_KIB, 2).is_err());
+    }
+
+    #[test]
+    fn the_qr_holds_the_short_address_with_its_finder_patterns() {
+        let short = Account::from_seed(&[0; 32], 2, 0).unwrap().address().short().unwrap();
+        let qr = qr_matrix(&short).unwrap();
+        let width = qr[0] as usize;
+        assert_eq!((width - 21) % 4, 0, "a QR is 21 + 4k modules wide");
+        assert_eq!(qr.len(), 1 + width * width);
+        let at = |row: usize, col: usize| qr[1 + row * width + col];
+        // The three finder patterns: dark corners, a light ring, a dark core.
+        for (row, col) in [(0, 0), (0, width - 7), (width - 7, 0)] {
+            assert_eq!((at(row, col), at(row + 1, col + 1), at(row + 3, col + 3)), (1, 0, 1));
+        }
+        // And the light separator around the first one.
+        assert!((0..8).all(|i| at(7, i) == 0 && at(i, 7) == 0));
     }
 }

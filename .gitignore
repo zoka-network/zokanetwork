@@ -27,6 +27,7 @@ releases/
 zsilent-core/
 zokaexplorer/
 zokaweb/
+zokawallet/
 
 # Local snapshots / migration artifacts
 zoka-local-*.snapshot.json

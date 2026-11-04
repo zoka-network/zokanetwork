@@ -1039,6 +1039,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1540,9 +1546,11 @@ dependencies = [
 name = "zoka-pq-wallet-wasm"
 version = "0.1.0"
 dependencies = [
+ "argon2",
  "bip39",
  "getrandom 0.4.3",
  "hex",
+ "qrcode",
  "serde",
  "serde_json",
  "wasm-bindgen",
