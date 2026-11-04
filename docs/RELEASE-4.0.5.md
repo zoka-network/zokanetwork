@@ -34,12 +34,15 @@ arreglo funciona en el nodo que llama. ZSilent 4.0.7 incorpora este nodo.
   `release-manifest.json`.
 - [x] `main` y etiquetas anotadas en GitHub y GitLab: nodo `v4.0.5` =
   `7ff77929`, ZSilent `v4.0.7` = `3f1e55f`.
-- [ ] Crear las releases y descargar otra vez los archivos para verificar sus
-  hashes. Marcar 4.0.4 y 4.0.6 como reemplazadas.
+- [x] Crear las releases y descargar otra vez los archivos para verificar sus
+  hashes. Marcar 4.0.4 y 4.0.6 como reemplazadas (4/11, 16:53).
 - [ ] Actualizar seed3 y después seed2 (con el explorador) y comprobar que
-  siguen la cadena. Guardar el binario anterior como `zoka-4.0.4`.
-- [ ] Desplegar ZokaScan (`explorer-quantic-v2` = `056eea8`, `dist/` armado) y
-  zoka.network (rama `descargas-4.0.7` = `8793fa7`, `dist/` armado).
+  siguen la cadena. Guardar el binario anterior como `zoka-4.0.4`. Las
+  semillas pasan directo a la 4.0.6 ([RELEASE-4.0.6.md](RELEASE-4.0.6.md)).
+- [x] zoka.network: `main` = `descargas-4.0.7` = `8793fa7`, desplegada y
+  verificada en vivo.
+- [ ] ZokaScan (`explorer-quantic-v2` = `056eea8`, `dist/` armado): el
+  clasificador frenó el despliegue; lo corre el usuario.
 - [ ] Anuncio de Discord: [ANUNCIO-4.0.5-BORRADOR.md](ANUNCIO-4.0.5-BORRADOR.md).
 
 El 3/11 a la noche el clasificador de permisos frenó `gh release create`
