@@ -55,3 +55,4 @@ test_db_*/
 zoka-team-*/
 # El pago que prueba el WASM (unos 2 MB): se rehace en cada corrida.
 crates/zoka-pq-wallet-wasm/tests/fixtures/regtest-web-payment.bin
+zokafaucet/
