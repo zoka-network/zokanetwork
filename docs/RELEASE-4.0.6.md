@@ -36,10 +36,13 @@ corren las semillas.
   semilla: arranca, toma el checkpoint 4444 de seed2 y sincroniza; el preflight
   de `POST /address` da 204 con `Content-Type` permitido, y los dos `POST`
   rechazan lo mal formado.
-- [ ] Instalar en seed3 y después en seed2 (el clasificador de permisos frenó
-  la escritura en los VPS: lo corre el usuario), guardar el binario anterior como
-  `zoka-4.0.4`, y comprobar que siguen la cadena.
-- [ ] `api.zokascan.cc`: versión 4.0.6, preflight de `POST /address` con
-  `Content-Type` permitido.
+- [x] Instalado en seed3 y en seed2 por el usuario (el clasificador frenó la
+  escritura en los VPS), con el respaldo `zoka-4.0.4`: las dos en el bloque
+  4808 con 3 pares salientes y 3 entrantes.
+- [x] `api.zokascan.cc` responde `node_version` 4.0.6; el preflight de
+  `POST /transactions` permite `Content-Type`; el directorio pasó de 5 a 6
+  direcciones cortas (la billetera web del usuario).
+- [x] Prueba con dinero del usuario: ZSilent → billetera web → ZKAPriv 3.0.0
+  → ZSilent, minada en los bloques 4789, 4791 y 4809.
 - [x] Release `v4.0.6` sin "Latest" (la 4.0.5 sigue siéndolo), bajada otra
   vez y verificada.

@@ -104,7 +104,17 @@ commit y los hashes del WASM copiado.
   espera. El nodo lo tomó por `POST /transactions` público (202), lo minó en
   el bloque 4 y Bob leyó sus 7 ZKA con la nota.
 
-## Lo que falta (todo pide un OK explícito)
+## Estado de la publicación (4/11, noche)
+
+- Publicada en `https://wallet.zoka.network` (Pages `zokawallet`) y enlazada
+  desde zoka.network. Nodo 4.0.6 en seed2 y seed3.
+- Probada con dinero por el usuario: ZSilent → web → ZKAPriv 3.0.0 → ZSilent
+  (bloques 4789, 4791 y 4809).
+- Falta, lo corre el usuario: crear el repo público `zokawallet` en GitHub
+  (el enlace "Source code" de la billetera y de zoka.network apunta ahí) y en
+  GitLab.
+
+## Lo que faltaba (histórico)
 
 1. Publicar el nodo 4.0.6, que es 4.0.5 más W3, y actualizar seed2. Sin eso,
    la web lee pero no puede publicar la corta ni pagar.
