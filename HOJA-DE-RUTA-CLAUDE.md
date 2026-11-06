@@ -45,6 +45,30 @@ Proyecto: `C:\Users\mderramus\ZOKA`.
   - **Publicado:** despliegue <https://c92bfd66.zokaweb.pages.dev>,
     verificado en zoka.network con los archivos `index-Drj2h4W4.js` e
     `index-Cj1huxvz.css` y recorrido con capturas en 1440 y 390 px.
+- **Roadmap y Tokenomics (6/11, noche), en Docs y no en el home.** El usuario
+  quiso que el home muestre solo la tecnología. Son dos páginas de un grupo
+  "Project" de Docs (`#docs/roadmap`, `#docs/tokenomics`), con enlaces
+  directos desde la columna Learn del pie y desde Tech. La barra sigue Tech ·
+  Download · Docs.
+  - **Decisiones del usuario para el roadmap:** sin fechas, salvo la mainnet,
+    con objetivo en el 4.º trimestre de 2027 y solo si pasa la revisión
+    externa; los checkpoints del equipo se retiran según crezca la red; la
+    billetera para iOS llega según la adopción.
+  - **Contenido del roadmap:** 2027 = pruebas más chicas, releases firmadas y
+    relays propios, pools de minería, revisión externa con bug bounty y
+    testnet final; 2028 = P2Pool, privacidad de metadatos, pruebas de pago,
+    API para comercios y segunda revisión.
+  - **Tokenomics:** el modelo de la testnet v2, tomado del código
+    (`crates/zoka-pq-pool/src/ledger.rs`): 23 M ZKA, 5 M del equipo en el
+    bloque 1 para desarrollo, 12 ZKA × 1.051.200 bloques y 6 ZKA × 897.600.
+    La economía de la mainnet **no está decidida** y puede seguir este
+    modelo.
+  - **Publicado:** zokaweb `a4db6c2`, despliegue
+    <https://59084821.zokaweb.pages.dev>, verificado en vivo
+    (`index-BejEA_8R.js`) y en GitHub y GitLab. 17 pruebas.
+  - **Pendiente si el usuario lo pide:** la sección 11 del whitepaper dice
+    "sin fechas" y no menciona el objetivo de la mainnet; hay que alinear los
+    papers.
 - **Hecho el 6/11 a la noche:** el usuario corrió `faucet-actualizar.ps1`.
   El VPS 1 tiene el arreglo `84127d7` (`faucet.py` SHA-256 `53968ef0…`), el
   servicio está activo y `/faucet/status` responde `ready`. El repo
