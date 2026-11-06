@@ -94,11 +94,28 @@ Proyecto: `C:\Users\mderramus\ZOKA`.
     minero CLI 4.0.5, XMRig por Stratum y preguntas frecuentes. Se verificó
     con `scripts/check-anchors.js`. La copia de lo viejo está en
     `discord-bot/backups/`.
-  - **Quedan, porque el usuario no eligió tocarlos:** los tutoriales del P2P
-    Exchange (#general-es/en) y del Mining Pool en equipo (#mineria/#mining),
-    los dos de Zenith; la FAQ nueva aclara que el pool ya no existe. También
-    #peers con las direcciones onion de Zenith. El bot conserva el permiso de
-    Administrador (conviene sacárselo).
+  - **Revisión completa del servidor (6/11, noche), con lo que eligió el
+    usuario** (`discord-bot/scripts/fix-server.js`, con copia en `backups/`):
+    - **Seguridad:** el rol **Verified tenía Administrador**, es decir, todo
+      miembro verificado era admin. Se lo sacó y quedó con permisos de miembro.
+      Se creó el rol **Staff** (moderación, ve #logs-mod y #reportes), vacío:
+      se lo da el dueño a quien modere.
+    - **Bots de terceros:** se echaron Flipsuite/Flippy (categoría privada
+      para 25 miembros y promociones) y OneTap (tenía Administrador). También
+      se borraron su categoría y #🚨alerts.
+    - **#general → #👋bienvenida:** el canal donde Discord avisa quién entra
+      pasó a INICIO, visible para todos y de solo lectura.
+    - **Tutoriales de Zenith borrados:** 18 mensajes del P2P Exchange y del
+      Mining Pool en equipo. La FAQ de minería ya no los menciona.
+    - **Verificado con un volcado nuevo:** solo zokabot tiene Administrador.
+  - **Quedan, porque el usuario no los marcó en la limpieza:**
+    - #peers, con las direcciones onion de Zenith, aunque al pedir la revisión
+      dijo que ya no se usa;
+    - las reglas, que mencionan `/reportar`, un comando que no responde;
+    - #support-to-blockchain-zoka-network, que está vacío;
+    - el rol «nuevo rol» y las categorías vacías.
+
+    El Administrador de zokabot lo saca el dueño a mano.
   - **El bot no está prendido 24/7** desde que se borraron los droplets en
     julio, así que sus comandos (`/mining`, `/updates`…) no responden.
     `/updates` apunta a la org vieja `ZokaNetwork` de GitHub. Queda
