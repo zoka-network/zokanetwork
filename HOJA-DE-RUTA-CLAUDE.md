@@ -108,14 +108,24 @@ Proyecto: `C:\Users\mderramus\ZOKA`.
     - **Tutoriales de Zenith borrados:** 18 mensajes del P2P Exchange y del
       Mining Pool en equipo. La FAQ de minería ya no los menciona.
     - **Verificado con un volcado nuevo:** solo zokabot tiene Administrador.
-  - **Quedan, porque el usuario no los marcó en la limpieza:**
-    - #peers, con las direcciones onion de Zenith, aunque al pedir la revisión
-      dijo que ya no se usa;
-    - las reglas, que mencionan `/reportar`, un comando que no responde;
-    - #support-to-blockchain-zoka-network, que está vacío;
-    - el rol «nuevo rol» y las categorías vacías.
+  - **Segunda ronda (6/11, noche), con el «sí» del usuario**
+    (`scripts/fix-server-2.js`, con copia en `backups/`):
+    - **Se borró:** #peers y su categoría; #support-to-blockchain-zoka-network,
+      que estaba vacío; el rol «nuevo rol»; y las categorías vacías «Canales
+      de texto» y «Canales de voz».
+    - **Reglas nuevas:** sin `/reportar`; prohíben la compraventa de ZKA de
+      prueba; los problemas se cuentan en #ayuda-es o #help-en, o mencionando
+      a Staff.
+    - **Descripciones y fijados:** cada canal tiene su descripción. Se fijaron
+      el anuncio nuevo y los enlaces oficiales, y se desfijaron el de ZSilent
+      1.8.0 y un mensaje de Zenith en #general-en.
+    - **Estructura final:**
+      - INICIO: reglas, verificacion, enlaces-oficiales, 👋bienvenida;
+      - ANUNCIOS: es y en;
+      - COMUNIDAD (ES) y COMMUNITY (EN): general, ayuda y minería;
+      - STAFF: logs y reportes.
 
-    El Administrador de zokabot lo saca el dueño a mano.
+    Queda para el dueño sacarle el Administrador a zokabot.
   - **El bot no está prendido 24/7** desde que se borraron los droplets en
     julio, así que sus comandos (`/mining`, `/updates`…) no responden.
     `/updates` apunta a la org vieja `ZokaNetwork` de GitHub. Queda
