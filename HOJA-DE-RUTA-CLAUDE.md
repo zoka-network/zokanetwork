@@ -45,12 +45,15 @@ Proyecto: `C:\Users\mderramus\ZOKA`.
   - **Publicado:** despliegue <https://c92bfd66.zokaweb.pages.dev>,
     verificado en zoka.network con los archivos `index-Drj2h4W4.js` e
     `index-Cj1huxvz.css` y recorrido con capturas en 1440 y 390 px.
-- **Pendientes:**
-  - confirmar que el usuario corrió `faucet-actualizar.ps1` (arreglo
-    `84127d7` del faucet: la respuesta es la última línea JSON);
-  - pasar a Public el repo `zokanetwork/zokafaucet` de GitLab;
-  - opcional, si el usuario lo pide: pasar a blanco y negro, con un filtro,
-    la línea rosa propia del video de la computadora cuántica.
+- **Hecho el 6/11 a la noche:** el usuario corrió `faucet-actualizar.ps1`.
+  El VPS 1 tiene el arreglo `84127d7` (`faucet.py` SHA-256 `53968ef0…`), el
+  servicio está activo y `/faucet/status` responde `ready`. El repo
+  `zokanetwork/zokafaucet` de GitLab ya es público.
+- **A vigilar:** la versión anterior del servicio consumió 3 h 17 min de CPU
+  desde el 5/11. Probablemente sea el espejo de la billetera sincronizando; en
+  los próximos días, comparar con `systemctl show zoka-faucet -p CPUUsageNSec`.
+- **Opcional, si el usuario lo pide:** pasar a blanco y negro, con un filtro,
+  la línea rosa propia del video de la computadora cuántica.
 
 ## 3/11, tarde: retomado el trabajo de Claude y publicada la primera etapa
 
