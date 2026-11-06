@@ -1,7 +1,56 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
-Actualizada: **3 de noviembre de 2026**, Argentina. Testnet v2 con dos semillas permanentes en VPS; nodo/minero 4.0.4, ZSilent 4.0.6 y web publicados. Sigue ZKAPriv 3.0.
+Actualizada: **6 de noviembre de 2026**, Argentina. Testnet v2 con semillas permanentes en VPS; billetera web, ZKAPriv 3.0.0 y faucet publicados; home nuevo de zoka.network en vivo.
 Proyecto: `C:\Users\mderramus\ZOKA`.
+
+## 4 al 6/11: billetera web, faucet y home nuevo de zoka.network (Claude)
+
+- **Billetera web y ZKAPriv 3.0.0 (4/11):** publicadas, con el ciclo probado
+  con dinero (ZSilent → web → ZKAPriv → ZSilent). Detalle en
+  [docs/BILLETERA-WEB.md](docs/BILLETERA-WEB.md) y
+  [docs/RELEASE-4.0.6.md](docs/RELEASE-4.0.6.md). zoka.network, la billetera y
+  ZokaScan llevan al pie los mismos íconos de GitHub, X y Discord.
+- **Faucet (5/11):** <https://faucet.zoka.network>, 10 ZKA por pedido, uno por
+  día por billetera y por IP, tope de 400 ZKA cada 24 h, presupuesto de
+  20.000 ZKA que mandó el usuario. Es un repo aparte (`zokafaucet/`, ignorado
+  por este; GitHub y GitLab `zokafaucet`). Funcionamiento, reglas e
+  instalación en `zokafaucet/README.md`; las credenciales viven solo en el
+  VPS 1, nunca en un repo. En zoka.network es discreto: un acceso chico
+  "Faucet" junto a "Web wallet" que lleva a la guía `#docs/faucet`.
+- **Home nuevo de zoka.network (6/11)**, pedido por el usuario a partir de
+  tres imágenes suyas (negro profundo, objetos de vidrio, revelado al bajar):
+  - **Estructura:** hero, cuatro capítulos de una pantalla, card de cierre
+    con los tres objetos y footer con mapa del sitio en cinco columnas;
+    abajo, la fila de siempre con los íconos.
+  - **Capítulos:** 1/4 *Private Payments by Default*, agregado por pedido
+    del usuario («somos una red privada»): qué oculta la cadena (destinatario,
+    monto, memo, nota gastada) y qué sigue público (comisión, hora, tamaño);
+    después STARKs/Plonky3/Poseidon2/FRI, X-Wing (ML-KEM-768 + X25519) y
+    ML-DSA-65 + QUIC/iroh + Tor opcional.
+  - **Antes de escribir lo que oculta la v2 se miró el código:** el
+    `Statement` público del pool (`crates/zoka-pq-pool/src/model.rs`) lleva
+    raíz, nullifiers, compromisos, comisión, emisión y sello. La nota gastada
+    y su camino quedan en la prueba. Se dice «privacidad», no «anonimato
+    total».
+  - **Movimiento:** los objetos (CSS 3D y SVG, sin imágenes) se mueven con
+    el scroll; con «reducir movimiento» quedan quietos.
+  - **Decisiones del usuario:** sin logo Z (solo texto «ZOKA QUANTIC»);
+    video sin botón Pause/Play; rosa solo en la palabra QUANTIC y en el
+    puntito y el «How it works →» de los capítulos (el botón «Web wallet» de
+    la barra pasó de rosa a vidrio blanco).
+  - **Código:** zokaweb `e52024b` (rama `home-v2`, llevada a `main` sin
+    merge), en GitHub y GitLab. Estructura, movimiento y regla de color
+    documentados en el README de zokaweb. 13 pruebas, tipos, lint (los 7
+    avisos de siempre) y build.
+  - **Publicado:** despliegue <https://c92bfd66.zokaweb.pages.dev>,
+    verificado en zoka.network con los archivos `index-Drj2h4W4.js` e
+    `index-Cj1huxvz.css` y recorrido con capturas en 1440 y 390 px.
+- **Pendientes:**
+  - confirmar que el usuario corrió `faucet-actualizar.ps1` (arreglo
+    `84127d7` del faucet: la respuesta es la última línea JSON);
+  - pasar a Public el repo `zokanetwork/zokafaucet` de GitLab;
+  - opcional, si el usuario lo pide: pasar a blanco y negro, con un filtro,
+    la línea rosa propia del video de la computadora cuántica.
 
 ## 3/11, tarde: retomado el trabajo de Claude y publicada la primera etapa
 
