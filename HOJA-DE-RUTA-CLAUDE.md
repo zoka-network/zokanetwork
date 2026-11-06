@@ -69,6 +69,25 @@ Proyecto: `C:\Users\mderramus\ZOKA`.
   - **Pendiente si el usuario lo pide:** la sección 11 del whitepaper dice
     "sin fechas" y no menciona el objetivo de la mainnet; hay que alinear los
     papers.
+- **Anuncio en Discord (6/11, noche), aprobado por el usuario.** Es el primero
+  desde el aviso de GitHub del 9/8 y cuenta todo el paso de Zenith a Quantic:
+  - Zenith retirado, sin migración de saldos;
+  - la tecnología de la v2;
+  - las tres billeteras, ZokaScan y el faucet;
+  - la web, el roadmap y la tokenomics;
+  - cómo ayudar y cómo cuidarse.
+
+  Salió en `#announcements-en` y `#anuncios-es`, cinco mensajes en cada uno,
+  con el banner del hero nuevo. Lo mandó el bot con
+  `discord-bot/scripts/send-notice.js` y `notice.quantic-launch.json`, que
+  quedó bloqueado otra vez. Se comprobó con `scripts/check-notice.js`: los
+  textos y la imagen coinciden.
+  - **Antes del anuncio se publicó** zokaweb `c8d9da0`: Tech decía «no
+    announced launch date» y ahora dice «targets Q4 2027», como el roadmap.
+  - **El bot no está prendido 24/7** desde que se borraron los droplets en
+    julio, así que sus comandos (`/mining`, `/updates`…) no responden.
+    `/updates` apunta a la org vieja `ZokaNetwork` de GitHub. Queda
+    pendiente si el usuario lo pide.
 - **Hecho el 6/11 a la noche:** el usuario corrió `faucet-actualizar.ps1`.
   El VPS 1 tiene el arreglo `84127d7` (`faucet.py` SHA-256 `53968ef0…`), el
   servicio está activo y `/faucet/status` responde `ready`. El repo
