@@ -84,6 +84,21 @@ Proyecto: `C:\Users\mderramus\ZOKA`.
   textos y la imagen coinciden.
   - **Antes del anuncio se publicó** zokaweb `c8d9da0`: Tech decía «no
     announced launch date» y ahora dice «targets Q4 2027», como el roadmap.
+  - **Servidor al día (6/11, noche), con el OK del usuario.** El ícono del
+    servidor y la foto de zokabot pasaron al cubo de vidrio con «ZOKA
+    QUANTIC» (`discord-bot/icon-zoka-quantic.png`). Antes era el ícono de
+    Zenith, «Zero Knowledge Network». Se editaron en su lugar, sin
+    notificaciones, 12 mensajes guía del bot (`anchors.quantic.js`,
+    `scripts/apply-anchors.js`): #enlaces-oficiales, #ayuda-es/#help-en y
+    #mineria/#mining, ahora con Quantic, ZSilent 4.0.7, ZKAPriv 3.0.0, el
+    minero CLI 4.0.5, XMRig por Stratum y preguntas frecuentes. Se verificó
+    con `scripts/check-anchors.js`. La copia de lo viejo está en
+    `discord-bot/backups/`.
+  - **Quedan, porque el usuario no eligió tocarlos:** los tutoriales del P2P
+    Exchange (#general-es/en) y del Mining Pool en equipo (#mineria/#mining),
+    los dos de Zenith; la FAQ nueva aclara que el pool ya no existe. También
+    #peers con las direcciones onion de Zenith. El bot conserva el permiso de
+    Administrador (conviene sacárselo).
   - **El bot no está prendido 24/7** desde que se borraron los droplets en
     julio, así que sus comandos (`/mining`, `/updates`…) no responden.
     `/updates` apunta a la org vieja `ZokaNetwork` de GitHub. Queda
