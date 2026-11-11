@@ -429,6 +429,17 @@ impl WebWallet {
             .map_err(|e| JsError::new(&e))?;
         serde_json::to_string(&record).map_err(js)
     }
+
+    /// Igual que [`WebWallet::address_record`], para la dirección número
+    /// `index`: así su corta también sirve.
+    #[wasm_bindgen(js_name = addressRecordAt)]
+    pub fn address_record_at(&self, index: u32) -> Result<String, JsError> {
+        let mut start = [0u8; 8];
+        getrandom::fill(&mut start).map_err(js)?;
+        let record = AddressRecord::new(&self.at(index)?.address(), u64::from_le_bytes(start))
+            .map_err(|e| JsError::new(&e))?;
+        serde_json::to_string(&record).map_err(js)
+    }
 }
 
 #[cfg(test)]

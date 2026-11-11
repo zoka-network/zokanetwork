@@ -342,6 +342,22 @@ fn api_ok(status: u16, value: Value) -> Result<Value, String> {
     Err(format!("node API {status}: {message}"))
 }
 
+/// Publish `full` on the node of `api` (`POST /address`), so that its short
+/// form finds it. The stamp is a few seconds of Argon2id here, not on the node.
+fn publish(api: &str, full: Address) -> Result<Value, String> {
+    let record = AddressRecord::new(&full).map_err(error)?;
+    let body =
+        serde_json::to_vec(&json!({"address":record.address,"stamp":record.stamp})).map_err(error)?;
+    let (status, reply) = api_json(
+        api,
+        "POST",
+        "/address",
+        Some(("application/json", &body)),
+        Duration::from_secs(60),
+    )?;
+    api_ok(status, reply)
+}
+
 /// A full address, or the full address the node finds for a short one. The
 /// node cannot answer another address: the short one is its digest.
 fn resolve(text: &str, profile: Profile, api: &str) -> Result<Address, String> {
@@ -519,31 +535,39 @@ async fn act(action: &str, args: &[String]) -> Result<Value, String> {
                 stark_cli::add_address(&path, &password)
             })
             .await?;
-            Ok(json!({"name":name,"index":index,"address":address.encode().map_err(error)?,
-                "short_address":address.short().map_err(error)?,
+            let full = address.encode().map_err(error)?;
+            let short = address.short().map_err(error)?;
+            // Published right away, so its short form works; a node that is
+            // off leaves it for `publish-address --index` later.
+            let published = blocking(move || publish(&api, address)).await;
+            Ok(json!({"name":name,"index":index,"address":full,"short_address":short,
+                "published":published.is_ok(),"publish_error":published.err(),
                 "note":"payments to this address are found from now on; give it out after creating it"}))
         }
         "publish-address" => {
             let (name, path) = store.select(args)?;
-            let (file, _) = stark_cli::read_wallet(&path)?;
-            let full = Address::decode(&file.address, profile.network).map_err(error)?;
+            // `--index N`: another of the wallet's addresses (it needs the
+            // password to derive it); without it, the main one, from the file.
+            let full = match option(args, "--index") {
+                None => {
+                    let (file, _) = stark_cli::read_wallet(&path)?;
+                    Address::decode(&file.address, profile.network).map_err(error)?
+                }
+                Some(index) => {
+                    let index: usize = index.parse().map_err(|_| "--index must be a number")?;
+                    let password = required_password(args)?;
+                    let (mut accounts, _) = blocking(move || {
+                        stark_cli::open_wallet_accounts(&path, &password)
+                    })
+                    .await?;
+                    if index >= accounts.len() {
+                        return Err(format!("the wallet has {} addresses", accounts.len()));
+                    }
+                    accounts.swap_remove(index).address()
+                }
+            };
             let short = full.short().map_err(error)?;
-            let node = blocking(move || {
-                // The stamp is a few seconds of Argon2id here, not on the node.
-                let record = AddressRecord::new(&full).map_err(error)?;
-                let body =
-                    serde_json::to_vec(&json!({"address":record.address,"stamp":record.stamp}))
-                        .map_err(error)?;
-                let (status, reply) = api_json(
-                    &api,
-                    "POST",
-                    "/address",
-                    Some(("application/json", &body)),
-                    Duration::from_secs(60),
-                )?;
-                api_ok(status, reply)
-            })
-            .await?;
+            let node = blocking(move || publish(&api, full)).await?;
             Ok(json!({"name":name,"short_address":short,"node":node}))
         }
         "backup" => {
@@ -936,10 +960,13 @@ mod tests {
         let before = fs::read_to_string(&file).unwrap();
         assert!(!before.contains("addresses"), "one address is written as before");
 
-        let second = act("new-address", &with(dir.path(), &["--name", "alice"]))
+        // No node at this API: the address is made, and left to publish later.
+        let closed = ["--name", "alice", "--api", "http://127.0.0.1:9"];
+        let second = act("new-address", &with(dir.path(), &closed))
             .await
             .unwrap();
         assert_eq!(second["index"], 1);
+        assert_eq!(second["published"], false);
         assert_ne!(second["address"], main.as_str());
         let listed = act("addresses", &with(dir.path(), &["--name", "alice"]))
             .await
@@ -957,17 +984,12 @@ mod tests {
         assert_eq!(accounts.len(), 2);
         assert_eq!(accounts[1].address().encode().unwrap(), second["address"].as_str().unwrap());
 
+        // Up to eight; the others without publishing (a few seconds each).
         for _ in 2..crate::quantic::stark::protocol::light::MAX_ADDRESSES {
-            act("new-address", &with(dir.path(), &["--name", "alice"]))
-                .await
-                .unwrap();
+            stark_cli::add_address(&file, "a test password").unwrap();
         }
-        assert!(act("new-address", &with(dir.path(), &["--name", "alice"]))
-            .await
-            .is_err());
-        assert!(act("new-address", &with(dir.path(), &["--name", "alice", "--password", "wrong"]))
-            .await
-            .is_err());
+        assert!(stark_cli::add_address(&file, "a test password").is_err());
+        assert!(act("new-address", &with(dir.path(), &closed)).await.is_err());
     }
 
     #[tokio::test]
