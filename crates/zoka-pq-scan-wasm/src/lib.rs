@@ -6,6 +6,7 @@
 //! every visitor downloads alike.
 #![forbid(unsafe_code)]
 use wasm_bindgen::prelude::*;
+use zeroize::Zeroizing;
 use zoka_pq_pool::{
     scan::{IncomingViewer, ScanPage, Viewer},
     wallet::{IncomingViewKey, ViewKey},
@@ -25,7 +26,10 @@ pub struct Scanner {
 impl Scanner {
     /// `network`: 1 mainnet, 2 testnet, 3 regtest.
     #[wasm_bindgen(constructor)]
-    pub fn new(view_key: &str, network: u8) -> Result<Scanner, JsError> {
+    pub fn new(view_key: String, network: u8) -> Result<Scanner, JsError> {
+        // Own and wipe the UTF-8 buffer passed across the WASM boundary,
+        // including when decoding fails. The decoded keys wipe on drop.
+        let view_key = Zeroizing::new(view_key);
         let text = view_key.trim();
         let viewer = if let Ok(key) = IncomingViewKey::decode(text, network) {
             Reader::Incoming(IncomingViewer::new(key))
