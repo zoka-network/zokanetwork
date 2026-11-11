@@ -4,7 +4,29 @@ Registro vivo para que otro agente (Codex, Claude) siga donde quedó este. Cada
 paso se marca al terminarlo, con su commit; lo que queda a medias dice en qué
 punto exacto está. Lo histórico está en [HOJA-DE-RUTA-CLAUDE.md](../HOJA-DE-RUTA-CLAUDE.md).
 
-## Estado actual al 11/11/2026: clave de entrantes en las apps y autoridad automática
+## Estado actual al 11/11/2026 (tarde): protocolo v3 en ramas
+
+El usuario pidió cerrar los diez puntos de la revisión. Lo que cambia el
+consenso está en ramas **`protocolo-v3`**, que salen de las
+`endurecimiento-sin-consenso`. No hay nada publicado, instalado ni
+reiniciado: la testnet v2 sigue con los programas de hoy.
+
+| Repo | Dónde | Qué |
+| --- | --- | --- |
+| ZOKA | esta carpeta | pool v3 (`6d1afcfa`), nodo v3 y checkpoints de k de n (`d4124934`), varias direcciones y documentos (después) |
+| ZSilent | worktree `target/zsilent-endurecimiento` | `16acbac`: testnet v3 en su carpeta, con las wallets y el setup de la v2 |
+| zkapriv | `zkapriv/` | el motor con varias direcciones |
+
+### Cómo seguir con el protocolo v3
+
+1. Lo que decide el usuario está en la entrada «11/11 (tarde)» de la
+   [hoja de ruta](../HOJA-DE-RUTA-CLAUDE.md): la autoridad (1 de 1 o 2 de
+   3), el génesis, las semillas y publicar.
+2. Antes de lanzar, medir un pago 8→2 en el teléfono de 32 bits y recompilar
+   lo que va a los usuarios (WebAssembly, `.so`, MSI, nodo de Linux).
+3. Los botones de «nueva dirección» en las tres apps.
+
+## Estado al 11/11/2026 (mañana): clave de entrantes en las apps y autoridad automática
 
 Codex siguió la revisión el 10/11 a la noche y se quedó sin cuota (hasta el
 17/11) con cuatro subagentes a medio hacer. Claude retomó el 11/11 a pedido

@@ -76,8 +76,10 @@ fn the_tree_writes_what_postcard_writes() {
     assert_eq!(capture(&page).unwrap().encode(), corpus.page);
     let page2 = ScanPage2::decode(&corpus.page2).unwrap();
     assert_eq!(capture(&page2).unwrap().encode(), corpus.page2);
+    // A stored state is its format byte and then the postcard of the wallet.
     let wallet = LightWallet::decode(&corpus.wallet).unwrap();
-    assert_eq!(capture(&wallet).unwrap().encode(), corpus.wallet);
+    assert_eq!(corpus.wallet[0], crate::light::STATE_FORMAT);
+    assert_eq!(capture(&wallet).unwrap().encode(), corpus.wallet[1..]);
     assert_eq!(proof_tree(&corpus.proof).unwrap().encode(), corpus.proof);
 
     // The kinds our own formats do not use.
@@ -459,7 +461,9 @@ fn no_stored_state_breaks_a_wallet() {
         if tree.mutate(&mut rng).is_none() {
             continue;
         }
-        let input = tree.encode();
+        // The format byte goes first: without it nothing is even read.
+        let mut input = vec![crate::light::STATE_FORMAT];
+        input.extend(tree.encode());
         survive("wallet_state", round, &input, || wallet_state(&input));
     }
 }

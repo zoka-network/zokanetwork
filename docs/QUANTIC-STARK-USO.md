@@ -365,7 +365,23 @@ $W = @('--network', 'testnet', '--dir', '.\stark-lab\zsilent', '--peer', '.\star
   `node_behind` en verdadero; `send` necesita la copia al día.
 - `send` reserva las entradas antes de entregar el pago. Si el nodo lo
   rechaza, las libera. Mientras un pago está pendiente no sale otro: se espera
-  a que se mine o caduque (20 bloques).
+  a que se mine o caduque (20 bloques; desde el protocolo v3, mientras su
+  ancla siga en la ventana de 30).
+- **Varias direcciones (protocolo v3, punto 4 de la revisión del 10/11):**
+  `new-address` da una dirección más de la misma semilla (la cuenta 1, 2…,
+  hasta ocho) y `addresses` las lista, la principal primero. Quienes pagan a
+  dos direcciones distintas no pueden saber que pagaron a la misma wallet.
+  - Saldo, historial y envíos leen todas.
+  - Un pago gasta notas de varias, cada una con su clave, y la cadena no lo
+    muestra.
+  - El vuelto va a la principal.
+  - Cada dirección es un descifrado más por salida leída.
+  - Los pagos a una dirección nueva se encuentran desde que se crea: hay que
+    crearla antes de darla.
+  - El archivo guarda cuántas hay (`addresses`); con una sola se escribe
+    igual que antes.
+  - La frase recupera la principal. Las demás son de la misma semilla: una
+    wallet restaurada las vuelve a encontrar al crearlas otra vez.
 
 ## Minar la testnet v2 con XMRig
 

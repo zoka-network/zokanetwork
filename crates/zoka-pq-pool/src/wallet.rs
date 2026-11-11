@@ -164,6 +164,9 @@ impl ShortAddress {
 
 pub struct Account {
     pub network: u8,
+    /// Its place among the accounts of its seed: 0 is the main address,
+    /// the others are extra receive addresses ([`crate::light::MAX_ADDRESSES`]).
+    pub index: u32,
     pub spend: SpendKey,
     view_seed: Zeroizing<[u8; 32]>,
     view: XWingSecretKey,
@@ -183,6 +186,7 @@ impl Account {
         ));
         Ok(Self {
             network,
+            index,
             spend,
             view_seed,
             view,

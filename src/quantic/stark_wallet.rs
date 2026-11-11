@@ -40,7 +40,7 @@ use super::{
 };
 use crate::economics::{format_zka_amount, parse_zka_amount};
 
-const USAGE: &str = "usage: zoka quantic-pq-wallet <new|generate-phrase|restore|address|publish-address|list|balance|history|estimate-fee|send|show-phrase|show-view-key|change-password|backup|import-backup> --network testnet|regtest --dir DIR [--name WALLET | --address ITS_ADDRESS] [--password-env VAR | --password-stdin] [--peer NODE_DESCRIPTOR] [--api http://127.0.0.1:9140] [history: --limit N] [show-view-key: --incoming] [restore: --phrase-env VAR or the phrase on stdin] [estimate-fee and send: --amount ZKA] [send: --to FULL_OR_SHORT [--memo TEXT]] [change-password: --new-password-env VAR] [backup: --out FILE] [import-backup: --file FILE] [--json]";
+const USAGE: &str = "usage: zoka quantic-pq-wallet <new|generate-phrase|restore|address|addresses|new-address|publish-address|list|balance|history|estimate-fee|send|show-phrase|show-view-key|change-password|backup|import-backup> --network testnet|regtest --dir DIR [--name WALLET | --address ITS_ADDRESS] [--password-env VAR | --password-stdin] [--peer NODE_DESCRIPTOR] [--api http://127.0.0.1:9140] [history: --limit N] [show-view-key: --incoming] [restore: --phrase-env VAR or the phrase on stdin] [estimate-fee and send: --amount ZKA] [send: --to FULL_OR_SHORT [--memo TEXT]] [change-password: --new-password-env VAR] [backup: --out FILE] [import-backup: --file FILE] [--json]";
 const DEFAULT_API: &str = "http://127.0.0.1:9140";
 /// Blocks one call imports into the mirror before it answers.
 const MIRROR_BUDGET: usize = 4096;
@@ -492,6 +492,37 @@ async fn act(action: &str, args: &[String]) -> Result<Value, String> {
                 json!({"name":name,"short_address":short_of(&file.address, profile),"address":file.address}),
             )
         }
+        // Point 4 of the 10/11 review: more receive addresses of the same
+        // seed. Whoever pays two of them cannot tell they paid one wallet.
+        "addresses" => {
+            let (name, path) = store.select(args)?;
+            let password = required_password(args)?;
+            let accounts = blocking(move || {
+                let (accounts, _) = stark_cli::open_wallet_accounts(&path, &password)?;
+                accounts
+                    .iter()
+                    .map(|account| {
+                        let address = account.address();
+                        Ok(json!({"index":account.index,"address":address.encode().map_err(error)?,
+                            "short_address":address.short().map_err(error)?}))
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .await?;
+            Ok(json!({"name":name,"addresses":accounts}))
+        }
+        "new-address" => {
+            let (name, path) = store.select(args)?;
+            let password = required_password(args)?;
+            let (index, address) = blocking(move || {
+                let _lock = stark_cli::wallet_lock(&path)?;
+                stark_cli::add_address(&path, &password)
+            })
+            .await?;
+            Ok(json!({"name":name,"index":index,"address":address.encode().map_err(error)?,
+                "short_address":address.short().map_err(error)?,
+                "note":"payments to this address are found from now on; give it out after creating it"}))
+        }
         "publish-address" => {
             let (name, path) = store.select(args)?;
             let (file, _) = stark_cli::read_wallet(&path)?;
@@ -611,8 +642,8 @@ async fn act(action: &str, args: &[String]) -> Result<Value, String> {
             let (state, lag) = mirror(&store, args).await?;
             let action = action.to_string();
             blocking(move || {
-                let (account, _) = stark_cli::open_wallet(&path, &password)?;
-                let scan = stark_cli::scan(&state.storage, profile, &account)?;
+                let (accounts, _) = stark_cli::open_wallet_accounts(&path, &password)?;
+                let scan = stark_cli::scan_for(&state.storage, profile, &accounts)?;
                 let figures = funds(&scan, &path, &password, profile)?;
                 let height = u64::from(scan.state.height);
                 Ok(match action.as_str() {
@@ -709,12 +740,12 @@ async fn act(action: &str, args: &[String]) -> Result<Value, String> {
             let wallet = fs::canonicalize(&path).map_err(error)?;
             blocking(move || {
                 let _lock = stark_cli::wallet_lock(&wallet)?;
-                let (account, _) = stark_cli::open_wallet(&wallet, &password)?;
+                let (accounts, _) = stark_cli::open_wallet_accounts(&wallet, &password)?;
                 let (tx, fee, _) = stark_cli::pay(
                     &state.storage,
                     profile,
                     &wallet,
-                    &account,
+                    &accounts,
                     &password,
                     to,
                     amount,
@@ -760,6 +791,7 @@ fn change_password(path: &Path, profile: Profile, old: &str, new: &str) -> Resul
     }
     let wallet = WalletFile {
         schema: file.schema,
+        addresses: file.addresses,
         chain_id: file.chain_id,
         address: account.address().encode().map_err(error)?,
         encrypted_seed_hex: hex::encode(
@@ -801,7 +833,17 @@ fn human(action: &str, reply: &Value) -> String {
             field("short_address")
         ),
         "generate-phrase" => field("recovery_phrase"),
-        "restore" | "address" | "publish-address" => field("short_address"),
+        "restore" | "address" | "publish-address" | "new-address" => field("short_address"),
+        "addresses" => reply["addresses"]
+            .as_array()
+            .map(|list| {
+                list.iter()
+                    .map(|entry| entry["short_address"].as_str().unwrap_or_default().to_string())
+                    .collect::<Vec<_>>()
+                    .join("
+")
+            })
+            .unwrap_or_default(),
         "balance" => {
             let mut text = format!(
                 "Spendable: {} ZKA\nImmature: {} ZKA\nHeight: {}",
@@ -879,6 +921,53 @@ mod tests {
         let mut all = base(dir);
         all.extend(args(more));
         all
+    }
+
+    /// Point 4: more receive addresses of the same seed, written to the
+    /// wallet file; the main one stays, and there are at most eight.
+    #[tokio::test]
+    async fn a_wallet_gets_more_addresses_and_keeps_its_main_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = act("new", &with(dir.path(), &["--name", "alice"]))
+            .await
+            .unwrap();
+        let main = created["address"].as_str().unwrap().to_string();
+        let file = dir.path().join("wallets").join("alice.json");
+        let before = fs::read_to_string(&file).unwrap();
+        assert!(!before.contains("addresses"), "one address is written as before");
+
+        let second = act("new-address", &with(dir.path(), &["--name", "alice"]))
+            .await
+            .unwrap();
+        assert_eq!(second["index"], 1);
+        assert_ne!(second["address"], main.as_str());
+        let listed = act("addresses", &with(dir.path(), &["--name", "alice"]))
+            .await
+            .unwrap();
+        let list = listed["addresses"].as_array().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0]["address"], main.as_str());
+        assert_eq!(list[1]["address"], second["address"]);
+        let shown = act("address", &with(dir.path(), &["--name", "alice"]))
+            .await
+            .unwrap();
+        assert_eq!(shown["address"], main.as_str());
+        // The phrase restores the main one; the others are the same seed's.
+        let (accounts, _) = stark_cli::open_wallet_accounts(&file, "a test password").unwrap();
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(accounts[1].address().encode().unwrap(), second["address"].as_str().unwrap());
+
+        for _ in 2..crate::quantic::stark::protocol::light::MAX_ADDRESSES {
+            act("new-address", &with(dir.path(), &["--name", "alice"]))
+                .await
+                .unwrap();
+        }
+        assert!(act("new-address", &with(dir.path(), &["--name", "alice"]))
+            .await
+            .is_err());
+        assert!(act("new-address", &with(dir.path(), &["--name", "alice", "--password", "wrong"]))
+            .await
+            .is_err());
     }
 
     #[tokio::test]

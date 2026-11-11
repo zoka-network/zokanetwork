@@ -20,6 +20,7 @@ use super::stark::{
     protocol::{
         crypto::Digest,
         ledger::{conventional_fee, Ledger},
+        light::MAX_ADDRESSES,
         model::{Input, Note, MAX_INPUTS},
         transaction::{self, Payment, Transaction, MAX_TRANSACTION_BYTES},
         wallet::{Account, Address, ShortAddress, MEMO_BYTES},
@@ -141,6 +142,19 @@ pub(crate) struct WalletFile {
     pub(crate) chain_id: String,
     pub(crate) address: String,
     pub(crate) encrypted_seed_hex: String,
+    /// How many receive addresses it reads for (the seed's accounts
+    /// `0..addresses`; `address` is the first). Left out while it is one, so
+    /// a wallet that never added one is written as before.
+    #[serde(default = "one_address", skip_serializing_if = "is_one_address")]
+    pub(crate) addresses: u32,
+}
+
+fn one_address() -> u32 {
+    1
+}
+
+fn is_one_address(count: &u32) -> bool {
+    *count == 1
 }
 
 pub(crate) fn read_wallet(path: &Path) -> Result<(WalletFile, Profile), String> {
@@ -150,6 +164,9 @@ pub(crate) fn read_wallet(path: &Path) -> Result<(WalletFile, Profile), String> 
         .filter(|_| file.schema == SCHEMA)
         .ok_or("not a STARK v2 wallet")?;
     Address::decode(&file.address, profile.network).map_err(error)?;
+    if !(1..=MAX_ADDRESSES).contains(&file.addresses) {
+        return Err("a wallet has one to eight addresses".into());
+    }
     Ok((file, profile))
 }
 
@@ -167,6 +184,7 @@ pub(crate) fn create_wallet(
         chain_id: profile.chain_id.into(),
         address: address.clone(),
         encrypted_seed_hex: hex::encode(encrypted),
+        addresses: 1,
     };
     write_new(path, &serde_json::to_vec_pretty(&file).map_err(error)?)?;
     Ok(address)
@@ -175,6 +193,44 @@ pub(crate) fn create_wallet(
 pub(crate) fn open_wallet(path: &Path, password: &str) -> Result<(Account, Profile), String> {
     let (account, profile, _) = open_wallet_seed(path, password)?;
     Ok((account, profile))
+}
+
+/// Every address the wallet reads for, the main one first: what scanning and
+/// paying need (point 4 of the 10/11 review).
+pub(crate) fn open_wallet_accounts(
+    path: &Path,
+    password: &str,
+) -> Result<(Vec<Account>, Profile), String> {
+    let (account, profile, seed) = open_wallet_seed(path, password)?;
+    let (file, _) = read_wallet(path)?;
+    let mut accounts = vec![account];
+    for index in 1..file.addresses {
+        accounts.push(Account::from_seed(&seed, profile.network, index).map_err(error)?);
+    }
+    Ok((accounts, profile))
+}
+
+/// One more receive address, written to the wallet file (it only grows, up
+/// to [`MAX_ADDRESSES`]). Returns it with its index. Payments to it are found
+/// from then on: create it before handing it out.
+pub(crate) fn add_address(path: &Path, password: &str) -> Result<(u32, Address), String> {
+    let (_, profile, seed) = open_wallet_seed(path, password)?;
+    let (mut file, _) = read_wallet(path)?;
+    if file.addresses >= MAX_ADDRESSES {
+        return Err("a wallet has at most eight addresses".into());
+    }
+    let index = file.addresses;
+    let account = Account::from_seed(&seed, profile.network, index).map_err(error)?;
+    file.addresses += 1;
+    let bytes = serde_json::to_vec_pretty(&file).map_err(error)?;
+    // Written beside it and moved over: a cut leaves the old file whole.
+    let mut temporary = path.as_os_str().to_os_string();
+    temporary.push(".addresses");
+    let temporary = PathBuf::from(temporary);
+    let _ = fs::remove_file(&temporary);
+    write_new(&temporary, &bytes)?;
+    fs::rename(&temporary, path).map_err(error)?;
+    Ok((index, account.address()))
 }
 
 /// Like [`open_wallet`], with the seed: the recovery phrase is its BIP-39 form.
@@ -254,6 +310,8 @@ pub(crate) fn tip(db: &RocksDbStorage, profile: Profile) -> Result<Block, String
 }
 
 pub(crate) struct OwnedNote {
+    /// The address it came to: the account index of the seed.
+    pub(crate) account: u32,
     pub(crate) note: Note,
     /// Position in the note tree; none while a coinbase output is immature.
     pub(crate) index: Option<u32>,
@@ -277,6 +335,16 @@ pub(crate) struct Scan {
     pub(crate) history: Vec<Movement>,
 }
 pub(crate) fn scan(db: &RocksDbStorage, profile: Profile, account: &Account) -> Result<Scan, String> {
+    scan_for(db, profile, std::slice::from_ref(account))
+}
+
+/// [`scan`] for every address of a wallet ([`open_wallet_accounts`]): each
+/// output is tried with each one, a decryption per address.
+pub(crate) fn scan_for(
+    db: &RocksDbStorage,
+    profile: Profile,
+    accounts: &[Account],
+) -> Result<Scan, String> {
     let parent = tip(db, profile)?;
     let state = stark::full_ledger(db, profile, &parent)?;
     let mut positions = BTreeMap::new();
@@ -301,7 +369,13 @@ pub(crate) fn scan(db: &RocksDbStorage, profile: Profile, account: &Account) -> 
         for tx in stark::decode(&block)? {
             let mut received = 0u64;
             for (cm, envelope) in tx.statement.commitments.iter().zip(&tx.envelopes) {
-                if let Ok((note, _memo)) = account.receive(*cm, envelope) {
+                let opened = accounts.iter().find_map(|account| {
+                    account
+                        .receive(*cm, envelope)
+                        .ok()
+                        .map(|(note, _memo)| (account, note))
+                });
+                if let Some((account, note)) = opened {
                     let nullifier = note
                         .nullifier(&account.spend, profile.network)
                         .map_err(error)?;
@@ -314,6 +388,7 @@ pub(crate) fn scan(db: &RocksDbStorage, profile: Profile, account: &Account) -> 
                         .ok_or("balance overflow")?;
                     if !state.spent.contains(&nullifier) {
                         notes.push(OwnedNote {
+                            account: account.index,
                             note,
                             index: positions.get(cm).copied(),
                             nullifier,
@@ -399,7 +474,7 @@ pub(crate) fn pay(
     db: &RocksDbStorage,
     profile: Profile,
     wallet: &Path,
-    account: &Account,
+    accounts: &[Account],
     password: &str,
     to: Address,
     amount: u64,
@@ -411,7 +486,8 @@ pub(crate) fn pay(
     if memo.is_some_and(|memo| memo.len() > MEMO_BYTES) {
         return Err("memo exceeds 512 UTF-8 bytes".into());
     }
-    let Scan { state, notes, .. } = scan(db, profile, account)?;
+    let account = accounts.first().ok_or("a wallet has an address")?;
+    let Scan { state, notes, .. } = scan_for(db, profile, accounts)?;
     if let Some(tx) = pending(wallet, password, profile)? {
         if live_pending(&tx, &state) {
             return Err("wallet already has a pending payment; mine it or use abandon".into());
@@ -428,7 +504,12 @@ pub(crate) fn pay(
         .into_iter()
         .map(|owned| {
             Ok(Input {
-                key: account.spend.clone(),
+                key: accounts
+                    .iter()
+                    .find(|candidate| candidate.index == owned.account)
+                    .ok_or("an input's address is missing")?
+                    .spend
+                    .clone(),
                 note: owned.note,
                 path: state
                     .tree
@@ -524,7 +605,7 @@ fn send(args: &[String]) -> Result<(), String> {
     }
     let _lock = wallet_lock(&wallet)?;
     let password = password(args)?;
-    let (account, profile) = open_wallet(&wallet, &password)?;
+    let (accounts, profile) = open_wallet_accounts(&wallet, &password)?;
     let to = recipient(args, profile)?;
     let amount = integer(args, "--amount-atoms")?;
     if amount == 0 {
@@ -535,7 +616,7 @@ fn send(args: &[String]) -> Result<(), String> {
         &db,
         profile,
         &wallet,
-        &account,
+        &accounts,
         &password,
         to,
         amount,
@@ -615,9 +696,9 @@ One atom = 0.000001 ZKA. No public chain or wallet path is selected automaticall
             let wallet = fs::canonicalize(path(args, "--wallet")?).map_err(error)?;
             let _lock = wallet_lock(&wallet)?;
             let password = password(args)?;
-            let (account, profile) = open_wallet(&wallet, &password)?;
+            let (accounts, profile) = open_wallet_accounts(&wallet, &password)?;
             let (db, _) = open_db(&path(args, "--db")?, Some(profile))?;
-            let Scan { state, notes, .. } = scan(&db, profile, &account)?;
+            let Scan { state, notes, .. } = scan_for(&db, profile, &accounts)?;
             let reservation =
                 pending(&wallet, &password, profile)?.filter(|tx| live_pending(tx, &state));
             let mut available = 0u64;

@@ -170,7 +170,11 @@ pub fn qr_matrix(text: &str) -> Result<Vec<u8>, JsError> {
 #[wasm_bindgen]
 pub struct WebWallet {
     network: u8,
-    account: Account,
+    seed: Zeroizing<[u8; 32]>,
+    /// Las direcciones que lee, las cuentas `0..` de la semilla: la 0 es la
+    /// principal (y la del vuelto), las demás se suman con
+    /// [`WebWallet::add_address`].
+    accounts: Vec<Account>,
     wallet: LightWallet,
     last: Option<Transaction>,
 }
@@ -196,6 +200,18 @@ fn movement(m: &Movement, tip: u32) -> Value {
     })
 }
 
+impl WebWallet {
+    fn primary(&self) -> &Account {
+        &self.accounts[0]
+    }
+
+    fn at(&self, index: u32) -> Result<&Account, JsError> {
+        self.accounts
+            .get(index as usize)
+            .ok_or_else(|| JsError::new("this wallet has no such address"))
+    }
+}
+
 #[wasm_bindgen]
 impl WebWallet {
     /// `state`: lo que devolvió [`WebWallet::encode_state`] la última vez, o
@@ -206,7 +222,6 @@ impl WebWallet {
             return Err(JsError::new("this network has no web wallet"));
         }
         let seed = seed_of(phrase).map_err(JsError::new)?;
-        let account = Account::from_seed(&seed, network, 0).map_err(js)?;
         let wallet = if state.is_empty() {
             LightWallet::new(network, 1).map_err(js)?
         } else {
@@ -217,36 +232,73 @@ impl WebWallet {
             }
             wallet
         };
+        let accounts = (0..wallet.addresses())
+            .map(|index| Account::from_seed(&seed, network, index))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(js)?;
         Ok(Self {
             network,
-            account,
+            seed,
+            accounts,
             wallet,
             last: None,
         })
     }
 
+    /// Cuántas direcciones lee: la principal y las que se sumaron.
+    pub fn addresses(&self) -> u32 {
+        self.wallet.addresses()
+    }
+
+    /// Una dirección más para dar a otra persona: quienes pagan a dos
+    /// direcciones distintas no pueden saber que pagaron a la misma billetera.
+    /// Hasta ocho; cada una es un descifrado más por salida leída. Lee los
+    /// pagos a la nueva desde el próximo bloque, así que hay que crearla antes
+    /// de darla. Devuelve su número.
+    #[wasm_bindgen(js_name = addAddress)]
+    pub fn add_address(&mut self) -> Result<u32, JsError> {
+        let index = self.wallet.addresses();
+        let account = Account::from_seed(&self.seed, self.network, index).map_err(js)?;
+        self.wallet.set_addresses(index + 1).map_err(js)?;
+        self.accounts.push(account);
+        Ok(index)
+    }
+
+    /// La dirección completa número `index` (0 es la principal).
+    #[wasm_bindgen(js_name = addressAt)]
+    pub fn address_at(&self, index: u32) -> Result<String, JsError> {
+        self.at(index)?.address().encode().map_err(js)
+    }
+
+    /// La dirección corta número `index`.
+    #[wasm_bindgen(js_name = shortAddressAt)]
+    pub fn short_address_at(&self, index: u32) -> Result<String, JsError> {
+        self.at(index)?.address().short().map_err(js)
+    }
+
     /// La dirección completa (unos 1.760 caracteres).
     pub fn address(&self) -> Result<String, JsError> {
-        self.account.address().encode().map_err(js)
+        self.primary().address().encode().map_err(js)
     }
 
     /// La dirección corta: la que se comparte y va en el QR.
     #[wasm_bindgen(js_name = shortAddress)]
     pub fn short_address(&self) -> Result<String, JsError> {
-        self.account.address().short().map_err(js)
+        self.primary().address().short().map_err(js)
     }
 
-    /// Muestra el saldo a quien la tenga, sin poder gastar.
+    /// Muestra el saldo de la dirección principal a quien la tenga, sin poder
+    /// gastar. Cada dirección tiene la suya.
     #[wasm_bindgen(js_name = viewKey)]
     pub fn view_key(&self) -> Result<String, JsError> {
-        Ok(self.account.view_key().map_err(js)?.encode())
+        Ok(self.primary().view_key().map_err(js)?.encode())
     }
 
     /// Solo lo recibido, sin saldo ni gastos. Se deriva de la misma cuenta:
     /// no hay que configurar ni migrar la billetera.
     #[wasm_bindgen(js_name = incomingViewKey)]
     pub fn incoming_view_key(&self) -> Result<String, JsError> {
-        Ok(self.account.incoming_view_key().map_err(js)?.encode())
+        Ok(self.primary().incoming_view_key().map_err(js)?.encode())
     }
 
     /// La altura del próximo bloque que necesita: pedir `/scan2?from=<next>`.
@@ -266,7 +318,7 @@ impl WebWallet {
     pub fn add_page(&mut self, bytes: &[u8]) -> Result<u32, JsError> {
         let page = ScanPage2::decode(bytes)
             .map_err(|_| JsError::new("the server sent an unreadable page"))?;
-        self.wallet.add_page(&self.account, &page).map_err(js)?;
+        self.wallet.add_page_for(&self.accounts, &page).map_err(js)?;
         Ok(page.tip)
     }
 
@@ -335,10 +387,10 @@ impl WebWallet {
             .map_err(|_| JsError::new("that is not a full address of this network"))?;
         let plan = self
             .wallet
-            .plan(&self.account, to, amount_atoms, memo.as_bytes())
+            .plan_for(&self.accounts, to, amount_atoms, memo.as_bytes())
             .map_err(js)?;
         let (amount, fee, expiry) = (plan.amount(), plan.fee, plan.expiry);
-        let tx = plan.prove(&self.account).map_err(js)?;
+        let tx = plan.prove_for(&self.accounts).map_err(js)?;
         self.wallet.reserve(&tx).map_err(js)?;
         let txid = hex::encode(tx.txid());
         self.last = Some(tx);
@@ -373,7 +425,7 @@ impl WebWallet {
     pub fn address_record(&self) -> Result<String, JsError> {
         let mut start = [0u8; 8];
         getrandom::fill(&mut start).map_err(js)?;
-        let record = AddressRecord::new(&self.account.address(), u64::from_le_bytes(start))
+        let record = AddressRecord::new(&self.primary().address(), u64::from_le_bytes(start))
             .map_err(|e| JsError::new(&e))?;
         serde_json::to_string(&record).map_err(js)
     }
@@ -386,6 +438,28 @@ mod tests {
     // El vector de BIP-39 de 24 palabras con entropía 0x00...: la misma semilla
     // que usan ZSilent y ZKAPriv para esas palabras.
     const ZEROS: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
+
+    /// Una dirección más de la misma semilla: distinta de la principal, la
+    /// misma que deriva cualquier otra billetera con esa frase, y el estado
+    /// guardado se acuerda de cuántas hay.
+    #[test]
+    fn a_web_wallet_adds_an_address_and_remembers_it() {
+        let mut wallet = WebWallet::new(ZEROS, 3, &[]).unwrap();
+        assert_eq!(wallet.addresses(), 1);
+        let main = wallet.address().unwrap();
+        assert_eq!(wallet.address_at(0).unwrap(), main);
+        assert_eq!(wallet.add_address().unwrap(), 1);
+        let second = wallet.address_at(1).unwrap();
+        assert_ne!(second, main);
+        let expected = Account::from_seed(&[0; 32], 3, 1).unwrap().address();
+        assert_eq!(second, expected.encode().unwrap());
+        assert_eq!(wallet.short_address_at(1).unwrap(), expected.short().unwrap());
+        let state = wallet.encode_state().unwrap();
+        let again = WebWallet::new(ZEROS, 3, &state).unwrap();
+        assert_eq!(again.addresses(), 2);
+        assert_eq!(again.address_at(1).unwrap(), second);
+        assert_eq!(again.address().unwrap(), main);
+    }
 
     #[test]
     fn the_phrase_gives_the_seed_and_address_of_the_other_wallets() {

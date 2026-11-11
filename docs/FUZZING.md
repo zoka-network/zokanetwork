@@ -212,6 +212,28 @@ circuitos con una regla menos, y en los tres lo detecta:
 No reemplaza una revisión formal del circuito. Cubre un cambio por vez: dos
 cambios que se compensan entre sí no entran.
 
+### Con el protocolo v3 (11/11, rama `protocolo-v3`)
+
+Las formas pasaron a 2, 4 u 8 entradas con relleno de valor 0, y las notas
+de relleno no prueban pertenencia (`(raíz − ancla) · valor = 0`). El modelo
+(`intended`) exige la ancla solo a las notas con valor. El barrido corre
+sobre las formas nuevas, en release:
+
+| Forma | Registros | Cambios | Aceptados (todos legítimos) | Rechazados | Tiempo |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 2 → 2, una nota real y un relleno | 975 | 2.925 | 560 | 2.365 | 44 s |
+| 2 → 2, dos reales | 975 | 2.923 | 192 | 2.731 | 22 s |
+| 4 → 2, tres reales y un relleno | 1.647 | 4.941 | 560 | 4.381 | 98 s |
+
+Con un relleno se aceptan más cambios porque el relleno puede estar en
+cualquier árbol: no vale nada. Una prueba aparte
+(`a_padding_input_cannot_bring_value`) fija que un relleno con valor no
+pase, y el barrido sigue detectando los tres circuitos con una regla menos.
+
+El estado guardado de la billetera liviana lleva ahora un byte de versión
+adelante. El mutador de forma lo antepone a lo que escribe, porque sin él no
+se leería nada.
+
 ## Qué falta
 
 - Correr libFuzzer en un VPS durante horas, con las semillas de arriba.

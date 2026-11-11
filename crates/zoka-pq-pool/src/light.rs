@@ -31,10 +31,21 @@ const SETTLE_STEP: u32 = 100;
 pub const PAYMENT_LIFETIME: u32 = crate::ledger::ANCHOR_WINDOW as u32;
 /// Hashes of the last blocks read, to confirm a checkpoint at any of them.
 const RECENT_HASHES: usize = 1024;
+/// How many receive addresses one wallet can have: the accounts `0..n` of its
+/// seed. Two people paid at two addresses cannot tell they paid the same
+/// wallet, but each address is one more decryption for every output read,
+/// so there are few.
+pub const MAX_ADDRESSES: u32 = 8;
+/// The first byte of [`LightWallet::encode`]: a state saved by another
+/// version (the v2 testnet's, say) is refused, not misread, and the wallet
+/// reads the chain again.
+pub(crate) const STATE_FORMAT: u8 = 3;
 
 /// A note the wallet received, spent or not.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct OwnedNote {
+    /// The address it came to: the account index of the seed.
+    pub account: u32,
     pub note: Note,
     pub commitment: Digest,
     pub nullifier: Digest,
@@ -140,6 +151,8 @@ pub struct LightWallet {
     pending: Option<Pending>,
     /// See [`LightBalance::verified`].
     verified: u32,
+    /// How many addresses it reads for: the accounts `0..addresses`.
+    addresses: u32,
 }
 
 impl LightWallet {
@@ -153,21 +166,60 @@ impl LightWallet {
             recent: None,
             pending: None,
             verified: 0,
+            addresses: 1,
         })
     }
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
-        postcard::to_allocvec(self).map_err(|_| Error::Encoding)
+        let mut bytes = vec![STATE_FORMAT];
+        bytes.extend(postcard::to_allocvec(self).map_err(|_| Error::Encoding)?);
+        Ok(bytes)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        let body = bytes
+            .strip_prefix(&[STATE_FORMAT])
+            .ok_or(Error::Encoding)?;
         let (wallet, rest): (Self, _) =
-            postcard::take_from_bytes(bytes).map_err(|_| Error::Encoding)?;
-        if !rest.is_empty() {
+            postcard::take_from_bytes(body).map_err(|_| Error::Encoding)?;
+        if !rest.is_empty() || !(1..=MAX_ADDRESSES).contains(&wallet.addresses) {
             return Err(Error::Encoding);
         }
         Ok(wallet)
     }
     pub fn network(&self) -> u8 {
         self.network
+    }
+    /// How many receive addresses it reads for: the seed's accounts
+    /// `0..addresses`. The callers derive them (`Account::from_seed`) and
+    /// pass them in that order.
+    pub fn addresses(&self) -> u32 {
+        self.addresses
+    }
+    /// Read for `count` addresses from the next block on. Only grows, up to
+    /// [`MAX_ADDRESSES`]: an address someone may have been given is never
+    /// dropped. A wallet restored from its phrase sets the count it had (or
+    /// the most) before its first page: payments to an address it does not
+    /// read for are not found.
+    pub fn set_addresses(&mut self, count: u32) -> Result<(), Error> {
+        if count < self.addresses || count > MAX_ADDRESSES {
+            return Err(Error::Ledger("addresses only grow, up to eight"));
+        }
+        self.addresses = count;
+        Ok(())
+    }
+
+    /// The accounts this wallet reads for, in order, all of `network`.
+    fn check_accounts(&self, accounts: &[Account]) -> Result<(), Error> {
+        if accounts.len() != self.addresses as usize
+            || accounts
+                .iter()
+                .enumerate()
+                .any(|(i, account)| account.index != i as u32 || account.network != self.network)
+        {
+            return Err(Error::Ledger(
+                "pass the wallet's addresses: its seed's accounts 0..addresses",
+            ));
+        }
+        Ok(())
     }
     /// The last block read.
     pub fn height(&self) -> u32 {
@@ -205,9 +257,16 @@ impl LightWallet {
     /// coinbase output joins the tree only when it matures, so hiding one is
     /// noticed then; until then it cannot be spent anyway.
     pub fn add_page(&mut self, account: &Account, page: &ScanPage2) -> Result<(), Error> {
-        if page.network != self.network || account.network != self.network {
+        self.add_page_for(std::slice::from_ref(account), page)
+    }
+
+    /// [`Self::add_page`] for a wallet with several addresses: `accounts` are
+    /// its seed's accounts `0..addresses`, in order.
+    pub fn add_page_for(&mut self, accounts: &[Account], page: &ScanPage2) -> Result<(), Error> {
+        if page.network != self.network || accounts.iter().any(|a| a.network != self.network) {
             return Err(Error::Network);
         }
+        self.check_accounts(accounts)?;
         if page.from != self.next() {
             return Err(Error::Shape);
         }
@@ -218,7 +277,7 @@ impl LightWallet {
                 return Ok(());
             }
             check_shape(block, self.next())?;
-            if let Err(e) = self.add_block(account, block) {
+            if let Err(e) = self.add_block(accounts, block) {
                 // A block that fails halfway leaves no trusted state.
                 self.rewind()?;
                 return Err(e);
@@ -288,7 +347,7 @@ impl LightWallet {
     }
 
     /// `block` passed [`check_shape`].
-    fn add_block(&mut self, account: &Account, block: &ScanBlock2) -> Result<(), Error> {
+    fn add_block(&mut self, accounts: &[Account], block: &ScanBlock2) -> Result<(), Error> {
         let height = self.next();
         let (coinbase, transfers) = block.transactions.split_first().ok_or(Error::Shape)?;
         let network = self.network;
@@ -304,8 +363,15 @@ impl LightWallet {
                 let mut memo = None;
                 let mut theirs = Vec::new();
                 for output in &tx.outputs {
-                    match account.receive(output.commitment, &output.envelope) {
-                        Ok((note, text)) => {
+                    // Each address in turn: one decryption per address.
+                    let opened = accounts.iter().find_map(|account| {
+                        account
+                            .receive(output.commitment, &output.envelope)
+                            .ok()
+                            .map(|received| (account, received))
+                    });
+                    match opened {
+                        Some((account, (note, text))) => {
                             let nullifier = note.nullifier(&account.spend, network)?;
                             if known.contains_key(&nullifier) {
                                 continue;
@@ -316,6 +382,7 @@ impl LightWallet {
                                 memo = Some(text);
                             }
                             state.notes.push(OwnedNote {
+                                account: account.index,
                                 note,
                                 commitment: output.commitment,
                                 nullifier,
@@ -324,7 +391,7 @@ impl LightWallet {
                                 coinbase: tx.coinbase(),
                             });
                         }
-                        Err(_) => theirs.push(output),
+                        None => theirs.push(output),
                     }
                 }
                 let spent = tx
@@ -338,9 +405,11 @@ impl LightWallet {
                     memo = theirs
                         .iter()
                         .find_map(|output| {
-                            account
-                                .recover_sent(output.commitment, &output.envelope)
-                                .ok()
+                            accounts.iter().find_map(|account| {
+                                account
+                                    .recover_sent(output.commitment, &output.envelope)
+                                    .ok()
+                            })
                         })
                         .map(|(_, text)| text);
                 }
@@ -530,9 +599,23 @@ impl LightWallet {
         amount: u64,
         memo: &[u8],
     ) -> Result<Plan, Error> {
-        if account.network != self.network || to.network != self.network {
+        self.plan_for(std::slice::from_ref(account), to, amount, memo)
+    }
+
+    /// [`Self::plan`] for a wallet with several addresses (`accounts`, as in
+    /// [`Self::add_page_for`]): it spends notes of any of them together,
+    /// which the chain does not show, and the change goes to the main one.
+    pub fn plan_for(
+        &self,
+        accounts: &[Account],
+        to: Address,
+        amount: u64,
+        memo: &[u8],
+    ) -> Result<Plan, Error> {
+        if accounts.iter().any(|a| a.network != self.network) || to.network != self.network {
             return Err(Error::Network);
         }
+        self.check_accounts(accounts)?;
         if !self.in_sync() {
             return Err(Error::Ledger("the wallet is behind the chain: sync first"));
         }
@@ -541,6 +624,7 @@ impl LightWallet {
         }
         let (selected, total, fee) = self.select(amount)?;
         let tree = &self.current.ledger.tree;
+        let owners = selected.iter().map(|owned| owned.account).collect();
         let inputs = selected
             .into_iter()
             .map(|owned| {
@@ -554,7 +638,8 @@ impl LightWallet {
         Ok(Plan {
             anchor: tree.root(),
             inputs,
-            payments: vec![payment, Payment::new(account.address(), change)],
+            owners,
+            payments: vec![payment, Payment::new(accounts[0].address(), change)],
             fee,
             expiry: self
                 .height()
@@ -602,6 +687,8 @@ fn check_shape(block: &ScanBlock2, height: u32) -> Result<(), Error> {
 pub struct Plan {
     pub anchor: Digest,
     pub inputs: Vec<(Note, MerklePath)>,
+    /// The address (account index) each input came to.
+    pub owners: Vec<u32>,
     pub payments: Vec<Payment>,
     pub fee: u64,
     pub expiry: u32,
@@ -615,16 +702,29 @@ impl Plan {
     }
     /// The slow part: the STARK proof, where the keys are.
     pub fn prove(self, account: &Account) -> Result<Transaction, Error> {
+        self.prove_for(std::slice::from_ref(account))
+    }
+    /// [`Self::prove`] with the wallet's addresses: each input is spent with
+    /// the key of the address it came to.
+    pub fn prove_for(self, accounts: &[Account]) -> Result<Transaction, Error> {
+        let sender = accounts.first().ok_or(Error::Shape)?;
         let inputs = self
             .inputs
             .into_iter()
-            .map(|(note, path)| Input {
-                key: account.spend.clone(),
-                note,
-                path,
+            .zip(self.owners)
+            .map(|((note, path), owner)| {
+                let account = accounts
+                    .iter()
+                    .find(|account| account.index == owner)
+                    .ok_or(Error::Ledger("an input's address is missing"))?;
+                Ok(Input {
+                    key: account.spend.clone(),
+                    note,
+                    path,
+                })
             })
-            .collect();
-        transaction::transfer(account, self.anchor, inputs, self.payments, self.fee)
+            .collect::<Result<Vec<_>, Error>>()?;
+        transaction::transfer(sender, self.anchor, inputs, self.payments, self.fee)
     }
 }
 
@@ -985,5 +1085,85 @@ mod tests {
         // A checkpoint for another block there: the pages were another chain.
         assert!(light.confirm_checkpoint(5, &at4).is_err());
         assert_eq!((light.height(), light.verified()), (0, 0));
+    }
+
+    /// Two addresses of one seed: paid apart, a wallet that reads one sees
+    /// only its payment; the wallet that reads both spends them together in
+    /// one payment and its change goes to the main address.
+    #[test]
+    fn two_addresses_receive_apart_and_spend_together() {
+        let alice = Account::from_seed(&[11; 32], NET, 0).unwrap();
+        let seed = [21; 32];
+        let accounts: Vec<Account> =
+            (0..2).map(|i| Account::from_seed(&seed, NET, i).unwrap()).collect();
+        assert_ne!(
+            accounts[0].address().encode().unwrap(),
+            accounts[1].address().encode().unwrap()
+        );
+        let mut chain = Chain::new();
+        for _ in 0..3 {
+            chain.mine(&alice, vec![], 0);
+        }
+        let mut payer = LightWallet::new(NET, 1).unwrap();
+        chain.sync(&mut payer, &alice);
+        for (to, amount) in [(0, 30 * ATOMS), (1, 20 * ATOMS)] {
+            let tx = payer
+                .plan(&alice, accounts[to].address(), amount, b"")
+                .unwrap()
+                .prove(&alice)
+                .unwrap();
+            payer.reserve(&tx).unwrap();
+            chain.ledger.check_transfer(&tx).unwrap();
+            chain.mine(&alice, vec![tx], 0);
+            chain.sync(&mut payer, &alice);
+        }
+
+        // Reading the main address alone: its payment and nothing else.
+        let mut one = LightWallet::new(NET, 1).unwrap();
+        chain.sync(&mut one, &accounts[0]);
+        assert_eq!(one.balance().spendable_atoms, 30 * ATOMS);
+
+        let mut both = LightWallet::new(NET, 1).unwrap();
+        assert!(both.add_page_for(&accounts, &chain.page(1)).is_err());
+        both.set_addresses(2).unwrap();
+        assert!(both.set_addresses(1).is_err());
+        assert!(both.set_addresses(MAX_ADDRESSES + 1).is_err());
+        let reversed: Vec<Account> =
+            [1, 0].map(|i| Account::from_seed(&seed, NET, i).unwrap()).into();
+        assert!(both.add_page_for(&reversed, &chain.page(1)).is_err());
+        // At least one page: `in_sync` knows only the tip the last one told.
+        let sync = |wallet: &mut LightWallet, chain: &Chain| loop {
+            wallet.add_page_for(&accounts, &chain.page(wallet.next())).unwrap();
+            if wallet.in_sync() {
+                break;
+            }
+        };
+        sync(&mut both, &chain);
+        assert_eq!(both.balance().spendable_atoms, 50 * ATOMS);
+        let owners: BTreeSet<u32> = both.current.unspent().map(|o| o.account).collect();
+        assert_eq!(owners, BTreeSet::from([0, 1]));
+
+        // 45 needs both notes: one payment, each spent with its own key.
+        let plan = both
+            .plan_for(&accounts, alice.address(), 45 * ATOMS, b"together")
+            .unwrap();
+        assert_eq!(plan.owners.iter().copied().collect::<BTreeSet<_>>(), owners);
+        let fee = conventional_fee(2, 2);
+        assert_eq!(plan.change(), 5 * ATOMS - fee);
+        let tx = plan.prove_for(&accounts).unwrap();
+        both.reserve(&tx).unwrap();
+        chain.ledger.check_transfer(&tx).unwrap();
+        chain.mine(&alice, vec![tx], 0);
+        sync(&mut both, &chain);
+        let left: Vec<&OwnedNote> = both.current.unspent().collect();
+        assert_eq!(left.len(), 1);
+        assert_eq!((left[0].account, left[0].note.value), (0, 5 * ATOMS - fee));
+        assert_eq!(both.history().last().unwrap().memo, "together");
+
+        // The state keeps its addresses; one without the format byte (an
+        // older version's) is refused, not misread.
+        let saved = both.encode().unwrap();
+        assert_eq!(LightWallet::decode(&saved).unwrap().addresses(), 2);
+        assert!(LightWallet::decode(&saved[1..]).is_err());
     }
 }

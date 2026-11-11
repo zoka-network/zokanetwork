@@ -1,7 +1,100 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
-Actualizada: **11 de noviembre de 2026**, Argentina. Testnet v2 con semillas permanentes en VPS; billetera web, ZKAPriv 3.0.0 y faucet publicados; home nuevo de zoka.network en vivo. Ramas `endurecimiento-sin-consenso` (nodo, ZSilent, billetera web, ZokaScan y ZKAPriv) con la primera tanda de la revisión técnica, sin integrar ni publicar.
+Actualizada: **11 de noviembre de 2026 (tarde)**, Argentina. Testnet v2 con semillas permanentes en VPS; billetera web, ZKAPriv 3.0.0 y faucet publicados; home nuevo de zoka.network en vivo. Ramas `endurecimiento-sin-consenso` (cinco repos) con la primera tanda de la revisión técnica y ramas `protocolo-v3` (nodo, ZSilent, ZKAPriv) con el protocolo del próximo reinicio: los diez puntos cerrados en código, sin integrar, publicar ni reiniciar.
 Proyecto: `C:\Users\mderramus\ZOKA`.
+
+## 11/11 (tarde): protocolo v3, los diez puntos cerrados en código
+
+El usuario pidió «cierra todos los puntos». Lo que cambia el consenso quedó
+en las ramas **`protocolo-v3`** del nodo, ZSilent y ZKAPriv, para el
+**reinicio de la testnet**, que pide su OK: nada publicado, nada instalado,
+la testnet v2 sigue andando con los programas de hoy.
+
+### Los diez puntos
+
+| Punto | Estado | Dónde |
+| --- | --- | --- |
+| 1. Forma del pago pública | **Hecho (v3).** Todo pago gasta 2, 4 u 8 notas (relleno con notas de valor 0, exentas de pertenencia en el AIR) y crea 2 | pool `6d1afcfa` |
+| 2. Comisión y vencimiento libres | **Hecho (v3).** Comisión exacta de la forma (100 × entradas) y sin vencimiento: vale mientras su ancla esté en la ventana (30 bloques) | pool `6d1afcfa` |
+| 3. Clave de vista todo o nada | Hecho el 10/11 (clave de entrantes) | `endurecimiento-sin-consenso` |
+| 4. Una dirección por cuenta | **Hecho en los motores** (billetera liviana, web y ZKAPriv; billetera del nodo, la de ZSilent): hasta 8 direcciones de la misma semilla, un pago gasta notas de varias, el vuelto va a la principal. Faltan los botones en las apps | ver abajo |
+| 5. Margen cuántico | **Decidido: A** (160 consultas, blowup 8) + Keccak; números de la v3 en [MARGEN-DE-SOLIDEZ.md](docs/MARGEN-DE-SOLIDEZ.md) | pool `6d1afcfa` |
+| 6. Todo cuelga de Poseidon2 | **Hecho (v3).** Merkle de FRI y transcript con Keccak; Poseidon2 queda dentro del circuito | pool `6d1afcfa` |
+| 7. Fuzzing | Hecho el 10/11; **libFuzzer en el VPS 2 espera al usuario** (comando abajo) | — |
+| 8. Barrido del circuito | Hecho el 11/11; repetido con las formas v3 | pool |
+| 9. Autoridad de una clave | **Hecho (v3): k de n firmantes.** La testnet v3 arranca con 1 de 1 en ese formato; pasar a 2 de 3 lo decide el usuario | nodo, `zoka-light` |
+| 10. `cargo audit` | Hecho el 10/11 | — |
+
+Además, la **raíz de Merkle del bloque** ahora cuenta las hojas (v3): dos
+cuerpos distintos ya no pueden tener el mismo hash.
+
+### Commits
+
+| Repo | Rama | Commits |
+| --- | --- | --- |
+| ZOKA | `protocolo-v3` | `6d1afcfa` pool v3 · `d4124934` nodo v3 y k de n · el del punto 4 y los documentos (ver `git log`) |
+| ZSilent | `protocolo-v3` (worktree `target/zsilent-endurecimiento`) | `16acbac` testnet v3 en su carpeta, con las wallets y el setup de la v2 |
+| zkapriv | `protocolo-v3` | `65c4d2a` motor con varias direcciones; un estado de otro formato se vuelve a leer |
+
+Todas salen de las ramas `endurecimiento-sin-consenso`, que tienen la
+primera tanda (10-11/11).
+
+### Lo que cambia para el usuario en el reinicio, y qué hacen solas las apps
+
+- **Mismas frases, mismas direcciones.** El formato de dirección no cambió
+  (`zqtest2…`). Los archivos de billetera de la v2 se abren en la v3, y
+  ZSilent los copia solo a su carpeta nueva (`.zoka/quantic-testnet-v3`)
+  con el setup, sin onboarding.
+- **Saldos de cero:** es una cadena nueva. El génesis de la v3 lo crea el
+  usuario con la wallet del equipo, como en la v2 (memoria «Emisión antes de
+  la mainnet»: crearlo justo al lanzar).
+- **Billetera web y ZKAPriv:** el estado guardado de la v2 se descarta solo
+  (byte de versión; ZKAPriv además lo guarda por cadena) y vuelven a leer la
+  cadena.
+- **Pagos:** cuestan siempre 0,0002 ZKA (2 notas), 0,0004 (4) o 0,0008 (8),
+  y ya no vencen a los 20 bloques: valen mientras su ancla esté en la
+  ventana de 30.
+
+### Qué falta antes del reinicio (pide OK del usuario)
+
+1. **Medir un pago 8→2 en el teléfono de 32 bits.** En la PC son 7,85 MB y
+   16 s; en el teléfono puede ser el caso que no entra en memoria.
+2. **Autoridad:** decidir si arranca con 1 de 1 (lo compilado) o 2 de 3, y
+   dónde vive cada clave ([CHECKPOINTS-AUTORITATIVOS.md](docs/CHECKPOINTS-AUTORITATIVOS.md),
+   «Versión 3»). Cambiarlo después obliga a actualizar todas las billeteras.
+3. Identidades v3 de las semillas y su manifiesto
+   (`docs/quantic-testnet-v3-network.v1.json`), y el génesis.
+4. Recompilar: los dos WebAssembly (billetera web y ZokaScan), el `.so` de
+   ZKAPriv en el VPS 2 (armeabi-v7a y arm64-v8a), el MSI de ZSilent, el
+   minero CLI y el nodo de Linux.
+5. Botones de «nueva dirección» en ZSilent, la billetera web y ZKAPriv: el
+   motor ya los soporta (`new-address` / `addresses`, `addAddress` /
+   `addressAt`, `addAddress0` / `addresses0`). En las billeteras livianas
+   el número de direcciones vive en el estado guardado: si un cambio de
+   formato lo descarta, la app tiene que volver a pedirlas antes de leer
+   (salen las mismas, de la misma frase), así que conviene que lo guarde
+   también en su configuración.
+6. Publicar (releases, web, Discord): OK explícito.
+
+### libFuzzer (punto 7)
+
+Sigue esperando al usuario: el clasificador no deja escribir en el VPS. El
+comando está más abajo, en «Qué falta» de la entrada del 11/11 de la
+mañana.
+
+### Pruebas (11/11, en la PC, perfil release)
+
+| Qué | Resultado |
+| --- | --- |
+| Pool (`--lib`, con el barrido y el fuzzing) | 43 sin fallas, una ignorada (costos del margen); las dos que fallaron primero (una prueba nueva mal escrita y el mutador de forma del estado guardado) se corrigieron y pasaron en una segunda pasada de `fuzzing::` y `light::` |
+| Nodo (`quantic::`, `checkpoint_authority::`, … `--test-threads=1`) | 214 sin fallas, 3 ignoradas a propósito; entre ellas la de tres nodos en loopback con dos de tres y la de varias direcciones en la billetera del nodo |
+| `quantic_node_fuzz` | 5 de 5, con la de la raíz de Merkle v3 |
+| `zoka-light` | sin fallas |
+| WebAssembly de la billetera web (nativo) | 5 sin fallas, con la de una dirección más |
+| ZSilent `gradle test` (rama `protocolo-v3`) | 95 sin fallas, con las 3 de la migración |
+| Motor de ZKAPriv (`cargo test --features quantic-pq --lib stark::`) y `gradle :network:testDebugUnitTest` | 4 y 47 sin fallas, con la de direcciones |
+
+No se probó: ningún teléfono, ningún paquete, la red pública ni libFuzzer.
 
 ## 11/11: Codex siguió la revisión y Claude la cerró en las cinco apps
 
