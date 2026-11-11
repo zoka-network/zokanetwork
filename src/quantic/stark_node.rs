@@ -1612,10 +1612,105 @@ async fn checkpoint_sign(options: Options) -> Result<(), String> {
     Ok(())
 }
 
+/// The public halves of the team's keys in `dir`, to check that encrypting
+/// them changed nothing. `password` opens encrypted files.
+fn authority_public_keys(dir: &Path, password: Option<&str>) -> Result<(String, String), String> {
+    let seed = checkpoint_authority::read_key_seed_with(
+        &dir.join(AUTHORITY_KEY_FILE),
+        checkpoint_authority::SEALED_ED25519,
+        "checkpoint authority key",
+        password,
+    )?;
+    let ed25519 = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let mldsa = checkpoint_authority::read_key_seed_with(
+        &dir.join(AUTHORITY_MLDSA_KEY_FILE),
+        checkpoint_authority::SEALED_MLDSA,
+        "ML-DSA key",
+        password,
+    )?;
+    let hybrid = HybridSigningKey::from_parts(ed25519.clone(), mldsa.as_ref()).map_err(err)?;
+    Ok((
+        hex::encode(ed25519.verifying_key().to_bytes()),
+        hex::encode(hybrid.verifying_key().mldsa().to_bytes()),
+    ))
+}
+
+/// Encrypts the two key files of `dir` in place. Nothing is deleted: each
+/// plain file stays next to its encrypted one under another name
+/// (`checkpoint_authority::seal_key_file`), for whoever runs this to remove
+/// once the node has signed with the new files.
+fn encrypt_authority_keys(dir: &Path, password: &str) -> Result<serde_json::Value, String> {
+    let files = [
+        (
+            dir.join(AUTHORITY_KEY_FILE),
+            checkpoint_authority::SEALED_ED25519,
+            "checkpoint authority key",
+        ),
+        (
+            dir.join(AUTHORITY_MLDSA_KEY_FILE),
+            checkpoint_authority::SEALED_MLDSA,
+            "ML-DSA key",
+        ),
+    ];
+    // Both halves have to be there, in hex and readable, before either changes.
+    for (path, _, _) in &files {
+        if checkpoint_authority::key_file_is_sealed(path)? {
+            return Err(format!(
+                "{} is already encrypted; nothing was changed",
+                path.display()
+            ));
+        }
+    }
+    let before = authority_public_keys(dir, None)?;
+    let mut backups: Vec<String> = Vec::new();
+    for (path, kind, what) in &files {
+        match checkpoint_authority::seal_key_file(path, kind, what, password) {
+            Ok(backup) => backups.push(backup.display().to_string()),
+            Err(error) => {
+                return Err(match backups.first() {
+                    None => error,
+                    Some(first) => format!(
+                        "{error}; the Ed25519 key is already encrypted and its plain copy is {first}"
+                    ),
+                })
+            }
+        }
+    }
+    if authority_public_keys(dir, Some(password))? != before {
+        return Err(
+            "the encrypted keys do not read back as the original ones; the plain copies are next to them"
+                .into(),
+        );
+    }
+    Ok(serde_json::json!({
+        "encrypted": files.iter().map(|(path, _, _)| path.display().to_string()).collect::<Vec<_>>(),
+        "plain_backups": backups,
+        "ed25519_public_key": before.0,
+        "password_variable": checkpoint_authority::AUTHORITY_PASSWORD_ENV,
+        "note": "The node now needs ZOKA_AUTHORITY_PASSWORD to sign. Start it, see it sign a checkpoint, and only then delete the plain backups yourself; replace any other copy of the plain keys with the encrypted files.",
+    }))
+}
+
+async fn authority_encrypt(options: Options) -> Result<(), String> {
+    let dir = PathBuf::from(options.required("--authority")?);
+    let variable = checkpoint_authority::AUTHORITY_PASSWORD_ENV;
+    let password = Zeroizing::new(std::env::var(variable).map_err(|_| {
+        format!("set {variable} to the password that will protect the authority keys")
+    })?);
+    let report = tokio::task::spawn_blocking(move || encrypt_authority_keys(&dir, &password))
+        .await
+        .map_err(err)??;
+    println!("{report}");
+    Ok(())
+}
+
 pub async fn run(args: &[String]) -> Result<(), String> {
     let command = args.first().map(String::as_str).unwrap_or("help");
     let rest = args.get(1..).unwrap_or(&[]);
     match command {
+        "authority-encrypt" => {
+            authority_encrypt(Options::parse(rest, &["--authority"])?).await
+        }
         "serve" => {
             serve(Options::parse(
                 rest,
@@ -1695,8 +1790,12 @@ or testnet (zoka-quantic-testnet-v2: RandomX, ASERT). An existing --db keeps its
         manifest pins; creates the identity if the file does not exist)\n\
   checkpoint-sign --authority DIR --network NAME --height H --hash HASH [--out FILE]\n\
         (signs by hand to correct the branch; POST the output to a node's /checkpoint)\n\
+  authority-encrypt --authority DIR   (encrypts the two key files in DIR with the password in\n\
+        ZOKA_AUTHORITY_PASSWORD; each plain file stays next to its encrypted one as\n\
+        *.plain-backup until you delete it)\n\
 --authority DIR makes the node the chain's checkpoint authority: DIR holds the team's\n\
 checkpoint-authority.key and checkpoint-authority-mldsa.key, which must be the compiled keys.\n\
+Encrypted key files are opened with ZOKA_AUTHORITY_PASSWORD.\n\
 Short addresses: POST /address publishes a wallet's full address, which the node pushes to its\n\
 peers; GET /address/SHORT answers the full one, asking the node's peers when it does not know it.\n\
 Set ZOKA_PQ_PASSWORD to create/open the encrypted node identity. Files are never overwritten.\n\
@@ -2211,6 +2310,56 @@ mod tests {
         let refused = load_authority(&team, &mixed).err().unwrap();
         assert!(refused.contains("ML-DSA"), "{refused}");
         assert!(load_authority(&dir.path().join("missing"), &keys).is_err());
+    }
+
+    #[test]
+    fn the_authority_keys_can_be_kept_encrypted() {
+        use checkpoint_authority::{AUTHORITY_PASSWORD_ENV, PLAIN_BACKUP_SUFFIX};
+        let dir = tempfile::tempdir().unwrap();
+        let team = dir.path().join("team");
+        let keys = test_authority(&team);
+        let read = |name: &str| std::fs::read_to_string(team.join(name)).unwrap();
+        let plain = [read(AUTHORITY_KEY_FILE), read(AUTHORITY_MLDSA_KEY_FILE)];
+
+        // An empty password changes nothing.
+        assert!(encrypt_authority_keys(&team, "").is_err());
+        assert_eq!(read(AUTHORITY_KEY_FILE), plain[0]);
+
+        let report = encrypt_authority_keys(&team, "a long passphrase").unwrap();
+        assert_eq!(report["plain_backups"].as_array().unwrap().len(), 2);
+        for (name, secret) in [AUTHORITY_KEY_FILE, AUTHORITY_MLDSA_KEY_FILE]
+            .into_iter()
+            .zip(&plain)
+        {
+            // The file a node reads no longer holds the secret; the plain
+            // copy next to it is the original, byte for byte.
+            assert!(checkpoint_authority::key_file_is_sealed(&team.join(name)).unwrap());
+            assert!(!read(name).contains(secret.trim()));
+            assert_eq!(&read(&format!("{name}{PLAIN_BACKUP_SUFFIX}")), secret);
+        }
+
+        // This test alone uses the variable: every other one reads keys in hex.
+        std::env::remove_var(AUTHORITY_PASSWORD_ENV);
+        let refused = load_authority(&team, &keys).err().unwrap();
+        assert!(refused.contains(AUTHORITY_PASSWORD_ENV), "{refused}");
+        std::env::set_var(AUTHORITY_PASSWORD_ENV, "another passphrase");
+        let refused = load_authority(&team, &keys).err().unwrap();
+        assert!(refused.contains("wrong password"), "{refused}");
+        std::env::set_var(AUTHORITY_PASSWORD_ENV, "a long passphrase");
+        let signer = load_authority(&team, &keys).unwrap();
+        let checkpoint = signer.sign_all(&keys, CHAIN, 3, &"ab".repeat(32)).remove(0);
+        checkpoint.verify(&keys).unwrap();
+
+        // Encrypting twice is refused, and one half is not taken for the other.
+        assert!(encrypt_authority_keys(&team, "a long passphrase").is_err());
+        let (first, second) = (team.join(AUTHORITY_KEY_FILE), team.join(AUTHORITY_MLDSA_KEY_FILE));
+        let held = team.join("held");
+        std::fs::rename(&first, &held).unwrap();
+        std::fs::rename(&second, &first).unwrap();
+        std::fs::rename(&held, &second).unwrap();
+        let refused = load_authority(&team, &keys).err().unwrap();
+        assert!(refused.contains("half"), "{refused}");
+        std::env::remove_var(AUTHORITY_PASSWORD_ENV);
     }
 
     #[tokio::test]

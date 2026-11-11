@@ -213,6 +213,43 @@ testnet v2, que reemplaza a la v1. Rama `quantic-v2-checkpoints`.
   - un checkpoint firmado a mano y entregado al seguidor llegó a los tres;
   - uno falsificado se rechazó (422).
 
+## Claves cifradas en disco (10/11/2026)
+
+Rama `endurecimiento-sin-consenso`. Los dos archivos de la autoridad son 32
+bytes en hex, sin cifrar: quien copia el archivo (o un respaldo) tiene la
+clave. Ahora el nodo también los lee cifrados con una contraseña.
+
+- **Formato:** un JSON con `schema` (`zoka-authority-key-v1`), `key`
+  (`ed25519` o `ml-dsa-65`, para no tomar una mitad por la otra) y la semilla
+  cifrada con Argon2id y AES-256-GCM, igual que la identidad del nodo.
+- **Lectura:** si el archivo empieza con `{` está cifrado y el nodo toma la
+  contraseña de `ZOKA_AUTHORITY_PASSWORD`. Sin ella, o con otra, no arranca
+  como autoridad y lo dice. Un archivo en hex se lee como siempre: nada
+  cambia para quien no cifra.
+- **Cifrar:** con la contraseña en esa variable,
+  `quantic-pq-node authority-encrypt --authority DIR`. Antes de tocar nada
+  comprueba que las dos mitades estén y se lean. Escribe cada archivo
+  cifrado aparte, lo vuelve a leer con la contraseña y recién entonces lo
+  pone en lugar del original.
+- **No borra nada.** La clave en claro queda al lado como
+  `checkpoint-authority.key.plain-backup` (y la ML-DSA igual). La borra quien
+  cifró, después de ver al nodo firmar un checkpoint con los archivos nuevos.
+  Los respaldos fuera de la PC también hay que cambiarlos por los cifrados.
+- **Sirve para los dos nodos:** `load_signing_key` y `load_mldsa_seed` son
+  las mismas funciones que usan `zoka checkpoint-sign` y el nodo de la v1.
+
+**No está activado.** Las claves de la PC siguen en hex. Para activarlo falta
+decidir cómo le llega la contraseña al nodo que arranca ZSilent:
+
+- pedirla al abrir ZSilent en la PC autoridad (lo que de verdad protege; es
+  un cambio de ZSilent);
+- o dejarla en una variable de entorno de Windows, que no pide tocar ZSilent
+  pero deja la contraseña en la misma máquina: protege los respaldos y una
+  copia suelta de los archivos, no una PC comprometida.
+
+Lo que esto no resuelve: una sola clave y una sola PC. Repartir la firma
+(dos de tres firmantes) es un cambio de la regla de aceptación.
+
 ## Pendiente
 
 - Crear la mitad ML-DSA de la clave de Zenith (la crea el usuario en la PC) y

@@ -247,18 +247,14 @@ impl fmt::Debug for HybridSignature {
     }
 }
 
-/// Lee una semilla ML-DSA de 32 bytes en hex.
+/// Lee una semilla ML-DSA de 32 bytes: en hex, o cifrada con la contraseña
+/// de `ZOKA_AUTHORITY_PASSWORD` (`checkpoint_authority::seal_key_file`).
 pub fn load_mldsa_seed(path: &Path) -> Result<Zeroizing<[u8; ML_DSA_65_SEED_BYTES]>, String> {
-    let mut text = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read ML-DSA key {}: {e}", path.display()))?;
-    let decoded = hex::decode(text.trim());
-    text.zeroize();
-    let mut bytes = decoded.map_err(|_| "ML-DSA key is not hex".to_string())?;
-    let result = <[u8; ML_DSA_65_SEED_BYTES]>::try_from(bytes.as_slice())
-        .map(Zeroizing::new)
-        .map_err(|_| format!("ML-DSA key must be {ML_DSA_65_SEED_BYTES} bytes"));
-    bytes.zeroize();
-    result
+    crate::checkpoint_authority::read_key_seed(
+        path,
+        crate::checkpoint_authority::SEALED_MLDSA,
+        "ML-DSA key",
+    )
 }
 
 /// Crea una semilla ML-DSA nueva en `path` (nunca sobrescribe) y devuelve la

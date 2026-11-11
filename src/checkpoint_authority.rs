@@ -32,6 +32,16 @@ pub const AUTHORITY_KEY_FILE: &str = "checkpoint-authority.key";
 /// Semilla ML-DSA-65 del equipo (32 bytes en hex), junto a la Ed25519. Con
 /// ella el nodo firma también checkpoints de la versión 2.
 pub const AUTHORITY_MLDSA_KEY_FILE: &str = "checkpoint-authority-mldsa.key";
+/// Contraseña de las claves de autoridad guardadas cifradas (`seal_key_file`).
+/// No hace falta mientras los archivos estén en hex, como se crean.
+pub const AUTHORITY_PASSWORD_ENV: &str = "ZOKA_AUTHORITY_PASSWORD";
+/// Qué mitad de la clave guarda un archivo cifrado.
+pub const SEALED_ED25519: &str = "ed25519";
+pub const SEALED_MLDSA: &str = "ml-dsa-65";
+const SEALED_KEY_SCHEMA: &str = "zoka-authority-key-v1";
+/// Sufijo de la copia en claro que deja `seal_key_file`: la borra quien cifró,
+/// después de comprobar que el nodo firma con el archivo nuevo.
+pub const PLAIN_BACKUP_SUFFIX: &str = ".plain-backup";
 /// Reemplaza la clave pública compilada. Solo para redes locales de prueba.
 pub const AUTHORITY_PUBKEY_ENV: &str = "ZOKA_CHECKPOINT_AUTHORITY_PUBKEY";
 /// Igual, para la mitad ML-DSA (hex de 1.952 bytes).
@@ -555,18 +565,182 @@ pub fn next_height_to_sign(tip: u64, last_signed: Option<u64>) -> Option<u64> {
     }
 }
 
-/// Lee la clave privada de la autoridad: 32 bytes en hex.
+/// Lee la clave privada de la autoridad: 32 bytes en hex, o cifrada con la
+/// contraseña de `ZOKA_AUTHORITY_PASSWORD` (`seal_key_file`).
 pub fn load_signing_key(path: &Path) -> Result<SigningKey, String> {
+    let seed = read_key_seed(path, SEALED_ED25519, "checkpoint authority key")?;
+    Ok(SigningKey::from_bytes(&seed))
+}
+
+/// Un archivo de clave cifrado. El formato del cifrado es el de la identidad
+/// del nodo (`wallet::storage::encrypt_data`: Argon2id y AES-256-GCM).
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealedKeyFile {
+    schema: String,
+    /// `SEALED_ED25519` o `SEALED_MLDSA`: para no tomar una mitad por la otra.
+    key: String,
+    encrypted_seed_hex: String,
+}
+
+/// Si el archivo de clave está cifrado. Un archivo en hex no lo está.
+pub fn key_file_is_sealed(path: &Path) -> Result<bool, String> {
     let mut text = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read checkpoint authority key {}: {e}", path.display()))?;
-    let decoded = hex::decode(text.trim());
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let sealed = text.trim_start().starts_with('{');
     text.zeroize();
-    let mut bytes = decoded.map_err(|_| "checkpoint authority key is not hex".to_string())?;
-    let result = <[u8; 32]>::try_from(bytes.as_slice())
-        .map(|seed| SigningKey::from_bytes(&seed))
-        .map_err(|_| "checkpoint authority key must be 32 bytes".to_string());
-    bytes.zeroize();
+    Ok(sealed)
+}
+
+/// Los 32 bytes secretos de un archivo de clave de la autoridad, con la
+/// contraseña del entorno si está cifrado. `what` nombra la clave en los
+/// errores; `kind` es la mitad que se espera.
+pub(crate) fn read_key_seed(
+    path: &Path,
+    kind: &str,
+    what: &str,
+) -> Result<zeroize::Zeroizing<[u8; 32]>, String> {
+    let password = std::env::var(AUTHORITY_PASSWORD_ENV)
+        .ok()
+        .map(zeroize::Zeroizing::new);
+    read_key_seed_with(path, kind, what, password.as_ref().map(|p| p.as_str()))
+}
+
+/// Como `read_key_seed`, con la contraseña dada. Un archivo en hex se lee
+/// igual que siempre y no la mira.
+pub(crate) fn read_key_seed_with(
+    path: &Path,
+    kind: &str,
+    what: &str,
+    password: Option<&str>,
+) -> Result<zeroize::Zeroizing<[u8; 32]>, String> {
+    let mut text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {what} {}: {e}", path.display()))?;
+    let result = if text.trim_start().starts_with('{') {
+        open_sealed_key(text.trim(), kind, what, password)
+    } else {
+        let decoded = hex::decode(text.trim());
+        decoded
+            .map_err(|_| format!("{what} is not hex"))
+            .and_then(|mut bytes| {
+                let seed = <[u8; 32]>::try_from(bytes.as_slice())
+                    .map(zeroize::Zeroizing::new)
+                    .map_err(|_| format!("{what} must be 32 bytes"));
+                bytes.zeroize();
+                seed
+            })
+    };
+    text.zeroize();
     result
+}
+
+fn open_sealed_key(
+    text: &str,
+    kind: &str,
+    what: &str,
+    password: Option<&str>,
+) -> Result<zeroize::Zeroizing<[u8; 32]>, String> {
+    let file: SealedKeyFile = serde_json::from_str(text)
+        .map_err(|_| format!("{what} is neither hex nor an encrypted key file"))?;
+    if file.schema != SEALED_KEY_SCHEMA {
+        return Err(format!("{what}: unknown encrypted key format"));
+    }
+    if file.key != kind {
+        return Err(format!(
+            "{what}: this file holds the {} half of the authority key",
+            file.key
+        ));
+    }
+    let password = password
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| format!("{what} is encrypted: set {AUTHORITY_PASSWORD_ENV}"))?;
+    let encrypted = hex::decode(&file.encrypted_seed_hex)
+        .map_err(|_| format!("{what}: damaged encrypted key file"))?;
+    // Ocho bytes de marca, sal de 16, nonce de 12, la semilla de 32 y la
+    // etiqueta GCM de 16. `decrypt_data` también lee un formato viejo sin
+    // autenticar: acá no se llega a él.
+    if encrypted.len() != 84 || !encrypted.starts_with(b"ZOKAENC1") {
+        return Err(format!("{what}: damaged encrypted key file"));
+    }
+    let plain = zeroize::Zeroizing::new(
+        crate::wallet::storage::decrypt_data(&encrypted, password)
+            .map_err(|_| format!("{what}: wrong password or damaged file"))?,
+    );
+    <[u8; 32]>::try_from(plain.as_slice())
+        .map(zeroize::Zeroizing::new)
+        .map_err(|_| format!("{what} must be 32 bytes"))
+}
+
+/// Cifra en su lugar un archivo de clave que está en hex. Devuelve la ruta
+/// de la copia en claro que deja al lado (`PLAIN_BACKUP_SUFFIX`).
+///
+/// Perder esta clave obliga a sacar binarios nuevos, así que no se borra
+/// nada: el archivo cifrado se escribe aparte, se vuelve a leer con la
+/// contraseña y recién entonces ocupa el lugar del original, que queda con
+/// otro nombre. Esa copia en claro la borra quien cifró, cuando haya visto al
+/// nodo firmar con el archivo nuevo.
+pub fn seal_key_file(path: &Path, kind: &str, what: &str, password: &str) -> Result<std::path::PathBuf, String> {
+    if password.is_empty() {
+        return Err(format!("{AUTHORITY_PASSWORD_ENV} cannot be empty"));
+    }
+    if key_file_is_sealed(path)? {
+        return Err(format!("{} is already encrypted", path.display()));
+    }
+    let seed = read_key_seed_with(path, kind, what, None)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("{} has no file name", path.display()))?;
+    let backup = path.with_file_name(format!("{name}{PLAIN_BACKUP_SUFFIX}"));
+    let staged = path.with_file_name(format!("{name}.encrypting"));
+    if backup.exists() || staged.exists() {
+        return Err(format!(
+            "{} or {} already exists; nothing was changed",
+            backup.display(),
+            staged.display()
+        ));
+    }
+    let encrypted = crate::wallet::storage::encrypt_data(seed.as_ref(), password)
+        .map_err(|e| format!("cannot encrypt {what}: {e}"))?;
+    let file = SealedKeyFile {
+        schema: SEALED_KEY_SCHEMA.into(),
+        key: kind.into(),
+        encrypted_seed_hex: hex::encode(encrypted),
+    };
+    let json = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
+        .and_then(|mut out| {
+            std::io::Write::write_all(&mut out, &json)?;
+            out.sync_all()
+        })
+        .map_err(|e| format!("cannot write {}: {e}", staged.display()))?;
+    // Lo que quedó en el disco tiene que abrir la misma semilla.
+    let reread = read_key_seed_with(&staged, kind, what, Some(password));
+    if reread.as_ref().map(|s| **s == *seed).unwrap_or(false) {
+        std::fs::rename(path, &backup)
+            .map_err(|e| format!("cannot move {} aside: {e}; nothing was changed", path.display()))?;
+        if let Err(e) = std::fs::rename(&staged, path) {
+            // Volver a como estaba: la clave en claro en su lugar.
+            let restored = std::fs::rename(&backup, path);
+            return Err(format!(
+                "cannot put the encrypted key in place: {e}; the original key is {}",
+                if restored.is_ok() {
+                    "back in place".to_string()
+                } else {
+                    format!("at {}", backup.display())
+                }
+            ));
+        }
+        Ok(backup)
+    } else {
+        Err(format!(
+            "the encrypted copy at {} does not read back; the original key was not touched",
+            staged.display()
+        ))
+    }
 }
 
 /// Crea una clave nueva en `path` y devuelve la pública en hex. No
@@ -739,6 +913,78 @@ mod tests {
         let leida = load_signing_key(&path).unwrap();
         assert_eq!(hex::encode(leida.verifying_key().to_bytes()), public);
         assert_eq!(parse_public_key(&public), Some(leida.verifying_key()));
+    }
+
+    #[test]
+    fn una_clave_cifrada_se_lee_con_su_contrasena_y_solo_con_ella() {
+        const QUE: &str = "checkpoint authority key";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(AUTHORITY_KEY_FILE);
+        let public = generate_signing_key(&path).unwrap();
+        let en_hex = std::fs::read_to_string(&path).unwrap();
+        let semilla = read_key_seed_with(&path, SEALED_ED25519, QUE, None).unwrap();
+        // En hex se lee como siempre: la contraseña ni se mira.
+        let igual = read_key_seed_with(&path, SEALED_ED25519, QUE, Some("x")).unwrap();
+        assert_eq!(*igual, *semilla);
+        assert!(!key_file_is_sealed(&path).unwrap());
+        // Una contraseña vacía no cifra nada.
+        assert!(seal_key_file(&path, SEALED_ED25519, QUE, "").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), en_hex);
+
+        let copia = seal_key_file(&path, SEALED_ED25519, QUE, "frase larga").unwrap();
+        // La clave en claro quedó al lado, intacta, y ya no está en el archivo.
+        assert_eq!(std::fs::read_to_string(&copia).unwrap(), en_hex);
+        assert!(copia.to_string_lossy().ends_with(PLAIN_BACKUP_SUFFIX));
+        assert!(key_file_is_sealed(&path).unwrap());
+        let cifrado = std::fs::read_to_string(&path).unwrap();
+        assert!(!cifrado.contains(en_hex.trim()));
+        let abierta = read_key_seed_with(&path, SEALED_ED25519, QUE, Some("frase larga")).unwrap();
+        assert_eq!(*abierta, *semilla);
+        assert_eq!(
+            hex::encode(SigningKey::from_bytes(&abierta).verifying_key().to_bytes()),
+            public
+        );
+
+        // Sin contraseña, con otra o tomada por la otra mitad, no abre.
+        let sin = read_key_seed_with(&path, SEALED_ED25519, QUE, None).unwrap_err();
+        assert!(sin.contains(AUTHORITY_PASSWORD_ENV), "{sin}");
+        let otra = read_key_seed_with(&path, SEALED_ED25519, QUE, Some("otra frase")).unwrap_err();
+        assert!(otra.contains("wrong password"), "{otra}");
+        let mitad = read_key_seed_with(&path, SEALED_MLDSA, QUE, Some("frase larga")).unwrap_err();
+        assert!(mitad.contains("half"), "{mitad}");
+        // No se cifra dos veces.
+        assert!(seal_key_file(&path, SEALED_ED25519, QUE, "frase larga").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), cifrado);
+
+        // Un solo dígito cambiado y el cifrado autenticado lo nota.
+        let mut archivo: serde_json::Value = serde_json::from_str(&cifrado).unwrap();
+        let hexa = archivo["encrypted_seed_hex"].as_str().unwrap().to_string();
+        let ultimo = if hexa.ends_with('0') { '1' } else { '0' };
+        archivo["encrypted_seed_hex"] = format!("{}{ultimo}", &hexa[..hexa.len() - 1]).into();
+        std::fs::write(&path, serde_json::to_vec(&archivo).unwrap()).unwrap();
+        let roto = read_key_seed_with(&path, SEALED_ED25519, QUE, Some("frase larga")).unwrap_err();
+        assert!(roto.contains("damaged"), "{roto}");
+        // Ni un archivo cortado cae a otro formato.
+        archivo["encrypted_seed_hex"] = hexa[..hexa.len() - 2].into();
+        std::fs::write(&path, serde_json::to_vec(&archivo).unwrap()).unwrap();
+        assert!(read_key_seed_with(&path, SEALED_ED25519, QUE, Some("frase larga")).is_err());
+    }
+
+    #[test]
+    fn cifrar_no_pisa_una_copia_en_claro_que_ya_existe() {
+        const QUE: &str = "checkpoint authority key";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(AUTHORITY_KEY_FILE);
+        generate_signing_key(&path).unwrap();
+        let en_hex = std::fs::read_to_string(&path).unwrap();
+        let copia = dir
+            .path()
+            .join(format!("{AUTHORITY_KEY_FILE}{PLAIN_BACKUP_SUFFIX}"));
+        std::fs::write(&copia, "otra cosa").unwrap();
+        let error = seal_key_file(&path, SEALED_ED25519, QUE, "frase larga").unwrap_err();
+        assert!(error.contains("nothing was changed"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), en_hex);
+        assert_eq!(std::fs::read_to_string(&copia).unwrap(), "otra cosa");
     }
 
     #[cfg(feature = "pq-experimental")]
