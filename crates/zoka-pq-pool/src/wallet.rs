@@ -188,6 +188,20 @@ impl Account {
             *self.outgoing,
         )
     }
+    /// What this account can show of what it receives: see
+    /// [`IncomingViewKey`].
+    pub fn incoming_view_key(&self) -> Result<IncomingViewKey, Error> {
+        IncomingViewKey::from_parts(
+            self.network,
+            self.spend.owner(self.network),
+            *self.view_seed,
+        )
+    }
+    /// The memo of this account's own change in the output whose `rho` is
+    /// given: see [`change_memo`].
+    pub(crate) fn change_memo(&self, rho: Digest) -> [u8; MEMO_BYTES] {
+        change_memo(&self.view_seed, rho)
+    }
     pub fn address(&self) -> Address {
         Address {
             network: self.network,
@@ -363,6 +377,127 @@ impl ViewKey {
     ) -> Result<(Note, [u8; MEMO_BYTES]), Error> {
         open_sent(&self.outgoing, self.network, commitment, envelope)
     }
+    /// The part of this key that reads what arrives and nothing else.
+    pub fn incoming(&self) -> Result<IncomingViewKey, Error> {
+        IncomingViewKey::from_parts(self.network, self.owner, *self.seed)
+    }
+}
+
+/// `zqviewin2`, `zqtestviewin2` or `zqregtestviewin2`: an incoming view key.
+/// No address and no full view key starts like one.
+pub fn incoming_view_key_prefix(network: u8) -> &'static str {
+    match network {
+        1 => "zqviewin2",
+        2 => "zqtestviewin2",
+        _ => "zqregtestviewin2",
+    }
+}
+
+const INCOMING_VIEW_KEY_BYTES: usize = 2 + 64 + 32;
+
+/// The half of a [`ViewKey`] that reads what arrives: the notes paid to the
+/// wallet, with their amounts and memos. Without the outgoing key it cannot
+/// open what the wallet sent, and nothing it holds says which of the notes
+/// it sees were spent later. It shows income: never an expense, never a
+/// balance. What to hand to whoever has to know what was collected (an
+/// accountant, a shop's payment page) and nothing about what was spent.
+///
+/// The wallet's own change comes back to its address like any payment.
+/// Wallets mark it with [`change_memo`], which this key recognises
+/// ([`IncomingViewKey::is_change`]); the change of a wallet older than that
+/// mark reads as one more payment.
+pub struct IncomingViewKey {
+    pub network: u8,
+    pub owner: Digest,
+    seed: Zeroizing<[u8; 32]>,
+    view: XWingSecretKey,
+}
+impl IncomingViewKey {
+    fn from_parts(network: u8, owner: Digest, seed: [u8; 32]) -> Result<Self, Error> {
+        check_network(network)?;
+        let _ = owner.fields()?;
+        let seed = Zeroizing::new(seed);
+        let view = XWingSecretKey::from_seed(seed.as_ref()).map_err(|_| Error::Encryption)?;
+        Ok(Self {
+            network,
+            owner,
+            seed,
+            view,
+        })
+    }
+    pub fn encode(&self) -> String {
+        let prefix = incoming_view_key_prefix(self.network);
+        let mut payload = Zeroizing::new(Vec::with_capacity(INCOMING_VIEW_KEY_BYTES + 4));
+        payload.extend([1, self.network]);
+        for word in self.owner.0 {
+            payload.extend(word.to_le_bytes());
+        }
+        payload.extend(self.seed.as_ref());
+        let check = digest(b"ZokaPQViewInC2__", &[prefix.as_bytes(), &payload]);
+        payload.extend(&check[..4]);
+        format!("{prefix}{}", bs58::encode(&payload[..]).into_string())
+    }
+    pub fn decode(text: &str, network: u8) -> Result<Self, Error> {
+        check_network(network)?;
+        let prefix = incoming_view_key_prefix(network);
+        let body = text.trim().strip_prefix(prefix).ok_or(Error::Network)?;
+        if body.len() > 200 {
+            return Err(Error::Encoding);
+        }
+        let raw = Zeroizing::new(bs58::decode(body).into_vec().map_err(|_| Error::Encoding)?);
+        if raw.len() != INCOMING_VIEW_KEY_BYTES + 4 || raw[..2] != [1, network] {
+            return Err(Error::Encoding);
+        }
+        let check = digest(
+            b"ZokaPQViewInC2__",
+            &[prefix.as_bytes(), &raw[..INCOMING_VIEW_KEY_BYTES]],
+        );
+        if raw[INCOMING_VIEW_KEY_BYTES..] != check[..4] {
+            return Err(Error::Encoding);
+        }
+        let owner = Digest(std::array::from_fn(|i| {
+            u32::from_le_bytes(raw[2 + i * 4..6 + i * 4].try_into().unwrap())
+        }));
+        Self::from_parts(network, owner, raw[66..98].try_into().unwrap())
+    }
+    /// The address whose payments this key sees.
+    pub fn address(&self) -> Address {
+        Address {
+            network: self.network,
+            owner: self.owner,
+            xwing: self.view.public_key().to_bytes().to_vec(),
+        }
+    }
+    pub fn receive(
+        &self,
+        commitment: Digest,
+        envelope: &Envelope,
+    ) -> Result<(Note, [u8; MEMO_BYTES]), Error> {
+        open_received(&self.view, self.owner, self.network, commitment, envelope)
+    }
+    /// Whether a note this key opened is the wallet's own change coming
+    /// back, as its wallet marked it.
+    pub fn is_change(&self, note: &Note, memo: &[u8; MEMO_BYTES]) -> bool {
+        *memo == change_memo(&self.seed, note.rho)
+    }
+}
+
+/// What a wallet writes as the memo of its own change.
+///
+/// An incoming view key sees the change come back and, without it, would
+/// count it as money collected. The mark is a tag of the output's `rho`
+/// under the view seed: the wallet and its view keys compute it and nobody
+/// else can, so a payer cannot dress a payment up as change (nor does the
+/// tag of one output fit another). Its first byte is zero: read as text, as
+/// every wallet reads memos, it is an empty memo.
+pub fn change_memo(view_seed: &[u8; 32], rho: Digest) -> [u8; MEMO_BYTES] {
+    let mut words = [0u8; 64];
+    for (bytes, word) in words.chunks_exact_mut(4).zip(rho.0) {
+        bytes.copy_from_slice(&word.to_le_bytes());
+    }
+    let mut memo = [0; MEMO_BYTES];
+    memo[1..33].copy_from_slice(&digest(b"ZokaPQChangeTag2", &[view_seed, &words]));
+    memo
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -619,5 +754,81 @@ mod tests {
             .unwrap()
             .receive(mined_cm, &coinbase)
             .is_err());
+    }
+
+    #[test]
+    fn an_incoming_view_key_sees_what_arrives_and_nothing_that_leaves() {
+        let alice = Account::from_seed(&[1; 32], 2, 0).unwrap();
+        let bob = Account::from_seed(&[2; 32], 2, 0).unwrap();
+        let key = alice.incoming_view_key().unwrap();
+        let text = key.encode();
+        assert!(text.starts_with("zqtestviewin2"));
+        let decoded = IncomingViewKey::decode(&format!("  {text}\n"), 2).unwrap();
+        assert_eq!(decoded.encode(), text);
+        assert_eq!(decoded.address(), alice.address());
+        // The full key gives the same incoming key, never the reverse: the
+        // incoming one is shorter by the outgoing key it does not carry.
+        let full = alice.view_key().unwrap();
+        assert_eq!(full.incoming().unwrap().encode(), text);
+        assert!(text.len() < full.encode().len());
+
+        // Each of the three texts is refused where another goes, and so are
+        // another network and a typo.
+        let address = alice.address().encode().unwrap();
+        assert!(IncomingViewKey::decode(&full.encode(), 2).is_err());
+        assert!(IncomingViewKey::decode(&address, 2).is_err());
+        assert!(ViewKey::decode(&text, 2).is_err());
+        assert!(Address::decode(&text, 2).is_err());
+        assert!(ShortAddress::decode(&text, 2).is_err());
+        assert!(IncomingViewKey::decode(&text, 3).is_err());
+        let last = text.chars().last().unwrap();
+        let typo = format!(
+            "{}{}",
+            &text[..text.len() - 1],
+            if last == 'a' { 'b' } else { 'a' }
+        );
+        assert!(IncomingViewKey::decode(&typo, 2).is_err());
+
+        let rho = Digest([7; crate::crypto::WORDS]);
+        let (paid, to_alice) =
+            encrypt_note(&alice.address(), 300, &[1; MEMO_BYTES], Some(&bob), rho).unwrap();
+        let (sent, to_bob) =
+            encrypt_note(&bob.address(), 120, &[2; MEMO_BYTES], Some(&alice), rho).unwrap();
+        let paid_cm = paid.commitment(2).unwrap();
+        let sent_cm = sent.commitment(2).unwrap();
+        let (note, memo) = decoded.receive(paid_cm, &to_alice).unwrap();
+        assert_eq!((note.value, memo), (300, [1; MEMO_BYTES]));
+        assert!(!decoded.is_change(&note, &memo));
+        // What alice sent is sealed with her outgoing key, which it lacks.
+        assert!(decoded.receive(sent_cm, &to_bob).is_err());
+        assert!(full.recover_sent(sent_cm, &to_bob).is_ok());
+    }
+
+    #[test]
+    fn only_the_wallet_can_mark_its_change() {
+        let alice = Account::from_seed(&[1; 32], 2, 0).unwrap();
+        let bob = Account::from_seed(&[2; 32], 2, 0).unwrap();
+        let key = alice.incoming_view_key().unwrap();
+        let rho = Digest([9; crate::crypto::WORDS]);
+        let other = Digest([10; crate::crypto::WORDS]);
+        let mark = alice.change_memo(rho);
+        // As text it is an empty memo, in every wallet.
+        assert_eq!(mark[0], 0);
+        assert_ne!(mark, [0; MEMO_BYTES]);
+        assert_eq!(crate::scan::memo_text(&mark), "");
+
+        let open = |memo: &[u8; MEMO_BYTES], from: &Account, rho: Digest| {
+            let (note, envelope) =
+                encrypt_note(&alice.address(), 50, memo, Some(from), rho).unwrap();
+            let (note, memo) = key.receive(note.commitment(2).unwrap(), &envelope).unwrap();
+            key.is_change(&note, &memo)
+        };
+        assert!(open(&mark, &alice, rho));
+        // An empty memo is not the mark, and the mark of one output is not
+        // another's: a mark that leaked cannot be reused.
+        assert!(!open(&[0; MEMO_BYTES], &alice, rho));
+        assert!(!open(&mark, &alice, other));
+        // Bob, who pays alice, can only guess: his own mark is not hers.
+        assert!(!open(&bob.change_memo(rho), &bob, rho));
     }
 }

@@ -157,13 +157,20 @@ pub fn transfer(
         .nullifier(&inputs[0].key, network)?;
     let mut outputs = vec![];
     let mut envelopes = vec![];
+    let own = sender.address();
     for (index, payment) in payments.into_iter().enumerate() {
         if payment.to.network != network {
             return Err(Error::Network);
         }
         let rho = transfer_rho(network, first, index)?;
-        let (note, envelope) =
-            encrypt_note(&payment.to, payment.value, &payment.memo, Some(sender), rho)?;
+        // What comes back to the sender without a memo is its change: marked
+        // so that its incoming view key does not count it as money collected.
+        let memo = if payment.to == own && payment.memo == [0; MEMO_BYTES] {
+            sender.change_memo(rho)
+        } else {
+            payment.memo
+        };
+        let (note, envelope) = encrypt_note(&payment.to, payment.value, &memo, Some(sender), rho)?;
         outputs.push(note);
         envelopes.push(envelope);
     }
@@ -249,7 +256,10 @@ mod tests {
         let mut more = cb.clone();
         more.openings[0].value += 1;
         more.statement.minted += 1;
-        assert!(resealed(more).verify(3, 1).is_err(), "value is in the commitment");
+        assert!(
+            resealed(more).verify(3, 1).is_err(),
+            "value is in the commitment"
+        );
         let mut other = cb.clone();
         other.openings[0].hide = Digest([1; crate::crypto::WORDS]);
         assert!(resealed(other).verify(3, 1).is_err());

@@ -10,7 +10,7 @@ use crate::{
     crypto::Digest,
     ledger::maturity,
     transaction::Transaction,
-    wallet::{Envelope, ViewKey, MEMO_BYTES},
+    wallet::{Envelope, IncomingViewKey, ViewKey, MEMO_BYTES},
     Error,
 };
 use serde::{Deserialize, Serialize};
@@ -341,6 +341,111 @@ impl Viewer {
     }
 }
 
+/// A note that arrived, as an incoming view key reads it.
+#[derive(Clone, Debug, Serialize)]
+pub struct Incoming {
+    pub height: u32,
+    #[serde(with = "hex32")]
+    pub txid: [u8; 32],
+    pub coinbase: bool,
+    pub value: u64,
+    pub memo: String,
+    /// The wallet's own change coming back, as its wallet marked it: not
+    /// money collected.
+    pub change: bool,
+}
+
+/// What an incoming view key can say at the last block read. No balance:
+/// the key does not see what the wallet spent.
+#[derive(Clone, Debug, Serialize)]
+pub struct Receipts {
+    pub height: u32,
+    /// Everything that arrived but the wallet's own change.
+    pub received_atoms: u64,
+    /// Of that, block rewards that are not mature yet.
+    pub immature_atoms: u64,
+    /// The change that came back to the wallet.
+    pub change_atoms: u64,
+    pub received: Vec<Incoming>,
+}
+
+/// What a wallet collected, as its incoming view key reads it block after
+/// block. The pages are the ones a [`Viewer`] reads.
+pub struct IncomingViewer {
+    key: IncomingViewKey,
+    next: u32,
+    received: Vec<Incoming>,
+}
+impl IncomingViewer {
+    pub fn new(key: IncomingViewKey) -> Self {
+        Self {
+            key,
+            next: 1,
+            received: Vec::new(),
+        }
+    }
+    pub fn key(&self) -> &IncomingViewKey {
+        &self.key
+    }
+    /// The next height it expects.
+    pub fn next(&self) -> u32 {
+        self.next
+    }
+    /// Read a page; it has to start where the previous one ended.
+    pub fn add_page(&mut self, page: &ScanPage) -> Result<(), Error> {
+        if page.network != self.key.network || page.from != self.next {
+            return Err(Error::Network);
+        }
+        for block in &page.blocks {
+            self.add(block)?;
+        }
+        Ok(())
+    }
+    pub fn add(&mut self, block: &ScanBlock) -> Result<(), Error> {
+        if block.height != self.next {
+            return Err(Error::Shape);
+        }
+        for tx in &block.transactions {
+            for output in &tx.outputs {
+                let Ok((note, memo)) = self.key.receive(output.commitment, &output.envelope) else {
+                    continue;
+                };
+                self.received.push(Incoming {
+                    height: block.height,
+                    txid: tx.txid,
+                    coinbase: tx.coinbase,
+                    value: note.value,
+                    memo: memo_text(&memo),
+                    // A reward has no sender: nothing in it is change.
+                    change: !tx.coinbase && self.key.is_change(&note, &memo),
+                });
+            }
+        }
+        self.next = block.height.checked_add(1).ok_or(Error::Shape)?;
+        Ok(())
+    }
+    pub fn receipts(&self) -> Receipts {
+        let tip = self.next.saturating_sub(1);
+        let wait = maturity(self.key.network);
+        let total = |keep: &dyn Fn(&Incoming) -> bool| {
+            self.received
+                .iter()
+                .filter(|r| keep(r))
+                .fold(0u64, |sum, r| sum.saturating_add(r.value))
+        };
+        Receipts {
+            height: tip,
+            received_atoms: total(&|r| !r.change),
+            // As in [`Viewer::balance`]: block 1 counts at once.
+            immature_atoms: total(&|r| {
+                r.coinbase && r.height > 1 && r.height.saturating_add(wait) > tip
+            }),
+            change_atoms: total(&|r| r.change),
+            received: self.received.clone(),
+        }
+    }
+}
+
 /// The memo up to its first zero byte, as text (lossy: it is whatever the
 /// sender typed).
 pub(crate) fn memo_text(memo: &[u8; MEMO_BYTES]) -> String {
@@ -493,5 +598,127 @@ mod tests {
         other.network = 3;
         assert!(viewer.add_page(&other).is_err());
         assert!(ScanPage::decode(&[page.encode().unwrap(), vec![0]].concat()).is_err());
+    }
+
+    /// The change of `owner`, marked as [`crate::transaction::transfer`]
+    /// marks it.
+    fn change(owner: &Account, value: u64) -> ScanOutput {
+        let rho = Digest([value as u32 % 9; WORDS]);
+        let (note, envelope) = encrypt_note(
+            &owner.address(),
+            value,
+            &owner.change_memo(rho),
+            Some(owner),
+            rho,
+        )
+        .unwrap();
+        ScanOutput {
+            commitment: note.commitment(owner.network).unwrap(),
+            envelope,
+        }
+    }
+
+    #[test]
+    fn an_incoming_view_key_counts_what_was_collected_and_not_the_change() {
+        let alice = Account::from_seed(&[1; 32], 2, 0).unwrap();
+        let bob = Account::from_seed(&[2; 32], 2, 0).unwrap();
+        let blocks = vec![
+            block(1, vec![tx(1, true, 0, vec![output(&alice, 12, None, b"")])]),
+            block(2, vec![tx(2, true, 0, vec![output(&bob, 12, None, b"")])]),
+            // Bob pays alice 5 (fee 1, change 6).
+            block(
+                3,
+                vec![
+                    tx(3, true, 0, vec![output(&bob, 12, None, b"")]),
+                    tx(
+                        4,
+                        false,
+                        1,
+                        vec![output(&alice, 5, Some(&bob), b"thanks"), change(&bob, 6)],
+                    ),
+                ],
+            ),
+            // Alice mines, and pays bob 7 out of her 17 (fee 1, change 9).
+            block(
+                4,
+                vec![
+                    tx(5, true, 0, vec![output(&alice, 12, None, b"")]),
+                    tx(
+                        6,
+                        false,
+                        1,
+                        vec![output(&bob, 7, Some(&alice), b"rent"), change(&alice, 9)],
+                    ),
+                ],
+            ),
+            // A wallet older than the mark: its change reads as a payment.
+            block(
+                5,
+                vec![
+                    tx(7, true, 0, vec![output(&bob, 12, None, b"")]),
+                    tx(
+                        8,
+                        false,
+                        1,
+                        vec![
+                            output(&bob, 4, Some(&alice), b""),
+                            output(&alice, 4, Some(&alice), b""),
+                        ],
+                    ),
+                ],
+            ),
+        ];
+        let page = ScanPage {
+            network: 2,
+            tip: 5,
+            from: 1,
+            blocks,
+        };
+
+        let mut viewer = IncomingViewer::new(alice.incoming_view_key().unwrap());
+        viewer.add_page(&page).unwrap();
+        assert_eq!(viewer.next(), 6);
+        let seen = viewer.receipts();
+        assert_eq!(seen.height, 5);
+        // Two rewards, bob's 5 and the unmarked 4; the marked 9 apart.
+        assert_eq!(seen.received_atoms, 12 + 5 + 12 + 4);
+        assert_eq!(seen.change_atoms, 9);
+        // Block 4's reward waits; block 1's counted at once.
+        assert_eq!(seen.immature_atoms, 12);
+        assert_eq!(seen.received.len(), 5);
+        let paid = &seen.received[1];
+        assert_eq!(
+            (paid.height, paid.value, paid.memo.as_str(), paid.change),
+            (3, 5, "thanks", false)
+        );
+        let back = &seen.received[3];
+        assert_eq!((back.value, back.memo.as_str(), back.change), (9, "", true));
+        // Nothing of what alice paid: neither the 7 nor its memo.
+        assert!(seen.received.iter().all(|r| r.memo != "rent"));
+
+        let mut viewer = IncomingViewer::new(bob.incoming_view_key().unwrap());
+        viewer.add_page(&page).unwrap();
+        let seen = viewer.receipts();
+        assert_eq!(seen.received_atoms, 12 + 12 + 7 + 12 + 4);
+        assert_eq!(seen.change_atoms, 6);
+
+        // The full view key reads the same pages as before: the mark is an
+        // empty memo to it, and its balance is exact.
+        let mut full = Viewer::new(alice.view_key().unwrap());
+        full.add_page(&page).unwrap();
+        let exact = full.balance();
+        // In: two rewards and bob's 5. Out: 7 and 4, a fee of 1 each time.
+        assert_eq!(exact.balance_atoms, 12 + 5 + 12 - 8 - 5);
+        assert_eq!(exact.received[3].memo, "");
+        assert_eq!(exact.sent[0].change, 9);
+
+        // A page that does not follow, or of another network, is refused.
+        let mut viewer = IncomingViewer::new(alice.incoming_view_key().unwrap());
+        let mut gap = page.clone();
+        gap.from = 2;
+        assert!(viewer.add_page(&gap).is_err());
+        let mut other = page.clone();
+        other.network = 3;
+        assert!(viewer.add_page(&other).is_err());
     }
 }
