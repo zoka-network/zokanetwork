@@ -9,8 +9,10 @@ Leé, en este orden:
 
 ## Reglas que no se negocian
 
-- Todo lo que lee el usuario va en castellano rioplatense (vos, tocá,
-  mandame). El código y sus comentarios siguen el estilo de cada archivo.
+- Las interfaces de Zoka van en **inglés**, por decisión del usuario del
+  3/11/2026. La conversación y la documentación interna van en castellano
+  rioplatense (vos, tocá, mandame). El código y sus comentarios siguen el
+  estilo de cada archivo.
 - **Publicar pide el OK explícito del usuario**: releases en GitHub, deploys de
   zoka.network y zokascan.cc, anuncios. Commits y push de ramas sí, sin
   preguntar.

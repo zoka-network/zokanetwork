@@ -1,7 +1,153 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
-Actualizada: **6 de noviembre de 2026**, Argentina. Testnet v2 con semillas permanentes en VPS; billetera web, ZKAPriv 3.0.0 y faucet publicados; home nuevo de zoka.network en vivo.
+Actualizada: **10 de noviembre de 2026**, Argentina. Testnet v2 con semillas permanentes en VPS; billetera web, ZKAPriv 3.0.0 y faucet publicados; home nuevo de zoka.network en vivo. Rama `endurecimiento-sin-consenso` con la primera tanda de la revisión técnica, sin integrar ni publicar.
 Proyecto: `C:\Users\mderramus\ZOKA`.
+
+## 10/11: revisión técnica y endurecimiento sin tocar el consenso (Claude)
+
+El usuario pidió revisar la estructura y decir en qué se puede mejorar
+tecnológicamente **ahora, fuera del roadmap** («fortalecer la cuántica o la
+privacidad»). Se leyó el código de la v2 (circuito, claves, formato,
+billeteras, red y autoridad) y se le presentaron diez puntos. Respondió «OK
+avanza» al orden propuesto. Esta entrada cubre el primer grupo, el que no
+toca el consenso.
+
+Rama **`endurecimiento-sin-consenso`**, sobre `main` (`c276021a`). Nada en
+`main`, nada publicado, nada instalado. Las claves de la PC no se leyeron ni
+se tocaron.
+
+### Los diez puntos de la revisión
+
+Privacidad:
+
+- **1. La forma del pago es pública**: cuántas notas entran y salen. La
+   billetera no rellena (elige las notas más grandes, hasta 8). Mejora: una
+   forma única, con entradas ficticias de valor 0. Cambia el circuito.
+- **2. Comisión y vencimiento son campos libres**: el consenso acepta cualquier
+   comisión mayor o igual al mínimo y el vencimiento lo elige el emisor.
+   Sirven de huella. Mejora: comisión exacta y vencimiento normalizado.
+- **3. La clave de vista es todo o nada.** → hecho abajo.
+- **4. Una sola dirección por cuenta**: dos contrapartes saben que sos la
+   misma. En postcuántico cada dirección extra es un descifrado más al
+   escanear; un número acotado es viable.
+
+Cuántica y solidez:
+
+- **5. Falta decidir el margen cuántico de la prueba.** 160 consultas, unos 132
+   bits clásicos, sin trabajo extra: contra una búsqueda cuántica son unos 66
+   bits, el nivel 1 de NIST (como AES-128). Subirlo duplica más o menos las
+   consultas y el tamaño. Hay que decidirlo antes de achicar las pruebas.
+- **6. Todo cuelga de Poseidon2**, un hash joven: compromisos, nullifiers,
+   árbol y también el Merkle de FRI y el transcript. Estos dos últimos pueden
+   pasar a BLAKE3 o Keccak.
+- **7. No había fuzzing.** → hecho abajo.
+- **8. Una falla de solidez sería inflación invisible**: el balance vive solo
+   en la prueba. Falta un arnés que mute cada registro del circuito.
+
+Claves y dependencias:
+
+- **9. La clave de autoridad está en hex sin cifrar**, y es una sola. → el
+   cifrado, hecho abajo; repartirla (dos de tres) queda.
+- **10. `cargo audit` daba seis avisos.** → hecho abajo.
+
+**Orden acordado:** ya, sin tocar consenso: 10, 7, cifrar la clave del 9 y
+la clave del 3 (esta entrada). En el próximo reinicio de la testnet, juntos
+porque cambian el formato: 1, 2, 6, la decisión del 5 y la raíz de Merkle
+(hallazgo de abajo). Después: 4, 8 y los dos de tres firmantes.
+
+### Hecho en la rama
+
+- **Dependencias** (`7a25c90f`). Seis avisos de RustSec cerrados con
+  actualizaciones compatibles: `rustls-webpki`, `webpki-roots`,
+  `webpki-root-certs`, `ctutils` (tiempo no constante; lo usan las firmas de
+  iroh y las primitivas postcuánticas), `libz-sys`, `zstd-sys` e `inout`.
+  También en los `Cargo.lock` de `zoka-pq`, `zoka-pq-pool`, `zoka-quantic` e
+  `ironwood-bench`. Quedan cuatro avisos de paquetes sin mantenimiento, que
+  no son fallas.
+- **Fuzzing** ([docs/FUZZING.md](docs/FUZZING.md)). Seis objetivos sobre lo
+  que el nodo y las billeteras leen de otros (transacción, prueba, página de
+  escaneo, sobre, texto de dirección o clave, estado guardado), con un
+  mutador de bytes y otro de forma. Corren como pruebas deterministas con
+  cada `cargo test` y como objetivos de libFuzzer en `fuzz/`. Además,
+  `tests/quantic_node_fuzz.rs` deforma bloques (con el trabajo rehecho) y
+  pedidos a la API contra un nodo real.
+- **Lo que encontró el fuzzing:**
+  - una billetera liviana se caía al abrir un estado guardado dañado (árbol
+    de notas con un nivel de menos). Arreglado: el árbol guardado se revisa
+    antes de usarlo;
+  - **dos cuerpos de bloque distintos pueden tener el mismo hash**: el árbol
+    de Merkle duplica la última hoja cuando son impares (lo de
+    CVE-2012-2459). Hoy no sirve para nada: el cuerpo alterado se rechaza y
+    no se guarda nunca, y una prueba lo fija. El arreglo cambia el hash de
+    todos los bloques: va con el próximo reinicio;
+  - el verificador de pruebas no cayó ni aceptó nada falso en unas 11.000
+    pruebas deformadas. Igual se le puso una red: una prueba que lo haga
+    caer es inválida. El nodo verifica con sus candados tomados y una caída
+    ahí lo dejaba rechazando todo hasta reiniciarlo.
+- **Clave de vista de entrantes**
+  ([docs/CLAVE-DE-VISTA-ENTRANTE.md](docs/CLAVE-DE-VISTA-ENTRANTE.md)). Ve lo
+  que llega y nada de lo que sale; empieza con `zqviewin2` /
+  `zqtestviewin2`. La billetera marca su vuelto con una etiqueta que solo
+  calculan ella y sus claves, para que no se cuente como plata cobrada.
+  `quantic-pq-wallet show-view-key --incoming` la muestra. **Faltan las
+  aplicaciones** (ZSilent, billetera web, ZKAPriv, ZokaScan y su lector en el
+  navegador).
+- **Claves de autoridad cifradas**
+  ([docs/CHECKPOINTS-AUTORITATIVOS.md](docs/CHECKPOINTS-AUTORITATIVOS.md),
+  «Claves cifradas en disco»). El nodo lee las dos mitades cifradas con la
+  contraseña de `ZOKA_AUTHORITY_PASSWORD`;
+  `quantic-pq-node authority-encrypt --authority DIR` las cifra sin borrar
+  nada. **No está activado**: las claves de la PC siguen en hex.
+
+Commits de la rama, en orden: `7a25c90f` dependencias, `f372d598` clave de
+entrantes, `f274b8e7` árbol guardado, `720c863b` claves cifradas y `1491bea`
+fuzzing. Codex retomó el cierre al detenerse Claude: verificó los registros
+terminados, guardó el fuzzing que estaba sin commit y actualizó el traspaso.
+
+### Pruebas (10/11, en la PC, perfil release)
+
+- **Pool:** 36 pruebas sin fallas (eran 22), 119 s:
+  `cargo test --release --manifest-path crates/zoka-pq-pool/Cargo.toml --lib`.
+- **Fuzzing del pool:** la pasada normal (unas 25.000 rondas) y una veinte
+  veces más larga con otra semilla (`ZOKA_FUZZ_SCALE=20`, unas 500.000
+  entradas, 1.178 s): sin caídas y sin pruebas falsas aceptadas.
+- **Nodo:** 201 pruebas sin fallas, 228 s, con
+  `--features quantic-pq --lib -- quantic:: checkpoint_authority::
+  hybrid_signature:: network::pq_tls snapshot wallet::storage state::chain
+  --test-threads=1`. Tres ignoradas a propósito: las dos del pago hecho en
+  WebAssembly (necesitan sus archivos) y la de Tor real.
+- **Fuzzing del nodo:** las cuatro pruebas aprobaron, sin fallas, en 61,31 s:
+  `--test quantic_node_fuzz` (bloques con el trabajo rehecho, bloques en
+  JSON, pedidos a la API y el caso del árbol de Merkle). La batería terminó
+  el **10/11 a las 21:54:30 (Argentina)**; al retomar no quedaban procesos de
+  pruebas activos. Registros conservados y comparados por SHA-256 en
+  `target/endurecimiento-2026-11-10/`, con el detalle en
+  [docs/FUZZING.md](docs/FUZZING.md). No se volvieron a correr al guardar los
+  commits; las pruebas finales del pool y nodo son posteriores a los últimos
+  cambios del código.
+- **`cargo audit`:** 0 avisos de seguridad en los cinco `Cargo.lock`.
+- **No se probó:** libFuzzer (los objetivos compilan, falta correrlos en
+  Linux), ninguna aplicación, ningún teléfono, ni la red pública. No se
+  armó ningún paquete.
+
+### Qué queda, y qué decide el usuario
+
+- **Integrar a `main` y sacar versiones.** La marca del vuelto y la clave de
+  entrantes recién existen para los usuarios cuando se publiquen el nodo,
+  ZSilent, la billetera web (su WASM) y el motor de ZKAPriv. Publicar pide
+  su OK.
+- **Activar el cifrado de las claves de autoridad:** decidir cómo le llega
+  la contraseña al nodo que arranca ZSilent (pedirla al abrir, que es lo que
+  protege, o una variable de entorno de Windows). Las claves las cifra él.
+- **Correr libFuzzer en un VPS** unas horas. Hay que instalar Rust nightly y
+  `cargo-fuzz` ahí.
+- **La interfaz de la clave de entrantes** en ZSilent, billetera web,
+  ZKAPriv y ZokaScan.
+- **`ml-kem` 0.3.4 y `ml-dsa` 0.1.2** existen y el pool fija 0.3.2 y 0.1.1.
+  No tienen avisos de seguridad; mirar sus cambios antes de moverlas, porque
+  tocan todas las billeteras.
+- **El grupo del próximo reinicio** (puntos 1, 2, 6, decisión del 5 y la
+  raíz de Merkle): es diseño de consenso, se conversa antes de escribirlo.
 
 ## 4 al 6/11: billetera web, faucet y home nuevo de zoka.network (Claude)
 

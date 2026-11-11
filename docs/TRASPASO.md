@@ -4,7 +4,115 @@ Registro vivo para que otro agente (Codex, Claude) siga donde quedó este. Cada
 paso se marca al terminarlo, con su commit; lo que queda a medias dice en qué
 punto exacto está. Lo histórico está en [HOJA-DE-RUTA-CLAUDE.md](../HOJA-DE-RUTA-CLAUDE.md).
 
-## Estado al 3/11/2026, retomado por Codex
+## Estado actual al 10/11/2026: batería terminada y trabajo recuperado
+
+El usuario pidió retomar a Claude, que se detuvo mientras corría el fuzzing
+del nodo. La tarea vigente es la **revisión técnica sin cambios de consenso**
+de la entrada del 10/11 en la hoja de ruta. La tarea del móvil del 3/11 que
+figuraba arriba en este archivo quedó vieja: ZKAPriv 3.0.0 y la billetera web
+se publicaron el 4/11, según esa hoja.
+
+### Lo que quedó terminado
+
+Rama `endurecimiento-sin-consenso`, sobre `main` (`c276021a`):
+
+- `7a25c90f`: dependencias con seis avisos de seguridad corregidos.
+- `f372d598`: clave de vista solo de entrantes, disponible en biblioteca y CLI.
+- `f274b8e7`: validar el árbol de notas guardado antes de abrir la billetera.
+- `720c863b`: lectura de claves de autoridad cifradas; **sin activar en la PC**.
+- `1491bea`: fuzzing determinista del pool y nodo, seis objetivos de
+  libFuzzer y protección frente a pánicos del verificador. Claude lo dejó
+  escrito y probado; Codex recuperó los resultados y guardó el commit.
+
+**La última prueba terminó a las 21:54:30 (Argentina). No queda una batería
+corriendo.** Resultados de los registros de Claude, verificados al retomar:
+
+| Batería | Resultado |
+| --- | --- |
+| Pool completo | 36 aprobadas, 0 fallas; 119,36 s |
+| Nodo, selección de módulos de esta revisión | 201 aprobadas, 0 fallas; 3 ignoradas y 883 filtradas; 228,17 s |
+| Fuzzing del nodo | 4 aprobadas, 0 fallas; 61,31 s |
+| Fuzzing del pool, escala 20 | 9 aprobadas, 0 fallas; unas 500.000 entradas; 1.178,10 s |
+
+Evidencia conservada en `target/endurecimiento-2026-11-10/`, con copias
+comparadas por SHA-256. Alcance, limitaciones y comandos en
+[FUZZING.md](FUZZING.md). La pasada extendida es anterior a la protección
+del verificador; las pruebas finales del pool y nodo cubren el código final.
+No hizo falta repetirlas para guardar el trabajo. No se probaron aplicaciones,
+teléfonos ni la red pública en esta tanda.
+
+### Cómo seguir
+
+1. Correr los seis objetivos de **libFuzzer guiado por cobertura en Linux**:
+   hasta ahora solo compilaron en Windows. La pasada determinista extendida
+   no reemplaza ese trabajo. Preparar el VPS sin interferir con sus nodos y
+   registrar límites, semilla, duración y resultados.
+2. Integrar la clave de vista de entrantes a las aplicaciones (ZSilent,
+   billetera web, ZKAPriv y ZokaScan) y validar cada una.
+3. El usuario decide cómo ingresar la contraseña de las claves de autoridad;
+   él cifra sus claves. No leerlas ni activar el cifrado por cuenta propia.
+4. Integración a `main`, paquetes y publicación siguen pendientes. **No hubo
+   release, deploy ni instalación de esta rama.** Publicar requiere su OK.
+
+Los cambios de consenso y las otras mejoras de la revisión están enumerados
+en la hoja de ruta; no se mezclan con este cierre.
+
+## Registro histórico al 3/11/2026, retomado por Codex
+
+Lo que sigue conserva el traspaso de ese día, incluidos pendientes que Claude
+resolvió después. No es el estado actual; consultar arriba y la hoja de ruta
+antes de volver a ejecutar sus pasos.
+
+### ZKAPriv en curso (3/11, después de las 18 h)
+
+El usuario pidió trabajar con el Samsung SM-A135M conectado (armeabi-v7a):
+Home limpio con saldo/Quantic/privacidad; navegación inferior Home, Send,
+Receive y Activity; cuadrícula animada durante la prueba, check rosa al
+aceptar y error rojo; saldo actualizado con la app abierta. **Corrección
+explícita del usuario: toda la interfaz de Zoka va en inglés**, aunque la
+conversación y este traspaso sigan en castellano. Esa decisión reemplaza la
+regla general de idioma para los textos del producto.
+
+Se trabaja en `zkapriv`, rama `zkapriv-v2`, conservando y revisando los cambios
+del 31/10. Respaldo previo en `target/zkapriv-3-review/previous-work.patch`
+y `previous-native.tar.gz`. No se leyeron claves ni el almacén del teléfono.
+La app vieja `com.zoka.zkapriv` (2.1.3, sin motor STARK) no fue reemplazada.
+La variante `com.zoka.zkapriv.benchmark` ya estaba instalada desde el 30/10
+y se actualizó con `adb install -r`, conservando sus datos. Ahí está abierta
+la vista de diseño con datos ficticios; no se abrió el almacén. Esa variante
+de octubre es la que hay que usar para las pruebas v2 con el usuario, no
+pedirle restaurar en la app vieja. Falta instalar el APK con el motor nuevo;
+el APK de diseño aún lleva `.so` previos y no sirve para probar envíos.
+
+- Ya compilaron interfaz y 53 pruebas de red/UI, incluidas recuperación de
+  sincronización y montos con coma decimal. Repetidas sin fallas a las 18:27
+  (`gradle-final-ui.log`). Capturas comprobadas `home-final-dark.png` y
+  `proof-final-light.png`: todo en inglés y barras del sistema acordes al tema.
+  Solo queda recompilar un retoque de etiqueta en Receive y formato del código.
+- Motor Android compilándose en VPS2: unidad `zkapriv3-native-build`, registro
+  `/root/zkapriv3-native-build.log`, fuentes `/root/zkapriv3-src`. NDK r27d
+  instalado y verificado. Script `native/build-android-linux.sh`. Ambos ABI
+  deben completarse antes del release; no mezclar con los `.so` anteriores.
+  **armeabi-v7a terminó a las 18:43**: `libzoka_mobile.so` SHA-256
+  `3ed07e893e6e9d8f6ec70c3dc0c9ab52ccfc4e0348ce8ce42144a21ccc10c385`, copiado
+  al repo y verificado; los tres símbolos JNI están exportados. ARM64 sigue
+  compilando. APK debug para el Samsung en `gradle-native-v7a.log`.
+  La copia del nodo incluye también los manifiestos públicos de `docs/`.
+  El enlace LTO necesitó memoria adicional: swap temporal de 4 GiB en
+  `/root/zkapriv3-build.swap` (no está en fstab), unidad limitada a 6 GiB RAM
+  y 3 GiB swap. Al terminar ambos ABI: `swapoff` y borrar solo ese archivo
+  temporal. El script mejorado local difiere del que está corriendo: copiarlo
+  después de que termine la unidad, no modificar el archivo en ejecución.
+- Falta validar el motor nuevo en el teléfono, firmar y comparar certificado,
+  actualizar sin borrar datos y hacer pruebas reales con los envíos del
+  usuario. No publicar el APK hasta completar esas pruebas.
+- Prueba instrumentada lista: `StarkReadOnlyInstrumentedTest` crea un estado
+  temporal aislado, consulta HTTPS/checkpoint y vuelve por P2P y Arti/Tor.
+  No manda pagos ni lee el almacén del usuario. Ejecutar solo esa clase; las
+  instrumentadas viejas esperan el servicio de la red v1, que ya no se empaqueta.
+  Detalle de pruebas en `zkapriv/docs/VALIDACION-3.0.0.md`.
+
+### Primera etapa terminada
 
 El plan vigente está conservado en [PLAN-CIERRE-2026-11-03.md](PLAN-CIERRE-2026-11-03.md),
 recuperado de `C:/Users/mderramus/.claude/plans/sprightly-swimming-papert.md`.
@@ -231,3 +339,134 @@ Tor es **opcional** (decisión del usuario): nunca obligatorio.
     y una auditoría (hoy la estimación es de 100 bits clásicos o más, y no es
     una auditoría PQ); firmar las releases con ML-DSA; y ocultar el origen
     del envío (sin Tor, la semilla ve la IP de quien manda).
+- 3/11, 19:00–20:00 (Claude): **pago lento y saldo escondido en ZSilent.**
+  Un pago de ZSilent a ZKAPriv tardó 11 bloques (4001 → 4012) y mientras tanto
+  ZSilent mostraba 36.776 ZKA en vez de 5.019.799. Diagnóstico completo en
+  `docs/MEMPOOL-ENTRE-PARES.md` de la rama del nodo `arreglo-mempool-entre-pares`
+  (worktree `target/nodo-mempool`): el P2P solo empujaba transacciones y el
+  único minero, detrás de NAT, dependía de que seed2 lograra llamarlo. Ahora el
+  que llama también pide el mempool (`MEMPOOL`/`GET_TX`, anunciado en `Head`).
+  ZSilent: rama `arreglo-reserva-y-nonce` de zsilent-core (worktree
+  `target/zsilent-arreglo-reserva`): el total suma `reserved_atoms` y el nonce
+  u64 ya no rompe "Latest blocks". Además, el nodo suma `GET /transactions/<txid>`
+  (pendiente en el mempool o minado en los últimos 720 bloques) y el buscador de
+  ZSilent y el de ZokaScan (rama `nonce-exacto`) lo usan: antes ningún pago ni hash
+  de bloque se encontraba en la v2. Nada publicado ni instalado.
+- 3/11, 20:00–21:00 (Claude): **4.0.5 / 4.0.7 armadas y Home de ZKAPriv.**
+  - Nodo 4.0.5 (`v4.0.5` = `7ff77929`) y ZSilent 4.0.7 (`v4.0.7` = `3f1e55f`):
+    `main` y etiquetas en GitHub y GitLab; paquetes, MSI y pruebas en
+    `docs/RELEASE-4.0.5.md`. **Falta, con OK explícito del usuario** (el
+    clasificador frenó `gh release create` y la escritura en los VPS): crear
+    las releases, marcar 4.0.4/4.0.6 como reemplazadas, actualizar seed3 y
+    seed2, desplegar ZokaScan (`dist/` armado) y zoka.network (rama
+    `descargas-4.0.7`), y el anuncio `docs/ANUNCIO-4.0.5-BORRADOR.md`.
+  - ZKAPriv (`zkapriv-v2`, sin commitear, encima de los cambios de Codex):
+    Home nuevo pedido por el usuario. Barra Wallet · Send · Receive · Activity
+    · Settings; Home limpio (ZKAPriv / ZOKA QUANTIC con el botón QR, saldo y
+    tarjeta de red con altura/hashrate/sincronización; la actividad solo en su
+    pestaña), sin botones de refrescar ni tarjeta "Quantic privacy"; Network &
+    Tor como pantalla propia (desde la tarjeta o Settings); escáner con marco,
+    línea, tocar para enfocar y linterna. Arreglado volver a Wallet: la barra
+    recibía una referencia memorizada a selectTab con la ruta vieja; ahora se
+    lee del NavController en cada toque. Respaldo previo de Codex:
+    `target/zkapriv-3-review/codex-estado-20261103-2016.patch` y
+    `codex-sin-seguimiento-20261103-2016.tar.gz`. Solo lo de Claude:
+    `target/zkapriv-3-review/claude-home-20261103.patch`. Instalado en el
+    Samsung (variante benchmark, datos conservados).
+  - **Varias billeteras en ZKAPriv** (pedido del usuario, hecho el 3/11 a la
+    noche, sin commitear): `QuanticVault` guarda una lista (`wallets`) y la
+    activa (`active_wallet`). La primera es `main` y conserva las claves y la
+    carpeta de antes (`phrase`, `birth`, `address_published`, `files/stark`):
+    nada se migra ni se resincroniza. Las demás usan `phrase.<id>`,
+    `birth.<id>`, `address_published.<id>`, `name.<id>` y `files/stark-<id>`.
+    PIN, biometría y Modo Tor son de la app. `QuanticWallet.switchTo/addWallet/
+    removeWallet` toman el candado `busy` (el mismo de sync y send); la
+    publicación de la dirección guarda el id con el que empezó. UI: pastilla con
+    el nombre arriba del saldo → pantalla Wallets (usar, renombrar, sacar,
+    "Create new wallet" con respaldo + verificación + nombre, "Restore with 24
+    words"). No se probó con una prueba instrumentada: escribiría en el almacén
+    real del teléfono del usuario.
+- 4/11, 09:00–10:40 (Claude): **billetera web armada y probada, sin publicar.**
+  Detalle en `docs/BILLETERA-WEB.md` de la rama `billetera-web` del nodo
+  (`05d46034`, en GitHub y GitLab).
+  - Nodo: W1 `crates/zoka-light` (checkpoint híbrido y estampilla, puro); W2/W4
+    `crates/zoka-pq-wallet-wasm`; W3 `POST /transactions` y `POST /address`
+    en `--public-api`, con cupos por cliente (CF-Connecting-IP) y globales y
+    permisos de escritura aparte. `quantic::`: 96 pruebas pasan.
+  - Un pago probado en WebAssembly (7,55 s, 1.937.222 bytes) lo aceptó la API
+    pública y lo minó un nodo de regtest (pruebas a mano, 3 pasos en el doc).
+  - Repo nuevo `zokawallet` (al lado de `zokaexplorer`, solo local, sin
+    remotos): React + Vite + TS, 30 pruebas; `scripts/e2e-browser.mjs` lo
+    probó en un Chrome sin ventana contra la testnet real (4.448 bloques en
+    37 s, sin violaciones de CSP, ningún pedido con las palabras).
+  - zoka.network: rama `billetera-web` (`cbdea17`, encima de `zkapriv-3.0.0`)
+    con el enlace en el menú y en Download. No desplegada.
+  - **Falta, con OK explícito:** nodo 4.0.6 (= 4.0.5 + W3) y seed2; repos
+    `zokawallet` en GitHub y GitLab; proyecto Pages `zokawallet` y el dominio
+    `wallet.zoka.network` (lo agrega el usuario); prueba con dinero real.
+  - ZKAPriv: `zkapriv-v2` ya está commiteada y subida (`e356c24`); el APK
+    3.0.0 está armado y espera la prueba de envío del usuario.
+- 4/11, 15:30–17:40 (Claude): **rediseño de la billetera web y publicación**,
+  con el OK del usuario («ahora me gustó, procedé con todo lo demás»).
+  - Billetera web rediseñada como web, estilo ZokaScan (barra de secciones,
+    Overview con grillas, tabla y QR, diálogos en Settings, responsive):
+    `zokawallet` `main` = `a4cc024`, 33 pruebas, Chrome en 1440 y 390 px.
+  - Publicado y verificado (bajado otra vez, hashes OK): nodo **v4.0.5**
+    (Latest) y **ZSilent v4.0.7**; 4.0.4 y ZSilent 4.0.6 marcadas como
+    reemplazadas. zoka.network desplegada con esas descargas (`8793fa7`).
+  - **Nodo v4.0.6** (release de servidor, sin "Latest"): `main` = `c8d793d6`
+    + docs `309d5b76`, etiqueta en GitHub y GitLab; binario Linux compilado en
+    el VPS 2 (`daf2e738…`), probado ahí con datos temporales sin tocar la
+    semilla (sincroniza; preflight de `POST /address` 204 con Content-Type).
+  - Billetera en Cloudflare Pages, proyecto `zokawallet` (creado con `--force`
+    para que sea Pages clásico): https://zokawallet.pages.dev, encabezados y
+    hashes verificados en vivo, e2e contra la copia publicada OK.
+  - zoka.network: rama `billetera-web-sobre-4.0.7` (`bc2de00`, sin lo de
+    ZKAPriv 3.0.0) con el enlace "Web wallet"; se despliega cuando exista el
+    dominio.
+  - **Frenado por el clasificador, lo corre el usuario**
+    (`scratchpad/comandos-para-vos.ps1`): crear los repos `zokawallet`
+    (GitHub público con Actions apagado, GitLab), desplegar ZokaScan
+    `056eea8`, instalar 4.0.6 en seed3 y seed2 (respaldo `zoka-4.0.4`) y
+    borrar el swap del VPS 2. El dominio `wallet.zoka.network` lo agrega en
+    Pages → zokawallet → Custom domains.
+  - Después: verificar semillas y api.zokascan.cc 4.0.6, desplegar el enlace
+    en zoka.network, prueba con dinero (ZSilent → web → ZKAPriv 3.0.0 de
+    prueba `com.zoka.zkapriv.benchmark`), y el anuncio de Discord.
+- 4/11, 21:20–22:20 (Claude): **billetera web y ZKAPriv 3.0.0 en vivo.**
+  - El usuario agregó `wallet.zoka.network` en Pages (gratis; la sesión de
+    wrangler no puede tocar DNS) e instaló la 4.0.6 en seed3 y seed2:
+    `api.zokascan.cc` responde 4.0.6, directorio con 6 direcciones cortas.
+  - Prueba con dinero del usuario: ZSilent → web → ZKAPriv → ZSilent, bloques
+    4789, 4791 y 4809.
+  - ZKAPriv **v3.0.0** publicada (`zkapriv` `main` = `01d40ca`): APK rearmado
+    sin tres `.so` sobrantes que git ignoraba (guardados en
+    `target/zkapriv-3-review/jnilibs-sobrantes-armeabi-v7a/`), misma firma que
+    la 2.1.3 (`061376f8…`), SHA-256 `e701a319…`; 2.1.2 marcada como
+    reemplazada.
+  - zoka.network `main` = `f315785`: descarga de ZKAPriv 3.0.0, guía de
+    Android y enlace a la billetera web, verificado en vivo.
+  - Anuncio: `docs/ANUNCIO-BILLETERA-WEB-ZKAPRIV-BORRADOR.md` (después del de
+    la 4.0.5).
+  - **Sigue pendiente del usuario:** repo público `zokawallet` (GitHub y
+    GitLab; los enlaces "Source code" apuntan ahí), desplegar ZokaScan
+    `056eea8` y borrar el swap del VPS 2 (pasos 1, 3 y 6 de
+    `scratchpad/comandos-para-vos.ps1`).
+- 4/11, 22:20–23:00 (Claude): **repos y sitios al día.**
+  - Auditoría de ramas y etiquetas contra GitHub y GitLab (GitLab por el 443:
+    el 22 está cortado). Etiquetas iguales en los dos; subidas las ramas que
+    faltaban en un lado (nodo `arreglo-mempool-entre-pares`,
+    `etapa5-investigacion`; zokaweb `billetera-web`; zokaexplorer y
+    zoka-guard-vault `seguridad-octubre-2026`). Quedan solo locales cuatro
+    ramas viejas sin publicar ni mergear: nodo `etapa5-quantic-nodo`; zkapriv
+    `envio-sin-cuerpos-perdidos`, `quantic-motor`, `wallet-liviana`.
+  - Pie con GitHub, X y Discord (íconos de zoka.network) en la billetera
+    (`zokawallet` `fcf109e`, desplegada) y en ZokaScan (`6e8eecf`,
+    desplegada: esta vez el clasificador dejó; incluye la búsqueda por txid).
+    zokaexplorer `main` avanzado a `explorer-quantic-v2` en los dos remotos.
+  - `zokawallet`: proyecto de GitLab creado al subir `main` (privado); el de
+    GitHub lo crea el usuario (el clasificador frenó dos veces "Create Public
+    Surface"). Remotos ya configurados. Pendiente también: swap del VPS 2.
+  - 22:37: el usuario creó `zoka-network/zokawallet` (público, Actions
+    apagado, `main` = `fcf109e`) y borró el swap del VPS 2. Falta pasar
+    `gitlab.com/zokanetwork/zokawallet` a Public desde el panel.
