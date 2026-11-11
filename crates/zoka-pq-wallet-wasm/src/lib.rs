@@ -242,6 +242,13 @@ impl WebWallet {
         Ok(self.account.view_key().map_err(js)?.encode())
     }
 
+    /// Solo lo recibido, sin saldo ni gastos. Se deriva de la misma cuenta:
+    /// no hay que configurar ni migrar la billetera.
+    #[wasm_bindgen(js_name = incomingViewKey)]
+    pub fn incoming_view_key(&self) -> Result<String, JsError> {
+        Ok(self.account.incoming_view_key().map_err(js)?.encode())
+    }
+
     /// La altura del próximo bloque que necesita: pedir `/scan2?from=<next>`.
     pub fn next(&self) -> u32 {
         self.wallet.next()

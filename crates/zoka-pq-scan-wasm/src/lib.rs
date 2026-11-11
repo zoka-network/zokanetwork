@@ -1,4 +1,4 @@
-//! A wallet's balance from its view key, inside the browser.
+//! A wallet's receipts or balance from its view key, inside the browser.
 //!
 //! The page fetches the node's public `/scan` pages, in order, and hands their
 //! bytes to a [`Scanner`]; the key stays in this module's memory and is wiped
@@ -7,13 +7,18 @@
 #![forbid(unsafe_code)]
 use wasm_bindgen::prelude::*;
 use zoka_pq_pool::{
-    scan::{ScanPage, Viewer},
-    wallet::ViewKey,
+    scan::{IncomingViewer, ScanPage, Viewer},
+    wallet::{IncomingViewKey, ViewKey},
 };
+
+enum Reader {
+    Full(Viewer),
+    Incoming(IncomingViewer),
+}
 
 #[wasm_bindgen]
 pub struct Scanner {
-    viewer: Viewer,
+    viewer: Reader,
 }
 
 #[wasm_bindgen]
@@ -21,25 +26,35 @@ impl Scanner {
     /// `network`: 1 mainnet, 2 testnet, 3 regtest.
     #[wasm_bindgen(constructor)]
     pub fn new(view_key: &str, network: u8) -> Result<Scanner, JsError> {
-        let key = ViewKey::decode(view_key, network)
-            .map_err(|_| JsError::new("that is not a view key of this network"))?;
-        Ok(Self {
-            viewer: Viewer::new(key),
-        })
+        let text = view_key.trim();
+        let viewer = if let Ok(key) = IncomingViewKey::decode(text, network) {
+            Reader::Incoming(IncomingViewer::new(key))
+        } else if let Ok(key) = ViewKey::decode(text, network) {
+            Reader::Full(Viewer::new(key))
+        } else {
+            return Err(JsError::new(
+                "that is not an incoming or full view key of this network",
+            ));
+        };
+        Ok(Self { viewer })
     }
 
     /// The short address whose payments this key sees.
     pub fn address(&self) -> Result<String, JsError> {
-        self.viewer
-            .key()
-            .address()
-            .short()
-            .map_err(|e| JsError::new(&e.to_string()))
+        match &self.viewer {
+            Reader::Full(viewer) => viewer.key().address(),
+            Reader::Incoming(viewer) => viewer.key().address(),
+        }
+        .short()
+        .map_err(|e| JsError::new(&e.to_string()))
     }
 
     /// The height of the next block it needs: ask for `/scan?from=<next>`.
     pub fn next(&self) -> u32 {
-        self.viewer.next()
+        match &self.viewer {
+            Reader::Full(viewer) => viewer.next(),
+            Reader::Incoming(viewer) => viewer.next(),
+        }
     }
 
     /// Read one page (it has to start at [`Scanner::next`]); returns the tip
@@ -47,14 +62,26 @@ impl Scanner {
     pub fn add_page(&mut self, bytes: &[u8]) -> Result<u32, JsError> {
         let page = ScanPage::decode(bytes)
             .map_err(|_| JsError::new("the node sent an unreadable page"))?;
-        self.viewer
-            .add_page(&page)
-            .map_err(|_| JsError::new("that page does not follow the last one read"))?;
+        match &mut self.viewer {
+            Reader::Full(viewer) => viewer.add_page(&page),
+            Reader::Incoming(viewer) => viewer.add_page(&page),
+        }
+        .map_err(|_| JsError::new("that page does not follow the last one read"))?;
         Ok(page.tip)
     }
 
-    /// Balance and history at the last block read, as JSON (atoms).
+    /// JSON (atoms) at the last block read. Full keys retain the balance
+    /// fields; incoming keys return receipts only, never a fabricated balance
+    /// or a sent list. `kind` tells the page which fields it may display.
     pub fn balance(&self) -> String {
-        serde_json::to_string(&self.viewer.balance()).unwrap_or_else(|_| "null".into())
+        let (kind, value) = match &self.viewer {
+            Reader::Full(viewer) => ("full", serde_json::to_value(viewer.balance())),
+            Reader::Incoming(viewer) => ("incoming", serde_json::to_value(viewer.receipts())),
+        };
+        let Ok(mut value) = value else {
+            return "null".into();
+        };
+        value["kind"] = kind.into();
+        value.to_string()
     }
 }
