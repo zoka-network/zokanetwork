@@ -6,6 +6,16 @@ publish = false
 description = "Hash-based private transfers for Zoka Quantic, with hiding STARK proofs"
 license = "MIT OR Apache-2.0"
 
+[features]
+# The entry points fuzzers call and their seeds (src/fuzzing). Off in every
+# build of a node or a wallet.
+fuzzing = []
+
+# Writes the seeds a libFuzzer run starts from (fuzz/ at the repository root).
+[[example]]
+name = "fuzz_seeds"
+required-features = ["fuzzing"]
+
 [dependencies]
 p3-air = "=0.8.0"
 p3-challenger = "=0.8.0"

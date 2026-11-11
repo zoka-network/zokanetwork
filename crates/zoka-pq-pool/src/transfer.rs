@@ -594,18 +594,48 @@ pub fn verify_transfer(statement: &Statement, envelope: &ProofEnvelope) -> Resul
         return Err(Error::Shape);
     }
     let air = TransferAir::new(statement.nullifiers.len(), statement.commitments.len());
-    let (proof, rest): (Proof<Config>, &[u8]) =
-        postcard::take_from_bytes(&envelope.proof).map_err(|_| Error::Encoding)?;
-    if !rest.is_empty()
-        || postcard::to_allocvec(&proof).map_err(|_| Error::Encoding)? != envelope.proof
-    {
-        return Err(Error::Encoding);
+    guarded(|| {
+        let (proof, rest): (Proof<Config>, &[u8]) =
+            postcard::take_from_bytes(&envelope.proof).map_err(|_| Error::Encoding)?;
+        if !rest.is_empty()
+            || postcard::to_allocvec(&proof).map_err(|_| Error::Encoding)? != envelope.proof
+        {
+            return Err(Error::Encoding);
+        }
+        // Reject alternative trace lengths: program selectors have a fixed period.
+        if proof.degree_bits != air.program.rows.ilog2() as usize + 1 {
+            return Err(Error::Shape);
+        }
+        verify(&config()?, &air, &proof, &public).map_err(|e| Error::Proof(format!("{e:?}")))
+    })
+}
+
+/// Runs the part of a verification that reads a stranger's bytes with a
+/// young proof system. If any of them makes it panic, that proof is invalid:
+/// a refusal like any other. A node checks proofs while it holds its state
+/// and mempool locks, and a panic there would poison both and leave it
+/// refusing every later request. No such proof is known (`fuzzing` deforms
+/// them by the thousand); this is for the one nobody found yet.
+///
+/// Where a build aborts on panic there is nothing to catch. WebAssembly
+/// does, and wallets do not verify the proofs of others.
+fn guarded(check: impl FnOnce() -> Result<(), Error>) -> Result<(), Error> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(check)).unwrap_or_else(|_| {
+        Err(Error::Proof(
+            "the verifier panicked: the proof is refused".into(),
+        ))
+    })
+}
+
+/// The shape of a proof's encoding, for mutations that keep it decodable
+/// (see [`crate::fuzzing::tree`]). `None` if `bytes` are not a proof.
+#[cfg(test)]
+pub(crate) fn proof_tree(bytes: &[u8]) -> Option<crate::fuzzing::tree::Node> {
+    let (proof, rest): (Proof<Config>, &[u8]) = postcard::take_from_bytes(bytes).ok()?;
+    if !rest.is_empty() {
+        return None;
     }
-    // Reject alternative trace lengths: program selectors have a fixed period.
-    if proof.degree_bits != air.program.rows.ilog2() as usize + 1 {
-        return Err(Error::Shape);
-    }
-    verify(&config()?, &air, &proof, &public).map_err(|e| Error::Proof(format!("{e:?}")))
+    crate::fuzzing::tree::capture(&proof).ok()
 }
 
 #[cfg(test)]
@@ -691,6 +721,21 @@ mod tests {
         let second = prove_transfer(&s, &w).unwrap();
         verify_transfer(&s, &second).unwrap();
         assert_ne!(proof.proof, second.proof, "independent hiding randomness");
+    }
+
+    #[test]
+    fn a_verifier_that_panics_refuses_the_proof() {
+        assert!(guarded(|| Ok(())).is_ok());
+        assert!(matches!(guarded(|| Err(Error::Shape)), Err(Error::Shape)));
+        let caught = guarded(|| {
+            let empty: Vec<u32> = Vec::new();
+            // What a missing length check looks like from the inside.
+            let _ = empty[std::hint::black_box(3)];
+            Ok(())
+        });
+        assert!(matches!(caught, Err(Error::Proof(_))));
+        // And the next proof is checked as if nothing had happened.
+        assert!(guarded(|| Ok(())).is_ok());
     }
 
     #[test]

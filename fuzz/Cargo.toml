@@ -1,0 +1,64 @@
+# Coverage-guided fuzzing (libFuzzer) of what Zoka Quantic reads from others.
+# The targets are one line each: what they check lives in
+# crates/zoka-pq-pool/src/fuzzing, where the same functions also run as
+# deterministic tests with every `cargo test`. See docs/FUZZING.md.
+[package]
+name = "zoka-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+zoka-pq-pool = { path = "../crates/zoka-pq-pool", features = ["fuzzing"] }
+
+# On its own: neither the node nor the wallets depend on a fuzzer.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "transaction"
+path = "fuzz_targets/transaction.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proof"
+path = "fuzz_targets/proof.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "scan_page"
+path = "fuzz_targets/scan_page.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "envelope"
+path = "fuzz_targets/envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "text"
+path = "fuzz_targets/text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wallet_state"
+path = "fuzz_targets/wallet_state.rs"
+test = false
+doc = false
+bench = false
