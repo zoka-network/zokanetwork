@@ -42,5 +42,10 @@ bs58 = "0.5"
 blake3 = "1.5"
 sha2 = "0.10"
 
+[dev-dependencies]
+# The soundness estimator term by term (src/transfer/margin.rs). The same
+# version p3-uni-stark already uses: tests only.
+p3-security = "=0.8.0"
+
 [profile.release]
 debug = false

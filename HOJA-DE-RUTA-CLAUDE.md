@@ -108,8 +108,33 @@ ni libFuzzer.
   Windows, confirmar el respaldo de las claves en D:.
 - **Integrar a `main` y sacar versiones** (nodo, ZSilent, billetera web,
   ZokaScan, ZKAPriv). Publicar pide su OK.
-- **El informe del margen cuántico** y, con él, el grupo del próximo
-  reinicio (puntos 1, 2, 5, 6 y la raíz de Merkle).
+- **El grupo del próximo reinicio** (puntos 1, 2, 5, 6 y la raíz de Merkle).
+  Para el 5 ya está la base de la decisión (abajo).
+
+### Después, el mismo día: puntos 8 y 5, sin tocar el consenso
+
+- **Punto 8, barrido de los registros del circuito** (`67075a77`,
+  [FUZZING.md](docs/FUZZING.md), «Barrido de los registros del circuito»):
+  - cada registro se cambia de tres maneras, se rehacen los hashes y se
+    vuelve a publicar todo;
+  - lo que el AIR acepta se controla contra el modelo;
+  - 1→2: 1.917 cambios, 560 aceptados, todos legítimos;
+  - 2→2: 2.923 cambios, 192 aceptados, todos legítimos;
+  - contra tres circuitos con una regla menos, detecta las tres.
+- **Punto 5, margen de solidez**
+  ([MARGEN-DE-SOLIDEZ.md](docs/MARGEN-DE-SOLIDEZ.md)): el estimador de
+  Plonky3 término por término, para las 64 formas y seis configuraciones.
+  - **Tope:** la cota es 128 bits clásicos en todas las formas, y lo que la
+    fija es la hipótesis de 128 bits del hash.
+  - **Sin el tope,** el protocolo da unos 190.
+  - **Consultas:** con trazas de 512 filas no entran más de 240, porque se
+    acaba el presupuesto del ocultamiento de FRI. Pasar de ahí obliga a
+    trazas de 1024 filas, con un 60 a 95 % más de tamaño y el doble de
+    tiempo, y gana 22 a 30 bits.
+  - **Lectura cuántica:** orientativa, según la cota de Chiesa, Manohar y
+    Spooner. Deja del orden de la mitad, y para llegar a 128 haría falta un
+    campo de desafíos más grande.
+  - **Opciones para el reinicio:** A, B o C, en el documento.
 
 ### Margen cuántico (punto 5)
 
