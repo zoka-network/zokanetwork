@@ -17,6 +17,8 @@ use std::fmt;
 use std::path::Path;
 use zeroize::Zeroize;
 
+pub mod protection;
+
 /// Versión 1: solo Ed25519.
 pub const SIGNED_CHECKPOINT_VERSION: u8 = 1;
 /// Versión 2: firma híbrida Ed25519 + ML-DSA-65 (etapa 6), las dos obligatorias.
@@ -617,7 +619,11 @@ pub(crate) fn read_key_seed_with(
     let mut text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {what} {}: {e}", path.display()))?;
     let result = if text.trim_start().starts_with('{') {
-        open_sealed_key(text.trim(), kind, what, password)
+        if protection::is_user_protected(text.trim()) {
+            protection::open_user_key(text.trim(), kind)
+        } else {
+            open_sealed_key(text.trim(), kind, what, password)
+        }
     } else {
         let decoded = hex::decode(text.trim());
         decoded

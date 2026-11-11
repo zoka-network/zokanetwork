@@ -145,6 +145,9 @@ postcard = { version = "1", features = ["alloc"], optional = true }
 # Objetivos de 256 bits de la dificultad de Quantic (ASERT).
 num-bigint = { version = "0.4", optional = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 proptest = "1.0"
 tempfile = "3"

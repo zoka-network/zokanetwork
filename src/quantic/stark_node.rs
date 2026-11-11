@@ -1201,6 +1201,11 @@ async fn serve(options: Options) -> Result<(), String> {
     };
     let signer = match authority_dir {
         Some(dir) => {
+            let protect_for_user = match options.get("--authority-protection") {
+                None => false,
+                Some("windows-user") => true,
+                Some(_) => return Err("unknown authority protection mode".into()),
+            };
             let keys = state.authority.clone().ok_or_else(|| {
                 format!(
                     "{} has no compiled checkpoint authority (a local test network sets {} and {})",
@@ -1210,9 +1215,17 @@ async fn serve(options: Options) -> Result<(), String> {
                 )
             })?;
             Some(Arc::new(
-                tokio::task::spawn_blocking(move || load_authority(&dir, &keys))
-                    .await
-                    .map_err(err)??,
+                tokio::task::spawn_blocking(move || {
+                    // Validate the chain's public keys before changing storage.
+                    let signer = load_authority(&dir, &keys)?;
+                    if protect_for_user {
+                        checkpoint_authority::protection::protect(&dir)?;
+                        return load_authority(&dir, &keys);
+                    }
+                    Ok(signer)
+                })
+                .await
+                .map_err(err)??,
             ))
         }
         None => None,
@@ -1704,10 +1717,88 @@ async fn authority_encrypt(options: Options) -> Result<(), String> {
     Ok(())
 }
 
+/// `authority-backup` writes the team's two seeds to one portable file,
+/// encrypted with `ZOKA_AUTHORITY_BACKUP_PASSWORD`; `authority-restore` puts
+/// them back, under the current Windows user's protection. ZSilent runs both
+/// inside its encrypted wallet backup, so the authority PC is recovered with
+/// the same file and password as its wallet.
+async fn authority_backup(options: Options, restore: bool) -> Result<(), String> {
+    use checkpoint_authority::protection;
+    let dir = PathBuf::from(options.required("--authority")?);
+    let path = PathBuf::from(options.required(if restore { "--file" } else { "--out" })?);
+    let password = Zeroizing::new(
+        std::env::var(protection::BACKUP_PASSWORD_ENV)
+            .map_err(|_| "authority backup password is required")?,
+    );
+    let profile = options
+        .network()?
+        .ok_or("authority backup requires --network")?;
+    let check_only = match options.get("--check-only") {
+        None | Some("no") => false,
+        Some("yes") => true,
+        _ => return Err("--check-only must be yes or no".into()),
+    };
+    let keys = checkpoint_authority::authority_keys_for_chain(profile.chain_id)
+        .ok_or("this chain has no checkpoint authority")?;
+    tokio::task::spawn_blocking(move || {
+        if restore {
+            restore_authority(&dir, &path, &password, &keys, check_only)
+        } else {
+            backup_authority(&dir, &path, &password, &keys)
+        }
+    })
+    .await
+    .map_err(err)??;
+    let action = if restore { "restore" } else { "backup" };
+    println!("{}", serde_json::json!({"ok": true, "action": action}));
+    Ok(())
+}
+
+/// Only the compiled authority is backed up: a file that would not sign
+/// anything the network accepts is refused before it is written.
+fn backup_authority(dir: &Path, out: &Path, password: &str, keys: &AuthorityKeys) -> Result<(), String> {
+    load_authority(dir, keys)?;
+    checkpoint_authority::protection::export_backup(dir, out, password)
+}
+
+/// The backup's seeds have to be the compiled authority's, and the keys
+/// already in `dir`, if any, the same ones. `check_only` stops there.
+fn restore_authority(
+    dir: &Path,
+    file: &Path,
+    password: &str,
+    keys: &AuthorityKeys,
+    check_only: bool,
+) -> Result<(), String> {
+    use checkpoint_authority::protection;
+    let bytes = read_bounded(file, 4096)?;
+    let seeds = protection::decode_backup(&bytes, password)?;
+    let ed = ed25519_dalek::SigningKey::from_bytes(seeds[..32].try_into().map_err(err)?);
+    let hybrid = HybridSigningKey::from_parts(ed.clone(), &seeds[32..]).map_err(err)?;
+    let mldsa = Some(hybrid.verifying_key().mldsa().to_bytes());
+    if ed.verifying_key() != keys.ed25519 || keys.mldsa.as_ref().map(|k| k.to_bytes()) != mldsa {
+        return Err("authority backup is for a different chain; nothing was changed".into());
+    }
+    protection::validate_restore(dir, &seeds)?;
+    if !check_only {
+        protection::restore_backup(dir, &seeds)?;
+        load_authority(dir, keys)?;
+    }
+    Ok(())
+}
+
 pub async fn run(args: &[String]) -> Result<(), String> {
     let command = args.first().map(String::as_str).unwrap_or("help");
     let rest = args.get(1..).unwrap_or(&[]);
     match command {
+        "authority-backup" => {
+            let options = Options::parse(rest, &["--authority", "--network", "--out"])?;
+            authority_backup(options, false).await
+        }
+        "authority-restore" => {
+            let allowed = ["--authority", "--network", "--file", "--check-only"];
+            authority_backup(Options::parse(rest, &allowed)?, true).await
+        }
         "authority-encrypt" => {
             authority_encrypt(Options::parse(rest, &["--authority"])?).await
         }
@@ -1728,6 +1819,7 @@ pub async fn run(args: &[String]) -> Result<(), String> {
                     "--seeds",
                     "--announce",
                     "--authority",
+                    "--authority-protection",
                     "--public-api",
                     "--tor",
                     "--stream-listen",
@@ -1796,6 +1888,11 @@ or testnet (zoka-quantic-testnet-v2: RandomX, ASERT). An existing --db keeps its
 --authority DIR makes the node the chain's checkpoint authority: DIR holds the team's\n\
 checkpoint-authority.key and checkpoint-authority-mldsa.key, which must be the compiled keys.\n\
 Encrypted key files are opened with ZOKA_AUTHORITY_PASSWORD.\n\
+ZSilent on Windows uses --authority-protection windows-user to protect them automatically\n\
+for the current Windows user, without a wallet password or plaintext backup.\n\
+authority-backup --authority DIR --network NAME --out FILE exports portable encrypted recovery.\n\
+authority-restore --authority DIR --network NAME --file FILE [--check-only yes] restores it\n\
+under the current Windows profile. Both commands use ZOKA_AUTHORITY_BACKUP_PASSWORD.\n\
 Short addresses: POST /address publishes a wallet's full address, which the node pushes to its\n\
 peers; GET /address/SHORT answers the full one, asking the node's peers when it does not know it.\n\
 Set ZOKA_PQ_PASSWORD to create/open the encrypted node identity. Files are never overwritten.\n\
@@ -2310,6 +2407,64 @@ mod tests {
         let refused = load_authority(&team, &mixed).err().unwrap();
         assert!(refused.contains("ML-DSA"), "{refused}");
         assert!(load_authority(&dir.path().join("missing"), &keys).is_err());
+    }
+
+    /// What ZSilent runs inside its encrypted wallet backup: the team's keys
+    /// leave in one file and come back, protected for this Windows user.
+    #[test]
+    #[cfg(windows)]
+    fn the_authority_comes_back_from_its_backup_and_only_to_its_chain() {
+        use checkpoint_authority::protection::is_protected_for_user;
+        let dir = tempfile::tempdir().unwrap();
+        let team = dir.path().join("team");
+        let keys = test_authority(&team);
+        let backup = dir.path().join("authority.json");
+        backup_authority(&team, &backup, "a long passphrase", &keys).unwrap();
+        // Another chain's authority is not backed up, and a file is never
+        // written over.
+        let other = test_authority(&dir.path().join("other"));
+        let refused = backup_authority(&team, &dir.path().join("other.json"), "x", &other)
+            .err()
+            .unwrap();
+        assert!(refused.contains("Ed25519"), "{refused}");
+        assert!(!dir.path().join("other.json").exists());
+        assert!(backup_authority(&team, &backup, "a long passphrase", &keys).is_err());
+
+        // On a new PC: a check writes nothing, and the restore protects both
+        // halves for this user. The node signs with them.
+        let fresh = dir.path().join("fresh");
+        restore_authority(&fresh, &backup, "a long passphrase", &keys, true).unwrap();
+        assert!(!fresh.join(AUTHORITY_KEY_FILE).exists());
+        restore_authority(&fresh, &backup, "a long passphrase", &keys, false).unwrap();
+        for name in [AUTHORITY_KEY_FILE, AUTHORITY_MLDSA_KEY_FILE] {
+            let text = std::fs::read_to_string(fresh.join(name)).unwrap();
+            assert!(is_protected_for_user(&text), "{name}");
+        }
+        let signer = load_authority(&fresh, &keys).unwrap();
+        signer
+            .sign_all(&keys, CHAIN, 3, &"ab".repeat(32))
+            .remove(0)
+            .verify(&keys)
+            .unwrap();
+        // A second restore of the same backup changes nothing.
+        let before = std::fs::read(fresh.join(AUTHORITY_KEY_FILE)).unwrap();
+        restore_authority(&fresh, &backup, "a long passphrase", &keys, false).unwrap();
+        assert_eq!(std::fs::read(fresh.join(AUTHORITY_KEY_FILE)).unwrap(), before);
+
+        // The wrong password, another chain's keys, or a PC that already holds
+        // another authority: refused, and nothing changes.
+        assert!(restore_authority(&fresh, &backup, "wrong", &keys, false).is_err());
+        let refused = restore_authority(&fresh, &backup, "a long passphrase", &other, false)
+            .err()
+            .unwrap();
+        assert!(refused.contains("different chain"), "{refused}");
+        let elsewhere = dir.path().join("elsewhere");
+        test_authority(&elsewhere);
+        let refused = restore_authority(&elsewhere, &backup, "a long passphrase", &keys, false)
+            .err()
+            .unwrap();
+        assert!(refused.contains("differs"), "{refused}");
+        assert_eq!(std::fs::read(fresh.join(AUTHORITY_KEY_FILE)).unwrap(), before);
     }
 
     #[test]

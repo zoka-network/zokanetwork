@@ -238,14 +238,53 @@ clave. Ahora el nodo también los lee cifrados con una contraseña.
 - **Sirve para los dos nodos:** `load_signing_key` y `load_mldsa_seed` son
   las mismas funciones que usan `zoka checkpoint-sign` y el nodo de la v1.
 
-**No está activado.** Las claves de la PC siguen en hex. Para activarlo falta
-decidir cómo le llega la contraseña al nodo que arranca ZSilent:
+La contraseña quedó como opción para quien firme a mano o fuera de ZSilent.
+En la PC autoridad manda lo de abajo.
 
-- pedirla al abrir ZSilent en la PC autoridad (lo que de verdad protege; es
-  un cambio de ZSilent);
-- o dejarla en una variable de entorno de Windows, que no pide tocar ZSilent
-  pero deja la contraseña en la misma máquina: protege los respaldos y una
-  copia suelta de los archivos, no una PC comprometida.
+## Protección automática con la cuenta de Windows (11/11/2026)
+
+Decisión del usuario (11/11, a Codex): **«todo lo que sea ZSilent y ZKAPriv
+debe ser automático, que el usuario haga lo menos posible»**. Entonces la PC
+autoridad no pide contraseña: las claves se protegen con la cuenta de
+Windows. Lo empezó Codex y lo terminó Claude, en la misma rama (nodo en
+`src/checkpoint_authority/protection.rs`; ZSilent en su rama
+`endurecimiento-sin-consenso`).
+
+- **Al arrancar:** si encuentra las claves, ZSilent lanza el nodo con
+  `--authority --authority-protection windows-user`. El nodo valida las dos
+  mitades contra las compiladas y las reescribe protegidas con DPAPI para el
+  usuario actual (`zoka-authority-windows-user-v1`). No queda copia en claro.
+  Cada mitad se escribe aparte, se vuelve a abrir y recién entonces
+  reemplaza al original (`ReplaceFileW`, que conserva los permisos del
+  archivo). Un corte entre las dos mitades se retoma solo en el arranque
+  siguiente. Si ya están protegidas, no se toca nada.
+- **Lo que protege:** una copia suelta de los archivos (otra PC, otro
+  usuario, un disco robado) no abre. **Lo que no:** un programa que corra
+  como el mismo usuario de Windows puede pedirle a DPAPI que la abra.
+- **Si falta una mitad**, el nodo no arranca como autoridad: falla en vez de
+  dejar de firmar sin avisar.
+- **Respaldo:** «Export encrypted backup» de ZSilent (Settings > Security),
+  con la contraseña que elige el usuario. En la PC autoridad el archivo lleva
+  además la recuperación de la autoridad (`quantic-pq-node authority-backup`),
+  cifrada aparte con Argon2id y AES-256-GCM y la misma contraseña. Nada de
+  la clave pasa por Kotlin.
+- **Restaurar:** «Restore encrypted backup» primero comprueba que la
+  recuperación sea de esta cadena y no choque con claves que ya haya
+  (`authority-restore --check-only yes`), importa la billetera y después
+  devuelve las claves, protegidas para el usuario actual. La billetera se
+  importa sola: la recuperación de la autoridad no queda adentro del archivo
+  de la billetera ni de sus respaldos.
+
+**Riesgo, y qué hacer antes de instalarlo:** DPAPI ata la clave al perfil de
+Windows. Si el perfil se pierde (Windows reinstalado, cuenta nueva o una
+contraseña reseteada por un administrador), la copia protegida no se abre.
+Entonces la recuperación es el respaldo cifrado de ZSilent o el respaldo en
+D:. **Antes de instalar en la PC autoridad una ZSilent con esto**, conviene
+confirmar que el respaldo en D: está al día o exportar el respaldo cifrado
+apenas arranque.
+
+**No está instalado.** Las claves de la PC siguen en hex hasta que el usuario
+instale esa versión.
 
 Lo que esto no resuelve: una sola clave y una sola PC. Repartir la firma
 (dos de tres firmantes) es un cambio de la regla de aceptación.
