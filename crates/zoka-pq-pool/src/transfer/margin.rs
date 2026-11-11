@@ -213,8 +213,10 @@ fn best(margin: &Margin) -> f64 {
 
 #[test]
 fn the_margin_of_every_shape_term_by_term() {
-    let shapes: Vec<(usize, usize)> = (1..=MAX_INPUTS)
-        .flat_map(|n| (1..=MAX_OUTPUTS).map(move |m| (n, m)))
+    // The three shapes a transfer may take.
+    let shapes: Vec<(usize, usize)> = TRANSFER_INPUTS
+        .into_iter()
+        .map(|n| (n, TRANSFER_OUTPUTS))
         .collect();
     for candidate in CANDIDATES {
         let margins: Vec<_> = shapes
@@ -234,23 +236,21 @@ fn the_margin_of_every_shape_term_by_term() {
             low.conjectured.security_bits()
         );
         for &(shape, ref margin) in &margins {
-            if [(1, 2), (2, 2), (8, 8)].contains(&shape) || shape == *weakest {
-                eprintln!(
-                    "{}x{} unique decoding: {}",
-                    shape.0,
-                    shape.1,
-                    terms(&margin.unique)
-                );
-                if let Some(list) = &margin.list {
-                    eprintln!("{}x{} list decoding: {}", shape.0, shape.1, terms(list));
-                }
-                eprintln!(
-                    "{}x{} conjectured: {}",
-                    shape.0,
-                    shape.1,
-                    terms(&margin.conjectured)
-                );
+            eprintln!(
+                "{}x{} unique decoding: {}",
+                shape.0,
+                shape.1,
+                terms(&margin.unique)
+            );
+            if let Some(list) = &margin.list {
+                eprintln!("{}x{} list decoding: {}", shape.0, shape.1, terms(list));
             }
+            eprintln!(
+                "{}x{} conjectured: {}",
+                shape.0,
+                shape.1,
+                terms(&margin.conjectured)
+            );
         }
         if candidate.name == CURRENT.name {
             // What `parameter_soundness_estimates…` already requires.
@@ -261,14 +261,9 @@ fn the_margin_of_every_shape_term_by_term() {
 
 /// The FRI parameters of `candidate`, with the hiding of the real prover.
 fn config_for(candidate: Candidate) -> Config {
-    let perm = default_koalabear_poseidon2_32();
     let rng = || StdRng::try_from_rng(&mut rand::rngs::SysRng).unwrap();
-    let mmcs = ValMmcs::new(
-        Hash::new(perm.clone()),
-        Compress::new(perm.clone()),
-        0,
-        rng(),
-    );
+    let sponge = Hash::new(KeccakF {});
+    let mmcs = ValMmcs::new(FieldHash::new(sponge), Compress::new(sponge), 0, rng());
     let fri = FriParameters {
         log_blowup: candidate.log_blowup,
         log_final_poly_len: 0,
@@ -286,20 +281,20 @@ fn config_for(candidate: Candidate) -> Config {
         RANDOM_CODEWORDS,
         rng(),
     );
-    Config::new(pcs, DuplexChallenger::new(perm))
+    Config::new(pcs, challenger())
 }
 
-/// What each candidate costs: a 1→2 payment's proof, its size and times.
+/// What each candidate costs: a 2→2 payment's proof, its size and times.
 /// Slow (one proof per candidate): run it by name.
 #[test]
 #[ignore = "proves a payment per candidate; run with --ignored"]
 fn what_each_candidate_costs() {
     let (statement, witness) = crate::fuzzing::fixture();
     let public = statement.public_values().unwrap();
-    eprintln!("\n| configuration | proven bits (1x2) | proof bytes | prove | verify |");
+    eprintln!("\n| configuration | proven bits (2x2) | proof bytes | prove | verify |");
     eprintln!("| --- | ---: | ---: | ---: | ---: |");
     for candidate in CANDIDATES {
-        let air = circuit(1, 2, candidate);
+        let air = circuit(2, 2, candidate);
         let config = config_for(candidate);
         let trace = air.program.trace(&statement, &witness).unwrap();
         let started = std::time::Instant::now();
@@ -312,7 +307,7 @@ fn what_each_candidate_costs() {
         eprintln!(
             "| {} | {:.1} | {} | {:.2} s | {:.0} ms |",
             candidate.name,
-            best(&margin(1, 2, candidate)),
+            best(&margin(2, 2, candidate)),
             bytes,
             proving.as_secs_f64(),
             verifying.as_secs_f64() * 1000.0

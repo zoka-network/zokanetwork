@@ -25,8 +25,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 pub const SETTLE_DEPTH: u32 = 100;
 /// Blocks between two such copies.
 const SETTLE_STEP: u32 = 100;
-/// A payment can be mined for this many blocks after the one it was built on.
-pub const PAYMENT_LIFETIME: u32 = 20;
+/// A payment can be mined for this many blocks after the one it was built
+/// on: while its anchor is in the ledger's window. It carries no expiry of
+/// its own.
+pub const PAYMENT_LIFETIME: u32 = crate::ledger::ANCHOR_WINDOW as u32;
 /// Hashes of the last blocks read, to confirm a checkpoint at any of them.
 const RECENT_HASHES: usize = 1024;
 
@@ -568,7 +570,10 @@ impl LightWallet {
         self.pending = Some(Pending {
             txid: tx.txid(),
             nullifiers: tx.statement.nullifiers.clone(),
-            expiry: tx.height,
+            expiry: self
+                .height()
+                .checked_add(PAYMENT_LIFETIME)
+                .ok_or(Error::Shape)?,
         });
         Ok(())
     }
@@ -619,14 +624,7 @@ impl Plan {
                 path,
             })
             .collect();
-        transaction::transfer(
-            account,
-            self.anchor,
-            inputs,
-            self.payments,
-            self.fee,
-            self.expiry,
-        )
+        transaction::transfer(account, self.anchor, inputs, self.payments, self.fee)
     }
 }
 

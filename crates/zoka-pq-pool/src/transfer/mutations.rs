@@ -18,10 +18,12 @@ use super::*;
 use crate::{crypto::Digest, ledger::NoteTree};
 use p3_field::PrimeField32;
 
-/// One input and two outputs, or two and two: a valid transfer and the
-/// statement it proves. Some unrelated notes come first, so the paths are
-/// not those of an empty tree.
-fn shape(n: usize, m: usize) -> (Statement, Witness) {
+/// A valid transfer of `inputs` notes, `real` of them notes of the tree and
+/// the rest padding (worth nothing, in no tree), and the statement it
+/// proves. Some unrelated notes come first, so the paths are not those of an
+/// empty tree. Two outputs, as every transfer has.
+fn shape(real: usize, inputs: usize) -> (Statement, Witness) {
+    let (n, m, shape) = (real, TRANSFER_OUTPUTS, inputs);
     let network = 3;
     let key = SpendKey::from_seed(&[7; 32], network, 0).unwrap();
     let mut tree = NoteTree::new(network).unwrap();
@@ -57,7 +59,7 @@ fn shape(n: usize, m: usize) -> (Statement, Witness) {
             }
         })
         .collect();
-    let inputs = notes
+    let mut inputs: Vec<Input> = notes
         .into_iter()
         .zip(indices)
         .map(|(note, index)| Input {
@@ -66,6 +68,22 @@ fn shape(n: usize, m: usize) -> (Statement, Witness) {
             path: tree.path(index).unwrap(),
         })
         .collect();
+    for pad in inputs.len()..shape {
+        let key = SpendKey::from_seed(&[100 + pad as u8; 32], network, 0).unwrap();
+        inputs.push(Input {
+            note: Note {
+                owner: key.owner(network),
+                rho: Digest([200 + pad as u32; WORDS]),
+                rcm: Digest([300 + pad as u32; WORDS]),
+                value: 0,
+            },
+            key,
+            path: MerklePath {
+                index: pad as u32,
+                siblings: std::array::from_fn(|depth| Digest([400 + depth as u32; WORDS])),
+            },
+        });
+    }
     let witness = Witness { inputs, outputs };
     let statement =
         Statement::from_witness(network, tree.root(), fee, 0, [3; 32], &witness).unwrap();
@@ -123,7 +141,10 @@ fn intended(program: &Program, r: &[F], public: &[F]) -> Result<(), String> {
             index: bits(input.index, DEPTH)? as u32,
             siblings: std::array::from_fn(|depth| digest(input.siblings + depth * WORDS)),
         };
-        if path.root(network, commitment).map_err(|e| e.to_string())? != published(10) {
+        // A note worth nothing needs no tree: it only pads the shape.
+        if note.value != 0
+            && path.root(network, commitment).map_err(|e| e.to_string())? != published(10)
+        {
             return Err(format!("input {i}: the note is not in the anchor's tree"));
         }
         incoming += u128::from(note.value);
@@ -298,14 +319,16 @@ fn sweep(air: &TransferAir, statement: &Statement, witness: &Witness, at: &[usiz
 
 #[test]
 fn every_change_the_circuit_accepts_is_still_a_legitimate_transfer() {
-    for (n, m) in [(1, 2), (2, 2)] {
-        let (statement, witness) = shape(n, m);
+    // One real note padded to two, two real notes, and three padded to four.
+    for (real, n) in [(1, 2), (2, 2), (3, 4)] {
+        let m = TRANSFER_OUTPUTS;
+        let (statement, witness) = shape(real, n);
         let air = TransferAir::new(n, m);
         let at = registers(&air.program);
         let started = std::time::Instant::now();
         let outcome = sweep(&air, &statement, &witness, &at);
         eprintln!(
-            "{n}x{m}: {} registers, {} changes, {} accepted (all legitimate), {} rejected, {:?}",
+            "{n}x{m} ({real} real): {} registers, {} changes, {} accepted (all legitimate), {} rejected, {:?}",
             at.len(),
             outcome.tried,
             outcome.accepted,
@@ -318,9 +341,10 @@ fn every_change_the_circuit_accepts_is_still_a_legitimate_transfer() {
             outcome.unsound.join("\n")
         );
         // Both kinds happen: the sweep reaches legitimate freedom (recipients,
-        // rcm, other trees) and the constraints that refuse the rest.
+        // rcm, other trees, anything of a padding input) and the constraints
+        // that refuse the rest.
         assert!(
-            outcome.accepted > 100 && outcome.rejected > outcome.accepted,
+            outcome.accepted > 100 && outcome.rejected > 1_000,
             "{n}x{m}"
         );
     }
@@ -332,7 +356,7 @@ fn every_change_the_circuit_accepts_is_still_a_legitimate_transfer() {
 fn the_sweep_finds_a_constraint_that_went_missing() {
     let (statement, witness) = shape(1, 2);
     let weakened = |drop: &dyn Fn(&mut Program)| {
-        let mut air = TransferAir::new(1, 2);
+        let mut air = TransferAir::new(2, 2);
         drop(&mut air.program);
         air
     };
@@ -378,11 +402,8 @@ fn the_sweep_finds_a_constraint_that_went_missing() {
         "the missing owner derivation went unnoticed"
     );
 
-    // Without the anchor binding, the note can be in any tree.
-    let air = weakened(&|p| {
-        p.bindings
-            .retain(|&(_, index)| !(10..10 + WORDS).contains(&index));
-    });
+    // Without the anchor constraint, the note can be in any tree.
+    let air = weakened(&|p| p.anchors.clear());
     let siblings = air.program.inputs[0].siblings;
     let outcome = sweep(&air, &statement, &witness, &[siblings, siblings + 15]);
     assert!(

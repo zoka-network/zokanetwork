@@ -7,6 +7,24 @@ use zeroize::Zeroizing;
 pub const DEPTH: usize = 32;
 pub const MAX_INPUTS: usize = 8;
 pub const MAX_OUTPUTS: usize = 8;
+/// The version of statements and proofs: 3 since the uniform shapes, the
+/// exact fee and the Keccak commitments of the proof.
+pub const VERSION: u32 = 3;
+/// How many notes a transfer spends: one of these, whatever it needs. A
+/// payment that spends fewer is padded with notes worth nothing
+/// (`transaction::transfer`), so the number of notes a payment really used
+/// is not public, only which of three sizes it took.
+pub const TRANSFER_INPUTS: [usize; 3] = [2, 4, 8];
+/// Every transfer creates two notes: the payment and the change, which may
+/// be worth nothing.
+pub const TRANSFER_OUTPUTS: usize = 2;
+
+/// The shape a transfer that spends `spent` notes takes, if any.
+pub fn transfer_inputs(spent: usize) -> Option<usize> {
+    TRANSFER_INPUTS
+        .into_iter()
+        .find(|&inputs| inputs >= spent.max(1))
+}
 
 /// A spending secret has no curve-based public key. The owner tag is a hash.
 /// Its debug representation deliberately contains no witness data.
@@ -150,13 +168,15 @@ pub fn check_network(network: u8) -> Result<(), Error> {
 impl Statement {
     pub fn validate(&self) -> Result<(), Error> {
         check_network(self.network)?;
-        if self.version != 2
-            || self.nullifiers.len() > MAX_INPUTS
-            || self.commitments.is_empty()
-            || self.commitments.len() > MAX_OUTPUTS
-            || (self.nullifiers.is_empty() && self.fee != 0)
-            || (!self.nullifiers.is_empty() && self.minted != 0)
-        {
+        let shape = if self.nullifiers.is_empty() {
+            // A coinbase: one note, nothing spent, no fee.
+            self.commitments.len() == 1 && self.fee == 0
+        } else {
+            TRANSFER_INPUTS.contains(&self.nullifiers.len())
+                && self.commitments.len() == TRANSFER_OUTPUTS
+                && self.minted == 0
+        };
+        if self.version != VERSION || !shape {
             return Err(Error::Shape);
         }
         let _ = self.anchor.fields()?;
@@ -179,7 +199,7 @@ impl Statement {
         witness: &Witness,
     ) -> Result<Self, Error> {
         let value = Self {
-            version: 2,
+            version: VERSION,
             network,
             anchor,
             fee,

@@ -67,8 +67,9 @@ pub fn transaction(data: &[u8]) {
     let _ = tx.verify(tx.statement.network, tx.height);
 }
 
-/// One input, two outputs, nothing random: every process computes the same
-/// statement, so a proof made in one is a seed for a fuzzer in another.
+/// One real input and one padding input, two outputs, nothing random:
+/// every process computes the same statement, so a proof made in one is a
+/// seed for a fuzzer in another.
 pub fn fixture() -> (Statement, Witness) {
     let key = SpendKey::from_seed(&[1; 32], NETWORK, 0).expect("a fixed seed is a key");
     let other = SpendKey::from_seed(&[2; 32], NETWORK, 0).expect("a fixed seed is a key");
@@ -101,8 +102,23 @@ pub fn fixture() -> (Statement, Witness) {
             value: 395,
         },
     ];
+    // The second input pads the shape: worth nothing, in no tree.
+    let padding_key = SpendKey::from_seed(&[3; 32], NETWORK, 0).expect("a fixed seed is a key");
+    let padding = Input {
+        note: Note {
+            owner: padding_key.owner(NETWORK),
+            rho: Digest([14; WORDS]),
+            rcm: Digest([15; WORDS]),
+            value: 0,
+        },
+        key: padding_key,
+        path: MerklePath {
+            index: 0,
+            siblings: [Digest::ZERO; crate::model::DEPTH],
+        },
+    };
     let witness = Witness {
-        inputs: vec![Input { key, note, path }],
+        inputs: vec![Input { key, note, path }, padding],
         outputs,
     };
     let statement = Statement::from_witness(NETWORK, anchor, 5, 0, [7; 32], &witness)
@@ -120,7 +136,7 @@ pub fn proof(data: &[u8]) -> bool {
 /// The same, against any statement.
 pub fn proof_of(statement: &Statement, data: &[u8]) -> bool {
     let envelope = ProofEnvelope {
-        version: 2,
+        version: crate::model::VERSION,
         proof: data.to_vec(),
     };
     verify_transfer(statement, &envelope).is_ok()

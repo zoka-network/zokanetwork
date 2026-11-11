@@ -12,7 +12,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 pub const ATOMS: u64 = 1_000_000;
 pub const PREMINE: u64 = 5_000_000 * ATOMS;
 pub const MAX_SUPPLY: u64 = 23_000_000 * ATOMS;
-pub const ANCHOR_WINDOW: usize = 100;
+/// How many of the latest roots a transfer may prove membership against.
+/// A transfer carries no expiry of its own: it can be mined while its
+/// anchor is among these, about an hour of blocks, and not after.
+pub const ANCHOR_WINDOW: usize = 30;
 pub const MAX_BLOCK_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_BLOCK_TRANSACTIONS: usize = 16;
 /// One short of a full depth-32 tree, so a frontier always has its root.
@@ -25,8 +28,13 @@ pub fn subsidy(height: u32) -> u64 {
         _ => 0,
     }
 }
-pub fn conventional_fee(inputs: usize, outputs: usize) -> u64 {
-    100 * (inputs.max(outputs).max(2) as u64)
+/// The fee of a transfer that spends `inputs` notes: 100 atoms per note of
+/// the shape it is padded to (`model::transfer_inputs`), so 200, 400 or
+/// 800. It is exact, not a minimum: a fee of the payer's choosing would tell
+/// payers apart. Every transfer has two outputs, so `_outputs` changes
+/// nothing; it stays for the callers that pass it.
+pub fn conventional_fee(inputs: usize, _outputs: usize) -> u64 {
+    100 * crate::model::transfer_inputs(inputs).unwrap_or(crate::model::MAX_INPUTS) as u64
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -255,7 +263,7 @@ pub fn check_transfer<S: LedgerState + ?Sized>(state: &S, tx: &Transaction) -> R
             return Err(Error::Ledger("spent nullifier"));
         }
     }
-    if s.fee < conventional_fee(s.nullifiers.len(), s.commitments.len()) {
+    if s.fee != conventional_fee(s.nullifiers.len(), s.commitments.len()) {
         return Err(Error::Ledger("fee"));
     }
     tx.verify(
@@ -607,6 +615,90 @@ mod tests {
         assert_eq!(subsidy(1_948_802), 0);
     }
 
+    /// Points 1 and 2 of the review of 10/11: a transfer takes one of three
+    /// shapes, pays the exact fee of its shape and names no expiry, so none
+    /// of the three tells payers apart.
+    #[test]
+    fn a_transfer_has_a_fixed_shape_an_exact_fee_and_no_expiry() {
+        use crate::{
+            crypto::WORDS,
+            model::{transfer_inputs, Input, TRANSFER_OUTPUTS},
+            transaction::{self, Payment, Transaction},
+            wallet::Account,
+        };
+        assert_eq!(
+            [1, 2, 3, 4, 5, 8, 9].map(transfer_inputs),
+            [Some(2), Some(2), Some(4), Some(4), Some(8), Some(8), None]
+        );
+        assert_eq!(
+            [1, 2, 3, 5, 8].map(|n| conventional_fee(n, TRANSFER_OUTPUTS)),
+            [200, 200, 400, 800, 800]
+        );
+
+        let alice = Account::from_seed(&[1; 32], 3, 0).unwrap();
+        let bob = Account::from_seed(&[2; 32], 3, 0).unwrap();
+        let mut ledger = Ledger::new(3).unwrap();
+        let genesis = transaction::coinbase(&alice.address(), PREMINE, 1).unwrap();
+        ledger.apply(&genesis, &[]).unwrap();
+        let (note, _) = alice
+            .receive(genesis.statement.commitments[0], &genesis.envelopes[0])
+            .unwrap();
+        let fee = conventional_fee(1, 2);
+        let payment = transaction::transfer(
+            &alice,
+            ledger.tree.root(),
+            vec![Input {
+                key: alice.spend.clone(),
+                note,
+                path: ledger.tree.path(0).unwrap(),
+            }],
+            vec![
+                Payment::new(bob.address(), ATOMS),
+                Payment::new(alice.address(), PREMINE - ATOMS - fee),
+            ],
+            fee,
+        )
+        .unwrap();
+        // One note spent, two published: the other one pads the shape.
+        assert_eq!(payment.statement.nullifiers.len(), 2);
+        assert_eq!(payment.statement.commitments.len(), 2);
+        assert_eq!((payment.statement.fee, payment.height), (200, 0));
+        ledger.check_transfer(&payment).unwrap();
+
+        let resealed = |mut tx: Transaction| {
+            tx.statement.binding = tx.effects_digest().unwrap();
+            tx
+        };
+        // Another fee, a higher one too, is refused before the proof is read.
+        for other in [199, 201, 400] {
+            let mut tx = payment.clone();
+            tx.statement.fee = other;
+            assert!(
+                matches!(
+                    ledger.check_transfer(&resealed(tx)),
+                    Err(Error::Ledger("fee"))
+                ),
+                "fee {other}"
+            );
+        }
+        // An expiry of its own makes it no transfer at all.
+        let mut tx = payment.clone();
+        tx.height = 10;
+        let tx = resealed(tx);
+        assert!(matches!(tx.check_shape(), Err(Error::Shape)));
+        assert!(Transaction::decode(&tx.encode().unwrap()).is_err());
+        // Neither does any other shape, whatever its proof.
+        for (inputs, outputs) in [(1, 2), (3, 2), (2, 1), (2, 3), (16, 2)] {
+            let mut statement = payment.statement.clone();
+            statement.nullifiers = (0..inputs).map(|i| Digest([i + 1; WORDS])).collect();
+            statement.commitments = (0..outputs).map(|i| Digest([i + 50; WORDS])).collect();
+            assert!(
+                matches!(statement.validate(), Err(Error::Shape)),
+                "{inputs}x{outputs}"
+            );
+        }
+    }
+
     #[test]
     fn encrypted_payment_maturity_replay_and_atomic_rejection() {
         use crate::{
@@ -635,7 +727,6 @@ mod tests {
                 Payment::new(alice.address(), PREMINE - 42 * ATOMS - fee),
             ],
             fee,
-            4,
         )
         .unwrap();
         let payment = Transaction::decode(&payment.encode().unwrap()).unwrap();
@@ -643,8 +734,9 @@ mod tests {
         extra.push(0);
         assert!(Transaction::decode(&extra).is_err());
         let mut overlong = payment.encode().unwrap();
-        assert_eq!(overlong[0], 2);
-        overlong[0] = 0x82;
+        // The statement's version, 3, also written as the overlong 0x83 0x00.
+        assert_eq!(overlong[0], 3);
+        overlong[0] = 0x83;
         overlong.insert(1, 0);
         assert!(Transaction::decode(&overlong).is_err());
         ledger.check_transfer(&payment).unwrap();

@@ -1,8 +1,11 @@
 use crate::{
     crypto::Digest,
-    model::{coinbase_rho, commit, transfer_rho, Input, Statement, Witness},
+    model::{
+        coinbase_rho, commit, transfer_inputs, transfer_rho, Input, MerklePath, Note, SpendKey,
+        Statement, Witness, DEPTH, TRANSFER_OUTPUTS, VERSION,
+    },
     prove_transfer, verify_transfer,
-    wallet::{digest, encrypt_note, Account, Address, Envelope, MEMO_BYTES},
+    wallet::{digest, encrypt_note, fresh, random_digest, Account, Address, Envelope, MEMO_BYTES},
     Error, ProofEnvelope,
 };
 use serde::{Deserialize, Serialize};
@@ -88,7 +91,7 @@ impl Transaction {
         let coinbase = self.statement.nullifiers.is_empty();
         if coinbase {
             if self.openings.len() != self.statement.commitments.len()
-                || self.proof.version != 2
+                || self.proof.version != VERSION
                 || !self.proof.proof.is_empty()
             {
                 return Err(Error::Shape);
@@ -96,7 +99,9 @@ impl Transaction {
             for opening in &self.openings {
                 let _ = opening.hide.fields()?;
             }
-        } else if !self.openings.is_empty() {
+        } else if !self.openings.is_empty() || self.height != 0 {
+            // A transfer names no height: it lives as long as its anchor is
+            // in the ledger's window, the same for every payer.
             return Err(Error::Shape);
         }
         if self.effects_digest()? != self.txid() {
@@ -114,8 +119,6 @@ impl Transaction {
                 return Err(Error::Ledger("coinbase height"));
             }
             return self.verify_coinbase();
-        } else if self.height != 0 && self.height < height {
-            return Err(Error::Ledger("expired transaction"));
         }
         verify_transfer(&self.statement, &self.proof)
     }
@@ -141,20 +144,47 @@ impl Transaction {
     }
 }
 
+/// A note worth nothing that only fills a transfer's shape. A fresh key
+/// makes its nullifier new and unlinkable to anything; it has no place in
+/// any tree, which the circuit asks of no note worth nothing.
+fn padding(network: u8) -> Result<Input, Error> {
+    let key = SpendKey::from_seed(&fresh::<32>()?, network, 0)?;
+    Ok(Input {
+        note: Note {
+            owner: key.owner(network),
+            rho: random_digest()?,
+            rcm: random_digest()?,
+            value: 0,
+        },
+        key,
+        path: MerklePath {
+            index: 0,
+            siblings: [Digest::ZERO; DEPTH],
+        },
+    })
+}
+
+/// A transfer of `inputs` (at least one, at most eight) to the two
+/// `payments`, the payment and the change. Fewer inputs than a shape of
+/// [`crate::model::TRANSFER_INPUTS`] are padded with notes worth nothing, so
+/// the number of notes really spent stays private within its shape. The fee
+/// has to be [`crate::ledger::conventional_fee`] of that shape.
 pub fn transfer(
     sender: &Account,
     anchor: Digest,
-    inputs: Vec<Input>,
+    mut inputs: Vec<Input>,
     payments: Vec<Payment>,
     fee: u64,
-    expiry: u32,
 ) -> Result<Transaction, Error> {
     let network = sender.network;
-    let first = inputs
-        .first()
-        .ok_or(Error::Shape)?
-        .note
-        .nullifier(&inputs[0].key, network)?;
+    if inputs.is_empty() || payments.len() != TRANSFER_OUTPUTS {
+        return Err(Error::Shape);
+    }
+    let shape = transfer_inputs(inputs.len()).ok_or(Error::Shape)?;
+    while inputs.len() < shape {
+        inputs.push(padding(network)?);
+    }
+    let first = inputs[0].note.nullifier(&inputs[0].key, network)?;
     let mut outputs = vec![];
     let mut envelopes = vec![];
     let own = sender.address();
@@ -178,11 +208,11 @@ pub fn transfer(
     let statement = Statement::from_witness(network, anchor, fee, 0, [0; 32], &witness)?;
     let mut tx = Transaction {
         statement,
-        height: expiry,
+        height: 0,
         envelopes,
         openings: vec![],
         proof: ProofEnvelope {
-            version: 2,
+            version: VERSION,
             proof: vec![],
         },
     };
@@ -197,7 +227,7 @@ pub fn coinbase(to: &Address, value: u64, height: u32) -> Result<Transaction, Er
     let rho = coinbase_rho(network, height, 0);
     let (note, envelope) = encrypt_note(to, value, &[0; MEMO_BYTES], None, rho)?;
     let statement = Statement {
-        version: 2,
+        version: VERSION,
         network,
         anchor: Digest::ZERO,
         nullifiers: vec![],
@@ -216,7 +246,7 @@ pub fn coinbase(to: &Address, value: u64, height: u32) -> Result<Transaction, Er
             value,
         }],
         proof: ProofEnvelope {
-            version: 2,
+            version: VERSION,
             proof: vec![],
         },
     };

@@ -1,40 +1,58 @@
 use crate::{
-    crypto::{self, HashAir, Perm, F, RATE, ROUNDS, WIDTH, WORDS},
+    crypto::{self, HashAir, F, RATE, ROUNDS, WIDTH, WORDS},
     model::*,
     Error,
 };
 use p3_air::{Air, AirBuilder, BaseAir, RowWindow, WindowAccess};
-use p3_challenger::DuplexChallenger;
+use p3_challenger::{HashChallenger, SerializingChallenger32};
 use p3_commit::ExtensionMmcs;
 use p3_dft::Radix2DitParallel;
-use p3_field::{extension::BinomialExtensionField, Dup, Field, PrimeCharacteristicRing};
+use p3_field::{extension::BinomialExtensionField, Dup, PrimeCharacteristicRing};
 use p3_fri::{FriParameters, HidingFriPcs};
+use p3_keccak::{Keccak256Hash, KeccakF, VECTOR_LEN};
 use p3_koala_bear::{default_koalabear_poseidon2_32, GenericPoseidon2LinearLayersKoalaBear};
 use p3_matrix::dense::RowMajorMatrix;
 use p3_merkle_tree::MerkleTreeHidingMmcs;
 use p3_poseidon2_air::{generate_trace_rows, num_cols, Poseidon2Cols};
-use p3_symmetric::{PaddingFreeSponge, Permutation, TruncatedPermutation};
+use p3_symmetric::{
+    CompressionFunctionFromHasher, PaddingFreeSponge, Permutation, SerializingHasher,
+};
 use p3_uni_stark::{prove, verify, Proof, StarkConfig};
 use rand::{rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::{borrow::Borrow, borrow::Cow};
 
 type Challenge = BinomialExtensionField<F, 8>;
-type Hash = PaddingFreeSponge<Perm, 32, 16, 16>;
-type Compress = TruncatedPermutation<Perm, 2, 16, 32>;
+// What the proof commits with and draws its challenges from: Keccak, the
+// permutation of SHA-3, not the Poseidon2 inside the circuit. A break of the
+// young algebraic hash then forges no proof through FRI's Merkle trees or
+// Fiat–Shamir, and the commitments' collision resistance is the generic 128
+// bits of a 256-bit digest (docs/MARGEN-DE-SOLIDEZ.md). Plonky3 tests this very
+// configuration in `p3-uni-stark/tests/fib_air.rs` (zero knowledge).
+/// Keccak-f[1600] as a sponge over the trace's field elements: rate 17
+/// words, 256-bit digests, vectorised across `VECTOR_LEN` lanes.
+type Hash = PaddingFreeSponge<KeccakF, 25, 17, 4>;
+type FieldHash = SerializingHasher<Hash>;
+type Compress = CompressionFunctionFromHasher<Hash, 2, 4>;
+/// Eight salt elements (about 248 bits) per leaf, as many bits as the digest.
+const SALT_ELEMS: usize = 8;
 type ValMmcs = MerkleTreeHidingMmcs<
-    <F as Field>::Packing,
-    <F as Field>::Packing,
-    Hash,
+    [F; VECTOR_LEN],
+    [u64; VECTOR_LEN],
+    FieldHash,
     Compress,
     StdRng,
     2,
-    16,
-    16,
+    4,
+    SALT_ELEMS,
 >;
 type ExtMmcs = ExtensionMmcs<F, Challenge, ValMmcs>;
 type Pcs = HidingFriPcs<F, Radix2DitParallel<F>, ValMmcs, ExtMmcs, StdRng>;
-type Config = StarkConfig<Pcs, Challenge, DuplexChallenger<F, Perm, 32, 16>>;
+type Challenger = SerializingChallenger32<F, HashChallenger<u8, Keccak256Hash, 32>>;
+type Config = StarkConfig<Pcs, Challenge, Challenger>;
+/// The transcript starts from this, so a proof of this protocol is not one of
+/// any other built from the same pieces.
+const TRANSCRIPT_DOMAIN: &[u8] = b"ZOKA QUANTIC transfer proof v3";
 type Columns<T> = Poseidon2Cols<T, 32, 3, 0, 4, ROUNDS>;
 const HASH_COLS: usize = num_cols::<32, 3, 0, 4, ROUNDS>();
 const MAX_PROOF_BYTES: usize = 16 * 1024 * 1024;
@@ -44,17 +62,12 @@ const LOG_BLOWUP: usize = 3;
 
 fn config() -> Result<Config, Error> {
     // OS-seeded CSPRNGs for every fresh prover configuration. No fixed masks.
-    let perm = default_koalabear_poseidon2_32();
     let rng = || {
         StdRng::try_from_rng(&mut rand::rngs::SysRng)
             .map_err(|_| Error::Proof("operating-system randomness unavailable".into()))
     };
-    let mmcs = ValMmcs::new(
-        Hash::new(perm.clone()),
-        Compress::new(perm.clone()),
-        0,
-        rng()?,
-    );
+    let sponge = Hash::new(KeccakF {});
+    let mmcs = ValMmcs::new(FieldHash::new(sponge), Compress::new(sponge), 0, rng()?);
     let fri = FriParameters {
         log_blowup: LOG_BLOWUP,
         log_final_poly_len: 0,
@@ -72,7 +85,11 @@ fn config() -> Result<Config, Error> {
         RANDOM_CODEWORDS,
         rng()?,
     );
-    Ok(Config::new(pcs, DuplexChallenger::new(perm)))
+    Ok(Config::new(pcs, challenger()))
+}
+
+fn challenger() -> Challenger {
+    Challenger::from_hasher(TRANSCRIPT_DOMAIN.to_vec(), Keccak256Hash {})
 }
 
 #[derive(Clone)]
@@ -129,6 +146,9 @@ struct Program {
     outputs: Vec<NoteLayout>,
     jobs: Vec<HashJob>,
     bindings: Vec<(usize, usize)>,
+    /// Per input, the root its path computes and its value's bits: the root
+    /// has to be the anchor unless the note is worth nothing.
+    anchors: Vec<(usize, usize)>,
     bits: Vec<usize>,
     carries: usize,
     public_count: usize,
@@ -193,6 +213,7 @@ impl Program {
             outputs: vec![],
             jobs: vec![],
             bindings: vec![],
+            anchors: vec![],
             bits: vec![],
             carries: 0,
             public_count: 26 + WORDS * (n + m) + 32,
@@ -240,7 +261,8 @@ impl Program {
                 p.hash(crypto::TREE, fields, next);
                 current = next;
             }
-            p.bindings.extend((0..WORDS).map(|j| (current + j, 10 + j)));
+            // In the anchor's tree, unless worth nothing: a padding input.
+            p.anchors.push((current, note.bits));
             p.inputs.push(InputLayout {
                 note,
                 key,
@@ -355,7 +377,12 @@ impl Program {
         let (trace, registers) = self.hash_trace(registers, &public);
         for &(r, p) in &self.bindings {
             if registers[r] != public[p] {
-                return Err(Error::Witness("commitment or membership"));
+                return Err(Error::Witness("commitment or nullifier"));
+            }
+        }
+        for (&(root, _), input) in self.anchors.iter().zip(&w.inputs) {
+            if input.note.value != 0 && registers[root..root + WORDS] != public[10..10 + WORDS] {
+                return Err(Error::Witness("membership"));
             }
         }
         Ok(trace)
@@ -496,6 +523,20 @@ impl<AB: AirBuilder<F = F>> Air<AB> for TransferAir {
         for &(register, p) in &self.program.bindings {
             b.when_first_row().assert_eq(r[register], public[p]);
         }
+        // (root − anchor) · Σ limbs = 0: the note is in the anchor's tree
+        // unless it is worth nothing. The limbs are range-checked 16-bit
+        // sums of bits, so their sum is below 2^18 and zero only for a zero
+        // value: a padding input (`transaction::transfer`) needs no tree, and
+        // every note worth anything does.
+        for &(root, bits) in &self.program.anchors {
+            let worth: AB::Expr = (0..4)
+                .map(|limb| Source::Limb(bits + limb * 16).expr::<AB>(r, &public))
+                .sum();
+            for j in 0..WORDS {
+                let gap: AB::Expr = r[root + j].into() - public[10 + j].into();
+                b.when_first_row().assert_zero(gap * worth.dup());
+            }
+        }
         let selectors = b.periodic_values().to_vec();
         let mut row = 0;
         for job in &self.program.jobs {
@@ -580,14 +621,14 @@ pub fn prove_transfer(statement: &Statement, witness: &Witness) -> Result<ProofE
         return Err(Error::Proof("proof exceeds protocol limit".into()));
     }
     Ok(ProofEnvelope {
-        version: 2,
+        version: VERSION,
         proof: bytes,
     })
 }
 
 pub fn verify_transfer(statement: &Statement, envelope: &ProofEnvelope) -> Result<(), Error> {
     let public = statement.public_values()?;
-    if envelope.version != 2 || envelope.proof.len() > MAX_PROOF_BYTES {
+    if envelope.version != VERSION || envelope.proof.len() > MAX_PROOF_BYTES {
         return Err(Error::Encoding);
     }
     if statement.nullifiers.is_empty() {
@@ -684,11 +725,30 @@ mod tests {
             },
         ];
         let witness = Witness {
-            inputs: vec![Input { key, note, path }],
+            inputs: vec![Input { key, note, path }, padding(network, 3)],
             outputs,
         };
         let statement = Statement::from_witness(network, anchor, 5, 0, [7; 32], &witness).unwrap();
         (statement, witness)
+    }
+
+    /// An input worth nothing in no tree, as `transaction::transfer` pads
+    /// with, from a fixed seed.
+    fn padding(network: u8, seed: u8) -> Input {
+        let key = SpendKey::from_seed(&[seed; 32], network, 0).unwrap();
+        Input {
+            note: Note {
+                owner: key.owner(network),
+                rho: Digest([30 + seed as u32; WORDS]),
+                rcm: Digest([40 + seed as u32; WORDS]),
+                value: 0,
+            },
+            key,
+            path: MerklePath {
+                index: 0,
+                siblings: [Digest::ZERO; DEPTH],
+            },
+        }
     }
 
     #[test]
@@ -745,6 +805,49 @@ mod tests {
         assert!(guarded(|| Ok(())).is_ok());
     }
 
+    /// The exemption from membership is for notes worth nothing only. A
+    /// padding input given a value, with an output raised by as much so the
+    /// balance holds, is a note out of no tree: the anchor refuses it, in
+    /// the host check and in the AIR, every hash recomputed.
+    #[test]
+    fn a_padding_input_cannot_bring_value() {
+        let (s, mut w) = fixture();
+        assert_eq!(w.inputs[1].note.value, 0);
+        w.inputs[1].note.value = 100;
+        w.outputs[0].value += 100;
+        let forged = Statement::from_witness(3, s.anchor, s.fee, 0, [7; 32], &w).unwrap();
+        assert!(matches!(
+            prove_transfer(&forged, &w),
+            Err(Error::Witness("membership"))
+        ));
+
+        let air = TransferAir::new(2, 2);
+        let public = s.public_values().unwrap();
+        let trace = air.program.trace(&s, &fixture().1).unwrap();
+        let mut registers = trace.values[HASH_COLS..trace.width].to_vec();
+        // Value 100 = bits 2, 5 and 6 of the padding note; 600 + 100 = 700
+        // for the first output, whose bits are rewritten from scratch.
+        let padding = air.program.inputs[1].note.bits;
+        for bit in [2, 5, 6] {
+            registers[padding + bit] = F::ONE;
+        }
+        let output = air.program.outputs[0].bits;
+        for bit in 0..64 {
+            registers[output + bit] = F::from_bool((700u64 >> bit) & 1 == 1);
+        }
+        let (forged, registers) = air.program.hash_trace(registers, &public);
+        let mut forged_public = public.clone();
+        for &(r, p) in &air.program.bindings {
+            forged_public[p] = registers[r];
+        }
+        let report = p3_air::check_all_constraints(&air, &forged, &forged_public, Some(1));
+        assert!(!report.is_ok(), "a padding input brought value");
+        // With the value back to zero the same trace is accepted: the change
+        // that made it fail was only that.
+        let honest = air.program.trace(&s, &fixture().1).unwrap();
+        assert!(p3_air::check_all_constraints(&air, &honest, &public, Some(1)).is_ok());
+    }
+
     #[test]
     fn witness_rejects_wrong_owner_inflation_and_foreign_tree() {
         let (s, mut w) = fixture();
@@ -770,7 +873,7 @@ mod tests {
     #[test]
     fn air_itself_rejects_forged_private_registers() {
         let (s, w) = fixture();
-        let air = TransferAir::new(1, 2);
+        let air = TransferAir::new(2, 2);
         let public = s.public_values().unwrap();
         let original = air.program.trace(&s, &w).unwrap();
         p3_air::check_constraints(&air, &original, &public);
@@ -801,7 +904,7 @@ mod tests {
     #[test]
     fn air_rejects_inflation_after_recomputing_all_hashes_and_public_outputs() {
         let (s, w) = fixture();
-        let air = TransferAir::new(1, 2);
+        let air = TransferAir::new(2, 2);
         let public = s.public_values().unwrap();
         let trace = air.program.trace(&s, &w).unwrap();
         assert!(p3_air::check_all_constraints(&air, &trace, &public, Some(8)).is_ok());
@@ -830,7 +933,7 @@ mod tests {
     #[test]
     fn air_rejects_a_chosen_output_rho_after_recomputing_every_hash() {
         let (s, w) = fixture();
-        let air = TransferAir::new(1, 2);
+        let air = TransferAir::new(2, 2);
         let public = s.public_values().unwrap();
         let trace = air.program.trace(&s, &w).unwrap();
         // Overwrite the second output's rho with the first one's and redo
@@ -860,8 +963,8 @@ mod tests {
         use p3_uni_stark::{AirLayout, OpeningShape, ProvenSecurity, StarkSecurityParams};
         // This is the upstream classical algebraic estimator with an explicit
         // 128-bit collision-resistance assumption. It is not a PQ/ZK audit.
-        for n in 1..=MAX_INPUTS {
-            for m in 1..=MAX_OUTPUTS {
+        for n in TRANSFER_INPUTS {
+            for m in [TRANSFER_OUTPUTS] {
                 let air = TransferAir::new(n, m);
                 let fri = FriParameters::<()> {
                     log_blowup: LOG_BLOWUP,
@@ -894,7 +997,7 @@ mod tests {
                     bits >= 100,
                     "{n} inputs, {m} outputs: only {bits} estimated classical bits"
                 );
-                if (n, m) == (1, 2) || (n, m) == (8, 8) {
+                if (n, m) == (2, 2) || (n, m) == (8, 2) {
                     eprintln!("shape {n}x{m}: {bits} estimated classical soundness bits (explicit hash assumption)");
                 }
             }
@@ -906,12 +1009,14 @@ mod tests {
         use crate::ledger::NoteTree;
         let key = SpendKey::from_seed(&[42; 32], 3, 0).unwrap();
         let mut tree = NoteTree::new(3).unwrap();
+        // Eight notes of nearly 2^62 each: more than one u64 holds, so the
+        // two outputs carry across every limb.
         let notes: Vec<_> = (0..MAX_INPUTS)
             .map(|i| Note {
                 owner: key.owner(3),
                 rho: Digest([100 + i as u32; WORDS]),
                 rcm: Digest([150 + i as u32; WORDS]),
-                value: u64::MAX - i as u64 * 1000,
+                value: u64::MAX / 4 - i as u64 * 1000,
             })
             .collect();
         let first = notes[0].nullifier(&key, 3).unwrap();
@@ -927,23 +1032,28 @@ mod tests {
                 path: tree.path(i as u32).unwrap(),
             })
             .collect();
-        let outputs = notes
-            .iter()
+        let total: u128 = notes.iter().map(|note| u128::from(note.value)).sum();
+        let fee = 255;
+        let first_value = u64::MAX;
+        let second_value =
+            u64::try_from(total - u128::from(first_value) - u128::from(fee)).unwrap();
+        let outputs = [first_value, second_value]
+            .into_iter()
             .enumerate()
-            .map(|(i, note)| Note {
-                owner: note.owner,
+            .map(|(i, value)| Note {
+                owner: key.owner(3),
                 rho: crate::model::transfer_rho(3, first, i).unwrap(),
                 rcm: Digest([200 + i as u32; WORDS]),
-                value: note.value - if i == 0 { 255 } else { 0 },
+                value,
             })
             .collect();
         let witness = Witness { inputs, outputs };
         let statement =
-            Statement::from_witness(3, tree.root(), 255, 0, [42; 32], &witness).unwrap();
+            Statement::from_witness(3, tree.root(), fee, 0, [42; 32], &witness).unwrap();
         let start = std::time::Instant::now();
         let proof = prove_transfer(&statement, &witness).unwrap();
         eprintln!(
-            "maximum 8x8 transfer: {} proof bytes, {:?} proving",
+            "maximum 8x2 transfer: {} proof bytes, {:?} proving",
             proof.proof.len(),
             start.elapsed()
         );

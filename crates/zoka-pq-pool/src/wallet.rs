@@ -25,12 +25,22 @@ pub(crate) fn digest(domain: &[u8; 16], parts: &[&[u8]]) -> [u8; 32] {
     }
     state.finalize().as_bytes().try_into().unwrap()
 }
-fn fresh<const N: usize>() -> Result<[u8; N], Error> {
+pub(crate) fn fresh<const N: usize>() -> Result<[u8; N], Error> {
     let mut bytes = [0; N];
     rand::rngs::SysRng
         .try_fill_bytes(&mut bytes)
         .map_err(|_| Error::Encryption)?;
     Ok(bytes)
+}
+
+/// A digest of fresh randomness, every word a canonical field element.
+pub(crate) fn random_digest() -> Result<Digest, Error> {
+    use p3_field::PrimeField32;
+    let entropy = fresh::<64>()?;
+    Ok(Digest(std::array::from_fn(|i| {
+        u32::from_le_bytes(entropy[i * 4..i * 4 + 4].try_into().unwrap())
+            % crate::crypto::F::ORDER_U32
+    })))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
