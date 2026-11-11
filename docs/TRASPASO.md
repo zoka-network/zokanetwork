@@ -15,7 +15,8 @@ reiniciado: la testnet v2 sigue con los programas de hoy.
 | --- | --- | --- |
 | ZOKA | esta carpeta | pool v3 (`6d1afcfa`), nodo v3 y checkpoints de k de n (`d4124934`), varias direcciones y documentos (después) |
 | ZSilent | worktree `target/zsilent-endurecimiento` | `16acbac`: testnet v3 en su carpeta, con las wallets y el setup de la v2 |
-| zkapriv | `zkapriv/` | el motor con varias direcciones |
+| zkapriv | `zkapriv/` | `65c4d2a`: el motor con varias direcciones |
+| zokaexplorer | `zokaexplorer/` | `94afe90`: la página Network con el checkpoint de k de n |
 
 ### Cómo seguir con el protocolo v3
 

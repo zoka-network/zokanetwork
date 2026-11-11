@@ -35,6 +35,7 @@ cuerpos distintos ya no pueden tener el mismo hash.
 | ZOKA | `protocolo-v3` | `6d1afcfa` pool v3 · `d4124934` nodo v3 y k de n · el del punto 4 y los documentos (ver `git log`) |
 | ZSilent | `protocolo-v3` (worktree `target/zsilent-endurecimiento`) | `16acbac` testnet v3 en su carpeta, con las wallets y el setup de la v2 |
 | zkapriv | `protocolo-v3` | `65c4d2a` motor con varias direcciones; un estado de otro formato se vuelve a leer |
+| zokaexplorer | `protocolo-v3` | `94afe90` la página Network muestra el checkpoint de k de n (con la v2 se hubiera caído al llegar el primero de la v3) |
 
 Todas salen de las ramas `endurecimiento-sin-consenso`, que tienen la
 primera tanda (10-11/11).
@@ -93,6 +94,7 @@ mañana.
 | WebAssembly de la billetera web (nativo) | 5 sin fallas, con la de una dirección más |
 | ZSilent `gradle test` (rama `protocolo-v3`) | 95 sin fallas, con las 3 de la migración |
 | Motor de ZKAPriv (`cargo test --features quantic-pq --lib stark::`) y `gradle :network:testDebugUnitTest` | 4 y 47 sin fallas, con la de direcciones |
+| ZokaScan (vitest, tsc, eslint) | 18 sin fallas, con las 2 del checkpoint v3 |
 
 No se probó: ningún teléfono, ningún paquete, la red pública ni libFuzzer.
 
