@@ -169,11 +169,54 @@ de compilación de sus seis objetivos en Windows.
    dos). Ningún texto deformado se aceptó como dirección o clave, y lo que se
    acepta tiene una sola forma de escribirse.
 
+## Barrido de los registros del circuito (11/11/2026)
+
+Es otra técnica, y apunta al riesgo más caro: el balance vive solo dentro
+de la prueba, así que una restricción que falte sería inflación que nadie
+ve. [transfer/mutations.rs](../crates/zoka-pq-pool/src/transfer/mutations.rs)
+lo hace así:
+
+1. Cambia cada registro de la traza de tres maneras: los bits a 1 − b, a 2 y
+   a −1; el resto a +1, a 0 y a −1.
+2. Rehace toda la traza de los hashes y vuelve a publicar nullifiers,
+   compromisos y ancla con lo que dan los registros cambiados, como haría
+   quien quiere hacer trampa.
+3. Si el AIR acepta el resultado, `intended` lo controla con las funciones
+   del modelo, no con los trabajos del AIR. Exige que el dueño sea el de la
+   clave, que la nota esté en el árbol de la ancla, que el `rho` de las
+   salidas salga del primer nullifier y que los montos cierren como enteros.
+
+Hay cambios aceptables: otro destinatario, otro `rcm`, otra nota de otro
+árbol. La exigencia es que todo lo que el AIR acepte sea una transferencia
+de verdad.
+
+| Forma | Registros | Cambios | Aceptados (todos legítimos) | Rechazados |
+| --- | ---: | ---: | ---: | ---: |
+| 1 → 2 | 639 | 1.917 | 560 | 1.357 |
+| 2 → 2 | 975 | 2.923 | 192 | 2.731 |
+
+De los hermanos y niveles del camino de Merkle, que son 32 × 16 palabras
+por entrada y todas cumplen el mismo papel, se toman dos palabras por
+nivel. Con dos entradas se aceptan menos cambios porque las dos notas
+tienen que estar en el mismo árbol: tocar una sola rompe la ancla. Tarda
+unos 30 s en release.
+
+**El barrido tiene dientes.** La segunda prueba lo corre contra tres
+circuitos con una regla menos, y en los tres lo detecta:
+
+- sin la derivación del `rho` de una salida (Faerie Gold);
+- sin la derivación del dueño desde la clave (cualquier clave gastaría la
+  nota);
+- sin la atadura a la ancla (la nota podría estar en cualquier árbol).
+
+No reemplaza una revisión formal del circuito. Cubre un cambio por vez: dos
+cambios que se compensan entre sí no entran.
+
 ## Qué falta
 
 - Correr libFuzzer en un VPS durante horas, con las semillas de arriba.
 - Fuzzing de lo que este trabajo no tocó: el protocolo entre nodos con
   conexiones reales (acá se prueba lo que hay detrás de cada pedido, no el
   transporte), el Stratum y el motor del teléfono por JNI.
-- Un arnés que mute cada registro del circuito de forma sistemática: es otra
-  técnica y otro trabajo.
+- Pares de cambios en el circuito, sobre todo los que se compensan en el
+  balance (un bit de una salida y un acarreo, por ejemplo).

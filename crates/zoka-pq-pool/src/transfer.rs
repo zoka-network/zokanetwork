@@ -638,6 +638,10 @@ pub(crate) fn proof_tree(bytes: &[u8]) -> Option<crate::fuzzing::tree::Node> {
     crate::fuzzing::tree::capture(&proof).ok()
 }
 
+/// Every register of the circuit changed one at a time (soundness sweep).
+#[cfg(test)]
+mod mutations;
+
 #[cfg(test)]
 mod tests {
     use super::*;
