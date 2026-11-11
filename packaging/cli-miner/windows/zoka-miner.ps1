@@ -1,4 +1,4 @@
-# Minero de Zoka Quantic Testnet v2 por línea de comandos, para Windows.
+# Minero de Zoka Quantic Testnet v3 por línea de comandos, para Windows.
 #
 # Todo queda dentro de la carpeta del paquete, en .\data\quantic-testnet-v2,
 # con el mismo orden que ZSilent 4.0: node (la cadena y la identidad del nodo),
@@ -35,14 +35,26 @@ $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
 $Zoka = Join-Path $Root "zoka.exe"
 $Network = "testnet"
-$V2 = Join-Path $Root "data\quantic-testnet-v2"
-$NodeDir = Join-Path $V2 "node"
+$Data = Join-Path $Root "data\quantic-testnet-v3"
+# La testnet v3 es una cadena nueva: el nodo empieza de cero, y las wallets de
+# la v2 (las mismas frases, las mismas direcciones) pasan una sola vez.
+$Old = Join-Path $Root "data\quantic-testnet-v2"
+$Marker = Join-Path $Data "migrated-from-v2"
+if ((Test-Path -LiteralPath (Join-Path $Old "wallets")) -and -not (Test-Path -LiteralPath $Marker)) {
+    New-Item -ItemType Directory -Force -Path (Join-Path $Data "wallets") | Out-Null
+    Get-ChildItem -LiteralPath (Join-Path $Old "wallets") -File | ForEach-Object {
+        $to = Join-Path (Join-Path $Data "wallets") $_.Name
+        if (-not (Test-Path -LiteralPath $to)) { Copy-Item -LiteralPath $_.FullName -Destination $to }
+    }
+    New-Item -ItemType File -Path $Marker | Out-Null
+}
+$NodeDir = Join-Path $Data "node"
 $Descriptor = Join-Path $NodeDir "peer.json"
 $ApiBind = "127.0.0.1:9180"
 $Api = "http://$ApiBind"
 $Stratum = "127.0.0.1:$StratumPort"
-$NodeLog = Join-Path $V2 "node.log"
-$NodeErrLog = Join-Path $V2 "node-errors.log"
+$NodeLog = Join-Path $Data "node.log"
+$NodeErrLog = Join-Path $Data "node-errors.log"
 
 New-Item -ItemType Directory -Force -Path $NodeDir | Out-Null
 
@@ -62,12 +74,12 @@ function Invoke-WithPassword([string]$Password, [scriptblock]$Action) {
     try { & $Action } finally { Remove-Item Env:ZOKA_CLI_PASSWORD -ErrorAction SilentlyContinue }
 }
 
-function Test-WalletExists { return (Test-Path -LiteralPath (Join-Path $V2 "wallets\$Wallet.json")) }
+function Test-WalletExists { return (Test-Path -LiteralPath (Join-Path $Data "wallets\$Wallet.json")) }
 
 function Get-Address([switch]$Full) {
     $extra = @()
     if ($Full) { $extra = @("--full") }
-    $out = & $Zoka quantic-pq-wallet address --network $Network --dir $V2 --name $Wallet @extra 2>&1
+    $out = & $Zoka quantic-pq-wallet address --network $Network --dir $Data --name $Wallet @extra 2>&1
     if ($LASTEXITCODE -ne 0) { throw "Could not read the address of wallet '$Wallet': $out" }
     return ("" + $out).Trim()
 }
@@ -172,7 +184,7 @@ function Start-Mining {
             }
             if ($online) {
                 # Publica la dirección corta en la red, así cualquiera puede pagarte con ella.
-                & $Zoka quantic-pq-wallet publish-address --network $Network --dir $V2 --name $Wallet --api $Api 2>&1 | Out-Null
+                & $Zoka quantic-pq-wallet publish-address --network $Network --dir $Data --name $Wallet --api $Api 2>&1 | Out-Null
                 if ($LASTEXITCODE -ne 0 -and $round -eq 1) { Say "Your short address could not be published yet; the full one always works." "Yellow" }
                 if ($round -eq 1) {
                     Say ""
@@ -271,7 +283,7 @@ switch ($Command) {
         Say "They are the only way to recover this wallet. They are shown only once," "Yellow"
         Say "and anyone who has them can spend your coins. Never type them on a website." "Yellow"
         Say ""
-        Invoke-WithPassword $p1 { & $Zoka quantic-pq-wallet new --network $Network --dir $V2 --name $Wallet --password-env ZOKA_CLI_PASSWORD }
+        Invoke-WithPassword $p1 { & $Zoka quantic-pq-wallet new --network $Network --dir $Data --name $Wallet --password-env ZOKA_CLI_PASSWORD }
         if ($LASTEXITCODE -ne 0) { throw "The wallet was not created." }
     }
     "restore-wallet" {
@@ -284,7 +296,7 @@ switch ($Command) {
         $env:ZOKA_CLI_PHRASE = $phrase
         try {
             Say "Restored. Your address:" "Cyan"
-            Invoke-WithPassword $p1 { & $Zoka quantic-pq-wallet restore --network $Network --dir $V2 --name $Wallet --phrase-env ZOKA_CLI_PHRASE --password-env ZOKA_CLI_PASSWORD }
+            Invoke-WithPassword $p1 { & $Zoka quantic-pq-wallet restore --network $Network --dir $Data --name $Wallet --phrase-env ZOKA_CLI_PHRASE --password-env ZOKA_CLI_PASSWORD }
         } finally { Remove-Item Env:ZOKA_CLI_PHRASE -ErrorAction SilentlyContinue }
         if ($LASTEXITCODE -ne 0) { throw "The wallet was not restored." }
     }
@@ -298,7 +310,7 @@ switch ($Command) {
         Say "Your view key. It shows every payment and the balance of this wallet (paste it in" "Cyan"
         Say "https://zokascan.cc/wallet, which reads it inside your browser); it cannot spend." "Cyan"
         Say "Share it only as you would a bank statement: it cannot be revoked." "Yellow"
-        Invoke-WithPassword $p { & $Zoka quantic-pq-wallet show-view-key --network $Network --dir $V2 --name $Wallet --password-env ZOKA_CLI_PASSWORD --json } |
+        Invoke-WithPassword $p { & $Zoka quantic-pq-wallet show-view-key --network $Network --dir $Data --name $Wallet --password-env ZOKA_CLI_PASSWORD --json } |
             ForEach-Object { if ($_ -match '"view_key":"([^"]+)"') { $Matches[1] } else { $_ } }
         if ($LASTEXITCODE -ne 0) { throw "Could not read the view key." }
     }
@@ -314,7 +326,7 @@ switch ($Command) {
             Say "The node is not running: this is the balance as of the last time it ran." "Yellow"
         }
         $p = Read-Password "Password of wallet '$Wallet'"
-        Invoke-WithPassword $p { & $Zoka quantic-pq-wallet balance --network $Network --dir $V2 --name $Wallet --password-env ZOKA_CLI_PASSWORD --api $Api @peer }
+        Invoke-WithPassword $p { & $Zoka quantic-pq-wallet balance --network $Network --dir $Data --name $Wallet --password-env ZOKA_CLI_PASSWORD --api $Api @peer }
     }
     "status" {
         if (-not (Test-NodeOnline)) { Say "The node is not running."; break }
@@ -339,7 +351,7 @@ switch ($Command) {
         Say "Both are public. To offer this node as a seed, keep it running all day and send them to the Zoka team." "Cyan"
     }
     default {
-        Say "Zoka Quantic Testnet v2 CLI miner. Commands:"
+        Say "Zoka Quantic Testnet v3 CLI miner. Commands:"
         Say "  create-wallet   a new wallet (shows its 24 words once)"
         Say "  restore-wallet  a wallet from its 24 words"
         Say "  address         the address you share to get paid"

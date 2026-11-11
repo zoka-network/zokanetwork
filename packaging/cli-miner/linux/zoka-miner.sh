@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Minero de Zoka Quantic Testnet v2 por línea de comandos, para Linux.
+# Minero de Zoka Quantic Testnet v3 por línea de comandos, para Linux.
 #
-# Todo queda dentro de la carpeta del paquete, en ./data/quantic-testnet-v2,
+# Todo queda dentro de la carpeta del paquete, en ./data/quantic-testnet-v3,
 # con el mismo orden que ZSilent 4.0: node (la cadena y la identidad del nodo),
 # wallets y wallet-mirror (la copia de la cadena que leen las wallets). El nodo
 # llega a la red por los relays de n0, sin abrir puertos. Su API va en
@@ -25,8 +25,16 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ZOKA="$ROOT/zoka"
 NETWORK="testnet"
-V2="$ROOT/data/quantic-testnet-v2"
-NODE_DIR="$V2/node"
+DATA="$ROOT/data/quantic-testnet-v3"
+OLD="$ROOT/data/quantic-testnet-v2"
+# La testnet v3 es una cadena nueva: el nodo empieza de cero, y las wallets de
+# la v2 (las mismas frases, las mismas direcciones) pasan una sola vez.
+if [ -d "$OLD/wallets" ] && [ ! -e "$DATA/migrated-from-v2" ]; then
+    mkdir -p "$DATA/wallets"
+    cp -n "$OLD/wallets/"* "$DATA/wallets/" 2>/dev/null || true
+    : > "$DATA/migrated-from-v2"
+fi
+NODE_DIR="$DATA/node"
 DESCRIPTOR="$NODE_DIR/peer.json"
 API_PORT=9180
 API="http://127.0.0.1:$API_PORT"
@@ -56,8 +64,8 @@ while [ $# -gt 0 ]; do
     esac
 done
 STRATUM="127.0.0.1:$STRATUM_PORT"
-NODE_LOG="$V2/node.log"
-NODE_ERR_LOG="$V2/node-errors.log"
+NODE_LOG="$DATA/node.log"
+NODE_ERR_LOG="$DATA/node-errors.log"
 
 # La identidad del nodo y las wallets son solo para este usuario.
 umask 077
@@ -72,10 +80,10 @@ read_password() {
     printf '%s' "$value"
 }
 
-wallet_exists() { [ -f "$V2/wallets/$WALLET.json" ]; }
+wallet_exists() { [ -f "$DATA/wallets/$WALLET.json" ]; }
 
 address() {
-    "$ZOKA" quantic-pq-wallet address --network "$NETWORK" --dir "$V2" --name "$WALLET" "$@" | tr -d '\r\n'
+    "$ZOKA" quantic-pq-wallet address --network "$NETWORK" --dir "$DATA" --name "$WALLET" "$@" | tr -d '\r\n'
 }
 
 # La API, por /dev/tcp de bash: no hace falta curl.
@@ -190,7 +198,7 @@ mine() {
         node_online && online=1
         if [ "$online" -eq 1 ]; then
             # Publica la dirección corta en la red, así cualquiera puede pagarte con ella.
-            if ! "$ZOKA" quantic-pq-wallet publish-address --network "$NETWORK" --dir "$V2" --name "$WALLET" \
+            if ! "$ZOKA" quantic-pq-wallet publish-address --network "$NETWORK" --dir "$DATA" --name "$WALLET" \
                 --api "$API" > /dev/null 2>&1 && [ "$round" -eq 1 ]; then
                 echo "Your short address could not be published yet; the full one always works."
             fi
@@ -245,7 +253,7 @@ autostart() {
     local unit="zoka-miner-$WALLET.service"
     local dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
     command -v systemctl > /dev/null || die "This system has no systemd. Add this line with 'crontab -e' instead:
-  @reboot $ROOT/zoka-miner.sh mine --wallet $WALLET >> $V2/autostart.log 2>&1"
+  @reboot $ROOT/zoka-miner.sh mine --wallet $WALLET >> $DATA/autostart.log 2>&1"
     if [ "$AUTOSTART_OFF" -eq 1 ]; then
         systemctl --user disable --now "$unit" 2> /dev/null || true
         rm -f "$dir/$unit"
@@ -300,7 +308,7 @@ case "$COMMAND" in
         echo "They are the only way to recover this wallet. They are shown only once,"
         echo "and anyone who has them can spend your coins. Never type them on a website."
         echo
-        ZOKA_CLI_PASSWORD="$p1" "$ZOKA" quantic-pq-wallet new --network "$NETWORK" --dir "$V2" --name "$WALLET" \
+        ZOKA_CLI_PASSWORD="$p1" "$ZOKA" quantic-pq-wallet new --network "$NETWORK" --dir "$DATA" --name "$WALLET" \
             --password-env ZOKA_CLI_PASSWORD
         ;;
     restore-wallet)
@@ -312,7 +320,7 @@ case "$COMMAND" in
         [ ${#p1} -ge 8 ] || die "Use at least 8 characters. Nothing was restored."
         echo "Restored. Your address:"
         ZOKA_CLI_PHRASE="$phrase" ZOKA_CLI_PASSWORD="$p1" "$ZOKA" quantic-pq-wallet restore --network "$NETWORK" \
-            --dir "$V2" --name "$WALLET" --phrase-env ZOKA_CLI_PHRASE --password-env ZOKA_CLI_PASSWORD
+            --dir "$DATA" --name "$WALLET" --phrase-env ZOKA_CLI_PHRASE --password-env ZOKA_CLI_PASSWORD
         ;;
     address)
         echo "Your address (share this one to get paid):"
@@ -325,7 +333,7 @@ case "$COMMAND" in
         echo "Your view key. It shows every payment and the balance of this wallet (paste it in"
         echo "https://zokascan.cc/wallet, which reads it inside your browser); it cannot spend."
         echo "Share it only as you would a bank statement: it cannot be revoked."
-        ZOKA_CLI_PASSWORD="$p" "$ZOKA" quantic-pq-wallet show-view-key --network "$NETWORK" --dir "$V2" \
+        ZOKA_CLI_PASSWORD="$p" "$ZOKA" quantic-pq-wallet show-view-key --network "$NETWORK" --dir "$DATA" \
             --name "$WALLET" --password-env ZOKA_CLI_PASSWORD --json | sed -n 's/.*"view_key":"\([^"]*\)".*/\1/p'
         ;;
     mine)
@@ -344,7 +352,7 @@ case "$COMMAND" in
             echo "The node is not running: this is the balance as of the last time it ran."
         fi
         p="$(read_password "Password of wallet '$WALLET'")"
-        ZOKA_CLI_PASSWORD="$p" "$ZOKA" quantic-pq-wallet balance --network "$NETWORK" --dir "$V2" --name "$WALLET" \
+        ZOKA_CLI_PASSWORD="$p" "$ZOKA" quantic-pq-wallet balance --network "$NETWORK" --dir "$DATA" --name "$WALLET" \
             --password-env ZOKA_CLI_PASSWORD --api "$API" "${peer[@]}"
         ;;
     status)
@@ -368,7 +376,7 @@ case "$COMMAND" in
         ;;
     *)
         cat << 'EOF'
-Zoka Quantic Testnet v2 CLI miner. Commands:
+Zoka Quantic Testnet v3 CLI miner. Commands:
   create-wallet   a new wallet (shows its 24 words once)
   restore-wallet  a wallet from its 24 words
   address         the address you share to get paid

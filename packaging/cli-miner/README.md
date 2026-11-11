@@ -1,16 +1,18 @@
-# Zoka Quantic Testnet v2 CLI miner
+# Zoka Quantic Testnet v3 CLI miner
 
-Mine the **Zoka Quantic Testnet v2** from a terminal, without the desktop
-wallet. This package is the Zoka node (`zoka`, the same one ZSilent 4.0 runs
+Mine the **Zoka Quantic Testnet v3** from a terminal, without the desktop
+wallet. This package is the Zoka node (`zoka`, the same one ZSilent 5.0 runs
 inside) plus a few scripts that create a wallet, start the node so XMRig can
 mine through it, and show your balance.
 
-> **Prefer an app?** Use **ZSilent 4.0**, the official desktop wallet for
+> **Prefer an app?** Use **ZSilent 5.0**, the official desktop wallet for
 > Windows: the same node and the same network, with buttons instead of
 > commands.
 
-- **Test coins, no value.** Testnet v2 replaces testnet v1 (the ZSilent 3.0
-  one): v1 wallets and coins do not carry over.
+- **Test coins, no value.** Testnet v3 replaces testnet v2: the same recovery
+  phrases give the same addresses, and this package copies the wallets of a
+  `data/quantic-testnet-v2` folder next to it by itself, but test balances
+  start again from zero.
 - **Private and post-quantum.** Rewards and payments are shielded notes, with
   STARK proofs and X-Wing encryption: the chain does not show which address
   receives them.
@@ -21,7 +23,7 @@ mine through it, and show your balance.
 
 | File | What for |
 | --- | --- |
-| `zoka` / `zoka.exe` | The Zoka Quantic node and wallet (version 4.0.5) |
+| `zoka` / `zoka.exe` | The Zoka Quantic node and wallet (version 5.0.0) |
 | `zoka-miner.ps1` / `zoka-miner.sh` | One script for every step below |
 | `*.cmd` (Windows) | Double-click shortcuts to that script |
 | `SHA256SUMS.txt` | The hashes of every file in the package |
@@ -42,12 +44,12 @@ Compare the file's SHA-256 with the one published next to it in the release:
 
 ```powershell
 # Windows (PowerShell)
-Get-FileHash .\zoka-cli-miner-4.0.5-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\zoka-cli-miner-5.0.0-windows-x64.zip -Algorithm SHA256
 ```
 
 ```bash
 # Linux
-sha256sum zoka-cli-miner-4.0.5-linux-x64.tar.gz
+sha256sum zoka-cli-miner-5.0.0-linux-x64.tar.gz
 ```
 
 If they do not match, do not run it: download it again from the official
@@ -57,7 +59,7 @@ release.
 
 - **Windows:** unzip the package anywhere (for example in Documents) and
   double-click **`1-create-wallet.cmd`**.
-- **Linux:** `tar xzf zoka-cli-miner-4.0.5-linux-x64.tar.gz`, `cd` into the
+- **Linux:** `tar xzf zoka-cli-miner-5.0.0-linux-x64.tar.gz`, `cd` into the
   folder and run `./zoka-miner.sh create-wallet`.
 
 Choose a password (at least 8 characters). Then you will see **24 words**:
@@ -68,12 +70,12 @@ your coins.
 You also get your **short address** (57 characters, starting with `zqtest2`).
 That is the one you share to get paid.
 
-Already have a testnet v2 wallet, for example in ZSilent 4.0? Use
+Already have a testnet wallet, for example in ZSilent? Use
 **`restore-wallet.cmd`** or `./zoka-miner.sh restore-wallet` with your 24 words.
 
 ## 3. Get XMRig
 
-On testnet v2 the node does not mine by itself: [XMRig](https://xmrig.com), the
+On the testnet the node does not mine by itself: [XMRig](https://xmrig.com), the
 RandomX miner (`rx/0`, Monero's algorithm), mines through the node's Stratum
 server. Every block it finds pays your wallet in full: this is solo mining
 through your own node, not a shared pool.
@@ -172,7 +174,7 @@ Both keep the options you give them (`-Threads 2`, `--threads 2`, `-Tor …`).
 
 ## Help the network: keep a node running
 
-Testnet v2 has two always-on seed nodes on servers and the team's PC when it is
+Testnet v3 has two always-on seed nodes on servers and the team's PC when it is
 online. The two servers share a provider and data center, so independent nodes
 still matter. Every node that stays online all day makes the network sturdier,
 and an always-on node can become a
@@ -190,7 +192,7 @@ and an always-on node can become a
 
 ## Your data and your backups
 
-- Everything is in **`data/quantic-testnet-v2`**, next to the scripts:
+- Everything is in **`data/quantic-testnet-v3`**, next to the scripts:
   - `node`: the chain and the node's identity;
   - `wallets`: your wallets, encrypted with their password;
   - `wallet-mirror`: the copy of the chain the wallets read.
@@ -198,9 +200,9 @@ and an always-on node can become a
   identity get in each other's way on the network. Every install creates its
   own.
 - Your **24 words** are the backup. With them you can restore the wallet in this
-  package or in ZSilent 4.0, on any computer.
+  package or in ZSilent 5.0, on any computer.
 - You can also make an encrypted copy in a file:
-  `zoka quantic-pq-wallet backup --network testnet --dir data/quantic-testnet-v2 --name miner --out <file>`
+  `zoka quantic-pq-wallet backup --network testnet --dir data/quantic-testnet-v3 --name miner --out <file>`
 
 ## Ports
 
@@ -212,7 +214,7 @@ and an always-on node can become a
 Both listen on this computer only. Towards the internet the node uses QUIC
 (UDP) and n0's relays, with no open ports.
 
-The API does not clash with ZSilent 4.0's. The Stratum uses the same port as
+The API does not clash with ZSilent 5.0's. The Stratum uses the same port as
 ZSilent's, though: if ZSilent's Stratum is on, pick another one with
 `zoka-miner.ps1 mine -StratumPort 3334` or `./zoka-miner.sh mine --stratum-port 3334`.
 Either way, do not mine with both at once: they share the same CPU.
@@ -222,7 +224,7 @@ Either way, do not mine with both at once: they share the same CPU.
 - **"A node is already running":** another window has the miner running. Close
   it first.
 - **"The node stopped", or the node does not start:** the details are in
-  `data/quantic-testnet-v2/node-errors.log`.
+  `data/quantic-testnet-v3/node-errors.log`.
 - **XMRig does not connect:** check that no other program (ZSilent, for example)
   uses the Stratum port and that the node is still running (`status`).
 - **XMRig closes right after starting:** usually the antivirus. The script shows
@@ -234,11 +236,11 @@ Either way, do not mine with both at once: they share the same CPU.
 ## Running the commands by hand
 
 The scripts only call `zoka`. To use it by hand, pass
-`--network testnet --dir data/quantic-testnet-v2`. For example, to send, with
+`--network testnet --dir data/quantic-testnet-v3`. For example, to send, with
 the node running:
 
 ```text
-zoka quantic-pq-wallet send --network testnet --dir data/quantic-testnet-v2 --name miner --to <address> --amount 5 --password-env ZOKA_CLI_PASSWORD --peer data/quantic-testnet-v2/node/peer.json --api http://127.0.0.1:9180
+zoka quantic-pq-wallet send --network testnet --dir data/quantic-testnet-v3 --name miner --to <address> --amount 5 --password-env ZOKA_CLI_PASSWORD --peer data/quantic-testnet-v3/node/peer.json --api http://127.0.0.1:9180
 ```
 
 `zoka quantic-pq-wallet help` lists the wallet's commands, and

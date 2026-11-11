@@ -36,7 +36,7 @@ New-Item -ItemType Directory -Path $probe | Out-Null
 $previousHome = $env:ZOKA_HOME
 $env:ZOKA_HOME = $probe
 try {
-    $list = (& $zoka quantic-pq-wallet list --network testnet --dir (Join-Path $probe "quantic-testnet-v2") --json 2>&1 | Out-String)
+    $list = (& $zoka quantic-pq-wallet list --network testnet --dir (Join-Path $probe "quantic-testnet-v3") --json 2>&1 | Out-String)
     $listExit = $LASTEXITCODE
 } finally {
     $env:ZOKA_HOME = $previousHome
