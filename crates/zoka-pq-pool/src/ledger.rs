@@ -30,11 +30,55 @@ pub fn conventional_fee(inputs: usize, outputs: usize) -> u64 {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(try_from = "StoredTree")]
 pub struct NoteTree {
     network: u8,
     count: u64,
     levels: Vec<BTreeMap<u32, Digest>>,
     empty: Vec<Digest>,
+}
+
+/// A tree as it was stored (a light wallet keeps one in its state file),
+/// before anything indexes it: a file cut short or damaged is refused here
+/// instead of breaking the wallet that opens it.
+#[derive(Deserialize)]
+struct StoredTree {
+    network: u8,
+    count: u64,
+    levels: Vec<BTreeMap<u32, Digest>>,
+    empty: Vec<Digest>,
+}
+impl TryFrom<StoredTree> for NoteTree {
+    type Error = Error;
+    fn try_from(stored: StoredTree) -> Result<Self, Error> {
+        let fresh = Self::new(stored.network)?;
+        if stored.count > MAX_NOTES
+            || stored.levels.len() != DEPTH + 1
+            || stored.empty != fresh.empty
+        {
+            return Err(Error::Encoding);
+        }
+        // `count` leaves put one node at every position below
+        // `ceil(count / 2^level)` of each level, and nowhere else.
+        for (level, nodes) in stored.levels.iter().enumerate() {
+            let width = (stored.count + (1u64 << level) - 1) >> level;
+            if nodes.len() as u64 != width {
+                return Err(Error::Encoding);
+            }
+            for (position, digest) in nodes {
+                let _ = digest.fields()?;
+                if u64::from(*position) >= width {
+                    return Err(Error::Encoding);
+                }
+            }
+        }
+        Ok(Self {
+            network: stored.network,
+            count: stored.count,
+            levels: stored.levels,
+            empty: stored.empty,
+        })
+    }
 }
 impl NoteTree {
     pub fn new(network: u8) -> Result<Self, Error> {
@@ -412,10 +456,18 @@ impl Ledger {
     pub fn check_transfer(&self, tx: &Transaction) -> Result<(), Error> {
         check_transfer(self, tx)
     }
-    pub fn apply(&mut self, coinbase: &Transaction, transfers: &[Transaction]) -> Result<(), Error> {
+    pub fn apply(
+        &mut self,
+        coinbase: &Transaction,
+        transfers: &[Transaction],
+    ) -> Result<(), Error> {
         apply(self, coinbase, transfers)
     }
-    pub fn replay(&mut self, coinbase: &Transaction, transfers: &[Transaction]) -> Result<(), Error> {
+    pub fn replay(
+        &mut self,
+        coinbase: &Transaction,
+        transfers: &[Transaction],
+    ) -> Result<(), Error> {
         replay(self, coinbase, transfers)
     }
 }
@@ -467,6 +519,46 @@ impl LedgerState for Ledger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_stored_tree_is_checked_before_it_is_used() {
+        let mut tree = NoteTree::new(3).unwrap();
+        for note in 1..=5 {
+            tree.append(Digest([note; crate::crypto::WORDS])).unwrap();
+        }
+        let stored = |tree: &NoteTree| {
+            postcard::to_allocvec(&(tree.network, tree.count, &tree.levels, &tree.empty)).unwrap()
+        };
+        let read = |bytes: &[u8]| postcard::from_bytes::<NoteTree>(bytes);
+        let again = read(&stored(&tree)).unwrap();
+        assert_eq!(again.root(), tree.root());
+        assert_eq!(stored(&again), postcard::to_allocvec(&tree).unwrap());
+
+        // Found by fuzzing a wallet's state file: a tree one level short
+        // used to be accepted, and `root` then indexed past its end.
+        let mut short = tree.clone();
+        short.levels.pop();
+        assert!(read(&stored(&short)).is_err());
+        let mut tall = tree.clone();
+        tall.levels.push(BTreeMap::new());
+        assert!(read(&stored(&tall)).is_err());
+        // More leaves than nodes, a node where the tree has none, a leaf
+        // that is not a field element and another network's empty subtrees.
+        let mut counted = tree.clone();
+        counted.count += 1;
+        assert!(read(&stored(&counted)).is_err());
+        let mut stray = tree.clone();
+        let leaf = stray.levels[0].remove(&4).unwrap();
+        stray.levels[0].insert(9, leaf);
+        assert!(read(&stored(&stray)).is_err());
+        let mut wide = tree.clone();
+        wide.levels[0].insert(0, Digest([u32::MAX; crate::crypto::WORDS]));
+        assert!(read(&stored(&wide)).is_err());
+        let mut foreign = tree.clone();
+        foreign.network = 2;
+        assert!(read(&stored(&foreign)).is_err());
+        assert!(read(&stored(&NoteTree::new(3).unwrap())).is_ok());
+    }
+
     #[test]
     fn merkle_paths_follow_append_and_detect_another_position() {
         let mut tree = NoteTree::new(3).unwrap();
