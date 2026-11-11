@@ -202,7 +202,7 @@ los nodos nuevos encuentren la red.
 - **No copies la carpeta `node` a otra computadora.** Dos nodos con la misma
   identidad se pisan en la red. Cada instalación crea la suya.
 - Tus **24 palabras** son la copia de seguridad. Con ellas podés restaurar la
-  wallet en este paquete o en ZSilent 4.0, en cualquier computadora.
+  wallet en este paquete o en ZSilent 5.0, en cualquier computadora.
 - También se puede hacer una copia cifrada en un archivo:
   `zoka quantic-pq-wallet backup --network testnet --dir data\quantic-testnet-v3 --name miner --out <archivo>`
 
