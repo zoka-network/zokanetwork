@@ -4,7 +4,41 @@ Registro vivo para que otro agente (Codex, Claude) siga donde quedó este. Cada
 paso se marca al terminarlo, con su commit; lo que queda a medias dice en qué
 punto exacto está. Lo histórico está en [HOJA-DE-RUTA-CLAUDE.md](../HOJA-DE-RUTA-CLAUDE.md).
 
-## Estado actual al 10/11/2026: batería terminada y trabajo recuperado
+## Estado actual al 11/11/2026: clave de entrantes en las apps y autoridad automática
+
+Codex siguió la revisión el 10/11 a la noche y se quedó sin cuota (hasta el
+17/11) con cuatro subagentes a medio hacer. Claude retomó el 11/11 a pedido
+del usuario. **Decisión del usuario del 11/11 (a Codex): «todo lo que sea
+ZSilent y ZKAPriv debe ser automático, que el usuario haga lo menos
+posible».** El detalle, con commits y pruebas, está en la entrada del 11/11
+de la [hoja de ruta](../HOJA-DE-RUTA-CLAUDE.md).
+
+Todo está en ramas `endurecimiento-sin-consenso`, sin integrar, publicar ni
+instalar:
+
+| Repo | Dónde | Último commit |
+| --- | --- | --- |
+| ZOKA | esta carpeta | ver `git log` |
+| ZSilent | worktree `target/zsilent-endurecimiento` | ver su `git log` |
+| zokawallet | `zokawallet/` | `48863f8` |
+| zokaexplorer | `zokaexplorer/` | `8de18f5` |
+| zkapriv | `zkapriv/` | `f93fe33` (Codex) |
+
+### Cómo seguir
+
+1. **libFuzzer en el VPS 2.** El permiso para escribir y ejecutar en el VPS
+   lo frenó el clasificador de Claude Code: lo lanza el usuario o lo
+   autoriza. Las fuentes de `2092af80` ya están en `/root/zoka-fuzz-src`
+   (SHA-256 del tar `6b887b71…`). El comando está en la hoja de ruta.
+2. **ZKAPriv:** recompilar `libzoka_mobile.so` (armeabi-v7a y arm64-v8a) en
+   el VPS 2 con el pool nuevo, armar el APK y probar en el teléfono.
+3. **Antes de instalar en la PC autoridad** la ZSilent con la protección de
+   Windows: confirmar el respaldo de las claves en D: o exportar el respaldo
+   cifrado al primer arranque (`docs/CHECKPOINTS-AUTORITATIVOS.md`).
+4. **Integrar a `main` y sacar versiones** de nodo, ZSilent, billetera web,
+   ZokaScan y ZKAPriv. Publicar pide su OK.
+
+## Estado al 10/11/2026: batería terminada y trabajo recuperado
 
 El usuario pidió retomar a Claude, que se detuvo mientras corría el fuzzing
 del nodo. La tarea vigente es la **revisión técnica sin cambios de consenso**
@@ -41,7 +75,7 @@ del verificador; las pruebas finales del pool y nodo cubren el código final.
 No hizo falta repetirlas para guardar el trabajo. No se probaron aplicaciones,
 teléfonos ni la red pública en esta tanda.
 
-### Cómo seguir
+### Cómo seguía el 10/11 (superado por lo de arriba)
 
 1. Correr los seis objetivos de **libFuzzer guiado por cobertura en Linux**:
    hasta ahora solo compilaron en Windows. La pasada determinista extendida

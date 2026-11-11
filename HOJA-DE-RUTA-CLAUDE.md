@@ -1,7 +1,134 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
-Actualizada: **10 de noviembre de 2026**, Argentina. Testnet v2 con semillas permanentes en VPS; billetera web, ZKAPriv 3.0.0 y faucet publicados; home nuevo de zoka.network en vivo. Rama `endurecimiento-sin-consenso` con la primera tanda de la revisión técnica, sin integrar ni publicar.
+Actualizada: **11 de noviembre de 2026**, Argentina. Testnet v2 con semillas permanentes en VPS; billetera web, ZKAPriv 3.0.0 y faucet publicados; home nuevo de zoka.network en vivo. Ramas `endurecimiento-sin-consenso` (nodo, ZSilent, billetera web, ZokaScan y ZKAPriv) con la primera tanda de la revisión técnica, sin integrar ni publicar.
 Proyecto: `C:\Users\mderramus\ZOKA`.
+
+## 11/11: Codex siguió la revisión y Claude la cerró en las cinco apps
+
+Codex retomó el 10/11 a la noche. A las 22:12 el usuario le dijo **«todo lo
+que sea zsilent y zkapriv debe ser automático, procuremos que el usuario
+haga lo menos posible»**. Codex lanzó cuatro subagentes: margen cuántico,
+ZSilent automático, ZKAPriv automático y la clave de entrantes en la web. Se
+quedó sin cuota (hasta el 17/11) con el trabajo a medio hacer y sin
+commitear, y el usuario le pidió a Claude seguir. La sesión de Codex está en
+`~/.codex/sessions/2026/11/03/rollout-2026-11-03T17-02-40-01a1a301-…jsonl`.
+De ella se leyeron solo los mensajes del usuario y las respuestas.
+
+### Qué quedó, por repo (ramas `endurecimiento-sin-consenso`)
+
+| Repo | Commits | Qué |
+| --- | --- | --- |
+| ZOKA | `b9c58ee6`, `2092af80` (Codex) | `fuzz/Cargo.lock` fijado y `scripts/run-pq-fuzz-linux.sh`; los WebAssembly con la clave de entrantes |
+| ZOKA | `bc008bc6` | el lector de ZokaScan borra el texto de la clave de su memoria |
+| ZOKA | `007397fa` | la autoridad protegida con la cuenta de Windows, y su respaldo portátil |
+| ZSilent | `e95f90f` (worktree `target/zsilent-endurecimiento`) | clave de entrantes por defecto; respaldo cifrado que lleva la autoridad; nodo protegido al arrancar |
+| zokawallet | `48863f8` | View keys: entrantes por defecto, completa a pedido |
+| zokaexplorer | `8de18f5` | My wallet lee las dos claves |
+| zkapriv | `f93fe33` (Codex) | clave de entrantes por defecto, sin migrar la billetera |
+
+- **Autoridad automática**
+  ([CHECKPOINTS-AUTORITATIVOS.md](docs/CHECKPOINTS-AUTORITATIVOS.md),
+  «Protección automática con la cuenta de Windows»). ZSilent lanza el nodo
+  con `--authority-protection windows-user`. El nodo valida las claves y
+  las reescribe protegidas con DPAPI, sin contraseña ni copia en claro. El
+  respaldo cifrado de ZSilent lleva la recuperación de la autoridad, con la
+  misma contraseña que el de la billetera.
+  - **Riesgo:** si se pierde el perfil de Windows, la recuperación es ese
+    respaldo o el de D:. Antes de instalarlo en la PC autoridad, confirmar
+    el de D:.
+- **Clave de entrantes en las apps**
+  ([CLAVE-DE-VISTA-ENTRANTE.md](docs/CLAVE-DE-VISTA-ENTRANTE.md)): en las
+  cuatro, la de entrantes es la opción inicial y la completa se elige. ZSilent
+  y ZKAPriv fallan cerrado si el motor devuelve otro tipo de clave.
+
+### Lo que corrigió Claude al retomar
+
+- **ZokaScan cargaba un WebAssembly viejo.** El arreglo de Codex al lector
+  (borrar el texto de la clave al decodificarla) se escribió después de
+  compilar el binario, y su prueba ni llegaba a cargarlo. Se commiteó el
+  arreglo, se recompiló el lector desde ese commit limpio y se corrigió la
+  carga del módulo en la prueba.
+- **La recuperación de la autoridad iba a quedar dentro de la billetera.** Al
+  restaurar, el nodo copia el respaldo tal cual como archivo de billetera,
+  así que el campo de la autoridad hubiera viajado en cada respaldo
+  posterior, también a PCs que no firman. Ahora ZSilent importa la billetera
+  sola.
+- **El respaldo y la restauración de la autoridad no tenían prueba propia.**
+  Se separaron en dos funciones y se probaron:
+  - un respaldo de otra cadena se rechaza;
+  - una PC con otra autoridad también;
+  - una contraseña equivocada no abre nada;
+  - `--check-only` no escribe;
+  - restaurar dos veces no cambia nada.
+- **El WebAssembly de la billetera web** se recompiló desde el código limpio
+  y dio los mismos cuatro archivos, byte a byte.
+- **En ZSilent, una exportación de clave cortada dejaba los botones
+  trabados.** Codex agregó que no se revele nada si en el medio se bloquea la
+  app o se cambia de billetera. Pero esa salida no apagaba el estado
+  «ocupado», y los botones de mostrar quedaban desactivados hasta
+  reiniciar.
+
+### Pruebas (11/11, en la PC)
+
+| Qué | Resultado |
+| --- | --- |
+| Nodo, release: `checkpoint_authority`, `hybrid_signature`, la autoridad de `stark_node`, `stark_wallet` | 31 sin fallas, con las dos de DPAPI en Windows y la nueva del respaldo |
+| ZSilent, `gradle test` | 92 sin fallas, con `V2NodeWalletE2ETest` contra el `zoka.exe` de `007397fa` (nodo regtest real en una carpeta temporal, puerto 19140) |
+| Billetera web | 37 pruebas, `tsc` y build; WebAssembly idéntico al recompilarlo |
+| ZokaScan | 16 pruebas (4 con el WebAssembly real), `tsc` y build; los 10 avisos de lint son de archivos de antes |
+
+No se probó: ningún teléfono, ningún paquete (MSI ni APK), la red pública
+ni libFuzzer.
+
+### Qué falta
+
+- **libFuzzer en el VPS 2.** El clasificador de permisos de Claude Code
+  frenó escribir y ejecutar un script en el VPS. Las fuentes de
+  `2092af80` ya están en `/root/zoka-fuzz-src` (tar con SHA-256
+  `6b887b71…`, el mismo que se mandó). Para lanzarla, como root en el VPS
+  2:
+
+  ```sh
+  rustup toolchain install nightly --profile minimal
+  cargo install cargo-fuzz --locked
+  cd /root/zoka-fuzz-src
+  systemd-run --unit=zoka-fuzz --property=CPUQuota=200% --property=MemoryMax=5G \
+    --property=Nice=10 --working-directory=/root/zoka-fuzz-src \
+    --setenv=PATH=/root/.cargo/bin:/usr/bin:/bin \
+    --setenv=FUZZ_SECONDS=3600 --setenv=FUZZ_SEED=20261111 \
+    --setenv=FUZZ_RESULTS=/root/zoka-fuzz-results \
+    bash scripts/run-pq-fuzz-linux.sh
+  ```
+
+  Son seis horas, una por objetivo, con dos de los cuatro núcleos. seed3
+  sigue andando. Los resultados quedan en `/root/zoka-fuzz-results`.
+- **ZKAPriv:** recompilar `libzoka_mobile.so` (armeabi-v7a y arm64-v8a) en el
+  VPS 2 con el pool nuevo, armar el APK y probar en el teléfono.
+- **Antes de instalar en la PC autoridad** la ZSilent con la protección de
+  Windows, confirmar el respaldo de las claves en D:.
+- **Integrar a `main` y sacar versiones** (nodo, ZSilent, billetera web,
+  ZokaScan, ZKAPriv). Publicar pide su OK.
+- **El informe del margen cuántico** y, con él, el grupo del próximo
+  reinicio (puntos 1, 2, 5, 6 y la raíz de Merkle).
+
+### Margen cuántico (punto 5)
+
+Lo revisó un subagente de Codex. **La cuenta «132 bits clásicos, 66
+cuánticos, nivel 1 de NIST» que dio Claude el 10/11 no está demostrada:**
+
+- 132 es solo el término de las consultas;
+- la estimación completa la limita la hipótesis de resistencia a
+  colisiones de 128 bits;
+- el estimador de Plonky3 es clásico;
+- NIST define sus categorías comparando con el costo de atacar AES-128, no
+  dividiendo bits por dos;
+- duplicar las consultas tampoco garantiza 128 bits cuánticos.
+
+Siguiente paso sin tocar el consenso: un informe reproducible de todas las
+formas de pago, que separe los términos algebraicos de las hipótesis de
+hash. Después, comparar configuraciones candidatas, medidas en tamaño,
+tiempo y memoria. Eso prepara la decisión del próximo reinicio. A los
+usuarios no se les promete una cantidad de bits ni una equivalencia NIST.
 
 ## 10/11: revisión técnica y endurecimiento sin tocar el consenso (Claude)
 
@@ -33,10 +160,14 @@ Privacidad:
 
 Cuántica y solidez:
 
-- **5. Falta decidir el margen cuántico de la prueba.** 160 consultas, unos 132
-   bits clásicos, sin trabajo extra: contra una búsqueda cuántica son unos 66
-   bits, el nivel 1 de NIST (como AES-128). Subirlo duplica más o menos las
-   consultas y el tamaño. Hay que decidirlo antes de achicar las pruebas.
+- **5. Falta decidir el margen cuántico de la prueba.** 160 consultas,
+   blowup 8 y sin trabajo extra (*grinding*). Hay que decidirlo antes de
+   achicar las pruebas. **Corregido el 11/11:** acá decía «unos 132 bits
+   clásicos, contra una búsqueda cuántica unos 66, el nivel 1 de NIST».
+   Eso no está demostrado. 132 es solo el término de las consultas, y la
+   estimación completa la limita la hipótesis de 128 bits del hash. Además,
+   el estimador es clásico, y NIST no define sus niveles dividiendo bits por
+   dos. Ver la entrada del 11/11.
 - **6. Todo cuelga de Poseidon2**, un hash joven: compromisos, nullifiers,
    árbol y también el Merkle de FRI y el transcript. Estos dos últimos pueden
    pasar a BLAKE3 o Keccak.
@@ -131,6 +262,9 @@ terminados, guardó el fuzzing que estaba sin commit y actualizó el traspaso.
   armó ningún paquete.
 
 ### Qué queda, y qué decide el usuario
+
+Superado por la entrada del 11/11, que ya hizo la interfaz de la clave de
+entrantes y la protección de la autoridad.
 
 - **Integrar a `main` y sacar versiones.** La marca del vuelto y la clave de
   entrantes recién existen para los usuarios cuando se publiquen el nodo,

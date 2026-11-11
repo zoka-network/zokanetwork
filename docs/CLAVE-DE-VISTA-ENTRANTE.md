@@ -74,13 +74,28 @@ zoka quantic-pq-wallet show-view-key --network testnet --dir <carpeta> --name <b
 Sin `--incoming` devuelve la clave completa, como antes. La respuesta en JSON
 suma el campo `kind` (`incoming` o `full`).
 
+## En las aplicaciones (11/11, sin publicar)
+
+Lo armó Codex y lo verificó Claude, en las ramas `endurecimiento-sin-consenso`
+de cada repo. En todas, **la de entrantes es la opción inicial** y la
+completa se elige a mano, sin migrar nada: las dos salen de la misma frase.
+
+| Dónde | Cómo |
+| --- | --- |
+| ZSilent | Settings > Security: «Incoming view key» o «Full view key». Si el nodo devuelve otro tipo, no la muestra. |
+| Billetera web | Settings > View keys: «Incoming payments only» o «Full history and balance». |
+| ZokaScan | My wallet lee las dos. Con la de entrantes muestra lo recibido, lo que madura y el vuelto marcado, sin saldo. |
+| ZKAPriv | Settings, igual que ZSilent. El motor recibe `view_key_kind`; un cliente viejo que no lo manda sigue recibiendo la completa. |
+
+El lector en el navegador (`crates/zoka-pq-scan-wasm`) acepta las dos y borra
+el texto de la clave de su memoria apenas la decodifica.
+
 ## Qué falta
 
-- **Las aplicaciones.** ZSilent, la billetera web y ZKAPriv muestran solo la
-  clave completa, y ZokaScan solo lee esa. Sumar la de entrantes es interfaz
-  en cada repo y pide publicar versiones nuevas.
-- **El lector en el navegador** (`crates/zoka-pq-scan-wasm`) todavía no
-  acepta esta clave.
+- **Publicar.** Nodo, ZSilent, billetera web y ZokaScan sacan versión con el
+  OK del usuario. ZKAPriv necesita además recompilar su motor
+  (`libzoka_mobile.so`, los dos ABI) con el pool nuevo, que es el que marca
+  el vuelto.
 - **Direcciones distintas por contraparte.** La clave de entrantes separa
   quién ve qué; no evita que dos personas con tu dirección sepan que sos la
   misma. Eso es otro trabajo.
