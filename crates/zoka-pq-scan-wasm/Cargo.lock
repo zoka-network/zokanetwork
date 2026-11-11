@@ -1321,6 +1321,7 @@ dependencies = [
  "p3-dft",
  "p3-field",
  "p3-fri",
+ "p3-keccak",
  "p3-koala-bear",
  "p3-matrix",
  "p3-merkle-tree",

@@ -7893,7 +7893,8 @@ async fn handle_fullnode_network_message(
                     &checkpoint.block_hash[..12],
                     checkpoint.height
                 )),
-                Ok(zoka::checkpoint_authority::Acceptance::AlreadyKnown) => None,
+                Ok(zoka::checkpoint_authority::Acceptance::AlreadyKnown)
+                | Ok(zoka::checkpoint_authority::Acceptance::Partial) => None,
                 Err(error @ zoka::checkpoint_authority::CheckpointError::Conflict { .. }) => {
                     Some(format!("ALERT: {error}"))
                 }
@@ -21245,6 +21246,7 @@ mod tests {
         let wrong = zoka::checkpoint_authority::AuthorityKeys {
             ed25519,
             mldsa: Some(other_mldsa),
+            cosigners: None,
         };
         assert!(sign_manual_checkpoint(&key_path, chain, Some(wrong.clone()), 120, &hash).is_err());
 
@@ -21254,6 +21256,7 @@ mod tests {
         let hybrid = zoka::checkpoint_authority::AuthorityKeys {
             ed25519,
             mldsa: zoka::checkpoint_authority::parse_mldsa_public_key(&mldsa_public),
+            cosigners: None,
         };
         let checkpoints = sign_manual_checkpoint(&key_path, chain, Some(hybrid.clone()), 120, &hash)
             .expect("signs both halves");
@@ -22813,7 +22816,7 @@ mod tests {
         let hybrid = zoka::hybrid_signature::HybridSigningKey::from_parts(classical.clone(), &[66; 32]).unwrap();
         let public = hybrid.verifying_key().to_hex();
         let signer = zoka::checkpoint_authority::CheckpointSigner {
-            ed25519: classical, hybrid: Some(hybrid), legacy_v1: true,
+            ed25519: classical, hybrid: Some(hybrid), cosigner: None, legacy_v1: true,
         };
         let chain = economics::MAINNET_CHAIN_ID;
         let (bytes, _) = export_snapshot_bytes(&storage, chain, Some(&signer)).unwrap();

@@ -4,6 +4,41 @@
 la configuración actual y la compara con alternativas, para decidir en el
 próximo reinicio de la testnet.
 
+## Lo que quedó en el protocolo v3 (11/11, rama `protocolo-v3`)
+
+- **Opción A:** 160 consultas, blowup 8, sin grinding, trazas de 512 filas.
+  No se sube el margen del protocolo (la B) ni se rediseña el campo (la C).
+  A los usuarios no se les promete una cantidad de bits ni un nivel de NIST.
+- **Punto 6, junto con este:** el Merkle de FRI y el transcript de
+  Fiat–Shamir pasan de Poseidon2 a **Keccak** (`PaddingFreeSponge` de
+  Keccak-f[1600] con salida de 256 bits, compresión por el mismo hash y
+  transcript Keccak-256 con el dominio `ZOKA QUANTIC transfer proof v3`). El
+  tope de 128 bits ahora es la resistencia a colisiones de Keccak-256, un
+  hash estándar y muy estudiado, en vez de la de Poseidon2. Poseidon2 sigue
+  dentro del circuito (notas, nullifiers, árbol), donde un hash aritmético es
+  lo que lo hace viable.
+- **Las formas cambian** (punto 1): todo pago gasta 2, 4 u 8 notas y crea 2.
+
+Números del estimador con la v3 (mismo comando de abajo):
+
+| Término | 2→2, única | 2→2, listas | 8→2, única | 8→2, listas |
+| --- | ---: | ---: | ---: | ---: |
+| Composición del AIR | 233,4 | 222,9 | 231,6 | 220,1 |
+| DEEP-ALI | 233,8 | 223,3 | 232,8 | 221,4 |
+| Bajo grado (FRI) | 132,8 | 202,6 | 132,8 | 198,7 |
+| Combinación de las aperturas | 221,4 | **190,0** | 218,6 | **184,3** |
+| Colisión del hash (hipótesis) | **128** | **128** | **128** | **128** |
+
+- **La cota sigue siendo 128 en las tres formas**, ahora fijada por
+  Keccak-256. Sin el tope, 190 (2→2), 189,1 (4→2) y 184,3 (8→2).
+- **Costo en la PC** (perfil release): 2→2, 2,59 MB y 3,0 s;
+  8→2, 7,85 MB y 15,9 s. Un 1→2 con Keccak, antes de las formas fijas, daba
+  1,72 MB y 1,2 s. **No se midió en el teléfono de 32 bits**, que es lo
+  primero antes de lanzar la v3: un pago de 8 notas es el caso pesado.
+
+Lo de abajo es el análisis del 11/11 que llevó a esta decisión, con la
+configuración de la v2 (Poseidon2 en todo, formas libres).
+
 **No es una auditoría ni un análisis cuántico.** Son los números del
 estimador de Plonky3 (`p3-security` 0.8.0) para el circuito real, término
 por término, más lo que cuesta cada alternativa. **No usar estas cifras en

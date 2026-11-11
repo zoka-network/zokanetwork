@@ -568,24 +568,43 @@ mod tests {
 
     #[test]
     fn a_checkpoint_counts_only_with_the_team_hybrid_signature() {
+        // A real one of the v2 testnet, checked under its own chain id: the
+        // v3 testnet has none yet, and the chain id is inside the signature.
+        let v2 = Profile {
+            chain_id: crate::economics::QUANTIC_PQ_TESTNET_V2_CHAIN_ID,
+            ..Profile::TESTNET
+        };
         let real: SignedCheckpoint =
             serde_json::from_str(include_str!("testdata/checkpoint-v2-3651.json")).unwrap();
-        let (height, hash) = verify_checkpoint(&real, Profile::TESTNET).unwrap();
+        let (height, hash) = verify_checkpoint(&real, v2).unwrap();
         assert_eq!(height, 3651);
         assert_eq!(hash, real.block_hash);
         // Another block, a missing ML-DSA half or another chain: refused.
         let mut other = real.clone();
         other.block_hash = "0".repeat(64);
-        assert!(verify_checkpoint(&other, Profile::TESTNET).is_err());
+        assert!(verify_checkpoint(&other, v2).is_err());
         let mut classical_only = real.clone();
         classical_only.mldsa_signature = None;
-        assert!(verify_checkpoint(&classical_only, Profile::TESTNET).is_err());
+        assert!(verify_checkpoint(&classical_only, v2).is_err());
         assert!(verify_checkpoint(&real, Profile::REGTEST).is_err());
+        assert!(verify_checkpoint(&real, Profile::TESTNET).is_err());
+        // Relabeled for the v3 testnet, the v2 signature does not hold.
+        let mut relabeled = real.clone();
+        relabeled.chain_id = Profile::TESTNET.chain_id.into();
+        assert!(verify_checkpoint(&relabeled, Profile::TESTNET).is_err());
     }
 
     #[test]
     fn the_testnet_seeds_include_one_reachable_over_tor() {
+        assert!(builtin_seeds(Profile::REGTEST).unwrap().is_empty());
         let seeds = builtin_seeds(Profile::TESTNET).unwrap();
+        let manifest = Manifest::builtin(Profile::TESTNET).unwrap().unwrap();
+        if manifest.status == "pre-genesis" {
+            // The v3 testnet gets its seeds at launch; then the explorer's
+            // seed carries the onion address again, and this checks it.
+            assert!(seeds.is_empty());
+            return;
+        }
         assert!(!seeds.is_empty());
         let onion = stark_net::over_tor(seeds);
         assert!(!onion.is_empty(), "Tor mode needs an onion seed");

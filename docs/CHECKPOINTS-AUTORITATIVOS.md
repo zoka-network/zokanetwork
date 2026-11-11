@@ -29,7 +29,9 @@ la lista ampliada en vivo, sin binario nuevo.
 - **Es una confianza explícita en el equipo.** Quien tenga la clave decide la
   cadena canónica. Hay que declararlo públicamente, igual que el premine.
 - **Si la clave se pierde**, la red sigue funcionando por trabajo acumulado desde
-  el último checkpoint; rotar la clave exige un binario nuevo.
+  el último checkpoint; rotar la clave exige un binario nuevo. Con una
+  autoridad de k de n (versión 3, más abajo) perder una clave no frena nada
+  mientras queden k.
 - **Si la clave se filtra**, el atacante puede congelar la red en una rama propia
   válida, pero no falsificar bloques. La clave vive solo en la PC del equipo.
 - **Ed25519 no es post-cuántico.** La versión 2 de la firma será híbrida
@@ -287,7 +289,94 @@ apenas arranque.
 instale esa versión.
 
 Lo que esto no resuelve: una sola clave y una sola PC. Repartir la firma
-(dos de tres firmantes) es un cambio de la regla de aceptación.
+(dos de tres firmantes) es un cambio de la regla de aceptación: lo de abajo.
+
+## Versión 3: k de n firmantes (protocolo v3, 11/11/2026)
+
+Punto 9 de la revisión del 10/11, rama `protocolo-v3`. Con una sola clave,
+quien la tenga (o quien entre a la PC) mueve los checkpoints de toda la red, y
+si la clave se pierde, no hay cómo firmar. Ahora una cadena puede tener una
+autoridad de **k de n claves**: ninguna sola alcanza, y perder una no frena
+nada mientras queden k.
+
+- **Formato:**
+
+  ```json
+  {"version":3,"chain_id":"…","height":180,"block_hash":"…64 hex…",
+   "cosignatures":[{"signer":0,"ed25519":"…128 hex…","mldsa":"…6.618 hex…"},
+                   {"signer":2,"ed25519":"…","mldsa":"…"}]}
+  ```
+
+  - Cada firma es híbrida (las dos mitades obligatorias) y cubre
+    `"zoka-signed-checkpoint-v3" ‖ 0x1f ‖ chain_id ‖ 0x1f ‖ height ‖ 0x1f ‖
+    block_hash`. El dominio es otro que el de la v2: una firma de una no sirve
+    en la otra.
+  - `signer` es el lugar de la clave en la lista compilada. Las firmas van en
+    orden de clave y sin repetir. Hasta 8 claves.
+  - No lleva `signature` ni `mldsa_signature`.
+- **Política:** una cadena de `economics::CHECKPOINT_AUTHORITY_COSIGNERS` (y
+  de la misma lista en `zoka-light`) solo acepta la versión 3, y una de una
+  sola clave, la 2. En el conjunto ninguna mitad se repite entre dos claves:
+  la misma persona no cuenta dos veces.
+- **Firmas parciales:** cada clave firma por su lado, en su propio nodo. Una
+  versión 3 con menos firmas que el umbral es parcial:
+  - el nodo verifica cada firma y la guarda (las de los 8 bloques más altos);
+  - se suma a las que ya tenía de ese bloque;
+  - en cada sesión empuja sus parciales a los pares que no tienen un
+    checkpoint igual o más alto, una vez cada una;
+  - el nodo donde se juntan k firmas acepta el checkpoint entero, y desde ahí
+    viaja como cualquier otro (`HEAD`, `CHECKPOINT`, `SUBMIT_CHECKPOINT`).
+  - `SUBMIT_CHECKPOINT` contesta `partial`, y `POST /checkpoint`,
+    `"partial": true`.
+- **Alturas alineadas:** dos firmas solo se juntan si son del mismo bloque,
+  así que todas las claves firman las mismas alturas: los múltiplos de 30 que
+  quedan 6 bloques por debajo de la punta (`aligned_height_to_sign`), con las
+  mismas condiciones de siempre (la red confirma la punta y la cadena contiene
+  el último checkpoint).
+- **Una clave no firma dos bloques a la misma altura.** Cada nodo firmante
+  anota la última altura que firmó (`checkpoint:signed:own`) antes de soltar
+  la firma, y nunca firma esa ni una más baja. Si una reorganización le
+  cambiara el bloque, dos hashes con su firma podrían completar dos
+  checkpoints distintos.
+- **Firmar a mano:** `checkpoint-sign` con una autoridad de k de n da la firma
+  de esa clave (versión 3, parcial). Cada uno firma la misma altura y el
+  mismo hash y la entrega con `POST /checkpoint`; el nodo las junta.
+- **Claves del firmante:** `--authority DIR` acepta cualquiera de las claves
+  del conjunto. El nodo sabe con eso qué número de clave es. El respaldo y la
+  restauración (`authority-backup` / `authority-restore`) aceptan también
+  cualquiera.
+- **Red local de prueba:** `ZOKA_CHECKPOINT_AUTHORITY_THRESHOLD` (k) y
+  `ZOKA_CHECKPOINT_AUTHORITY_COSIGNERS` (las otras claves, `ed25519:ml-dsa`
+  en hex, separadas por comas), junto con las dos de la primera clave. Si
+  algo de eso no es válido, la cadena no acepta ningún checkpoint.
+- **Billeteras:** `zoka-light` (billetera web y ZokaScan) y el motor de
+  ZKAPriv verifican la versión 3 con el mismo umbral. Solo aceptan el
+  checkpoint entero.
+- **Probado** (`checkpoint_authority`, `stark_node`, `zoka_light_equivalence`):
+  - una firma sola no alcanza;
+  - la misma firma dos veces no suma;
+  - con la segunda clave se completa;
+  - una clave ajena, repetida, fuera de orden o con otro número no cuenta;
+  - otro bloque a la misma altura es un conflicto;
+  - lo que junta el nodo vale en `zoka-light`, y una parcial no vale en
+    ninguno de los dos;
+  - con tres nodos en loopback y dos de tres: la primera clave sola no fijó
+    nada; con la segunda, en otro nodo, los tres tuvieron el checkpoint con
+    las dos firmas, y la tercera clave no hizo falta.
+
+**La testnet v3 arranca con uno de uno**: la clave de siempre (la PC), ya en
+la versión 3. Pasar a dos de tres es agregar las otras dos claves y subir el
+umbral, en el nodo y en `zoka-light`, con nodos y billeteras nuevos. **Lo
+decide el usuario**, porque es dónde vive cada clave. Una propuesta:
+
+- la PC (la clave de hoy);
+- el VPS 1, con su propia clave;
+- una tercera sin conexión, en D: o en un pendrive, que solo firma a mano
+  si falta una de las otras dos.
+
+Con eso, ni la PC sola ni el VPS solo mueven la red, y perder cualquiera de
+los tres no frena las firmas. Conviene decidirlo antes del génesis de la v3:
+cambiar el conjunto después obliga a actualizar todas las billeteras.
 
 ## Pendiente
 

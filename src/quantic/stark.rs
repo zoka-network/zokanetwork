@@ -25,7 +25,7 @@ use protocol::{
 };
 pub use zoka_pq_pool as protocol;
 
-const PREFIX: &str = "quantic-v2:";
+const PREFIX: &str = crate::types::STARK_V3_STATE_PREFIX;
 /// One [`Record`] per validated block, on any branch.
 const RECORD_KEY: &str = "quantic:stark:record:";
 pub const MEMPOOL_BYTES: usize = 128 * 1024 * 1024;
@@ -58,6 +58,16 @@ impl Profile {
 
     pub fn for_chain(chain_id: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|p| p.chain_id == chain_id)
+    }
+    /// The chain a wallet file belongs to. One made on the v2 chains opens on
+    /// the v3 ones: same network byte, same seed, same keys and addresses.
+    /// Only its balance starts over, with the chain.
+    pub fn for_wallet(chain_id: &str) -> Option<Self> {
+        match chain_id {
+            crate::economics::QUANTIC_PQ_TESTNET_V2_CHAIN_ID => Some(Self::TESTNET),
+            crate::economics::QUANTIC_PQ_REGTEST_V2_CHAIN_ID => Some(Self::REGTEST),
+            other => Self::for_chain(other),
+        }
     }
     pub fn named(name: &str) -> Result<Self, String> {
         Self::ALL
@@ -639,7 +649,6 @@ mod tests {
                 Payment::new(alice.address(), PREMINE - ATOMS - 200),
             ],
             200,
-            10,
         )
         .unwrap();
         let mut pool = Mempool::default();
@@ -719,7 +728,6 @@ mod tests {
                 Payment::new(alice.address(), PREMINE - ATOMS - 200),
             ],
             200,
-            10,
         )
         .unwrap();
         let canonical = mine(&db, P, &genesis, &bob.address(), vec![payment.clone()], 1_700_000_120).unwrap();
@@ -789,13 +797,11 @@ mod tests {
         };
         let err = validate(&db, launched, &block, &parent).err().unwrap();
         assert!(err.contains("genesis"), "{err}");
-        // The real testnet is launched: another block 1 is not its genesis.
-        assert_eq!(
-            Profile::TESTNET.genesis,
-            Some("69249437d8c35b7e4bf28ec524491fe18384b9869670fadff546fef29148fdb2")
-        );
-        let err = validate(&db, Profile::TESTNET, &block, &parent).err().unwrap();
-        assert!(err.contains("genesis"), "{err}");
+        // The v3 testnet is not launched yet: its block 1 is the first one
+        // mined. At launch `QUANTIC_PQ_TESTNET_GENESIS` fixes it, and this
+        // checks again that another block 1 is not its genesis.
+        assert_eq!(Profile::TESTNET.genesis, None);
+        assert!(Profile::TESTNET.chain_id.ends_with("-v3"));
     }
 
     /// Light wallets recompute what a header commits to with

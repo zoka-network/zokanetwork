@@ -43,7 +43,7 @@ const RETRY_MAX_SECS: u64 = 6 * 3600;
 const MANIFEST_SCHEMA: &str = "zoka-quantic-stark-network-v1";
 pub const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_SEEDS: usize = 16;
-const TESTNET_MANIFEST: &str = include_str!("../../docs/quantic-testnet-v2-network.v1.json");
+const TESTNET_MANIFEST: &str = include_str!("../../docs/quantic-testnet-v3-network.v1.json");
 
 fn err(value: impl std::fmt::Display) -> String {
     value.to_string()
@@ -649,36 +649,13 @@ mod tests {
     fn manifests_pin_seeds_by_id_and_key_and_the_builtin_one_parses() {
         let builtin = Manifest::builtin(P).unwrap().unwrap();
         assert_eq!(builtin.chain_id, P.chain_id);
-        // Launched: the team's PC is seed1, pinned by id and key alone (n0
-        // address lookup finds the rest); seed2, the explorer node, also
-        // carries the onion address that Tor mode dials. seed2 and seed3 are
-        // servers with a fixed UDP port, reached by IP without n0.
-        let seeds = builtin.seeds().unwrap();
-        assert_eq!(seeds.len(), 3);
-        assert_eq!(
-            seeds[0].endpoint_addr.id.to_string(),
-            "e3bf05e22b0f491d74e07028ffa02db833bc9d06f441acb820cbf723c7eb70c4"
-        );
-        assert!(seeds[0].endpoint_addr.addrs.is_empty());
-        for (seed, ip) in [(&seeds[1], "13.140.206.10:4433"), (&seeds[2], "13.140.206.11:4433")] {
-            assert!(seed
-                .endpoint_addr
-                .addrs
-                .contains(&iroh::TransportAddr::Ip(ip.parse().unwrap())));
-        }
-        let onion: Vec<_> = seeds[1]
-            .endpoint_addr
-            .addrs
-            .iter()
-            .filter_map(|a| match a {
-                iroh::TransportAddr::Custom(c) => crate::network::stream_transport::dial_target(c),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            onion,
-            vec!["u2soz3q63237afuccfxf3jzytpljpbxpvyzt3jumrr45ukzowdakayqd.onion:9444".to_string()]
-        );
+        // The v3 testnet is not launched: its seeds get their v3 identities,
+        // and this manifest their descriptors, at launch. Then this checks
+        // them as it checked the v2 ones: the team's PC pinned by id and key
+        // alone, the VPS seeds by IP with a fixed UDP port, and the
+        // explorer's seed with the onion address that Tor mode dials.
+        assert_eq!(builtin.status, "pre-genesis");
+        assert!(builtin.seeds().unwrap().is_empty());
         assert!(Manifest::builtin(Profile::REGTEST).unwrap().is_none());
 
         let seed = peer(9);

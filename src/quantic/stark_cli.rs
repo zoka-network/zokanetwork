@@ -146,7 +146,7 @@ pub(crate) struct WalletFile {
 pub(crate) fn read_wallet(path: &Path) -> Result<(WalletFile, Profile), String> {
     let file: WalletFile =
         serde_json::from_slice(&read_bounded(path, MAX_WALLET_BYTES)?).map_err(error)?;
-    let profile = Profile::for_chain(&file.chain_id)
+    let profile = Profile::for_wallet(&file.chain_id)
         .filter(|_| file.schema == SCHEMA)
         .ok_or("not a STARK v2 wallet")?;
     Address::decode(&file.address, profile.network).map_err(error)?;
@@ -437,14 +437,18 @@ pub(crate) fn pay(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let expiry = state.height.checked_add(20).ok_or("expiry overflow")?;
+    // A payment names no expiry: it can be mined while its anchor, this
+    // block's root, is in the ledger's window.
+    let expiry = state
+        .height
+        .checked_add(stark::protocol::light::PAYMENT_LIFETIME)
+        .ok_or("expiry overflow")?;
     let tx = transaction::transfer(
         account,
         state.tree.root(),
         inputs,
         vec![payment, Payment::new(account.address(), total - needed)],
         fee,
-        expiry,
     )
     .map_err(error)?;
     state.check_transfer(&tx).map_err(error)?;
@@ -842,7 +846,7 @@ mod tests {
         assert!(open_db(&v2, None).is_ok());
         assert!(open_db(&v2, Some(P)).is_ok());
         let err = open_db(&v2, Some(Profile::TESTNET)).err().unwrap();
-        assert!(err.contains("belongs to zoka-quantic-regtest-v2"), "{err}");
+        assert!(err.contains("belongs to zoka-quantic-regtest-v3"), "{err}");
         let testnet = dir.path().join("testnet");
         let (db, profile) = open_db(&testnet, Some(Profile::TESTNET)).unwrap();
         assert_eq!(profile, Profile::TESTNET);
@@ -917,7 +921,6 @@ mod tests {
                 Payment::new(alice.address(), PREMINE - ATOMS - 200),
             ],
             200,
-            20,
         )
         .unwrap();
         let encrypted =

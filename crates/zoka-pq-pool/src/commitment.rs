@@ -11,7 +11,7 @@ use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 
 /// Prefix of a v2 block's `state_root`.
-pub const STATE_PREFIX: &str = "quantic-v2:";
+pub const STATE_PREFIX: &str = "quantic-v3:";
 
 /// The ledger state a block header commits to.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]

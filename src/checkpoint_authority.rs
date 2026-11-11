@@ -23,6 +23,18 @@ pub mod protection;
 pub const SIGNED_CHECKPOINT_VERSION: u8 = 1;
 /// Versión 2: firma híbrida Ed25519 + ML-DSA-65 (etapa 6), las dos obligatorias.
 pub const SIGNED_CHECKPOINT_HYBRID_VERSION: u8 = 2;
+/// Versión 3: k de n firmas híbridas, cada una de otra clave de la autoridad
+/// ([`Cosigners`]). Con menos de las que hacen falta es una firma parcial: los
+/// nodos la guardan y la reenvían hasta que se juntan las que faltan.
+pub const SIGNED_CHECKPOINT_COSIGNED_VERSION: u8 = 3;
+/// Cuántas claves puede tener una autoridad de k de n.
+pub const MAX_COSIGNERS: usize = 8;
+/// Umbral de una autoridad de k de n en una red local de prueba. Con él, la
+/// clave de [`AUTHORITY_PUBKEY_ENV`] es la primera del conjunto.
+pub const AUTHORITY_THRESHOLD_ENV: &str = "ZOKA_CHECKPOINT_AUTHORITY_THRESHOLD";
+/// Las otras claves de ese conjunto: pares `ed25519:ml-dsa` en hex, separados
+/// por comas.
+pub const AUTHORITY_COSIGNERS_ENV: &str = "ZOKA_CHECKPOINT_AUTHORITY_COSIGNERS";
 /// El firmador publica un checkpoint cada tantos bloques...
 pub const AUTHORITY_SIGN_INTERVAL: u64 = 30;
 /// ...y firma el bloque que está tantos por debajo de la punta, para no
@@ -55,8 +67,19 @@ const MLDSA_SIGNATURE_HEX_LEN: usize = zoka_pq::ML_DSA_65_SIGNATURE_BYTES * 2;
 const SIGNING_DOMAIN: &[u8] = b"zoka-signed-checkpoint-v1";
 #[cfg(feature = "pq-experimental")]
 const SIGNING_DOMAIN_V2: &[u8] = b"zoka-signed-checkpoint-v2";
+#[cfg(feature = "pq-experimental")]
+const SIGNING_DOMAIN_V3: &[u8] = b"zoka-signed-checkpoint-v3";
 const LATEST_KEY: &str = "checkpoint:signed:latest";
 const BY_HEIGHT_PREFIX: &str = "checkpoint:signed:h:";
+/// Las firmas parciales de la versión 3 que tiene este nodo, todas juntas.
+#[cfg(feature = "pq-experimental")]
+const PARTIALS_KEY: &str = "checkpoint:signed:partials";
+/// Cuántos bloques con firmas incompletas guarda: los más altos.
+#[cfg(feature = "pq-experimental")]
+const MAX_PARTIALS: usize = 8;
+/// La última altura que firmó este nodo como una de las claves de k de n.
+#[cfg(feature = "pq-experimental")]
+const OWN_COSIGNATURE_KEY: &str = "checkpoint:signed:own";
 /// En el nodo de la autoridad: la última firma de la otra versión, la que su
 /// propia política no guarda, para seguir reenviándola a los nodos que la usan.
 const COMPAT_LATEST_KEY: &str = "checkpoint:signed:compat:latest";
@@ -67,12 +90,29 @@ pub struct SignedCheckpoint {
     pub chain_id: String,
     pub height: u64,
     pub block_hash: String,
-    /// Firma Ed25519 en hex (64 bytes). En la versión 2 es la mitad Ed25519.
+    /// Firma Ed25519 en hex (64 bytes). En la versión 2 es la mitad Ed25519;
+    /// la 3 no la usa.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub signature: String,
     /// Mitad ML-DSA-65 de la firma híbrida (versión 2), en hex. Un nodo viejo
     /// ignora el campo y rechaza la versión 2; nada más se rompe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mldsa_signature: Option<String>,
+    /// Versión 3: las firmas de las claves de la autoridad, en orden de clave.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cosignatures: Vec<Cosignature>,
+}
+
+/// Una firma híbrida de una de las claves de una autoridad de k de n.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Cosignature {
+    /// Qué clave firmó: su lugar en [`Cosigners::keys`].
+    pub signer: u8,
+    /// Mitad Ed25519, en hex.
+    pub ed25519: String,
+    /// Mitad ML-DSA-65, en hex.
+    pub mldsa: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +128,12 @@ pub enum CheckpointError {
     HybridRequired,
     /// Llegó una versión 2 y este nodo no conoce la mitad ML-DSA de la clave.
     NoHybridAuthority,
+    /// La autoridad de esta cadena es de k de n: solo acepta la versión 3.
+    CosignedRequired,
+    /// Llegó una versión 3 y la autoridad de esta cadena es una sola clave.
+    NotCosigned,
+    /// Una versión 3 válida pero con menos firmas de las que hacen falta.
+    Incomplete { have: usize, need: usize },
     /// Hay uno aceptado más nuevo: un checkpoint viejo no lo reemplaza.
     Stale { latest: u64, received: u64 },
     /// Misma altura, otro hash: la clave estaría comprometida o el firmador
@@ -116,6 +162,16 @@ impl fmt::Display for CheckpointError {
             Self::NoHybridAuthority => {
                 f.write_str("hybrid checkpoint, but this node has no ML-DSA authority key")
             }
+            Self::CosignedRequired => f.write_str(
+                "this chain only accepts checkpoints cosigned by its authority keys (version 3)",
+            ),
+            Self::NotCosigned => {
+                f.write_str("cosigned checkpoint, but this chain's authority is a single key")
+            }
+            Self::Incomplete { have, need } => write!(
+                f,
+                "checkpoint signed by {have} authority keys, {need} are needed"
+            ),
             Self::Stale { latest, received } => write!(
                 f,
                 "signed checkpoint at {received} is older than the accepted one at {latest}"
@@ -142,6 +198,45 @@ pub enum Acceptance {
     Accepted,
     /// Ya estaba: no hace falta reenviarlo.
     AlreadyKnown,
+    /// Firmas parciales de una autoridad de k de n: guardadas, juntas con las
+    /// que ya había de ese bloque, a la espera de las que faltan.
+    Partial,
+}
+
+/// Una autoridad de k de n: sus claves, en el orden compilado, y cuántas
+/// firmas distintas hacen falta. Ninguna clave sola mueve los checkpoints.
+#[cfg(feature = "pq-experimental")]
+#[derive(Clone, PartialEq, Eq)]
+pub struct Cosigners {
+    keys: Vec<crate::hybrid_signature::HybridVerifyingKey>,
+    threshold: usize,
+}
+
+#[cfg(feature = "pq-experimental")]
+impl Cosigners {
+    /// `threshold` de `keys`. Ninguna mitad se repite entre dos claves: una
+    /// misma persona no cuenta dos veces.
+    pub fn new(
+        keys: Vec<crate::hybrid_signature::HybridVerifyingKey>,
+        threshold: usize,
+    ) -> Option<Self> {
+        let distinct = keys.iter().enumerate().all(|(i, key)| {
+            keys[..i].iter().all(|other| {
+                other.ed25519() != key.ed25519()
+                    && other.mldsa().to_bytes() != key.mldsa().to_bytes()
+            })
+        });
+        (distinct && (1..=keys.len()).contains(&threshold) && keys.len() <= MAX_COSIGNERS)
+            .then_some(Self { keys, threshold })
+    }
+
+    pub fn keys(&self) -> &[crate::hybrid_signature::HybridVerifyingKey] {
+        &self.keys
+    }
+
+    pub fn threshold(&self) -> usize {
+        self.threshold
+    }
 }
 
 /// Las claves públicas de la autoridad de una cadena. Si se conoce la mitad
@@ -152,6 +247,10 @@ pub struct AuthorityKeys {
     pub ed25519: VerifyingKey,
     #[cfg(feature = "pq-experimental")]
     pub mldsa: Option<zoka_pq::MlDsa65PublicKey>,
+    /// Una autoridad de k de n: la cadena solo acepta la versión 3, y
+    /// `ed25519` y `mldsa` son la primera clave del conjunto.
+    #[cfg(feature = "pq-experimental")]
+    pub cosigners: Option<Cosigners>,
 }
 
 impl AuthorityKeys {
@@ -160,6 +259,54 @@ impl AuthorityKeys {
             ed25519,
             #[cfg(feature = "pq-experimental")]
             mldsa: None,
+            #[cfg(feature = "pq-experimental")]
+            cosigners: None,
+        }
+    }
+
+    /// Una sola clave híbrida (versión 2).
+    #[cfg(feature = "pq-experimental")]
+    pub fn hybrid_key(ed25519: VerifyingKey, mldsa: zoka_pq::MlDsa65PublicKey) -> Self {
+        Self {
+            ed25519,
+            mldsa: Some(mldsa),
+            cosigners: None,
+        }
+    }
+
+    /// k de n (versión 3).
+    #[cfg(feature = "pq-experimental")]
+    pub fn cosigned(cosigners: Cosigners) -> Self {
+        let first = &cosigners.keys[0];
+        Self {
+            ed25519: *first.ed25519(),
+            mldsa: Some(first.mldsa().clone()),
+            cosigners: Some(cosigners),
+        }
+    }
+
+    /// El lugar de `key` entre las que firman esta cadena: su índice en una
+    /// autoridad de k de n, 0 si es la clave híbrida única.
+    #[cfg(feature = "pq-experimental")]
+    pub fn member(&self, key: &crate::hybrid_signature::HybridVerifyingKey) -> Option<u8> {
+        match &self.cosigners {
+            Some(cosigners) => cosigners
+                .keys
+                .iter()
+                .position(|candidate| candidate == key)
+                .and_then(|index| u8::try_from(index).ok()),
+            None => (self.hybrid().as_ref() == Some(key)).then_some(0),
+        }
+    }
+
+    pub fn is_cosigned(&self) -> bool {
+        #[cfg(feature = "pq-experimental")]
+        {
+            self.cosigners.is_some()
+        }
+        #[cfg(not(feature = "pq-experimental"))]
+        {
+            false
         }
     }
 
@@ -190,6 +337,16 @@ impl From<VerifyingKey> for AuthorityKeys {
 
 impl fmt::Debug for AuthorityKeys {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        #[cfg(feature = "pq-experimental")]
+        if let Some(cosigners) = &self.cosigners {
+            return write!(
+                f,
+                "AuthorityKeys({} of {}, first ed25519 {})",
+                cosigners.threshold,
+                cosigners.keys.len(),
+                hex::encode(self.ed25519.to_bytes())
+            );
+        }
         write!(
             f,
             "AuthorityKeys(ed25519 {}, hybrid {})",
@@ -235,7 +392,71 @@ impl SignedCheckpoint {
             block_hash: block_hash.to_string(),
             signature: hex::encode(signature.to_bytes()),
             mldsa_signature: None,
+            cosignatures: Vec::new(),
         }
+    }
+
+    /// Versión 3: la firma de una de las claves de una autoridad de k de n
+    /// (`signer`, su lugar en el conjunto). Sola es parcial si el umbral es
+    /// mayor que uno; [`merge`](Self::merge) junta las de las demás.
+    #[cfg(feature = "pq-experimental")]
+    pub fn cosign(
+        key: &crate::hybrid_signature::HybridSigningKey,
+        signer: u8,
+        chain_id: &str,
+        height: u64,
+        block_hash: &str,
+    ) -> Self {
+        let signature = key
+            .sign(SIGNING_DOMAIN_V3, &checkpoint_body(chain_id, height, block_hash))
+            .expect("the checkpoint domain is a valid ML-DSA context");
+        let (ed25519, mldsa) = signature.to_hex_parts();
+        Self {
+            version: SIGNED_CHECKPOINT_COSIGNED_VERSION,
+            chain_id: chain_id.to_string(),
+            height,
+            block_hash: block_hash.to_string(),
+            signature: String::new(),
+            mldsa_signature: None,
+            cosignatures: vec![Cosignature {
+                signer,
+                ed25519,
+                mldsa,
+            }],
+        }
+    }
+
+    /// Las claves que firmaron una versión 3, en orden.
+    pub fn signers(&self) -> impl Iterator<Item = u8> + '_ {
+        self.cosignatures.iter().map(|cosignature| cosignature.signer)
+    }
+
+    /// Suma las firmas de `other` que este no tiene, si los dos son la
+    /// versión 3 del mismo bloque de la misma cadena. Devuelve si sumó alguna.
+    pub fn merge(&mut self, other: &SignedCheckpoint) -> bool {
+        if self.version != SIGNED_CHECKPOINT_COSIGNED_VERSION
+            || !self.same_block(other)
+            || other.version != SIGNED_CHECKPOINT_COSIGNED_VERSION
+        {
+            return false;
+        }
+        let mut added = false;
+        for cosignature in &other.cosignatures {
+            if let Err(at) = self
+                .cosignatures
+                .binary_search_by_key(&cosignature.signer, |held| held.signer)
+            {
+                self.cosignatures.insert(at, cosignature.clone());
+                added = true;
+            }
+        }
+        added
+    }
+
+    fn same_block(&self, other: &SignedCheckpoint) -> bool {
+        self.chain_id == other.chain_id
+            && self.height == other.height
+            && self.block_hash == other.block_hash
     }
 
     /// Versión 2: las dos firmas sobre el mismo mensaje.
@@ -257,12 +478,44 @@ impl SignedCheckpoint {
             block_hash: block_hash.to_string(),
             signature: ed25519,
             mldsa_signature: Some(mldsa),
+            cosignatures: Vec::new(),
         }
     }
 
     /// Forma, sin la firma: lo que se puede revisar antes de saber la clave.
     pub fn validate_shape(&self) -> Result<(), CheckpointError> {
+        let cosigned = self.version == SIGNED_CHECKPOINT_COSIGNED_VERSION;
+        if cosigned {
+            #[cfg(feature = "pq-experimental")]
+            {
+                if !self.signature.is_empty() {
+                    return Err(CheckpointError::Malformed("signature"));
+                }
+                if self.mldsa_signature.is_some() {
+                    return Err(CheckpointError::Malformed("mldsa_signature"));
+                }
+                // En orden de clave y sin repetir: cada clave cuenta una vez.
+                if self.cosignatures.is_empty()
+                    || self.cosignatures.len() > MAX_COSIGNERS
+                    || !self.cosignatures.windows(2).all(|pair| pair[0].signer < pair[1].signer)
+                {
+                    return Err(CheckpointError::Malformed("cosignatures"));
+                }
+                if self.cosignatures.iter().any(|cosignature| {
+                    cosignature.ed25519.len() != 128
+                        || cosignature.mldsa.len() != MLDSA_SIGNATURE_HEX_LEN
+                }) {
+                    return Err(CheckpointError::Malformed("cosignature"));
+                }
+            }
+            #[cfg(not(feature = "pq-experimental"))]
+            return Err(CheckpointError::Version(self.version));
+        } else if !self.cosignatures.is_empty() {
+            return Err(CheckpointError::Malformed("cosignatures"));
+        }
         match (self.version, &self.mldsa_signature) {
+            #[cfg(feature = "pq-experimental")]
+            (SIGNED_CHECKPOINT_COSIGNED_VERSION, _) => {}
             (SIGNED_CHECKPOINT_VERSION, None) => {}
             (SIGNED_CHECKPOINT_VERSION, Some(_)) => {
                 return Err(CheckpointError::Malformed("mldsa_signature"))
@@ -288,14 +541,67 @@ impl SignedCheckpoint {
         if !is_block_hash(&self.block_hash) {
             return Err(CheckpointError::Malformed("block_hash"));
         }
-        if self.signature.len() != 128 {
+        if !cosigned && self.signature.len() != 128 {
             return Err(CheckpointError::Malformed("signature"));
         }
         Ok(())
     }
 
+    /// Versión 3: que cada firma sea de una clave de la autoridad y valga.
+    /// Devuelve cuántas son, alcancen o no; [`verify`](Self::verify) exige
+    /// además el umbral. Es lo que se revisa antes de guardar una parcial.
+    pub fn verify_cosignatures(&self, authority: &AuthorityKeys) -> Result<usize, CheckpointError> {
+        self.validate_shape()?;
+        if self.version != SIGNED_CHECKPOINT_COSIGNED_VERSION {
+            return Err(if authority.is_cosigned() {
+                CheckpointError::CosignedRequired
+            } else {
+                CheckpointError::Version(self.version)
+            });
+        }
+        #[cfg(feature = "pq-experimental")]
+        {
+            let cosigners = authority
+                .cosigners
+                .as_ref()
+                .ok_or(CheckpointError::NotCosigned)?;
+            let body = checkpoint_body(&self.chain_id, self.height, &self.block_hash);
+            for cosignature in &self.cosignatures {
+                let key = cosigners
+                    .keys
+                    .get(usize::from(cosignature.signer))
+                    .ok_or(CheckpointError::Malformed("signer"))?;
+                let signature = crate::hybrid_signature::HybridSignature::from_hex_parts(
+                    &cosignature.ed25519,
+                    &cosignature.mldsa,
+                )
+                .map_err(|_| CheckpointError::Malformed("cosignature"))?;
+                key.verify(SIGNING_DOMAIN_V3, &body, &signature)
+                    .map_err(|_| CheckpointError::BadSignature)?;
+            }
+            Ok(self.cosignatures.len())
+        }
+        #[cfg(not(feature = "pq-experimental"))]
+        Err(CheckpointError::Version(self.version))
+    }
+
     pub fn verify(&self, authority: &AuthorityKeys) -> Result<(), CheckpointError> {
         self.validate_shape()?;
+        #[cfg(feature = "pq-experimental")]
+        if let Some(cosigners) = &authority.cosigners {
+            let have = self.verify_cosignatures(authority)?;
+            return if have >= cosigners.threshold {
+                Ok(())
+            } else {
+                Err(CheckpointError::Incomplete {
+                    have,
+                    need: cosigners.threshold,
+                })
+            };
+        }
+        if self.version == SIGNED_CHECKPOINT_COSIGNED_VERSION {
+            return Err(CheckpointError::NotCosigned);
+        }
         if self.version == SIGNED_CHECKPOINT_VERSION {
             if authority.requires_hybrid() {
                 return Err(CheckpointError::HybridRequired);
@@ -389,10 +695,67 @@ pub fn authority_keys_for_chain(chain_id: &str) -> Option<AuthorityKeys> {
             Some(text) => Some(parse_mldsa_public_key(&text)?),
             None => None,
         };
-        authority_policy(chain_id, AuthorityKeys { ed25519, mldsa })
+        let keys = AuthorityKeys {
+            ed25519,
+            mldsa,
+            cosigners: None,
+        };
+        let keys = match cosigners_for_chain(chain_id, &keys).ok()? {
+            Some(cosigners) => AuthorityKeys::cosigned(cosigners),
+            None => keys,
+        };
+        authority_policy(chain_id, keys)
     }
     #[cfg(not(feature = "pq-experimental"))]
     authority_policy(chain_id, AuthorityKeys::ed25519_only(ed25519))
+}
+
+/// El conjunto de k de n de `chain_id`, con `first` como primera clave: el de
+/// [`AUTHORITY_THRESHOLD_ENV`] y [`AUTHORITY_COSIGNERS_ENV`] en una red local
+/// de prueba, o el de `economics::CHECKPOINT_AUTHORITY_COSIGNERS`. `Err` si hay
+/// uno y no es válido: entonces la cadena no acepta nada, mejor que aceptar
+/// con menos firmas por un error.
+#[cfg(feature = "pq-experimental")]
+fn cosigners_for_chain(chain_id: &str, first: &AuthorityKeys) -> Result<Option<Cosigners>, ()> {
+    let configured = std::env::var(AUTHORITY_THRESHOLD_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let (threshold, others): (usize, Vec<(String, String)>) = match configured {
+        Some(threshold) => {
+            let others = std::env::var(AUTHORITY_COSIGNERS_ENV).unwrap_or_default();
+            let others = others
+                .split(',')
+                .filter(|pair| !pair.trim().is_empty())
+                .map(|pair| {
+                    pair.split_once(':')
+                        .map(|(ed, mldsa)| (ed.trim().to_string(), mldsa.trim().to_string()))
+                        .ok_or(())
+                })
+                .collect::<Result<_, _>>()?;
+            (threshold.trim().parse().map_err(drop)?, others)
+        }
+        None => match crate::economics::CHECKPOINT_AUTHORITY_COSIGNERS
+            .iter()
+            .find(|(chain, _, _)| *chain == chain_id)
+        {
+            Some((_, threshold, others)) => (
+                *threshold,
+                others
+                    .iter()
+                    .map(|(ed, mldsa)| (ed.to_string(), mldsa.to_string()))
+                    .collect(),
+            ),
+            None => return Ok(None),
+        },
+    };
+    let mut keys = vec![first.hybrid().ok_or(())?];
+    for (ed, mldsa) in others {
+        keys.push(crate::hybrid_signature::HybridVerifyingKey::from_parts(
+            parse_public_key(&ed).ok_or(())?,
+            parse_mldsa_public_key(&mldsa).ok_or(())?,
+        ));
+    }
+    Cosigners::new(keys, threshold).map(Some).ok_or(())
 }
 
 /// Zoka Quantic exige firmas híbridas desde el génesis: una cadena de Quantic
@@ -417,6 +780,10 @@ pub struct CheckpointSigner {
     pub ed25519: SigningKey,
     #[cfg(feature = "pq-experimental")]
     pub hybrid: Option<crate::hybrid_signature::HybridSigningKey>,
+    /// Su lugar entre las claves de una autoridad de k de n
+    /// ([`AuthorityKeys::member`]): firma la versión 3 con ese índice.
+    #[cfg(feature = "pq-experimental")]
+    pub cosigner: Option<u8>,
     /// Firma también la versión 1 para los nodos que todavía no conocen la
     /// clave ML-DSA (los de Zenith anteriores a la etapa 6).
     pub legacy_v1: bool,
@@ -428,6 +795,8 @@ impl CheckpointSigner {
             ed25519,
             #[cfg(feature = "pq-experimental")]
             hybrid: None,
+            #[cfg(feature = "pq-experimental")]
+            cosigner: None,
             legacy_v1: true,
         }
     }
@@ -442,6 +811,14 @@ impl CheckpointSigner {
         block_hash: &str,
     ) -> Vec<SignedCheckpoint> {
         let mut out = Vec::new();
+        // k de n: solo la versión 3, con la clave de este firmante.
+        #[cfg(feature = "pq-experimental")]
+        if authority.cosigners.is_some() {
+            if let (Some(hybrid), Some(signer)) = (&self.hybrid, self.cosigner) {
+                out.push(SignedCheckpoint::cosign(hybrid, signer, chain_id, height, block_hash));
+            }
+            return out;
+        }
         #[cfg(feature = "pq-experimental")]
         if let Some(hybrid) = &self.hybrid {
             out.push(SignedCheckpoint::sign_hybrid(hybrid, chain_id, height, block_hash));
@@ -521,11 +898,27 @@ pub fn accept_signed_checkpoint(
             actual: checkpoint.chain_id.clone(),
         });
     }
+    #[cfg(feature = "pq-experimental")]
+    if let Some(cosigners) = &authority.cosigners {
+        return accept_cosigned(storage, checkpoint, authority, cosigners);
+    }
     checkpoint.verify(authority)?;
+    if let Some(known) = against_accepted(storage, checkpoint)? {
+        return Ok(known);
+    }
+    store_accepted(storage, checkpoint)
+}
 
+/// Lo que ya se aceptó decide sin mirar las firmas: la misma altura con el
+/// mismo hash ya se conoce, con otro es un conflicto, y una más baja que la
+/// vigente es vieja. `None`: es nuevo.
+fn against_accepted(
+    storage: &RocksDbStorage,
+    checkpoint: &SignedCheckpoint,
+) -> Result<Option<Acceptance>, CheckpointError> {
     if let Some(at_height) = read(storage, &by_height_key(checkpoint.height))? {
         return if at_height.block_hash == checkpoint.block_hash {
-            Ok(Acceptance::AlreadyKnown)
+            Ok(Some(Acceptance::AlreadyKnown))
         } else {
             Err(CheckpointError::Conflict {
                 height: checkpoint.height,
@@ -542,7 +935,107 @@ pub fn accept_signed_checkpoint(
             });
         }
     }
+    Ok(None)
+}
 
+/// k de n. Cada firma tiene que valer, sean las que sean. Se suman a las que
+/// este nodo ya tenía de ese bloque; si llegan al umbral, es el checkpoint
+/// vigente, y si no, se guardan para reenviarlas.
+#[cfg(feature = "pq-experimental")]
+fn accept_cosigned(
+    storage: &RocksDbStorage,
+    checkpoint: &SignedCheckpoint,
+    authority: &AuthorityKeys,
+    cosigners: &Cosigners,
+) -> Result<Acceptance, CheckpointError> {
+    checkpoint.verify_cosignatures(authority)?;
+    if let Some(known) = against_accepted(storage, checkpoint)? {
+        return Ok(known);
+    }
+    let mut partials = partial_checkpoints(storage)?;
+    let held = partials.iter().position(|partial| partial.same_block(checkpoint));
+    let (merged, added) = match held {
+        Some(index) => {
+            let mut merged = partials.remove(index);
+            let added = merged.merge(checkpoint);
+            (merged, added)
+        }
+        None => (checkpoint.clone(), true),
+    };
+    if merged.cosignatures.len() >= cosigners.threshold {
+        let accepted = store_accepted(storage, &merged)?;
+        partials.retain(|partial| partial.height > merged.height);
+        write_partials(storage, &partials)?;
+        return Ok(accepted);
+    }
+    partials.push(merged);
+    partials.sort_by(|a, b| b.height.cmp(&a.height));
+    partials.truncate(MAX_PARTIALS);
+    write_partials(storage, &partials)?;
+    Ok(if added {
+        Acceptance::Partial
+    } else {
+        Acceptance::AlreadyKnown
+    })
+}
+
+/// Las firmas parciales que este nodo tiene, la más alta primero. Se
+/// verificaron al guardarse; el nodo las reenvía a sus pares.
+#[cfg(feature = "pq-experimental")]
+pub fn partial_checkpoints(
+    storage: &RocksDbStorage,
+) -> Result<Vec<SignedCheckpoint>, CheckpointError> {
+    match storage
+        .get_raw(PARTIALS_KEY)
+        .map_err(|e| CheckpointError::Storage(e.to_string()))?
+    {
+        Some(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|e| CheckpointError::Storage(e.to_string()))
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+#[cfg(feature = "pq-experimental")]
+fn write_partials(
+    storage: &RocksDbStorage,
+    partials: &[SignedCheckpoint],
+) -> Result<(), CheckpointError> {
+    let bytes = serde_json::to_vec(partials).map_err(|e| CheckpointError::Storage(e.to_string()))?;
+    storage
+        .put_raw(PARTIALS_KEY, bytes)
+        .map_err(|e| CheckpointError::Storage(e.to_string()))
+}
+
+/// La última altura que este nodo firmó como una de las claves de k de n.
+#[cfg(feature = "pq-experimental")]
+pub fn last_own_cosignature(storage: &RocksDbStorage) -> Result<Option<u64>, CheckpointError> {
+    let Some(bytes) = storage
+        .get_raw(OWN_COSIGNATURE_KEY)
+        .map_err(|e| CheckpointError::Storage(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let bytes: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| CheckpointError::Storage("own cosignature height".into()))?;
+    Ok(Some(u64::from_le_bytes(bytes)))
+}
+
+/// Se anota antes de soltar la firma. Un firmante no firma nunca dos veces la
+/// misma altura ni una más baja: si una reorganización le cambiara el bloque,
+/// dos hashes con su firma podrían completar dos checkpoints distintos.
+#[cfg(feature = "pq-experimental")]
+pub fn record_own_cosignature(storage: &RocksDbStorage, height: u64) -> Result<(), CheckpointError> {
+    storage
+        .put_raw(OWN_COSIGNATURE_KEY, height.to_le_bytes().to_vec())
+        .map_err(|e| CheckpointError::Storage(e.to_string()))
+}
+
+fn store_accepted(
+    storage: &RocksDbStorage,
+    checkpoint: &SignedCheckpoint,
+) -> Result<Acceptance, CheckpointError> {
     let bytes = serde_json::to_vec(checkpoint).map_err(|e| CheckpointError::Storage(e.to_string()))?;
     storage
         .put_raw(&by_height_key(checkpoint.height), bytes.clone())
@@ -565,6 +1058,17 @@ pub fn next_height_to_sign(tip: u64, last_signed: Option<u64>) -> Option<u64> {
         Some(last) if target < last.saturating_add(AUTHORITY_SIGN_INTERVAL) => None,
         _ => Some(target),
     }
+}
+
+/// Para una autoridad de k de n: las claves firman cada una por su lado y sus
+/// firmas solo se juntan si son del mismo bloque, así que todas firman las
+/// mismas alturas, los múltiplos de [`AUTHORITY_SIGN_INTERVAL`] que quedan
+/// [`AUTHORITY_CONFIRMATIONS`] por debajo de la punta. `last` es la más alta
+/// ya aceptada o firmada por este nodo.
+pub fn aligned_height_to_sign(tip: u64, last: Option<u64>) -> Option<u64> {
+    let below = tip.checked_sub(AUTHORITY_CONFIRMATIONS)?;
+    let target = below - below % AUTHORITY_SIGN_INTERVAL;
+    (target > 0 && last.map_or(true, |last| target > last)).then_some(target)
 }
 
 /// Lee la clave privada de la autoridad: 32 bytes en hex, o cifrada con la
@@ -822,7 +1326,13 @@ mod tests {
     fn la_forma_se_revisa_antes_de_la_firma() {
         let k = key(1);
         let mut cp = SignedCheckpoint::sign(&k, CHAIN, 100, &hash('a'));
+        cp.version = 4;
+        assert_eq!(cp.validate_shape(), Err(CheckpointError::Version(4)));
+        // Una v1 con el número de la 3: la 3 no lleva `signature`.
         cp.version = 3;
+        #[cfg(feature = "pq-experimental")]
+        assert_eq!(cp.validate_shape(), Err(CheckpointError::Malformed("signature")));
+        #[cfg(not(feature = "pq-experimental"))]
         assert_eq!(cp.validate_shape(), Err(CheckpointError::Version(3)));
         cp.version = 2;
         // Una versión 2 sin la mitad ML-DSA está mal formada (o, sin X-Wing ni
@@ -1001,10 +1511,7 @@ mod tests {
     #[cfg(feature = "pq-experimental")]
     fn hybrid_authority(byte: u8) -> AuthorityKeys {
         let public = hybrid(byte).verifying_key();
-        AuthorityKeys {
-            ed25519: *public.ed25519(),
-            mldsa: Some(public.mldsa().clone()),
-        }
+        AuthorityKeys::hybrid_key(*public.ed25519(), public.mldsa().clone())
     }
 
     #[cfg(feature = "pq-experimental")]
@@ -1106,6 +1613,7 @@ mod tests {
         let signer = CheckpointSigner {
             ed25519: key(5),
             hybrid: Some(hybrid(5)),
+            cosigner: None,
             legacy_v1: true,
         };
         let all = signer.sign_all(&authority, CHAIN, 180, &hash('c'));
@@ -1161,5 +1669,204 @@ mod tests {
         store_compat_checkpoint(&storage, &v1).unwrap();
         assert_eq!(latest_compat_checkpoint(&storage).unwrap(), Some(v1));
         assert_eq!(latest_signed_checkpoint(&storage).unwrap(), None);
+    }
+
+    /// Las claves 11, 12 y 13, dos de tres.
+    #[cfg(feature = "pq-experimental")]
+    fn two_of_three() -> AuthorityKeys {
+        let keys = [11, 12, 13].map(|byte| hybrid(byte).verifying_key()).to_vec();
+        AuthorityKeys::cosigned(Cosigners::new(keys, 2).unwrap())
+    }
+
+    #[cfg(feature = "pq-experimental")]
+    fn cosign(byte: u8, signer: u8, height: u64, block: char) -> SignedCheckpoint {
+        SignedCheckpoint::cosign(&hybrid(byte), signer, CHAIN, height, &hash(block))
+    }
+
+    #[cfg(feature = "pq-experimental")]
+    #[test]
+    fn dos_de_tres_firmas_hacen_el_checkpoint_y_una_sola_no() {
+        let authority = two_of_three();
+        let (storage, _dir) = storage();
+        let first = cosign(11, 0, 60, 'a');
+        assert_eq!(
+            first.verify(&authority),
+            Err(CheckpointError::Incomplete { have: 1, need: 2 })
+        );
+        assert_eq!(
+            accept_signed_checkpoint(&storage, CHAIN, &first, &authority),
+            Ok(Acceptance::Partial)
+        );
+        assert_eq!(latest_signed_checkpoint(&storage).unwrap(), None);
+        // La misma firma otra vez no suma nada.
+        assert_eq!(
+            accept_signed_checkpoint(&storage, CHAIN, &first, &authority),
+            Ok(Acceptance::AlreadyKnown)
+        );
+        assert_eq!(partial_checkpoints(&storage).unwrap(), vec![first.clone()]);
+
+        // La tercera clave sobre el mismo bloque completa el checkpoint, y el
+        // vigente lleva las dos firmas en orden de clave.
+        let third = cosign(13, 2, 60, 'a');
+        assert_eq!(
+            accept_signed_checkpoint(&storage, CHAIN, &third, &authority),
+            Ok(Acceptance::Accepted)
+        );
+        let latest = latest_signed_checkpoint(&storage).unwrap().unwrap();
+        assert_eq!(latest.signers().collect::<Vec<_>>(), vec![0, 2]);
+        latest.verify(&authority).unwrap();
+        assert!(partial_checkpoints(&storage).unwrap().is_empty());
+        // Así viaja: un nodo que lo recibe entero lo acepta de una vez.
+        let json = serde_json::to_string(&latest).unwrap();
+        assert!(!json.contains("\"signature\"") && !json.contains("mldsa_signature"));
+        let (other, _dir2) = super::tests::storage();
+        let travelled: SignedCheckpoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            accept_signed_checkpoint(&other, CHAIN, &travelled, &authority),
+            Ok(Acceptance::Accepted)
+        );
+        // La segunda clave, tarde: ya se conoce.
+        assert_eq!(
+            accept_signed_checkpoint(&storage, CHAIN, &cosign(12, 1, 60, 'a'), &authority),
+            Ok(Acceptance::AlreadyKnown)
+        );
+        // Dos claves sobre otro bloque a la misma altura: conflicto.
+        let mut fork = cosign(11, 0, 60, 'b');
+        assert!(fork.merge(&cosign(12, 1, 60, 'b')));
+        assert!(matches!(
+            accept_signed_checkpoint(&storage, CHAIN, &fork, &authority),
+            Err(CheckpointError::Conflict { .. })
+        ));
+    }
+
+    #[cfg(feature = "pq-experimental")]
+    #[test]
+    fn una_clave_ajena_repetida_o_mal_numerada_no_cuenta() {
+        let authority = two_of_three();
+        let (storage, _dir) = storage();
+        // Una clave que no es de la autoridad, con el número de una que sí.
+        let mut outsider = cosign(11, 0, 60, 'a');
+        outsider.cosignatures.push(cosign(99, 1, 60, 'a').cosignatures.remove(0));
+        assert_eq!(outsider.verify(&authority), Err(CheckpointError::BadSignature));
+        assert_eq!(
+            accept_signed_checkpoint(&storage, CHAIN, &outsider, &authority),
+            Err(CheckpointError::BadSignature)
+        );
+        // La misma clave dos veces no son dos firmas.
+        let mut twice = cosign(11, 0, 60, 'a');
+        twice.cosignatures.push(cosign(11, 0, 60, 'a').cosignatures.remove(0));
+        assert_eq!(twice.verify(&authority), Err(CheckpointError::Malformed("cosignatures")));
+        // Ni fuera de orden, ni con un número que no existe.
+        let mut unordered = cosign(12, 1, 60, 'a');
+        unordered.cosignatures.push(cosign(11, 0, 60, 'a').cosignatures.remove(0));
+        assert_eq!(
+            unordered.verify(&authority),
+            Err(CheckpointError::Malformed("cosignatures"))
+        );
+        assert_eq!(
+            cosign(11, 3, 60, 'a').verify(&authority),
+            Err(CheckpointError::Malformed("signer"))
+        );
+        // La firma de la clave 0 no sirve como la de la 1.
+        assert_eq!(
+            cosign(11, 1, 60, 'a').verify(&authority),
+            Err(CheckpointError::BadSignature)
+        );
+        // Nada de esto quedó guardado.
+        assert!(partial_checkpoints(&storage).unwrap().is_empty());
+        // Ni una clave repetida en el conjunto, ni un umbral imposible.
+        let same = vec![hybrid(11).verifying_key(), hybrid(11).verifying_key()];
+        assert!(Cosigners::new(same, 1).is_none());
+        let keys = [11, 12].map(|byte| hybrid(byte).verifying_key()).to_vec();
+        assert!(Cosigners::new(keys.clone(), 0).is_none());
+        assert!(Cosigners::new(keys, 3).is_none());
+    }
+
+    #[cfg(feature = "pq-experimental")]
+    #[test]
+    fn cada_autoridad_acepta_solo_su_version() {
+        let cosigned = two_of_three();
+        let single = hybrid_authority(11);
+        let v2 = SignedCheckpoint::sign_hybrid(&hybrid(11), CHAIN, 60, &hash('a'));
+        assert_eq!(v2.verify(&cosigned), Err(CheckpointError::CosignedRequired));
+        let mut both = cosign(11, 0, 60, 'a');
+        assert!(both.merge(&cosign(12, 1, 60, 'a')));
+        both.verify(&cosigned).unwrap();
+        assert_eq!(both.verify(&single), Err(CheckpointError::NotCosigned));
+        // Con uno de uno, una sola firma de la versión 3 alcanza.
+        let one = AuthorityKeys::cosigned(
+            Cosigners::new(vec![hybrid(11).verifying_key()], 1).unwrap(),
+        );
+        cosign(11, 0, 60, 'a').verify(&one).unwrap();
+        // La versión 3 no lleva los campos de la 2.
+        let mut mixed = cosign(11, 0, 60, 'a');
+        mixed.mldsa_signature = v2.mldsa_signature.clone();
+        assert_eq!(mixed.verify(&one), Err(CheckpointError::Malformed("mldsa_signature")));
+        let mut mixed = cosign(11, 0, 60, 'a');
+        mixed.signature = v2.signature.clone();
+        assert_eq!(mixed.verify(&one), Err(CheckpointError::Malformed("signature")));
+        let mut mixed = v2.clone();
+        mixed.cosignatures = cosign(11, 0, 60, 'a').cosignatures;
+        assert_eq!(mixed.verify(&single), Err(CheckpointError::Malformed("cosignatures")));
+        // Y el miembro de cada clave.
+        assert_eq!(cosigned.member(&hybrid(13).verifying_key()), Some(2));
+        assert_eq!(cosigned.member(&hybrid(14).verifying_key()), None);
+        assert_eq!(single.member(&hybrid(11).verifying_key()), Some(0));
+        assert_eq!(single.member(&hybrid(12).verifying_key()), None);
+    }
+
+    #[cfg(feature = "pq-experimental")]
+    #[test]
+    fn las_parciales_guardadas_son_pocas_y_las_mas_altas() {
+        let authority = two_of_three();
+        let (storage, _dir) = storage();
+        for step in 1..=(MAX_PARTIALS as u64 + 3) {
+            assert_eq!(
+                accept_signed_checkpoint(&storage, CHAIN, &cosign(11, 0, step * 30, 'a'), &authority),
+                Ok(Acceptance::Partial)
+            );
+        }
+        let held = partial_checkpoints(&storage).unwrap();
+        assert_eq!(held.len(), MAX_PARTIALS);
+        assert_eq!(held[0].height, (MAX_PARTIALS as u64 + 3) * 30);
+        assert_eq!(held.last().unwrap().height, 4 * 30);
+        // Completar una altura descarta las parciales de abajo y las viejas
+        // dejan de entrar.
+        accept_signed_checkpoint(&storage, CHAIN, &cosign(12, 1, 6 * 30, 'a'), &authority).unwrap();
+        assert_eq!(latest_signed_checkpoint(&storage).unwrap().unwrap().height, 180);
+        assert!(partial_checkpoints(&storage).unwrap().iter().all(|p| p.height > 180));
+        assert!(matches!(
+            accept_signed_checkpoint(&storage, CHAIN, &cosign(12, 1, 150, 'a'), &authority),
+            Err(CheckpointError::Stale { .. })
+        ));
+    }
+
+    #[cfg(feature = "pq-experimental")]
+    #[test]
+    fn el_firmador_de_k_de_n_firma_solo_alturas_alineadas_y_una_vez() {
+        assert_eq!(aligned_height_to_sign(35, None), None);
+        assert_eq!(aligned_height_to_sign(36, None), Some(30));
+        assert_eq!(aligned_height_to_sign(65, None), Some(30));
+        assert_eq!(aligned_height_to_sign(65, Some(30)), None);
+        assert_eq!(aligned_height_to_sign(66, Some(30)), Some(60));
+        assert_eq!(aligned_height_to_sign(200, Some(60)), Some(180));
+        let (storage, _dir) = storage();
+        assert_eq!(last_own_cosignature(&storage).unwrap(), None);
+        record_own_cosignature(&storage, 180).unwrap();
+        assert_eq!(last_own_cosignature(&storage).unwrap(), Some(180));
+
+        // Cada firmante firma con su número; uno que no es del conjunto, nada.
+        let authority = two_of_three();
+        let mut signer = CheckpointSigner::ed25519_only(key(12));
+        signer.hybrid = Some(hybrid(12));
+        signer.cosigner = authority.member(&hybrid(12).verifying_key());
+        signer.legacy_v1 = false;
+        let signed = signer.sign_all(&authority, CHAIN, 60, &hash('a'));
+        assert_eq!(signed.len(), 1);
+        assert_eq!(signed[0].version, SIGNED_CHECKPOINT_COSIGNED_VERSION);
+        assert_eq!(signed[0].signers().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(signed[0].verify_cosignatures(&authority), Ok(1));
+        signer.cosigner = None;
+        assert!(signer.sign_all(&authority, CHAIN, 60, &hash('a')).is_empty());
     }
 }

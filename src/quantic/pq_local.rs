@@ -206,20 +206,18 @@ impl Chain {
         }
         let (inputs, fee, change) =
             inputs_for(&account, &position.ledger, &position.spendable, amount)?;
-        let mut payments = vec![Payment::new(destination, amount)];
-        if change > 0 {
-            payments.push(Payment::new(account.address(), change));
-        }
-        let expiry = u32::try_from(position.height)
-            .unwrap_or(u32::MAX)
-            .saturating_add(40);
+        // Every transfer has two outputs: the change goes back even when it
+        // is worth nothing.
+        let payments = vec![
+            Payment::new(destination, amount),
+            Payment::new(account.address(), change),
+        ];
         let payment = transfer(
             &account,
             position.ledger.tree.root(),
             inputs,
             payments,
             fee,
-            expiry,
         )
         .map_err(|e| format!("no pude armar el pago: {e}"))?;
         let mut pool = stark::Mempool::default();
@@ -694,26 +692,35 @@ mod tests {
         let source = &position.spendable[0];
         let first = source.note.nullifier(&alice.spend, NETWORK).unwrap();
         let rho = |i| transfer_rho(NETWORK, first, i).unwrap();
-        let fee = conventional_fee(1, 3);
+        let fee = conventional_fee(1, 2);
         // The same note twice: same rho, so same nullifier for Bob (the
         // "Faerie Gold" attack). Output rhos are bound to their index, so the
-        // second copy cannot be proven.
+        // second copy cannot be proven. The second input only pads the shape.
         let (note, _) = encrypt_note(&bob.address(), ATOMS, &[0; 512], Some(&alice), rho(0)).unwrap();
-        let (change, _) = encrypt_note(
-            &alice.address(),
-            PREMINE - 2 * ATOMS - fee,
-            &[0; 512],
-            Some(&alice),
-            rho(2),
-        )
-        .unwrap();
+        let padding_key = protocol::model::SpendKey::from_seed(&[77; 32], NETWORK, 0).unwrap();
+        let padding = Input {
+            note: protocol::model::Note {
+                owner: padding_key.owner(NETWORK),
+                rho: protocol::crypto::Digest([5; protocol::crypto::WORDS]),
+                rcm: protocol::crypto::Digest([6; protocol::crypto::WORDS]),
+                value: 0,
+            },
+            key: padding_key,
+            path: protocol::model::MerklePath {
+                index: 0,
+                siblings: [protocol::crypto::Digest::ZERO; protocol::model::DEPTH],
+            },
+        };
         let witness = Witness {
-            inputs: vec![Input {
-                key: alice.spend.clone(),
-                note: source.note.clone(),
-                path: position.ledger.tree.path(source.index).unwrap(),
-            }],
-            outputs: vec![note.clone(), note, change],
+            inputs: vec![
+                Input {
+                    key: alice.spend.clone(),
+                    note: source.note.clone(),
+                    path: position.ledger.tree.path(source.index).unwrap(),
+                },
+                padding,
+            ],
+            outputs: vec![note.clone(), note],
         };
         let statement = Statement::from_witness(
             NETWORK,

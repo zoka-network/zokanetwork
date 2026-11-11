@@ -39,7 +39,7 @@ use zoka::{
     },
     state::chain::{apply_block, ChainError},
     storage::RocksDbStorage,
-    types::Block,
+    types::{Block, PublicKey, Signature},
 };
 
 const P: Profile = Profile::REGTEST;
@@ -147,7 +147,6 @@ fn node() -> Node {
             Payment::new(alice.address(), PREMINE - ATOMS - 200),
         ],
         200,
-        40,
     )
     .unwrap();
     Node {
@@ -242,7 +241,7 @@ fn deform_block(block: &mut Block, rng: &mut Rng) -> &'static str {
             "a longer state root"
         }
         6 => {
-            block.header.state_root = "quantic-v2:".into();
+            block.header.state_root = "quantic-v3:".into();
             "an empty state root"
         }
         7 => {
@@ -411,20 +410,55 @@ fn no_block_of_a_peer_breaks_the_node() {
     assert_sound(&node);
 }
 
-/// Found by the campaign above. A block's Merkle tree pairs its leaves and,
-/// when a level has an odd number, pairs the last one with itself. So a
-/// block whose leaves are odd in number and the same block with its last
-/// transaction repeated have one Merkle root, one header, one proof of
-/// work and one hash (what Bitcoin fixed as CVE-2012-2459).
-///
-/// Today it gives an attacker nothing, and this test holds that: the body
-/// with the repeated payment is refused on its own, and sent again under
-/// the hash of the block the node already has, it changes nothing the node
-/// stores. It stays a reason never to remember a block as bad by its hash
-/// alone. The fix (a tree that commits to its number of leaves) changes
-/// every block's hash, so it belongs with the next network reset.
+/// Found by the campaign above, fixed by the v3 protocol. A block's Merkle
+/// tree pairs its leaves and, when a level has an odd number, pairs the last
+/// one with itself: a block whose leaves are odd in number and the same block
+/// with its last leaf repeated shared one root, one header and one hash
+/// (Bitcoin's CVE-2012-2459). A v3 block's root also commits to how many
+/// leaves it has; blocks of the older chains keep the roots they had.
 #[test]
-fn a_body_that_shares_a_valid_block_s_hash_is_never_stored() {
+fn a_repeated_last_leaf_changes_a_v3_block_s_root() {
+    let block = |state_root: &str, leaves: usize| {
+        let mut block = Block::new(
+            "00".repeat(32),
+            1_700_000_000,
+            0,
+            1,
+            vec![],
+            PublicKey(vec![]),
+            Signature(vec![]),
+        );
+        block.header.state_root = state_root.into();
+        block.quantic_transactions = (0..leaves).map(|i| vec![i as u8; 40]).collect();
+        block
+    };
+    let repeated = |block: &Block| {
+        let mut twice = block.clone();
+        let last = twice.quantic_transactions.last().unwrap().clone();
+        twice.quantic_transactions.push(last);
+        twice
+    };
+    for leaves in [3, 5, 7] {
+        let v3 = block("quantic-v3:ab", leaves);
+        assert_ne!(
+            v3.compute_merkle_root(),
+            repeated(&v3).compute_merkle_root(),
+            "{leaves} leaves"
+        );
+        let v2 = block("quantic-v2:ab", leaves);
+        assert_eq!(
+            v2.compute_merkle_root(),
+            repeated(&v2).compute_merkle_root(),
+            "the older chains keep their roots"
+        );
+    }
+}
+
+/// So the body with the repeated payment no longer passes for the honest
+/// block: under the honest header it is refused, and the node stores only
+/// the honest body.
+#[test]
+fn a_body_with_a_repeated_payment_is_not_the_block() {
     let node = node();
     let storage = &node.state.storage;
     let honest = stark::mine(
@@ -436,17 +470,11 @@ fn a_body_that_shares_a_valid_block_s_hash_is_never_stored() {
         1_700_000_240,
     )
     .unwrap();
-    // One spent note and two transactions: three leaves.
-    assert_eq!(honest.private_nullifiers.len(), 1);
-    assert_eq!(honest.quantic_transactions.len(), 2);
     let mut twice = honest.clone();
     twice
         .quantic_transactions
         .push(honest.quantic_transactions[1].clone());
-    assert_eq!(twice.compute_merkle_root(), honest.header.merkle_root);
-    assert_eq!(twice.compute_hash(), honest.header.hash);
-
-    // Unknown to the node, the repeated payment is what it looks like.
+    assert_ne!(twice.compute_merkle_root(), honest.header.merkle_root);
     let refused = apply_block(storage, CHAIN, &twice);
     assert!(
         !matches!(
@@ -456,14 +484,7 @@ fn a_body_that_shares_a_valid_block_s_hash_is_never_stored() {
         "a block that pays twice was not refused"
     );
     assert!(storage.get_block(&honest.header.hash).unwrap().is_none());
-    // And having refused that body does not turn the node against the hash.
     apply_block(storage, CHAIN, &honest).unwrap();
-
-    // Known to the node, the other body is "a block it already has".
-    assert!(matches!(
-        apply_block(storage, CHAIN, &twice),
-        Err(ChainError::BlockAlreadyKnown(_))
-    ));
     let stored = storage.get_block(&honest.header.hash).unwrap().unwrap();
     assert_eq!(stored.quantic_transactions, honest.quantic_transactions);
     assert_sound(&node);

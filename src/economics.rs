@@ -136,8 +136,9 @@ pub const CHECKPOINT_AUTHORITY_KEYS: &[(&str, &str)] = &[
     // quantic-testnet`). La privada no sale de esa PC.
     (QUANTIC_TESTNET_CHAIN_ID, QUANTIC_TESTNET_AUTHORITY),
     // La testnet v2 (STARK) la reemplaza con la misma autoridad: la misma PC y
-    // las mismas claves. Cada firma lleva el chain id, así que un checkpoint de
-    // una cadena no sirve en la otra.
+    // las mismas claves, y la v3 a la v2. Cada firma lleva el chain id, así que
+    // un checkpoint de una cadena no sirve en la otra.
+    (QUANTIC_PQ_TESTNET_V2_CHAIN_ID, QUANTIC_TESTNET_AUTHORITY),
     (QUANTIC_PQ_TESTNET_CHAIN_ID, QUANTIC_TESTNET_AUTHORITY),
     (
         MAINNET_CHAIN_ID,
@@ -153,7 +154,21 @@ pub const CHECKPOINT_AUTHORITY_KEYS: &[(&str, &str)] = &[
 /// quantic-testnet` crea las dos mitades en la PC de la autoridad.
 pub const CHECKPOINT_AUTHORITY_MLDSA_KEYS: &[(&str, &str)] = &[
     (QUANTIC_TESTNET_CHAIN_ID, QUANTIC_TESTNET_AUTHORITY_MLDSA),
+    (QUANTIC_PQ_TESTNET_V2_CHAIN_ID, QUANTIC_TESTNET_AUTHORITY_MLDSA),
     (QUANTIC_PQ_TESTNET_CHAIN_ID, QUANTIC_TESTNET_AUTHORITY_MLDSA),
+];
+
+/// Autoridades de k de n (checkpoints de la versión 3), por cadena: cuántas
+/// firmas distintas hacen falta y las claves que no son la de
+/// `CHECKPOINT_AUTHORITY_KEYS` / `_MLDSA_KEYS` (que es la primera), como pares
+/// (Ed25519, ML-DSA-65) en hex. Una cadena de esta lista solo acepta la
+/// versión 3 (`docs/CHECKPOINTS-AUTORITATIVOS.md`, «Versión 3»).
+pub const CHECKPOINT_AUTHORITY_COSIGNERS: &[(&str, usize, &[(&str, &str)])] = &[
+    // La testnet v3 arranca con uno de uno, la clave de siempre, ya en el
+    // formato de k de n. Sumar firmantes (dos de tres) es agregar sus claves
+    // acá y en `zoka-light`, subir el umbral y sacar nodos y billeteras
+    // nuevos: lo decide el usuario, junto con dónde vive cada clave.
+    (QUANTIC_PQ_TESTNET_CHAIN_ID, 1, &[]),
 ];
 
 /// Las dos mitades de la clave de la autoridad de las testnets de Quantic.
@@ -448,17 +463,24 @@ pub const QUANTIC_MAINNET_CHAIN_ID: &str = "zoka-quantic-v1";
 pub const QUANTIC_TESTNET_CHAIN_ID: &str = "zoka-quantic-testnet-v1";
 /// Redes locales de prueba de Quantic: prueba de trabajo liviana.
 pub const QUANTIC_REGTEST_CHAIN_ID: &str = "zoka-quantic-regtest-v1";
-/// Separate chain identity: v1 peers must never follow a STARK test chain.
-pub const QUANTIC_PQ_REGTEST_CHAIN_ID: &str = "zoka-quantic-regtest-v2";
-/// La testnet que reemplaza a la v1 cuando salga el pool STARK: RandomX (XMRig)
-/// y la ASERT de la v1, con el pool postcuántico desde su primer bloque.
-pub const QUANTIC_PQ_TESTNET_CHAIN_ID: &str = "zoka-quantic-testnet-v2";
-/// El hash de su bloque 1, el del premine de 5.000.000 ZKA a la wallet del
-/// equipo: lo minó XMRig por el Stratum de la PC el 29/10/2026 a las 08:35:05
-/// (hora de Argentina). La ASERT se ancla en esa hora. Antes de fijarlo, quien
-/// minaba un bloque 1 armaba su propia cadena local.
-pub const QUANTIC_PQ_TESTNET_GENESIS: Option<&str> =
-    Some("69249437d8c35b7e4bf28ec524491fe18384b9869670fadff546fef29148fdb2");
+/// Separate chain identity: v1 peers must never follow a STARK test chain,
+/// nor v2 peers a v3 one (protocolo v3: tres formas de pago, comisión exacta,
+/// Keccak en la prueba, raíz de Merkle con la cantidad de hojas).
+pub const QUANTIC_PQ_REGTEST_CHAIN_ID: &str = "zoka-quantic-regtest-v3";
+/// La testnet que reemplaza a la v2 en el próximo reinicio: RandomX (XMRig) y
+/// la ASERT de siempre, con el protocolo v3 desde su primer bloque.
+pub const QUANTIC_PQ_TESTNET_CHAIN_ID: &str = "zoka-quantic-testnet-v3";
+/// El hash de su bloque 1 se fija al lanzarla, como el de la v2: hasta
+/// entonces, quien mina un bloque 1 arma su propia cadena local.
+pub const QUANTIC_PQ_TESTNET_GENESIS: Option<&str> = None;
+/// La testnet v2 (29/10/2026 al reinicio): su bloque 1 fue
+/// 69249437d8c35b7e4bf28ec524491fe18384b9869670fadff546fef29148fdb2. Un nodo v3
+/// no la sigue; queda su id para los checkpoints reales que se guardan como
+/// vectores de prueba y para abrir las billeteras que la nombran, que son las
+/// mismas claves en la v3.
+pub const QUANTIC_PQ_TESTNET_V2_CHAIN_ID: &str = "zoka-quantic-testnet-v2";
+/// La regtest de la v2, por lo mismo.
+pub const QUANTIC_PQ_REGTEST_V2_CHAIN_ID: &str = "zoka-quantic-regtest-v2";
 
 /// El byte de red del pool STARK (`zoka-pq-pool`) de una cadena v2.
 pub fn stark_pool_network(chain_id: &str) -> Option<u8> {

@@ -51,8 +51,9 @@ pub const DB_MARKER: &str = "quantic:stark:chain-id";
 pub const MAX_BLOCK_REQUEST_BYTES: usize =
     2 * stark::protocol::ledger::MAX_BLOCK_BYTES + 1024 * 1024;
 pub const MAX_CRYPTO_WORKERS: usize = 2;
-/// A hybrid checkpoint is about 7 KB of JSON (the ML-DSA half is 6,618 hex).
-pub const MAX_CHECKPOINT_BYTES: usize = 16 * 1024;
+/// A hybrid signature is about 7 KB of JSON (the ML-DSA half is 6,618 hex),
+/// and a cosigned checkpoint carries up to `MAX_COSIGNERS` (8) of them.
+pub const MAX_CHECKPOINT_BYTES: usize = 64 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// Summaries per `/blocks/recent` request.
 pub const MAX_RECENT_BLOCKS: usize = 25;
@@ -159,6 +160,13 @@ impl NodeState {
     /// The latest accepted checkpoint. Hold `gate`.
     pub fn latest_checkpoint(&self) -> Result<Option<SignedCheckpoint>, String> {
         checkpoint_authority::latest_signed_checkpoint(&self.storage).map_err(|e| e.to_string())
+    }
+
+    /// Partial signatures of a k-of-n authority this node holds, highest
+    /// first: verified when kept, and pushed to peers until they add up.
+    /// Hold `gate`.
+    pub fn partial_checkpoints(&self) -> Result<Vec<SignedCheckpoint>, String> {
+        checkpoint_authority::partial_checkpoints(&self.storage).map_err(|e| e.to_string())
     }
 
     /// Whether the canonical chain holds `checkpoint` (false while it is
@@ -1580,7 +1588,9 @@ async fn latest_checkpoint(
 }
 
 /// Verified like one from a peer: this is how a checkpoint signed by hand
-/// (`quantic-pq-node checkpoint-sign`) enters the network.
+/// (`quantic-pq-node checkpoint-sign`) enters the network. With a k-of-n
+/// authority each key holder posts their own signature; the node adds them up
+/// (`"partial": true` until there are enough) and relays them.
 async fn submit_checkpoint(
     State(state): State<NodeState>,
     Extension(permit): Extension<WorkPermit>,
@@ -1594,7 +1604,8 @@ async fn submit_checkpoint(
         let _gate = state.gate.lock().map_err(|_| ApiError::internal("node gate poisoned"))?;
         let accepted = state.accept_checkpoint(&checkpoint).map_err(ApiError::invalid)?;
         json_response(StatusCode::OK, &serde_json::json!({
-            "accepted":true,"already_known":accepted == Acceptance::AlreadyKnown,
+            "accepted":accepted != Acceptance::Partial,"partial":accepted == Acceptance::Partial,
+            "already_known":accepted == Acceptance::AlreadyKnown,
             "height":checkpoint.height,"block_hash":checkpoint.block_hash,
             "followed":state.follows(&checkpoint).map_err(ApiError::internal)?,
         }))
@@ -2045,7 +2056,6 @@ mod tests {
                     Payment::new(alice.address(), PREMINE - ATOMS - 200),
                 ],
                 200,
-                10,
             )
             .unwrap()
         })

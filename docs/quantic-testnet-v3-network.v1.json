@@ -1,0 +1,14 @@
+{
+  "schema": "zoka-quantic-stark-network-v1",
+  "status": "pre-genesis",
+  "chain_id": "zoka-quantic-testnet-v3",
+  "alpn": "/zoka/quantic-stark/3",
+  "transport": "iroh QUIC with mandatory X25519MLKEM768 TLS and an ML-DSA-65 server signature bound to each connection. Relays and address lookup by n0, so no node needs an open port; seeds with a public IP and a fixed UDP port (--bind) also list it, and are reached without n0.",
+  "seed_nodes": [],
+  "notes": [
+    "Zoka Quantic Testnet v3: the protocol of the review of 2026-11-10. Every payment spends 2, 4 or 8 notes (padded with notes worth nothing) and creates 2, pays the exact fee of its shape and names no expiry; the proof commits with Keccak; a block's Merkle root commits to its number of leaves. Test coins with no value. It replaces the v2 testnet.",
+    "Pre-genesis: the seeds get their v3 identities, and this list its descriptors, when the network is launched.",
+    "A seed is pinned by its iroh endpoint id and the key id (blake3) of its ML-DSA-65 public key; `quantic-pq-node identity` prints both.",
+    "Peers learned from other nodes are dialed and authenticated before they are shared. Blocks are validated locally whoever serves them."
+  ]
+}

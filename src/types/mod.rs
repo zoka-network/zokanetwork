@@ -249,6 +249,10 @@ pub struct PrivateCoinbaseOutput {
 /// transactions are referenced by hash only. A future height-gated format
 /// also carries their serialized bodies as bytes, keeping this type free of
 /// a cyclic dependency on the private wallet module.
+/// The `state_root` prefix of a STARK v3 block (protocolo v3). Its Merkle
+/// root also commits to how many leaves it has: see `compute_merkle_root`.
+pub const STARK_V3_STATE_PREFIX: &str = "quantic-v3:";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Block {
     pub header: BlockHeader,
@@ -484,6 +488,10 @@ impl Block {
             hashes.push(hasher.finalize().to_vec());
         }
 
+        // An odd level pairs its last node with itself, so a block and the
+        // same block with its last leaf repeated would share a root (Bitcoin's
+        // CVE-2012-2459). A STARK v3 block commits to its number of leaves too.
+        let leaves = hashes.len() as u64;
         while hashes.len() > 1 {
             let mut next_level = Vec::new();
             for chunk in hashes.chunks(2) {
@@ -499,6 +507,13 @@ impl Block {
             hashes = next_level;
         }
 
+        if self.header.state_root.starts_with(STARK_V3_STATE_PREFIX) {
+            let mut hasher = Sha256::new();
+            hasher.update(b"zoka-merkle-leaves-v1:");
+            hasher.update(leaves.to_le_bytes());
+            hasher.update(&hashes[0]);
+            return format!("{:x}", hasher.finalize());
+        }
         format!("{:x}", sha2::Sha256::digest(&hashes[0]))
     }
 

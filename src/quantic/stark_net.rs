@@ -49,11 +49,11 @@ use stark::protocol::{
     transaction::{Transaction, MAX_TRANSACTION_BYTES},
 };
 
-pub const ALPN: &[u8] = b"/zoka/quantic-stark/2";
+pub const ALPN: &[u8] = b"/zoka/quantic-stark/3";
 pub const DESCRIPTOR_VERSION: u8 = 3;
 pub const MAX_BLOCK_WIRE_BYTES: usize = 2 * stark::protocol::ledger::MAX_BLOCK_BYTES + 1024 * 1024;
-const MAGIC: &[u8; 4] = b"ZQS2";
-const AUTH_CONTEXT: &[u8] = b"zoka-quantic-stark-server-v2";
+const MAGIC: &[u8; 4] = b"ZQS3";
+const AUTH_CONTEXT: &[u8] = b"zoka-quantic-stark-server-v3";
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-ZOKA-QUANTIC-STARK-v2";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Block requests sent before their answers are read (see `fetch_and_import`).
@@ -699,6 +699,7 @@ fn handle_request(state: &NodeState, tag: u8, body: &[u8]) -> Result<Vec<u8>, St
             Ok(match state.accept_checkpoint(&checkpoint)? {
                 Acceptance::Accepted => b"accepted".to_vec(),
                 Acceptance::AlreadyKnown => b"known".to_vec(),
+                Acceptance::Partial => b"partial".to_vec(),
             })
         }
         _ => Err("unknown STARK request".into()),
@@ -1562,7 +1563,6 @@ mod tests {
                     Payment::new(alice.address(), PREMINE - ATOMS - 200),
                 ],
                 200,
-                20,
             )
             .map_err(err)
         })
@@ -1754,10 +1754,10 @@ mod tests {
         )
         .unwrap();
         let public = key.verifying_key();
-        let keys = crate::checkpoint_authority::AuthorityKeys {
-            ed25519: *public.ed25519(),
-            mldsa: Some(public.mldsa().clone()),
-        };
+        let keys = crate::checkpoint_authority::AuthorityKeys::hybrid_key(
+            *public.ed25519(),
+            public.mldsa().clone(),
+        );
         (key, keys)
     }
 

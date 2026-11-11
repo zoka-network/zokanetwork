@@ -63,6 +63,8 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const RETRY_MIN: Duration = Duration::from_secs(5);
 const RETRY_MAX: Duration = Duration::from_secs(300);
 const AUTHORITY_TICK: Duration = Duration::from_secs(10);
+/// Partial signatures one session remembers having pushed.
+const MAX_PUSHED_PARTIALS: usize = 64;
 
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -369,19 +371,32 @@ async fn head(state: &NodeState) -> Result<Head, String> {
     with_state(state, stark_net::head).await
 }
 
+/// What one session already did with checkpoints.
+#[derive(Default)]
+struct CheckpointRelay {
+    /// A checkpoint this node refused from this peer: not fetched again.
+    refused: Option<u64>,
+    /// Partial signatures already pushed to this peer: block and signers.
+    pushed: BTreeSet<(u64, String, Vec<u8>)>,
+}
+
 /// Bring the newer of the two latest checkpoints to the side that lacks it.
 /// Runs before blocks move, so a fresh checkpoint already constrains the pull.
 /// A checkpoint this node rejected is not fetched again from this session.
+/// Offering, it also pushes the partial signatures of a k-of-n authority it
+/// holds above the peer's checkpoint, once each: they travel from node to
+/// node until some node adds up enough of them, and the whole checkpoint then
+/// spreads like any other.
 async fn exchange_checkpoint(
     client: &mut Client,
     state: &NodeState,
     offer: bool,
-    refused: &mut Option<u64>,
+    relay: &mut CheckpointRelay,
 ) -> Result<Head, String> {
     let remote = client.head().await?;
     let local = with_state(state, |state| state.latest_checkpoint()).await?;
     let local_height = local.as_ref().map(|cp| cp.height);
-    if remote.checkpoint > local_height && remote.checkpoint != *refused {
+    if remote.checkpoint > local_height && remote.checkpoint != relay.refused {
         if let Some(checkpoint) = client.checkpoint().await? {
             let height = checkpoint.height;
             let hash = checkpoint.block_hash.clone();
@@ -390,9 +405,9 @@ async fn exchange_checkpoint(
                     "{}",
                     serde_json::json!({"checkpoint_accepted":height,"hash":hash,"from":client.remote_id().to_string()})
                 ),
-                Ok(Acceptance::AlreadyKnown) => {}
+                Ok(Acceptance::AlreadyKnown | Acceptance::Partial) => {}
                 Err(reason) => {
-                    *refused = Some(height);
+                    relay.refused = Some(height);
                     eprintln!("STARK checkpoint {height} from a peer refused: {reason}");
                 }
             }
@@ -403,6 +418,33 @@ async fn exchange_checkpoint(
             Ok(()) => {}
             Err(reason) if rejected(&reason) => eprintln!("STARK checkpoint offer: {reason}"),
             Err(reason) => return Err(reason),
+        }
+    }
+    if offer && state.authority.as_ref().is_some_and(|keys| keys.is_cosigned()) {
+        let partials = with_state(state, |state| state.partial_checkpoints()).await?;
+        for partial in partials {
+            if remote.checkpoint.is_some_and(|height| height >= partial.height) {
+                continue;
+            }
+            let mark = (
+                partial.height,
+                partial.block_hash.clone(),
+                partial.signers().collect::<Vec<_>>(),
+            );
+            if relay.pushed.contains(&mark) {
+                continue;
+            }
+            match client.submit_checkpoint(&partial).await {
+                Ok(()) => {}
+                Err(reason) if rejected(&reason) => {
+                    eprintln!("STARK partial checkpoint offer: {reason}")
+                }
+                Err(reason) => return Err(reason),
+            }
+            if relay.pushed.len() >= MAX_PUSHED_PARTIALS {
+                relay.pushed.clear();
+            }
+            relay.pushed.insert(mark);
         }
     }
     Ok(remote)
@@ -812,7 +854,7 @@ async fn session(
     let id = client.remote_id();
     let mut cursor = None;
     let mut relay = TxRelay::default();
-    let mut refused = None;
+    let mut checkpoints = CheckpointRelay::default();
     let mut addresses = AddressExchange::default();
     let mut asked = net.state.directory.asked();
     let mut exchange = tokio::time::Instant::now();
@@ -821,7 +863,7 @@ async fn session(
         tokio::select! {
             _ = stopped(stop) => return Ok(()),
             result = async {
-                let remote = exchange_checkpoint(client, &net.state, true, &mut refused).await?;
+                let remote = exchange_checkpoint(client, &net.state, true, &mut checkpoints).await?;
                 net.state.peers.book().observe(id, remote.height);
                 exchange_addresses(client, &net.state, &mut addresses).await?;
                 peer_cycle(client, &net.state, &mut cursor, &mut relay).await
@@ -998,21 +1040,26 @@ async fn mining_loop(
 }
 
 /// The team's checkpoint keys from `dir` (the files `zoka checkpoint-keygen`
-/// creates). Both halves must be the ones compiled for the chain: a node
+/// creates). Both halves must be the ones compiled for the chain (one of them,
+/// for a k-of-n authority, which also gives the signer its place): a node
 /// would reject anything else, so a mismatch is an error, not a warning.
 fn load_authority(dir: &Path, keys: &AuthorityKeys) -> Result<CheckpointSigner, String> {
     let ed25519 = checkpoint_authority::load_signing_key(&dir.join(AUTHORITY_KEY_FILE))?;
-    if ed25519.verifying_key() != keys.ed25519 {
+    if !keys.is_cosigned() && ed25519.verifying_key() != keys.ed25519 {
         return Err("the Ed25519 authority key is not the one compiled for this chain".into());
     }
     let seed = load_mldsa_seed(&dir.join(AUTHORITY_MLDSA_KEY_FILE))?;
     let hybrid = HybridSigningKey::from_parts(ed25519.clone(), seed.as_ref()).map_err(err)?;
-    match &keys.mldsa {
-        Some(expected) if hybrid.verifying_key().mldsa().to_bytes() == expected.to_bytes() => {}
-        _ => return Err("the ML-DSA authority key is not the one compiled for this chain".into()),
-    }
+    let Some(member) = keys.member(&hybrid.verifying_key()) else {
+        return Err(if keys.is_cosigned() {
+            "these authority keys are not among the ones compiled for this chain".into()
+        } else {
+            "the ML-DSA authority key is not the one compiled for this chain".into()
+        });
+    };
     let mut signer = CheckpointSigner::ed25519_only(ed25519);
     signer.hybrid = Some(hybrid);
+    signer.cosigner = keys.is_cosigned().then_some(member);
     signer.legacy_v1 = false;
     Ok(signer)
 }
@@ -1021,8 +1068,13 @@ fn load_authority(dir: &Path, keys: &AuthorityKeys) -> Result<CheckpointSigner, 
 /// `AUTHORITY_CONFIRMATIONS` below the tip, only while the network confirms
 /// the tip (`Peers::confirm_tip`) and the chain holds the latest checkpoint.
 /// One that corrects the branch (signed by hand) is not signed over again
-/// higher up: signing resumes once the node reorganizes. Hold `gate`.
-fn sign_due(state: &NodeState, signer: &CheckpointSigner) -> Result<Option<SignedCheckpoint>, String> {
+/// higher up: signing resumes once the node reorganizes. One key of a k-of-n
+/// authority signs the aligned heights all of them sign, each only once
+/// (`checkpoint_authority::record_own_cosignature`). Hold `gate`.
+fn sign_due(
+    state: &NodeState,
+    signer: &CheckpointSigner,
+) -> Result<Option<(SignedCheckpoint, Acceptance)>, String> {
     let tip = state.storage.get_chain_height().map_err(err)?;
     if !state.peers.confirm_tip(tip) {
         return Ok(None);
@@ -1033,12 +1085,17 @@ fn sign_due(state: &NodeState, signer: &CheckpointSigner) -> Result<Option<Signe
             return Ok(None);
         }
     }
-    let Some(height) =
-        checkpoint_authority::next_height_to_sign(tip, latest.as_ref().map(|cp| cp.height))
-    else {
+    let keys = state.authority.as_ref().ok_or("no checkpoint authority")?;
+    let latest_height = latest.as_ref().map(|cp| cp.height);
+    let height = if keys.is_cosigned() {
+        let own = checkpoint_authority::last_own_cosignature(&state.storage).map_err(err)?;
+        checkpoint_authority::aligned_height_to_sign(tip, latest_height.max(own))
+    } else {
+        checkpoint_authority::next_height_to_sign(tip, latest_height)
+    };
+    let Some(height) = height else {
         return Ok(None);
     };
-    let keys = state.authority.as_ref().ok_or("no checkpoint authority")?;
     let hash = state
         .storage
         .get_canonical_block_hash_at_height(height)
@@ -1049,8 +1106,11 @@ fn sign_due(state: &NodeState, signer: &CheckpointSigner) -> Result<Option<Signe
         .into_iter()
         .next()
         .ok_or("nothing signed")?;
-    state.accept_checkpoint(&checkpoint)?;
-    Ok(Some(checkpoint))
+    if keys.is_cosigned() {
+        checkpoint_authority::record_own_cosignature(&state.storage, height).map_err(err)?;
+    }
+    let acceptance = state.accept_checkpoint(&checkpoint)?;
+    Ok(Some((checkpoint, acceptance)))
 }
 
 async fn authority_loop(state: NodeState, signer: Arc<CheckpointSigner>, mut stop: watch::Receiver<bool>) {
@@ -1058,9 +1118,10 @@ async fn authority_loop(state: NodeState, signer: Arc<CheckpointSigner>, mut sto
         tokio::select! { _ = stopped(&mut stop) => return, _ = tokio::time::sleep(AUTHORITY_TICK) => {} }
         let signer = signer.clone();
         match with_state(&state, move |state| sign_due(state, &signer)).await {
-            Ok(Some(cp)) => println!(
+            Ok(Some((cp, acceptance))) => println!(
                 "{}",
-                serde_json::json!({"checkpoint_signed":cp.height,"hash":cp.block_hash})
+                serde_json::json!({"checkpoint_signed":cp.height,"hash":cp.block_hash,
+                    "complete":acceptance != Acceptance::Partial})
             ),
             Ok(None) => {}
             Err(reason) => eprintln!("STARK checkpoint signing: {reason}"),
@@ -1467,7 +1528,7 @@ async fn sync(options: Options) -> Result<(), String> {
         signal = tokio::signal::ctrl_c() => signal.map_err(err),
         result = async {
             // A mirror follows the authority too: checkpoint first, then blocks.
-            exchange_checkpoint(&mut client, &state, false, &mut None).await?;
+            exchange_checkpoint(&mut client, &state, false, &mut CheckpointRelay::default()).await?;
             let mut total = 0;
             loop {
                 let imported = client.pull_limited(&state, PEER_BATCH.min(maximum - total)).await?;
@@ -1507,7 +1568,7 @@ pub(crate) async fn follow(
     }
     let mut client = Client::connect(peer, presets::Minimal).await?;
     let result = async {
-        exchange_checkpoint(&mut client, state, false, &mut None).await?;
+        exchange_checkpoint(&mut client, state, false, &mut CheckpointRelay::default()).await?;
         let mut total = 0;
         while total < maximum {
             let imported = client
@@ -1595,7 +1656,9 @@ async fn identity(options: Options) -> Result<(), String> {
 /// Sign a checkpoint by hand, to move the network onto the right branch
 /// (docs/CHECKPOINTS-AUTORITATIVOS.md, "Corregir a mano"). Only with the
 /// compiled authority's keys; the result is verified before it is printed.
-/// Deliver it with `POST /checkpoint` to a node, which relays it.
+/// Deliver it with `POST /checkpoint` to a node, which relays it. With a
+/// k-of-n authority this is one key's signature: each holder signs the same
+/// height and hash and posts theirs, and the node adds them up.
 async fn checkpoint_sign(options: Options) -> Result<(), String> {
     let profile = options.network()?.unwrap_or(Profile::REGTEST);
     let dir = PathBuf::from(options.required("--authority")?);
@@ -1610,9 +1673,12 @@ async fn checkpoint_sign(options: Options) -> Result<(), String> {
             .into_iter()
             .next()
             .ok_or("nothing signed")?;
-        checkpoint
-            .verify(&keys)
-            .map_err(|e| format!("refusing to emit an invalid checkpoint: {e}"))?;
+        let verified = if keys.is_cosigned() {
+            checkpoint.verify_cosignatures(&keys).map(drop)
+        } else {
+            checkpoint.verify(&keys)
+        };
+        verified.map_err(|e| format!("refusing to emit an invalid checkpoint: {e}"))?;
         Ok::<_, String>(checkpoint)
     })
     .await
@@ -1761,8 +1827,9 @@ fn backup_authority(dir: &Path, out: &Path, password: &str, keys: &AuthorityKeys
     checkpoint_authority::protection::export_backup(dir, out, password)
 }
 
-/// The backup's seeds have to be the compiled authority's, and the keys
-/// already in `dir`, if any, the same ones. `check_only` stops there.
+/// The backup's seeds have to be the compiled authority's (one of its keys,
+/// for a k-of-n authority), and the keys already in `dir`, if any, the same
+/// ones. `check_only` stops there.
 fn restore_authority(
     dir: &Path,
     file: &Path,
@@ -1774,9 +1841,8 @@ fn restore_authority(
     let bytes = read_bounded(file, 4096)?;
     let seeds = protection::decode_backup(&bytes, password)?;
     let ed = ed25519_dalek::SigningKey::from_bytes(seeds[..32].try_into().map_err(err)?);
-    let hybrid = HybridSigningKey::from_parts(ed.clone(), &seeds[32..]).map_err(err)?;
-    let mldsa = Some(hybrid.verifying_key().mldsa().to_bytes());
-    if ed.verifying_key() != keys.ed25519 || keys.mldsa.as_ref().map(|k| k.to_bytes()) != mldsa {
+    let hybrid = HybridSigningKey::from_parts(ed, &seeds[32..]).map_err(err)?;
+    if keys.member(&hybrid.verifying_key()).is_none() {
         return Err("authority backup is for a different chain; nothing was changed".into());
     }
     protection::validate_restore(dir, &seeds)?;
@@ -1860,7 +1926,7 @@ pub async fn run(args: &[String]) -> Result<(), String> {
         "identity" => identity(Options::parse(rest, &["--identity", "--network"])?).await,
         "help" | "--help" | "-h" => {
             println!("STARK v2 node. --network regtest (default for a new --db: CPU test PoW)\n\
-or testnet (zoka-quantic-testnet-v2: RandomX, ASERT). An existing --db keeps its chain.\n\
+or testnet (zoka-quantic-testnet-v3: RandomX, ASERT). An existing --db keeps its chain.\n\
   serve --db DIR --identity FILE [--network NAME] [--api 127.0.0.1:9140] [--descriptor-out FILE]\n\
         [--peer DESCRIPTOR ...] [--seeds builtin|none|MANIFEST] [--relay N0|none]\n\
         [--announce yes|no] [--authority DIR] [--mine-to ADDRESS] [--interval 120]\n\
@@ -1932,7 +1998,7 @@ mod tests {
         let err = identity_file(&path, Profile::TESTNET, "temporary test password")
             .err()
             .unwrap();
-        assert!(err.contains("belongs to zoka-quantic-regtest-v2"), "{err}");
+        assert!(err.contains("belongs to zoka-quantic-regtest-v3"), "{err}");
         assert_eq!(read_bounded(&path, MAX_IDENTITY_BYTES).unwrap(), before);
 
         let wallet = dir.path().join("wallet.json");
@@ -2044,7 +2110,6 @@ mod tests {
                     Payment::new(alice.address(), PREMINE - ATOMS - 200),
                 ],
                 200,
-                20,
             )
             .map_err(err)?;
             let id = payment.txid();
@@ -2150,7 +2215,6 @@ mod tests {
                     Payment::new(alice.address(), PREMINE - ATOMS - 200),
                 ],
                 200,
-                20,
             )
             .map_err(err)?;
             let id = payment.txid();
@@ -2320,10 +2384,10 @@ mod tests {
         let mldsa =
             crate::hybrid_signature::generate_mldsa_seed(&dir.join(AUTHORITY_MLDSA_KEY_FILE))
                 .unwrap();
-        AuthorityKeys {
-            ed25519: checkpoint_authority::parse_public_key(&ed25519).unwrap(),
-            mldsa: Some(checkpoint_authority::parse_mldsa_public_key(&mldsa).unwrap()),
-        }
+        AuthorityKeys::hybrid_key(
+            checkpoint_authority::parse_public_key(&ed25519).unwrap(),
+            checkpoint_authority::parse_mldsa_public_key(&mldsa).unwrap(),
+        )
     }
 
     async fn eventually(what: &str, mut check: impl FnMut() -> bool) {
@@ -2400,10 +2464,7 @@ mod tests {
         let other = test_authority(&dir.path().join("other"));
         let refused = load_authority(&team, &other).err().unwrap();
         assert!(refused.contains("Ed25519"), "{refused}");
-        let mixed = AuthorityKeys {
-            ed25519: keys.ed25519,
-            mldsa: other.mldsa.clone(),
-        };
+        let mixed = AuthorityKeys::hybrid_key(keys.ed25519, other.mldsa.clone().unwrap());
         let refused = load_authority(&team, &mixed).err().unwrap();
         assert!(refused.contains("ML-DSA"), "{refused}");
         assert!(load_authority(&dir.path().join("missing"), &keys).is_err());
@@ -2612,6 +2673,86 @@ mod tests {
         assert_eq!(c.state.storage.get_chain_height().unwrap(), 8);
         assert_eq!(a.state.storage.get_canonical_block_hash_at_height(1).unwrap(), first);
         assert_eq!(c.state.latest_checkpoint().unwrap().unwrap().height, 2);
+
+        let _ = shutdown.send(true);
+        for task in tasks {
+            task.await.unwrap();
+        }
+        for server in [a_server, b_server, c_server] {
+            server.close().await;
+        }
+    }
+
+    /// Two of three keys: the first alone fixes nothing, however long it
+    /// waits. Once a second key signs the same block, on another node, every
+    /// node holds the checkpoint with both signatures; the third key, offline,
+    /// was not needed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_of_three_keys_fix_a_checkpoint_that_one_alone_cannot() {
+        let dir = tempfile::tempdir().unwrap();
+        let teams: Vec<PathBuf> = (0..3).map(|i| dir.path().join(format!("team{i}"))).collect();
+        let members = teams
+            .iter()
+            .map(|team| test_authority(team).hybrid().unwrap())
+            .collect();
+        let keys = AuthorityKeys::cosigned(checkpoint_authority::Cosigners::new(members, 2).unwrap());
+        let first = load_authority(&teams[0], &keys).unwrap();
+        let second = load_authority(&teams[1], &keys).unwrap();
+        assert_eq!((first.cosigner, second.cosigner), (Some(0), Some(1)));
+        let outsider = dir.path().join("outsider");
+        test_authority(&outsider);
+        let refused = load_authority(&outsider, &keys).err().unwrap();
+        assert!(refused.contains("not among"), "{refused}");
+        let (shutdown, stop) = watch::channel(false);
+        let alice = Account::from_seed(&[99; 32], 3, 0).unwrap().address();
+
+        // Tip 36: every key signs block 30.
+        let state = node_state(dir.path(), "a", Some(&keys)).await;
+        for _ in 0..36 {
+            mine_once(&state, alice.clone()).await.unwrap();
+        }
+        let (a, a_server, a_own, mut tasks) =
+            start_node(state, 121, vec![], &stop, Some(Arc::new(first))).await;
+        let state = node_state(dir.path(), "c", Some(&keys)).await;
+        let (c, c_server, _, more) = start_node(state, 123, vec![a_own.clone()], &stop, None).await;
+        tasks.extend(more);
+        eventually("A to sign block 30 with its key", || {
+            a.state
+                .partial_checkpoints()
+                .unwrap()
+                .iter()
+                .any(|partial| partial.height == 30)
+        })
+        .await;
+        tokio::time::sleep(AUTHORITY_TICK).await;
+        assert!(a.state.latest_checkpoint().unwrap().is_none());
+        assert!(c.state.latest_checkpoint().unwrap().is_none());
+        assert_eq!(
+            checkpoint_authority::last_own_cosignature(&a.state.storage).unwrap(),
+            Some(30)
+        );
+
+        let state = node_state(dir.path(), "b", Some(&keys)).await;
+        let (b, b_server, _, more) =
+            start_node(state, 122, vec![a_own], &stop, Some(Arc::new(second))).await;
+        tasks.extend(more);
+        for (name, node) in [("A", &a), ("B", &b), ("C", &c)] {
+            eventually(&format!("{name} to hold the checkpoint of block 30"), || {
+                node.state
+                    .latest_checkpoint()
+                    .unwrap()
+                    .is_some_and(|cp| cp.height == 30)
+            })
+            .await;
+        }
+        let checkpoint = c.state.latest_checkpoint().unwrap().unwrap();
+        assert_eq!(checkpoint.signers().collect::<Vec<_>>(), vec![0, 1]);
+        checkpoint.verify(&keys).unwrap();
+        assert_eq!(
+            a.state.storage.get_canonical_block_hash_at_height(30).unwrap(),
+            Some(checkpoint.block_hash.clone())
+        );
+        assert!(a.state.partial_checkpoints().unwrap().is_empty());
 
         let _ = shutdown.send(true);
         for task in tasks {
