@@ -19,7 +19,8 @@ param(
     [string]$Faucet = ''
 )
 $ErrorActionPreference = 'Stop'
-# Sin BOM: si no, bash recibe "﻿set -eu" y no corta ante un error.
+# PowerShell 5.1 antepone igual una marca BOM a lo que manda por stdin, y bash
+# leia "<BOM>set -eu" y no cortaba ante un error: el VPS la saca con sed.
 $OutputEncoding = New-Object System.Text.UTF8Encoding $false
 # En PowerShell 5.1 $PSScriptRoot no existe todavía en los valores por defecto.
 if (-not $Faucet) {
@@ -118,7 +119,7 @@ foreach ($target in @(@{ ip = '13.140.206.10'; role = 'vps1' }, @{ ip = '13.140.
         if ($LASTEXITCODE -ne 0) { throw "no se pudo subir el faucet a $ip" }
     }
     $script = $remote.Replace('__SHA__', $sha).Replace('__ROLE__', $target.role)
-    $script | & ssh @ssh "root@$ip" 'bash -s'
+    $script | & ssh @ssh "root@$ip" 'sed 1s/^$(printf ''\357\273\277'')// | bash -s'
     if ($LASTEXITCODE -ne 0) { throw "fallo la instalacion en $ip (codigo $LASTEXITCODE): lo de la v2 quedo intacto en db-v2 y zoka-4.0.6" }
 }
 Write-Output ''

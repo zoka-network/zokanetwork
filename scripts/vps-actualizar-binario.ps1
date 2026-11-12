@@ -15,7 +15,8 @@ param(
     [string[]]$Hosts = @('13.140.206.10', '13.140.206.11')
 )
 $ErrorActionPreference = 'Stop'
-# Sin BOM: si no, bash recibe la marca pegada a "set -eu" y no corta ante un error.
+# PowerShell 5.1 antepone igual una marca BOM a lo que manda por stdin, y bash
+# leia "<BOM>set -eu" y no cortaba ante un error: el VPS la saca con sed.
 $OutputEncoding = New-Object System.Text.UTF8Encoding $false
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "version invalida: $Version" }
 $Binary = (Resolve-Path $Binary).Path
@@ -36,7 +37,7 @@ chmod 0755 $new
 $new --version | grep -qx "zoka $VERSION"
 old=$(/usr/local/bin/zoka --version | awk '{print $2}')
 echo ANTERIOR=$old
-if [ "$old" = "$VERSION" ]; then echo YA-ESTABA; echo LISTO=$(hostname); exit 0; fi
+if [ "$old" = "$VERSION" ]; then rm -f $new; echo YA-ESTABA; echo LISTO=$(hostname); exit 0; fi
 [ -e /usr/local/bin/zoka-$old ] || cp -a /usr/local/bin/zoka /usr/local/bin/zoka-$old
 since=$(date '+%Y-%m-%d %H:%M:%S')
 systemctl stop zoka-seed
@@ -70,7 +71,7 @@ foreach ($ip in $Hosts) {
     & scp @scp $Binary "root@${ip}:/root/zoka-$Version.new"
     if ($LASTEXITCODE -ne 0) { throw "no se pudo subir el binario a $ip" }
     $script = $remote.Replace('__SHA__', $sha).Replace('__VERSION__', $Version)
-    $script | & ssh @ssh "root@$ip" 'bash -s'
+    $script | & ssh @ssh "root@$ip" 'sed 1s/^$(printf ''\357\273\277'')// | bash -s'
     if ($LASTEXITCODE -ne 0) { throw "fallo en $ip (codigo $LASTEXITCODE): no se sigue con el resto" }
 }
 Write-Output ''
