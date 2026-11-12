@@ -364,10 +364,16 @@ nada mientras queden k.
     nada; con la segunda, en otro nodo, los tres tuvieron el checkpoint con
     las dos firmas, y la tercera clave no hizo falta.
 
-**La testnet v3 arranca con uno de uno**: la clave de siempre (la PC), ya en
-la versión 3. Pasar a dos de tres es agregar las otras dos claves y subir el
-umbral, en el nodo y en `zoka-light`, con nodos y billeteras nuevos. **Lo
-decide el usuario**, porque es dónde vive cada clave. Una propuesta:
+**La testnet v3 arranca con dos de tres** (decisión del usuario del
+11/11/2026): la clave de siempre en la PC (la 0), una en el VPS 1 (la 1) y
+otra en el VPS 2 (la 2). Las tres firman solas. Cada privada se creó en su
+máquina con `scripts\vps-v3-1-claves-autoridad.ps1`, que trajo solo las
+públicas, y en los VPS queda cifrada con una contraseña que el nodo recibe
+por systemd (`/root/zoka-authority.env`). Contra lo que proponía abajo, la
+tercera no está sin conexión: los dos VPS son del mismo proveedor, que
+podría tener las dos claves; el usuario eligió que todo sea automático.
+
+La propuesta que se había hecho antes de decidir:
 
 - la PC (la clave de hoy);
 - el VPS 1, con su propia clave;
