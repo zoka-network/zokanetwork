@@ -16,9 +16,15 @@ param(
     [Parameter(Mandatory = $true)][string]$Binary,
     [string]$Key = (Join-Path $HOME '.ssh\zoka_vps'),
     [string]$KnownHosts = (Join-Path $HOME '.ssh\known_hosts_zoka_vps'),
-    [string]$Faucet = (Join-Path $PSScriptRoot '..\zokafaucet\server')
+    [string]$Faucet = ''
 )
 $ErrorActionPreference = 'Stop'
+# Sin BOM: si no, bash recibe "﻿set -eu" y no corta ante un error.
+$OutputEncoding = New-Object System.Text.UTF8Encoding $false
+# En PowerShell 5.1 $PSScriptRoot no existe todavía en los valores por defecto.
+if (-not $Faucet) {
+    $Faucet = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) '..\zokafaucet\server'
+}
 $Binary = (Resolve-Path $Binary).Path
 $sha = (Get-FileHash -Algorithm SHA256 $Binary).Hash.ToLower()
 Write-Output "Binario: $Binary"
@@ -32,6 +38,7 @@ set -eu
 SHA=__SHA__
 ROLE=__ROLE__
 echo "$SHA  /root/zoka-5.0.0.new" | sha256sum -c -
+chmod 0755 /root/zoka-5.0.0.new
 /root/zoka-5.0.0.new --version | grep -q '^zoka 5\.0\.0'
 unit=/etc/systemd/system/zoka-seed.service
 keys=/var/lib/zoka-authority/.zoka/quantic-testnet

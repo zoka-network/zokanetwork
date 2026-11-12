@@ -18,6 +18,8 @@ param(
     [string[]]$Hosts = @('13.140.206.10', '13.140.206.11')
 )
 $ErrorActionPreference = 'Stop'
+# Sin BOM: si no, bash recibe "﻿set -eu" y no corta ante un error.
+$OutputEncoding = New-Object System.Text.UTF8Encoding $false
 
 # Solo ASCII y sin \r: va por stdin a bash.
 $remote = @'
