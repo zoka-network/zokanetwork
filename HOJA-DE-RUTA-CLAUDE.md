@@ -3,6 +3,30 @@
 Actualizada: **11 de noviembre de 2026 (tarde)**, Argentina. Testnet v2 con semillas permanentes en VPS; billetera web, ZKAPriv 3.0.0 y faucet publicados; home nuevo de zoka.network en vivo. Ramas `endurecimiento-sin-consenso` (cinco repos) con la primera tanda de la revisión técnica y ramas `protocolo-v3` (nodo, ZSilent, ZKAPriv) con el protocolo del próximo reinicio: los diez puntos cerrados en código, sin integrar, publicar ni reiniciar.
 Proyecto: `C:\Users\mderramus\ZOKA`.
 
+## 11/11 (noche): lanzamiento de la testnet v3, en curso
+
+El usuario contestó todo lo pendiente (memoria «Lanzamiento v3:
+decisiones»): reinicio ya, autoridad **2 de 3 con la PC, el VPS 1 y el
+VPS 2**, premine a la misma wallet de la v2, versiones 5.0.0 y ZKAPriv
+4.0.0, «New address» en las tres apps, todo a `main`, scripts .ps1 para los
+VPS, anuncio en Discord con vista previa, faucet con 20.000 ZKA.
+
+| Paso | Estado |
+| --- | --- |
+| «New address» en ZSilent, billetera web y ZKAPriv; `new-address` publica | hecho, con pruebas |
+| Versiones 5.0.0 / ZKAPriv 4.0.0 (código 19) | hecho |
+| Minero CLI en `data/quantic-testnet-v3` con las wallets de la v2 | hecho |
+| ZokaScan, faucet y web (rama `testnet-v3` de zokaweb) con la v3 | hecho, sin publicar |
+| Migración de ZSilent: wallets en `%APPDATA%\Zoka`, setup en `%APPDATA%\ZSilent Core` | corregido (la primera versión buscaba las dos en la misma carpeta) |
+| Teléfono de 32 bits: 2→2 en 14 s / 121 MB, 8→2 en 90 s / 741 MB | medido |
+| 1. `scripts\vps-v3-1-claves-autoridad.ps1` (lo corre el usuario) | **esperando** |
+| 2. Compilar con las públicas de los VPS en `economics.rs` y `zoka-light` | después del 1 |
+| 3. `scripts\genesis-testnet-v3.ps1 -Wallet <la del premine>` + XMRig | después del 2 |
+| 4. Fijar el génesis y el manifiesto (seed1 nueva, seed2/seed3 con su identidad), compilar Windows y Linux (WSL), WebAssembly, `.so` y APK | después del 3 |
+| 5. `scripts\vps-v3-2-instalar.ps1 -Binary <zoka de Linux>` (lo corre el usuario) | después del 4 |
+| 6. ZSilent 5.0.0 en la PC (con ZSilent cerrada), ZKAPriv 4.0.0 en el teléfono por adb | después del 4 |
+| 7. `main` en los repos, releases (5.0.0 Latest, 4.x Superseded), Cloudflare (el usuario autoriza wrangler), Discord | al final |
+
 ## 11/11 (tarde): protocolo v3, los diez puntos cerrados en código
 
 El usuario pidió «cierra todos los puntos». Lo que cambia el consenso quedó
