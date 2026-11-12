@@ -42,10 +42,11 @@ FLAG_SECURE bloquea las capturas: para ver la pantalla, `uiautomator dump`.
 
 **Qué falta:**
 
-- El usuario manda 20.000 ZKA desde `zsilent` a la dirección **completa** del
-  faucet (la corta `zqtest2YVVQP8…` no está publicada en la v3: el faucet no
-  publica la suya, y hacerlo pide su contraseña, que está en las credenciales
-  de systemd). Después, `https://api.zokascan.cc/faucet/status` → `ready`.
+- ~~Fondear el faucet~~: hecho el 12/11, **200.000 ZKA** desde `zsilent`
+  (un cero de más; se queda así), tx `a6bb24e3…` en el bloque 394, `ready`.
+  Se mandó a la dirección **completa**: la corta `zqtest2YVVQP8…` no está
+  publicada en la v3 (el faucet no publica la suya, y hacerlo pide su
+  contraseña, que está en las credenciales de systemd).
 - Anuncio de Discord: borrador `notice.testnet-v3.json` (ya en 5.0.1), lo
   manda el usuario con `discord-bot/scripts/send-notice.js`, mejor con el
   faucet ya fondeado.
