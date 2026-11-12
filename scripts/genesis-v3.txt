@@ -1,0 +1,14 @@
+# Genesis de la testnet v3, 2026-11-11T21:52:20
+genesis 397714b6a79d7988944bb71e5b869bffadcc7ea4031e323ea4e547a4acace94f
+premine zqtest22XonPy9DPnHF16DiWXEdeE9CmC5VJpYoioyTVbGGjaLhysLDbN (wallet zsilent)
+identity:
+{
+  "chain_id": "zoka-quantic-testnet-v3",
+  "seed_entry": {
+    "endpoint_id": "0b13394012fa531c9afa9651383d78b19e851bdadc5cd284c4730a5fdd47ebab",
+    "label": "seed1",
+    "ml_dsa_key_id": "c77998b435f010f65ebf56ec6e78551d430ee3ba5af29d1f8a4c1b9ad202f018",
+    "operator": "zoka-core",
+    "status": "active"
+  }
+}

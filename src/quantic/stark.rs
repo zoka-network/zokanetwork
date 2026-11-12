@@ -797,11 +797,15 @@ mod tests {
         };
         let err = validate(&db, launched, &block, &parent).err().unwrap();
         assert!(err.contains("genesis"), "{err}");
-        // The v3 testnet is not launched yet: its block 1 is the first one
-        // mined. At launch `QUANTIC_PQ_TESTNET_GENESIS` fixes it, and this
-        // checks again that another block 1 is not its genesis.
-        assert_eq!(Profile::TESTNET.genesis, None);
+        // The v3 testnet is launched (11/11/2026): another block 1 is not its
+        // genesis.
+        assert_eq!(
+            Profile::TESTNET.genesis,
+            Some("397714b6a79d7988944bb71e5b869bffadcc7ea4031e323ea4e547a4acace94f")
+        );
         assert!(Profile::TESTNET.chain_id.ends_with("-v3"));
+        let err = validate(&db, Profile::TESTNET, &block, &parent).err().unwrap();
+        assert!(err.contains("genesis"), "{err}");
     }
 
     /// Light wallets recompute what a header commits to with

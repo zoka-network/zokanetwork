@@ -201,7 +201,12 @@ fn identity_file(
         if identity.schema != IDENTITY_SCHEMA {
             return Err("not a STARK v2 node identity file".into());
         }
-        if identity.chain_id != profile.chain_id {
+        // A seed of the v2 testnet keeps its identity on the v3 one: the same
+        // endpoint and ML-DSA key, so the manifest pins the same ids. The
+        // chain still travels in every descriptor and handshake.
+        let carried = profile.chain_id == crate::economics::QUANTIC_PQ_TESTNET_CHAIN_ID
+            && identity.chain_id == crate::economics::QUANTIC_PQ_TESTNET_V2_CHAIN_ID;
+        if identity.chain_id != profile.chain_id && !carried {
             return Err(format!(
                 "this node identity belongs to {}, not {}",
                 identity.chain_id, profile.chain_id
@@ -2000,6 +2005,19 @@ mod tests {
             .unwrap();
         assert!(err.contains("belongs to zoka-quantic-regtest-v3"), "{err}");
         assert_eq!(read_bounded(&path, MAX_IDENTITY_BYTES).unwrap(), before);
+
+        // A seed of the v2 testnet opens its identity on the v3 testnet (the
+        // same endpoint and key), and only there.
+        let seed = dir.path().join("seed.identity");
+        let file = IdentityFile {
+            schema: stored.schema.clone(),
+            chain_id: crate::economics::QUANTIC_PQ_TESTNET_V2_CHAIN_ID.into(),
+            encrypted_seed_hex: stored.encrypted_seed_hex.clone(),
+        };
+        write_new(&seed, &serde_json::to_vec(&file).unwrap()).unwrap();
+        let carried = identity_file(&seed, Profile::TESTNET, "temporary test password").unwrap();
+        assert_eq!(carried.public_key(), created.public_key());
+        assert!(identity_file(&seed, P, "temporary test password").is_err());
 
         let wallet = dir.path().join("wallet.json");
         let wallet_bytes = br#"{"schema":"zoka-quantic-stark-wallet-v2","chain_id":"zoka-quantic-regtest-v2","encrypted_seed_hex":"00"}"#;

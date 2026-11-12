@@ -483,12 +483,13 @@ pub const QUANTIC_REGTEST_CHAIN_ID: &str = "zoka-quantic-regtest-v1";
 /// nor v2 peers a v3 one (protocolo v3: tres formas de pago, comisión exacta,
 /// Keccak en la prueba, raíz de Merkle con la cantidad de hojas).
 pub const QUANTIC_PQ_REGTEST_CHAIN_ID: &str = "zoka-quantic-regtest-v3";
-/// La testnet que reemplaza a la v2 en el próximo reinicio: RandomX (XMRig) y
-/// la ASERT de siempre, con el protocolo v3 desde su primer bloque.
+/// La testnet que reemplaza a la v2 (11/11/2026): RandomX (XMRig) y la ASERT
+/// de siempre, con el protocolo v3 desde su primer bloque.
 pub const QUANTIC_PQ_TESTNET_CHAIN_ID: &str = "zoka-quantic-testnet-v3";
-/// El hash de su bloque 1 se fija al lanzarla, como el de la v2: hasta
-/// entonces, quien mina un bloque 1 arma su propia cadena local.
-pub const QUANTIC_PQ_TESTNET_GENESIS: Option<&str> = None;
+/// Su bloque 1, minado en la PC del equipo el 11/11/2026 con el premine de
+/// 5.000.000 ZKA: otro bloque 1 no es esta cadena.
+pub const QUANTIC_PQ_TESTNET_GENESIS: Option<&str> =
+    Some("397714b6a79d7988944bb71e5b869bffadcc7ea4031e323ea4e547a4acace94f");
 /// La testnet v2 (29/10/2026 al reinicio): su bloque 1 fue
 /// 69249437d8c35b7e4bf28ec524491fe18384b9869670fadff546fef29148fdb2. Un nodo v3
 /// no la sigue; queda su id para los checkpoints reales que se guardan como

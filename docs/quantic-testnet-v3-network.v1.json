@@ -1,14 +1,42 @@
 {
   "schema": "zoka-quantic-stark-network-v1",
-  "status": "pre-genesis",
+  "status": "active",
   "chain_id": "zoka-quantic-testnet-v3",
   "alpn": "/zoka/quantic-stark/3",
   "transport": "iroh QUIC with mandatory X25519MLKEM768 TLS and an ML-DSA-65 server signature bound to each connection. Relays and address lookup by n0, so no node needs an open port; seeds with a public IP and a fixed UDP port (--bind) also list it, and are reached without n0.",
-  "seed_nodes": [],
+  "seed_nodes": [
+    {
+      "label": "seed1",
+      "operator": "Zoka Network",
+      "endpoint_id": "0b13394012fa531c9afa9651383d78b19e851bdadc5cd284c4730a5fdd47ebab",
+      "ml_dsa_key_id": "c77998b435f010f65ebf56ec6e78551d430ee3ba5af29d1f8a4c1b9ad202f018",
+      "status": "active",
+      "note": "The team's PC: the first seed and one of the three checkpoint authority keys. Online only while ZSilent runs there."
+    },
+    {
+      "label": "seed2",
+      "operator": "Zoka Network",
+      "endpoint_id": "8aa55aa80f94d0c87b9e5afa46286b22fd5c7f81299dc405cb23758a9393d54c",
+      "ml_dsa_key_id": "99f5cabd3528a7ee966bd16de3004b34054b36b0db59f2098c0915646f15b729",
+      "direct_addresses": ["13.140.206.10:4433"],
+      "stream_address": "u2soz3q63237afuccfxf3jzytpljpbxpvyzt3jumrr45ukzowdakayqd.onion:9444",
+      "status": "active",
+      "note": "The explorer node, on a server (Contabo, EU), also behind an onion service: the seed that nodes in Tor mode (--tor) dial. One of the three checkpoint authority keys."
+    },
+    {
+      "label": "seed3",
+      "operator": "Zoka Network",
+      "endpoint_id": "ce70a5606d0307edf2d9528192b6e316217ecedf5ce00dcea585767240c5dd8d",
+      "ml_dsa_key_id": "83b4dd369c89b73359c69e54345c6d052ad1d63527730b0ae7ca091ce263d3e8",
+      "direct_addresses": ["13.140.206.11:4433"],
+      "status": "active",
+      "note": "A server (Contabo, EU) that serves the chain without mining. One of the three checkpoint authority keys."
+    }
+  ],
   "notes": [
-    "Zoka Quantic Testnet v3: the protocol of the review of 2026-11-10. Every payment spends 2, 4 or 8 notes (padded with notes worth nothing) and creates 2, pays the exact fee of its shape and names no expiry; the proof commits with Keccak; a block's Merkle root commits to its number of leaves. Test coins with no value. It replaces the v2 testnet.",
-    "Pre-genesis: the seeds get their v3 identities, and this list its descriptors, when the network is launched.",
-    "A seed is pinned by its iroh endpoint id and the key id (blake3) of its ML-DSA-65 public key; `quantic-pq-node identity` prints both.",
+    "Zoka Quantic Testnet v3: the protocol of the review of 2026-11-10. Every payment spends 2, 4 or 8 notes (padded with notes worth nothing) and creates 2, pays the exact fee of its shape and names no expiry; the proof commits with Keccak; a block's Merkle root commits to its number of leaves; a checkpoint counts with two of the three authority keys. Test coins with no value. It replaces the v2 testnet.",
+    "Launched on 2026-11-11: block 1 (397714b6a79d7988944bb71e5b869bffadcc7ea4031e323ea4e547a4acace94f) carries the 5,000,000 ZKA premine and is fixed in the binary.",
+    "A seed is pinned by its iroh endpoint id and the key id (blake3) of its ML-DSA-65 public key; `quantic-pq-node identity` prints both. seed2 and seed3 keep the identities they had on testnet v2.",
     "Peers learned from other nodes are dialed and authenticated before they are shared. Blocks are validated locally whoever serves them."
   ]
 }
