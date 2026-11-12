@@ -1,9 +1,60 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
-Actualizada: **11 de noviembre de 2026 (tarde)**, Argentina. Testnet v2 con semillas permanentes en VPS; billetera web, ZKAPriv 3.0.0 y faucet publicados; home nuevo de zoka.network en vivo. Ramas `endurecimiento-sin-consenso` (cinco repos) con la primera tanda de la revisión técnica y ramas `protocolo-v3` (nodo, ZSilent, ZKAPriv) con el protocolo del próximo reinicio: los diez puntos cerrados en código, sin integrar, publicar ni reiniciar.
+Actualizada: **12 de noviembre de 2026**, Argentina. **Testnet v3 en vivo** (génesis `397714b6…`): nodo y minero 5.0.1, ZSilent 5.0.1, ZKAPriv 4.0.0, billetera web, ZokaScan, faucet y zoka.network publicados; autoridad de checkpoints 2 de 3 (PC, VPS 1, VPS 2) firmando. `main` = `protocolo-v3` en ZOKA, ZSilent y ZKAPriv.
 Proyecto: `C:\Users\mderramus\ZOKA`.
 
-## 11/11 (noche): lanzamiento de la testnet v3, en curso
+## 12/11: testnet v3 publicada, y la 5.0.1
+
+**Publicado** (releases en GitHub, `main` y etiquetas en GitHub y GitLab):
+
+| Qué | Versión | Archivo / hash | Commit |
+| --- | --- | --- | --- |
+| Nodo y minero CLI (Latest; 5.0.0 Superseded) | 5.0.1 | zip `cb66930f…`, tar.gz `95072fc5…`, Linux `5cf8c192…`; `zoka.exe` `3f22529f…` | compilado de `afd0193a`, etiqueta en `c4e05053` |
+| ZSilent (Latest; 5.0.0 Superseded) | 5.0.1 | `ZSilent-Core-5.0.1.msi` `ab0c4454…` (verificado por dentro: zoka, zokahd y tor) | `717105b` |
+| ZKAPriv (Latest; 3.0.0 Superseded) | 4.0.0 (código 19) | `ZKAPriv-4.0.0.apk` `3340f6e5…`, firma `061376f8…` | `49c6b68` |
+| ZokaScan, billetera web | v3 | Cloudflare Pages | zokaexplorer `cae4c3c`, zokawallet `049b4d8` |
+| zoka.network | descargas 5.0.1 / 4.0.0 | Cloudflare Pages | zokaweb `0c3a221` |
+
+La release del nodo 5.0.1 la creó el usuario con `gh` (el clasificador la frenó sin motivo; las otras dos pasaron).
+
+**El arreglo de la 5.0.1.** Una billetera copiada de la v2 trae
+`<billetera>.json.stark-pending`, el pago reservado de su último envío, que
+queda en el disco aunque el pago se haya minado (solo se borra en el envío
+siguiente). La 5.0.0 no lo podía decodificar y el saldo fallaba con
+«invalid transaction shape»: le pasó al faucet y a la wallet `zsilent` de la
+PC (ZSilent copia toda la carpeta `wallets`). Ahora, si el archivo se
+descifra con la contraseña pero no es un pago de esta cadena, se aparta como
+`.stark-pending.stale` y la billetera sigue (`stark_cli::pending`, prueba
+`a_pending_payment_of_an_earlier_protocol_is_set_aside`). La billetera web y
+ZKAPriv no tenían el problema: un estado de formato 2 no se acepta y vuelven a
+leer la cadena. En el faucet y en la PC el archivo se renombró a mano a
+`.stark-pending.v2` antes de la 5.0.1.
+
+**VPS.** Los dos corren 5.0.1 (`scripts\vps-actualizar-binario.ps1`, con la
+5.0.0 guardada como `/usr/local/bin/zoka-5.0.0`); checkpoint 360 firmado por
+dos de tres y seguido. Los scripts de los VPS sacan ahora en el VPS la marca
+BOM que PowerShell 5.1 antepone a stdin aunque `$OutputEncoding` no la lleve
+(bash leía `<BOM>set -eu` y no cortaba ante un error).
+
+**Teléfono.** ZKAPriv 4.0.0 instalada por adb sobre la 2.1.3; la bienvenida y
+la pantalla de red decían «Testnet v2» y se corrigieron antes de publicar.
+FLAG_SECURE bloquea las capturas: para ver la pantalla, `uiautomator dump`.
+
+**Qué falta:**
+
+- El usuario manda 20.000 ZKA desde `zsilent` a la dirección **completa** del
+  faucet (la corta `zqtest2YVVQP8…` no está publicada en la v3: el faucet no
+  publica la suya, y hacerlo pide su contraseña, que está en las credenciales
+  de systemd). Después, `https://api.zokascan.cc/faucet/status` → `ready`.
+- Anuncio de Discord: borrador `notice.testnet-v3.json` (ya en 5.0.1), lo
+  manda el usuario con `discord-bot/scripts/send-notice.js`, mejor con el
+  faucet ya fondeado.
+- ZSilent 5.0.1 en la PC (con ZSilent cerrada): no es urgente, la wallet ya
+  anda con la 5.0.0.
+- Regrabar los fixtures de la billetera web con páginas v3 (prueba saltada) y
+  libFuzzer en el VPS 2 (punto 7).
+
+## 11/11 (noche): lanzamiento de la testnet v3 (terminado el 12/11, ver arriba)
 
 El usuario contestó todo lo pendiente (memoria «Lanzamiento v3:
 decisiones»): reinicio ya, autoridad **2 de 3 con la PC, el VPS 1 y el

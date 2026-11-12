@@ -4,7 +4,26 @@ Registro vivo para que otro agente (Codex, Claude) siga donde quedó este. Cada
 paso se marca al terminarlo, con su commit; lo que queda a medias dice en qué
 punto exacto está. Lo histórico está en [HOJA-DE-RUTA-CLAUDE.md](../HOJA-DE-RUTA-CLAUDE.md).
 
-## Estado actual al 11/11/2026 (tarde): protocolo v3 en ramas
+## Estado actual al 12/11/2026: testnet v3 en vivo
+
+La testnet v3 está lanzada y publicada (detalle, hashes y commits en la
+entrada «12/11» de la [hoja de ruta](../HOJA-DE-RUTA-CLAUDE.md)). Versiones
+vigentes: nodo y minero **5.0.1**, ZSilent **5.0.1**, ZKAPriv **4.0.0**.
+`main` = `protocolo-v3` en ZOKA (`e1907d03`), ZSilent (`717105b`) y zkapriv
+(`49c6b68`); zokaweb `main` = `testnet-v3` (`0c3a221`).
+
+| Dónde | Estado |
+| --- | --- |
+| PC (seed1, autoridad 0) | ZSilent 5.0.0 instalada (falta pasar a 5.0.1, con ZSilent cerrada); mina con XMRig por su Stratum |
+| VPS 1 (seed2, autoridad 1) | zoka 5.0.1, explorador, túnel, .onion y faucet |
+| VPS 2 (seed3, autoridad 2) | zoka 5.0.1 |
+| Teléfono | ZKAPriv 4.0.0, sin billetera creada |
+| Faucet | anda; espera los 20.000 ZKA que manda el usuario a su dirección completa |
+
+Para cambiar el binario de los VPS dentro de la misma red:
+`scripts\vps-actualizar-binario.ps1 -Binary <zoka de Linux> -Version <x.y.z>`.
+
+## Estado al 11/11/2026 (tarde): protocolo v3 en ramas
 
 El usuario pidió cerrar los diez puntos de la revisión. Lo que cambia el
 consenso está en ramas **`protocolo-v3`**, que salen de las
