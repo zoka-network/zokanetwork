@@ -561,11 +561,24 @@ pub(crate) fn pending(
     }
     let plaintext =
         Zeroizing::new(crate::wallet::storage::decrypt_data(&bytes, password).map_err(error)?);
-    let tx = Transaction::decode(&plaintext).map_err(error)?;
-    if tx.statement.network != profile.network || tx.statement.nullifiers.is_empty() {
-        return Err("invalid pending payment".into());
+    match Transaction::decode(&plaintext) {
+        Ok(tx) if tx.statement.network == profile.network && !tx.statement.nullifiers.is_empty() => {
+            Ok(Some(tx))
+        }
+        // Written with this wallet's password, so it is the wallet's own, but
+        // not a payment this chain can carry: one an earlier protocol reserved
+        // (a wallet copied from testnet v2 keeps the file after its payment was
+        // mined). No node of this chain can mine it, so it reserves nothing.
+        // It is set aside, not deleted, and the wallet goes on.
+        _ => {
+            let mut stale = path.as_os_str().to_os_string();
+            stale.push(".stale");
+            match fs::rename(&path, PathBuf::from(stale)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(error(e)),
+                _ => Ok(None),
+            }
+        }
     }
-    Ok(Some(tx))
 }
 pub(crate) fn live_pending(tx: &Transaction, state: &Ledger) -> bool {
     (tx.height == 0 || tx.height > state.height)
@@ -1036,5 +1049,28 @@ mod tests {
                 .sum::<u64>(),
             12 * ATOMS + 200
         );
+    }
+
+    /// A wallet copied from testnet v2 keeps the pending file of its last
+    /// payment. Its bytes are no transaction of this protocol: the balance
+    /// must not fail on it (it did on the faucet and on ZSilent, 12/11/2026).
+    #[test]
+    fn a_pending_payment_of_an_earlier_protocol_is_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = dir.path().join("alice.json");
+        create_wallet(&wallet, P, &[4; 32], "test password").unwrap();
+        let old = crate::wallet::storage::encrypt_data(b"a v2 payment", "test password").unwrap();
+        write_new(&pending_path(&wallet), &old).unwrap();
+        // The wrong password still fails: the file may be someone else's.
+        assert!(pending(&wallet, "wrong password", P).is_err());
+        assert!(pending_path(&wallet).exists());
+        assert!(pending(&wallet, "test password", P).unwrap().is_none());
+        assert!(!pending_path(&wallet).exists());
+        let mut stale = pending_path(&wallet).into_os_string();
+        stale.push(".stale");
+        assert_eq!(fs::read(PathBuf::from(stale)).unwrap(), old);
+        // With it aside the wallet can reserve a new payment.
+        write_new(&pending_path(&wallet), &old).unwrap();
+        assert!(pending(&wallet, "test password", P).unwrap().is_none());
     }
 }
