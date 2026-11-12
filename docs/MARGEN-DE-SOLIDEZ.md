@@ -33,8 +33,13 @@ Números del estimador con la v3 (mismo comando de abajo):
   Keccak-256. Sin el tope, 190 (2→2), 189,1 (4→2) y 184,3 (8→2).
 - **Costo en la PC** (perfil release): 2→2, 2,59 MB y 3,0 s;
   8→2, 7,85 MB y 15,9 s. Un 1→2 con Keccak, antes de las formas fijas, daba
-  1,72 MB y 1,2 s. **No se midió en el teléfono de 32 bits**, que es lo
-  primero antes de lanzar la v3: un pago de 8 notas es el caso pesado.
+  1,72 MB y 1,2 s.
+- **En el teléfono de 32 bits** (Samsung A13, armeabi-v7a, 3,8 GB; las
+  pruebas del pool compiladas para Android y corridas por adb el 11/11):
+  2→2, 2,59 MB, 14 s de prueba y 121 MB de memoria pico; 8→2, 7,86 MB,
+  90 s y 741 MB. Entra en memoria, pero un pago de 8 notas tarda un minuto
+  y medio. Las billeteras eligen las notas más grandes primero, así que la
+  forma de 8 aparece solo cuando hacen falta muchas notas chicas.
 
 Lo de abajo es el análisis del 11/11 que llevó a esta decisión, con la
 configuración de la v2 (Poseidon2 en todo, formas libres).
