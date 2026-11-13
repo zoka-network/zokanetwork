@@ -1,7 +1,35 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
-Actualizada: **12 de noviembre de 2026**, Argentina. **Testnet v3 en vivo** (génesis `397714b6…`): nodo y minero 5.0.1, ZSilent 5.0.1, ZKAPriv 4.0.0, billetera web, ZokaScan, faucet y zoka.network publicados; autoridad de checkpoints 2 de 3 (PC, VPS 1, VPS 2) firmando. `main` = `protocolo-v3` en ZOKA, ZSilent y ZKAPriv.
+Actualizada: **13 de noviembre de 2026**, Argentina. **Testnet v3 en vivo** (génesis `397714b6…`): nodo y minero 5.0.1, ZSilent 5.0.1, ZKAPriv 4.0.0, billetera web, ZokaScan, faucet y zoka.network publicados; autoridad de checkpoints 2 de 3 (PC, VPS 1, VPS 2) firmando. `main` = `protocolo-v3` en ZOKA, ZSilent y ZKAPriv.
 Proyecto: `C:\Users\mderramus\ZOKA`.
+
+## 13/11: rediseño de ZKAPriv 4.1 en el teléfono de prueba
+
+El usuario pidió continuar donde se cortó Claude y avisó que el dispositivo
+estaba conectado. Se recuperó el plan de Claude en
+`zkapriv/docs/PLAN-REDISENO-4.1.md`, rama `rediseno-vidrio`.
+
+- Claude había guardado Receive (`3fbc06b`: una dirección a la vez,
+  publicación automática) y Restore (`3550b61`: 24 casillas y sugerencias).
+  El tema y varias pantallas seguían sin commitear ni compilar.
+- Codex completa Settings, navegación de Reset desde bloqueo y ajustes,
+  PIN compartido, billeteras, escáner, galería y vistas de diseño. Botones
+  negros y texto rosa en claro y oscuro, sin cambiar las cinco pestañas.
+- Se corrige el selector para que la dirección elegida quede a la vista
+  con ocho direcciones. Los diálogos se desplazan al abrir el teclado.
+- APK **4.1.0 (código 20)** de depuración, paquete
+  `com.zoka.zkapriv.benchmark`, nombre **ZKAPriv Testnet**, instalado por
+  `adb install -r` en el Samsung SM-A135M. La instalación habitual
+  `com.zoka.zkapriv` queda conservada.
+- **75 pruebas JVM y 6 instrumentadas sin fallas**. Revisión visual con datos ficticios en
+  los dos temas a 360 dp y letra al 110 %. Resultado de las pruebas del
+  dispositivo y hashes en `zkapriv/docs/VALIDACION-4.1.0.md`.
+- Commits `c8787e0` (rediseño) y `745a3bd` (diálogos con teclado), subidos
+  a `rediseno-vidrio` en GitHub y GitLab. APK final `3a2d17f9…`.
+
+No se leen wallets ni el portapapeles. No se hacen envíos, borrados o
+restauraciones reales. No hay APK release firmado, merge a `main` ni
+publicación. La release vigente sigue siendo 4.0.0.
 
 ## 12/11: testnet v3 publicada, y la 5.0.1
 

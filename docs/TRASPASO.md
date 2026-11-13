@@ -4,7 +4,34 @@ Registro vivo para que otro agente (Codex, Claude) siga donde quedó este. Cada
 paso se marca al terminarlo, con su commit; lo que queda a medias dice en qué
 punto exacto está. Lo histórico está en [HOJA-DE-RUTA-CLAUDE.md](../HOJA-DE-RUTA-CLAUDE.md).
 
-## Estado actual al 12/11/2026: testnet v3 en vivo
+## Estado al 13/11/2026: ZKAPriv 4.1 de prueba instalada
+
+Codex retoma el rediseño que Claude dejó a medias, por pedido del usuario,
+con el Samsung SM-A135M conectado. Rama `rediseno-vidrio` del repo `zkapriv`.
+Plan recuperado en `zkapriv/docs/PLAN-REDISENO-4.1.md`: todas las pantallas,
+botones negros con letras rosa en ambos temas, Receive con un solo QR y
+selector, restauración con 24 casillas. Receive y las casillas ya estaban
+commiteados (`3fbc06b`, `3550b61`); el resto seguía sin compilar.
+
+Se completaron navegación de Reset, Settings, PIN compartido, billeteras,
+escáner y vista de diseño. **75 pruebas JVM y 6 instrumentadas sin fallas**;
+22 pantallas revisadas en claro y oscuro a 360 dp y letra al 110 %.
+Instalada la variante **ZKAPriv Testnet 4.1.0 (20)**,
+`com.zoka.zkapriv.benchmark`, con `adb install -r`. Se conserva la app
+habitual `com.zoka.zkapriv`. No se leyó el almacén ni se probaron envíos.
+No se publica ni se integra a `main`.
+Evidencia local en `target/zkapriv-rediseno-2026-11-13/` (incluye parche del
+trabajo de Claude antes de continuar).
+
+Guardado en `c8787e0` (rediseño) y `745a3bd` (teclado de los diálogos),
+ambos en la rama `rediseno-vidrio` de GitHub y GitLab. El repo zkapriv queda
+limpio. APK de prueba final: SHA-256 `3a2d17f9…`.
+
+Validación y hash del APK en `zkapriv/docs/VALIDACION-4.1.0.md`. Sigue la
+revisión del usuario en la app de prueba; los envíos, la restauración de su
+billetera y la biometría los prueba él. Publicar la 4.1 sigue pidiendo su OK.
+
+## Estado al 12/11/2026: testnet v3 en vivo
 
 La testnet v3 está lanzada y publicada (detalle, hashes y commits en la
 entrada «12/11» de la [hoja de ruta](../HOJA-DE-RUTA-CLAUDE.md)). Versiones
