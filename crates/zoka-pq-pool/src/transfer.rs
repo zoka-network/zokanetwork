@@ -61,6 +61,12 @@ const QUERIES: usize = 160;
 const LOG_BLOWUP: usize = 3;
 
 fn config() -> Result<Config, Error> {
+    config_with(TRANSCRIPT_DOMAIN)
+}
+
+/// The proof configuration, its transcript started from `domain`: each
+/// circuit has its own, so a proof of one is never a proof of another.
+fn config_with(domain: &[u8]) -> Result<Config, Error> {
     // OS-seeded CSPRNGs for every fresh prover configuration. No fixed masks.
     let rng = || {
         StdRng::try_from_rng(&mut rand::rngs::SysRng)
@@ -85,11 +91,15 @@ fn config() -> Result<Config, Error> {
         RANDOM_CODEWORDS,
         rng()?,
     );
-    Ok(Config::new(pcs, challenger()))
+    Ok(Config::new(pcs, challenger_with(domain)))
 }
 
 fn challenger() -> Challenger {
-    Challenger::from_hasher(TRANSCRIPT_DOMAIN.to_vec(), Keccak256Hash {})
+    challenger_with(TRANSCRIPT_DOMAIN)
+}
+
+fn challenger_with(domain: &[u8]) -> Challenger {
+    Challenger::from_hasher(domain.to_vec(), Keccak256Hash {})
 }
 
 #[derive(Clone)]
@@ -297,6 +307,16 @@ impl Program {
     }
 
     fn trace(&self, s: &Statement, w: &Witness) -> Result<RowMajorMatrix<F>, Error> {
+        let (registers, public) = self.witness(s, w)?;
+        let (trace, registers) = self.hash_trace(registers, &public);
+        self.check(&registers, &public, w)?;
+        Ok(trace)
+    }
+
+    /// The registers a witness fills (notes, keys, paths, carries), before
+    /// the jobs compute theirs, and the public values; the host checks that
+    /// need no hash first. Shared by both circuits (see [`narrow`]).
+    fn witness(&self, s: &Statement, w: &Witness) -> Result<(Vec<F>, Vec<F>), Error> {
         if w.inputs.len() != self.inputs.len() || w.outputs.len() != self.outputs.len() {
             return Err(Error::Shape);
         }
@@ -374,7 +394,12 @@ impl Program {
         if carry != 0 {
             return Err(Error::Witness("overflow"));
         }
-        let (trace, registers) = self.hash_trace(registers, &public);
+        Ok((registers, public))
+    }
+
+    /// After the jobs ran: the bound registers are the public commitments
+    /// and nullifiers, and every note worth something is in the anchor's tree.
+    fn check(&self, registers: &[F], public: &[F], w: &Witness) -> Result<(), Error> {
         for &(r, p) in &self.bindings {
             if registers[r] != public[p] {
                 return Err(Error::Witness("commitment or nullifier"));
@@ -385,26 +410,33 @@ impl Program {
                 return Err(Error::Witness("membership"));
             }
         }
-        Ok(trace)
+        Ok(())
     }
 
-    // Low-level trace generation is separated from host witness checks so
-    // adversarial tests can recompute a fully consistent hash trace for a
-    // forged balance. The verifier must reject it using AIR constraints.
-    fn hash_trace(&self, mut registers: Vec<F>, public: &[F]) -> (RowMajorMatrix<F>, Vec<F>) {
+    /// Run every job in order: each writes its result into its registers.
+    /// Returns the state each permutation starts from, one per operation.
+    fn run_jobs(&self, registers: &mut [F], public: &[F]) -> Vec<[F; WIDTH]> {
         let permutation = default_koalabear_poseidon2_32();
-        let mut hash_inputs = Vec::with_capacity(self.rows);
+        let mut hash_inputs = Vec::with_capacity(self.operations());
         for job in &self.jobs {
             let mut state = [F::ZERO; WIDTH];
             for chunk in job.message.chunks_exact(RATE) {
                 for i in 0..RATE {
-                    state[i] += chunk[i].value(&registers, &public);
+                    state[i] += chunk[i].value(registers, public);
                 }
                 hash_inputs.push(state);
                 permutation.permute_mut(&mut state);
             }
             registers[job.result..job.result + WORDS].copy_from_slice(&state[..WORDS]);
         }
+        hash_inputs
+    }
+
+    // Low-level trace generation is separated from host witness checks so
+    // adversarial tests can recompute a fully consistent hash trace for a
+    // forged balance. The verifier must reject it using AIR constraints.
+    fn hash_trace(&self, mut registers: Vec<F>, public: &[F]) -> (RowMajorMatrix<F>, Vec<F>) {
+        let mut hash_inputs = self.run_jobs(&mut registers, public);
         hash_inputs.resize(self.rows, [F::ZERO; WIDTH]);
         let hashes =
             generate_trace_rows::<F, GenericPoseidon2LinearLayersKoalaBear, 32, 3, 0, 4, ROUNDS>(
@@ -626,7 +658,35 @@ pub fn prove_transfer(statement: &Statement, witness: &Witness) -> Result<ProofE
     })
 }
 
+/// The proof of version 3: the first circuit, one column per register.
+pub const PROOF_V3: u32 = VERSION;
+/// The same relation on a narrow trace ([`narrow`]): much smaller proofs.
+pub const PROOF_V4: u32 = narrow::PROOF_VERSION;
+
+/// A proof of `version` ([`PROOF_V3`] or [`PROOF_V4`]). Which one a block
+/// accepts is the chain's rule ([`crate::ledger`] callers), not this one's.
+pub fn prove_transfer_as(
+    statement: &Statement,
+    witness: &Witness,
+    version: u32,
+) -> Result<ProofEnvelope, Error> {
+    match version {
+        PROOF_V3 => prove_transfer(statement, witness),
+        PROOF_V4 => narrow::prove(statement, witness),
+        _ => Err(Error::Encoding),
+    }
+}
+
+/// Check `envelope` with the circuit of the version it declares.
 pub fn verify_transfer(statement: &Statement, envelope: &ProofEnvelope) -> Result<(), Error> {
+    match envelope.version {
+        PROOF_V3 => verify_wide(statement, envelope),
+        PROOF_V4 => narrow::verify(statement, envelope),
+        _ => Err(Error::Encoding),
+    }
+}
+
+fn verify_wide(statement: &Statement, envelope: &ProofEnvelope) -> Result<(), Error> {
     let public = statement.public_values()?;
     if envelope.version != VERSION || envelope.proof.len() > MAX_PROOF_BYTES {
         return Err(Error::Encoding);
@@ -679,6 +739,8 @@ pub(crate) fn proof_tree(bytes: &[u8]) -> Option<crate::fuzzing::tree::Node> {
     crate::fuzzing::tree::capture(&proof).ok()
 }
 
+/// Version 4: the same program on a narrow trace.
+pub mod narrow;
 /// The soundness margin of every shape, term by term, and what candidates cost.
 #[cfg(test)]
 mod margin;

@@ -476,12 +476,16 @@ pub(crate) fn pay(
         .height
         .checked_add(stark::protocol::light::PAYMENT_LIFETIME)
         .ok_or("expiry overflow")?;
+    // The proof of the version the next block accepts (the narrow circuit
+    // from its activation on).
+    let next = state.height.checked_add(1).ok_or("height overflow")?;
     let tx = transaction::transfer(
         account,
         state.tree.root(),
         inputs,
         vec![payment, Payment::new(account.address(), total - needed)],
         fee,
+        stark::protocol::ledger::proof_version_for(profile.network, next),
     )
     .map_err(error)?;
     state.check_transfer(&tx).map_err(error)?;
@@ -967,6 +971,7 @@ mod tests {
                 Payment::new(alice.address(), PREMINE - ATOMS - 200),
             ],
             200,
+            stark::protocol::ledger::proof_version_for(P.network, 2),
         )
         .unwrap();
         let encrypted =

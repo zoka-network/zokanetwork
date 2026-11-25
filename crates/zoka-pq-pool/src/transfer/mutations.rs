@@ -22,7 +22,7 @@ use p3_field::PrimeField32;
 /// the rest padding (worth nothing, in no tree), and the statement it
 /// proves. Some unrelated notes come first, so the paths are not those of an
 /// empty tree. Two outputs, as every transfer has.
-fn shape(real: usize, inputs: usize) -> (Statement, Witness) {
+pub(super) fn shape(real: usize, inputs: usize) -> (Statement, Witness) {
     let (n, m, shape) = (real, TRANSFER_OUTPUTS, inputs);
     let network = 3;
     let key = SpendKey::from_seed(&[7; 32], network, 0).unwrap();

@@ -166,6 +166,55 @@ pub fn maturity(network: u8) -> u32 {
     }
 }
 
+/// The first block of the testnet (network 2) whose transfers may prove with
+/// the narrow circuit, `transfer::narrow` (proof version 4). Announced with
+/// the release that brings it: a network upgrade at a height, never a new
+/// chain. About two weeks after 25/11/2026 (height ~9,780, ~800 blocks a
+/// day).
+pub const TESTNET_PROOF_V4_HEIGHT: u32 = 20_000;
+/// The same for regtest: low, so the tests rehearse the upgrade.
+pub const REGTEST_PROOF_V4_HEIGHT: u32 = 8;
+/// After the switch, a transfer of the first circuit stays valid this many
+/// blocks: a payment built just before it is still mined. Its anchor
+/// expires sooner (`ANCHOR_WINDOW`), so this is only a margin.
+pub const PROOF_V3_GRACE: u32 = 100;
+
+/// The first block whose transfers may prove with version 4 on `network`.
+/// A network that is not the testnet or regtest (the mainnet, when it
+/// starts) has version 4 from its first block.
+pub fn proof_v4_height(network: u8) -> u32 {
+    match network {
+        2 => TESTNET_PROOF_V4_HEIGHT,
+        3 => REGTEST_PROOF_V4_HEIGHT,
+        _ => 1,
+    }
+}
+
+/// Whether a transfer in block `height` of `network` may carry a proof of
+/// `version`: version 3 until [`PROOF_V3_GRACE`] blocks after the switch,
+/// version 4 from the switch on. The consensus rule of the upgrade. A
+/// network that starts on version 4 never had version 3, grace included.
+pub fn proof_version_allowed(network: u8, height: u32, version: u32) -> bool {
+    let switch = proof_v4_height(network);
+    match version {
+        crate::transfer::PROOF_V3 => {
+            switch > 1 && height < switch.saturating_add(PROOF_V3_GRACE)
+        }
+        crate::transfer::PROOF_V4 => height >= switch,
+        _ => false,
+    }
+}
+
+/// The version a wallet proves a transfer for block `height` with: the
+/// newest one that block accepts.
+pub fn proof_version_for(network: u8, height: u32) -> u32 {
+    if height >= proof_v4_height(network) {
+        crate::transfer::PROOF_V4
+    } else {
+        crate::transfer::PROOF_V3
+    }
+}
+
 /// An incremental note tree: the left nodes that still wait for a right
 /// sibling, one per set bit of `count`. Enough to append and compute the root
 /// of the full tree, so a node keeps this per block instead of every note.
@@ -527,6 +576,80 @@ impl LedgerState for Ledger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The network upgrade of the narrow proof, as consensus: a transfer of
+    /// version 4 is refused before the switch and accepted from it on; one
+    /// of version 3 stays valid for the grace blocks and not after. Wallets
+    /// prove with the version of the block they aim at.
+    #[test]
+    fn the_proof_version_follows_the_upgrade_height() {
+        use crate::{
+            model::Input,
+            transaction::{self, Payment},
+            wallet::Account,
+            PROOF_V3, PROOF_V4,
+        };
+        let alice = Account::from_seed(&[1; 32], 3, 0).unwrap();
+        let bob = Account::from_seed(&[2; 32], 3, 0).unwrap();
+        let mut ledger = Ledger::new(3).unwrap();
+        let genesis = transaction::coinbase(&alice.address(), PREMINE, 1).unwrap();
+        ledger.apply(&genesis, &[]).unwrap();
+        let (note, _) = alice
+            .receive(genesis.statement.commitments[0], &genesis.envelopes[0])
+            .unwrap();
+        let grow_to = |ledger: &mut Ledger, height: u32| {
+            while ledger.height < height {
+                let next = ledger.height + 1;
+                let reward = transaction::coinbase(&bob.address(), subsidy(next), next).unwrap();
+                ledger.apply(&reward, &[]).unwrap();
+            }
+        };
+        let fee = conventional_fee(1, 2);
+        let pay = |ledger: &Ledger, version: u32| {
+            transaction::transfer(
+                &alice,
+                ledger.tree.root(),
+                vec![Input {
+                    key: alice.spend.clone(),
+                    note: note.clone(),
+                    path: ledger.tree.path(0).unwrap(),
+                }],
+                vec![
+                    Payment::new(bob.address(), ATOMS),
+                    Payment::new(alice.address(), PREMINE - ATOMS - fee),
+                ],
+                fee,
+                version,
+            )
+            .unwrap()
+        };
+        let switch = REGTEST_PROOF_V4_HEIGHT;
+        // The block before the switch: version 3 only.
+        grow_to(&mut ledger, switch - 2);
+        assert_eq!(proof_version_for(3, switch - 1), PROOF_V3);
+        assert!(matches!(
+            ledger.check_transfer(&pay(&ledger, PROOF_V4)),
+            Err(Error::Ledger("proof version"))
+        ));
+        ledger.check_transfer(&pay(&ledger, PROOF_V3)).unwrap();
+        // The switch: both, and wallets move to version 4.
+        grow_to(&mut ledger, switch - 1);
+        assert_eq!(proof_version_for(3, switch), PROOF_V4);
+        ledger.check_transfer(&pay(&ledger, PROOF_V4)).unwrap();
+        ledger.check_transfer(&pay(&ledger, PROOF_V3)).unwrap();
+        // After the grace: version 4 only.
+        grow_to(&mut ledger, switch + PROOF_V3_GRACE - 1);
+        ledger.check_transfer(&pay(&ledger, PROOF_V4)).unwrap();
+        assert!(matches!(
+            ledger.check_transfer(&pay(&ledger, PROOF_V3)),
+            Err(Error::Ledger("proof version"))
+        ));
+        // No other version, ever; and a later network starts on version 4.
+        assert!(!proof_version_allowed(3, switch, 5));
+        assert!(!proof_version_allowed(1, 1, PROOF_V3));
+        assert!(proof_version_allowed(1, 1, PROOF_V4));
+        assert_eq!(proof_v4_height(2), TESTNET_PROOF_V4_HEIGHT);
+    }
     #[test]
     fn a_stored_tree_is_checked_before_it_is_used() {
         let mut tree = NoteTree::new(3).unwrap();
@@ -657,6 +780,7 @@ mod tests {
                 Payment::new(alice.address(), PREMINE - ATOMS - fee),
             ],
             fee,
+            proof_version_for(3, 2),
         )
         .unwrap();
         // One note spent, two published: the other one pads the shape.
@@ -727,6 +851,7 @@ mod tests {
                 Payment::new(alice.address(), PREMINE - 42 * ATOMS - fee),
             ],
             fee,
+            proof_version_for(3, 2),
         )
         .unwrap();
         let payment = Transaction::decode(&payment.encode().unwrap()).unwrap();

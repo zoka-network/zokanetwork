@@ -642,6 +642,7 @@ impl LightWallet {
         let mut payment = Payment::new(to, amount);
         payment.memo[..memo.len()].copy_from_slice(memo);
         let change = total - amount - fee;
+        let next = self.height().checked_add(1).ok_or(Error::Shape)?;
         Ok(Plan {
             anchor: tree.root(),
             inputs,
@@ -652,6 +653,7 @@ impl LightWallet {
                 .height()
                 .checked_add(PAYMENT_LIFETIME)
                 .ok_or(Error::Shape)?,
+            version: crate::ledger::proof_version_for(self.network, next),
         })
     }
 
@@ -699,6 +701,9 @@ pub struct Plan {
     pub payments: Vec<Payment>,
     pub fee: u64,
     pub expiry: u32,
+    /// The proof's version: the one the next block accepts
+    /// ([`crate::ledger::proof_version_for`]).
+    pub version: u32,
 }
 impl Plan {
     pub fn amount(&self) -> u64 {
@@ -731,7 +736,14 @@ impl Plan {
                 })
             })
             .collect::<Result<Vec<_>, Error>>()?;
-        transaction::transfer(sender, self.anchor, inputs, self.payments, self.fee)
+        transaction::transfer(
+            sender,
+            self.anchor,
+            inputs,
+            self.payments,
+            self.fee,
+            self.version,
+        )
     }
 }
 

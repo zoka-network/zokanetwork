@@ -4,7 +4,7 @@ use crate::{
         coinbase_rho, commit, transfer_inputs, transfer_rho, Input, MerklePath, Note, SpendKey,
         Statement, Witness, DEPTH, TRANSFER_OUTPUTS, VERSION,
     },
-    prove_transfer, verify_transfer,
+    prove_transfer_as, verify_transfer,
     wallet::{digest, encrypt_note, fresh, random_digest, Account, Address, Envelope, MEMO_BYTES},
     Error, ProofEnvelope,
 };
@@ -120,6 +120,11 @@ impl Transaction {
             }
             return self.verify_coinbase();
         }
+        // Which circuit a block of this height accepts is a consensus rule:
+        // the network upgrade of `ledger::proof_v4_height`.
+        if !crate::ledger::proof_version_allowed(network, height, self.proof.version) {
+            return Err(Error::Ledger("proof version"));
+        }
         verify_transfer(&self.statement, &self.proof)
     }
 
@@ -168,13 +173,15 @@ fn padding(network: u8) -> Result<Input, Error> {
 /// `payments`, the payment and the change. Fewer inputs than a shape of
 /// [`crate::model::TRANSFER_INPUTS`] are padded with notes worth nothing, so
 /// the number of notes really spent stays private within its shape. The fee
-/// has to be [`crate::ledger::conventional_fee`] of that shape.
+/// has to be [`crate::ledger::conventional_fee`] of that shape. `version` is
+/// the proof's: [`crate::ledger::proof_version_for`] the block it is meant for.
 pub fn transfer(
     sender: &Account,
     anchor: Digest,
     mut inputs: Vec<Input>,
     payments: Vec<Payment>,
     fee: u64,
+    version: u32,
 ) -> Result<Transaction, Error> {
     let network = sender.network;
     if inputs.is_empty() || payments.len() != TRANSFER_OUTPUTS {
@@ -217,7 +224,7 @@ pub fn transfer(
         },
     };
     tx.statement.binding = tx.effects_digest()?;
-    tx.proof = prove_transfer(&tx.statement, &witness)?;
+    tx.proof = prove_transfer_as(&tx.statement, &witness, version)?;
     Ok(tx)
 }
 

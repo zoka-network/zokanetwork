@@ -12,7 +12,9 @@ pub mod scan;
 pub mod transaction;
 mod transfer;
 pub mod wallet;
-pub use transfer::{prove_transfer, verify_transfer, ProofEnvelope};
+pub use transfer::{
+    prove_transfer, prove_transfer_as, verify_transfer, ProofEnvelope, PROOF_V3, PROOF_V4,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
