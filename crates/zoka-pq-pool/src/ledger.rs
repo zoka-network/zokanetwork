@@ -169,9 +169,9 @@ pub fn maturity(network: u8) -> u32 {
 /// The first block of the testnet (network 2) whose transfers may prove with
 /// the narrow circuit, `transfer::narrow` (proof version 4). Announced with
 /// the release that brings it: a network upgrade at a height, never a new
-/// chain. About two weeks after 25/11/2026 (height ~9,780, ~800 blocks a
-/// day).
-pub const TESTNET_PROOF_V4_HEIGHT: u32 = 20_000;
+/// chain. Chosen on 25/11/2026 at height 9,865, for the same afternoon
+/// (~17:00 Argentina), so the first upgrade is watched as it activates.
+pub const TESTNET_PROOF_V4_HEIGHT: u32 = 10_000;
 /// The same for regtest: low, so the tests rehearse the upgrade.
 pub const REGTEST_PROOF_V4_HEIGHT: u32 = 8;
 /// After the switch, a transfer of the first circuit stays valid this many
