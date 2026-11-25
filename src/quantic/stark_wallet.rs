@@ -2,12 +2,17 @@
 //! `quantic-wallet`, so ZSilent keeps its calls and models.
 //!
 //! Wallets are `<dir>/wallets/<name>.json` in the `quantic-pq` format, so the
-//! explicit-path tools open them too. Balance, history and payments read a
-//! mirror database (`<dir>/wallet-mirror`) that each call first brings up to
-//! the wallet's own node over a direct connection (`--peer`, the file the
-//! node writes with `--descriptor-out`). The node's loopback API (`--api`)
-//! resolves short addresses, takes payments and publishes the wallet's
-//! address. Unlike `quantic-pq wallet-create`, `new` prints the recovery
+//! explicit-path tools open them too. Balance, history and payments run on
+//! the light engine of ZKAPriv and the web wallet ([`LightWallet`]): its
+//! state, sealed with a key of the seed, sits beside the wallet file
+//! (`<name>.json.light`), and each call reads only the blocks that are new
+//! since the last one, as `/scan2` pages of the wallet's own node, without
+//! the proofs. Until 25/11/2026 each call rebuilt the whole ledger from a
+//! mirror of the chain (`<dir>/wallet-mirror`, no longer used): about 30 s
+//! and 2 GB read per call at height 9,741, growing with the chain. The
+//! node's loopback API (`--api`) also resolves short addresses, takes
+//! payments and publishes the wallet's address. `--peer` is still accepted
+//! and ignored. Unlike `quantic-pq wallet-create`, `new` prints the recovery
 //! phrase once, as the v1 wallet did: ZSilent shows it to be written down.
 //!
 //! Every reply is one JSON line (`--json`) after anything the node code may
@@ -18,10 +23,13 @@ use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
-    sync::Arc,
     time::Duration,
 };
 
+use aes_gcm::{
+    aead::{Aead, Payload},
+    Aes256Gcm, KeyInit, Nonce,
+};
 use bip39::{Language, Mnemonic};
 use rand::RngCore;
 use serde_json::{json, Value};
@@ -29,24 +37,32 @@ use zeroize::Zeroizing;
 
 use super::{
     stark::{
-        protocol::wallet::{Address, ShortAddress},
+        protocol::{
+            light::LightWallet,
+            scan::{ScanPage2, MAX_SCAN_BLOCKS, MAX_SCAN_PAGE_BYTES},
+            transaction::Transaction,
+            wallet::{Account, Address, ShortAddress},
+        },
         Profile,
     },
-    stark_api::NodeState,
-    stark_cli::{self, error, flag, option, required, Scan, WalletFile},
+    stark_cli::{self, error, flag, option, required, WalletFile},
     stark_directory::AddressRecord,
-    stark_net::NodeDescriptor,
-    stark_node,
 };
 use crate::economics::{format_zka_amount, parse_zka_amount};
 
-const USAGE: &str = "usage: zoka quantic-pq-wallet <new|generate-phrase|restore|address|addresses|new-address|publish-address|list|balance|history|estimate-fee|send|show-phrase|show-view-key|change-password|backup|import-backup> --network testnet|regtest --dir DIR [--name WALLET | --address ITS_ADDRESS] [--password-env VAR | --password-stdin] [--peer NODE_DESCRIPTOR] [--api http://127.0.0.1:9140] [history: --limit N] [show-view-key: --incoming] [restore: --phrase-env VAR or the phrase on stdin] [estimate-fee and send: --amount ZKA] [send: --to FULL_OR_SHORT [--memo TEXT]] [change-password: --new-password-env VAR] [backup: --out FILE] [import-backup: --file FILE] [--json]";
+const USAGE: &str = "usage: zoka quantic-pq-wallet <new|generate-phrase|restore|address|addresses|new-address|publish-address|list|balance|history|estimate-fee|send|show-phrase|show-view-key|change-password|backup|import-backup> --network testnet|regtest --dir DIR [--name WALLET | --address ITS_ADDRESS] [--password-env VAR | --password-stdin] [--api http://127.0.0.1:9140] [history: --limit N] [show-view-key: --incoming] [restore: --phrase-env VAR or the phrase on stdin] [estimate-fee and send: --amount ZKA] [send: --to FULL_OR_SHORT [--memo TEXT]] [change-password: --new-password-env VAR] [backup: --out FILE] [import-backup: --file FILE] [--json]";
 const DEFAULT_API: &str = "http://127.0.0.1:9140";
-/// Blocks one call imports into the mirror before it answers.
-const MIRROR_BUDGET: usize = 4096;
-const MAX_DESCRIPTOR_BYTES: usize = 8 * 1024;
 const MAX_API_REPLY: usize = 1024 * 1024;
 const MAX_NAME: usize = 64;
+/// Pages of `/scan2` one call reads before it answers (100 blocks each): a
+/// wallet that starts from block 1 reads 40,000 blocks in its first call,
+/// and the rest in the next ones.
+const LIGHT_PAGE_BUDGET: usize = 400;
+/// What a sealed light state may weigh: its ledger grows with the chain's
+/// notes (about 100 bytes each).
+const MAX_LIGHT_STATE_BYTES: usize = 1 << 30;
+const LIGHT_MAGIC: &[u8; 8] = b"ZQLIGHT1";
+const LIGHT_KEY_CONTEXT: &str = "ZOKA quantic light wallet state v1";
 
 /// The wallets of one chain under `--dir`.
 struct Store {
@@ -192,34 +208,194 @@ async fn blocking<T: Send + 'static>(
     .map_err(error)?
 }
 
-/// The wallet mirror, brought up to the wallet's node when `--peer` names
-/// it. Returns the mirror and why it may lag, if it does: an unreachable or
-/// still catching-up node does not stop a balance from answering.
-async fn mirror(store: &Store, args: &[String]) -> Result<(NodeState, Option<String>), String> {
-    let path = store.dir.join("wallet-mirror");
-    let profile = store.profile;
-    let state = blocking(move || {
-        let (db, _) = stark_cli::open_db(&path, Some(profile))?;
-        NodeState::new(Arc::new(db))
-    })
-    .await?;
-    let Some(peer) = option(args, "--peer") else {
-        return Ok((state, Some("no --peer node descriptor".into())));
-    };
-    let descriptor: NodeDescriptor = serde_json::from_slice(&stark_cli::read_bounded(
-        Path::new(peer),
-        MAX_DESCRIPTOR_BYTES,
-    )?)
-    .map_err(error)?;
-    let lag = match stark_node::follow(&state, &descriptor, MIRROR_BUDGET).await {
-        Ok((_, true)) => None,
-        Ok((head, false)) => Some(format!(
-            "the mirror is at height {} and the node is ahead",
-            head.height
-        )),
-        Err(reason) => Some(reason),
-    };
-    Ok((state, lag))
+/// A wallet opened on the light engine: its addresses, its state, and where
+/// and with what the state is sealed. The caller holds the wallet lock.
+struct Light {
+    wallet: LightWallet,
+    accounts: Vec<Account>,
+    path: PathBuf,
+    key: Zeroizing<[u8; 32]>,
+    chain_id: &'static str,
+    /// A payment the earlier engine left reserved (`<name>.json.stark-pending`),
+    /// to hold again once the state has read the chain.
+    pending_payment: Option<Transaction>,
+    wallet_path: PathBuf,
+    /// The earlier engine's file is set aside once the state that took its
+    /// payment over is written.
+    retire_pending: bool,
+}
+
+impl Light {
+    /// Open the wallet with its password and its state, or a new state that
+    /// reads the chain from block 1 if there is none or it cannot be read
+    /// (another chain, another format, damaged): it is only a cache.
+    fn open(wallet: &Path, password: &str, profile: Profile) -> Result<Self, String> {
+        let (_, _, seed) = stark_cli::open_wallet_seed(wallet, password)?;
+        let (file, _) = stark_cli::read_wallet(wallet)?;
+        let key = light_key(&seed, profile);
+        let path = light_path(wallet);
+        let mut light = match read_light(&path, &key, profile)
+            .ok()
+            .flatten()
+            .filter(|state| state.network() == profile.network)
+        {
+            Some(state) => state,
+            None => LightWallet::new(profile.network, 1).map_err(error)?,
+        };
+        // The file only grows its addresses; a state that read for more (a
+        // file put back from an older backup) keeps reading for those.
+        let count = file.addresses.max(light.addresses()).max(1);
+        if count > light.addresses() {
+            light.set_addresses(count).map_err(error)?;
+        }
+        let accounts = (0..count)
+            .map(|index| Account::from_seed(&seed, profile.network, index).map_err(error))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            wallet: light,
+            accounts,
+            path,
+            key,
+            chain_id: profile.chain_id,
+            pending_payment: stark_cli::pending(wallet, password, profile).ok().flatten(),
+            wallet_path: wallet.to_path_buf(),
+            retire_pending: false,
+        })
+    }
+
+    /// Bring the state up to the node of `api`, page by page from where it
+    /// stopped. Returns why it may lag: an unreachable or still catching-up
+    /// node does not stop a balance from answering.
+    fn sync(&mut self, api: &str) -> Option<String> {
+        let lag = self.read_pages(api);
+        if lag.is_none() {
+            self.adopt_pending();
+        }
+        lag
+    }
+
+    /// The payment the earlier engine reserved, held again if it can still
+    /// be mined (the engine checks it against the ledger it read), and its
+    /// file set aside as `.adopted` so this happens once.
+    fn adopt_pending(&mut self) {
+        let Some(tx) = self.pending_payment.take() else {
+            return;
+        };
+        if self.wallet.pending().is_none() {
+            let _ = self.wallet.reserve(&tx);
+        }
+        self.retire_pending = true;
+    }
+
+    fn read_pages(&mut self, api: &str) -> Option<String> {
+        for _ in 0..LIGHT_PAGE_BUDGET {
+            let path = format!("/scan2?from={}&count={MAX_SCAN_BLOCKS}", self.wallet.next());
+            let bytes = match api_bytes(api, &path, MAX_SCAN_PAGE_BYTES) {
+                Ok(bytes) => bytes,
+                Err(reason) => return Some(reason),
+            };
+            let page = match ScanPage2::decode(&bytes) {
+                Ok(page) => page,
+                Err(_) => return Some("the node sent an unreadable scan page".into()),
+            };
+            if page.network != self.wallet.network() {
+                return Some("the node at --api runs another chain".into());
+            }
+            let empty = page.blocks.is_empty();
+            if let Err(reason) = self.wallet.add_page_for(&self.accounts, &page) {
+                return Some(format!("the node's scan page was refused: {reason}"));
+            }
+            if empty || self.wallet.in_sync() {
+                return None;
+            }
+        }
+        Some(format!(
+            "the wallet read up to height {} and the node is at {}",
+            self.wallet.height(),
+            self.wallet.tip()
+        ))
+    }
+
+    /// Seal and write the state, replacing the last one only once the new
+    /// one is whole.
+    fn save(&self) -> Result<(), String> {
+        let plain = Zeroizing::new(self.wallet.encode().map_err(error)?);
+        let cipher = Aes256Gcm::new_from_slice(self.key.as_ref()).map_err(error)?;
+        let mut nonce = [0u8; 12];
+        rand::rngs::OsRng.try_fill_bytes(&mut nonce).map_err(error)?;
+        let sealed = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: plain.as_slice(),
+                    aad: &light_aad(self.chain_id),
+                },
+            )
+            .map_err(|_| "the wallet state could not be sealed".to_string())?;
+        let mut bytes = Vec::with_capacity(LIGHT_MAGIC.len() + nonce.len() + sealed.len());
+        bytes.extend_from_slice(LIGHT_MAGIC);
+        bytes.extend_from_slice(&nonce);
+        bytes.extend_from_slice(&sealed);
+        let mut temporary = self.path.as_os_str().to_os_string();
+        temporary.push(".new");
+        let temporary = PathBuf::from(temporary);
+        fs::write(&temporary, &bytes).map_err(error)?;
+        fs::rename(&temporary, &self.path).map_err(error)?;
+        if self.retire_pending {
+            let old = stark_cli::pending_path(&self.wallet_path);
+            let mut done = old.as_os_str().to_os_string();
+            done.push(".adopted");
+            let _ = fs::rename(&old, PathBuf::from(done));
+        }
+        Ok(())
+    }
+}
+
+/// `<name>.json.light`, beside the wallet.
+fn light_path(wallet: &Path) -> PathBuf {
+    let mut path = wallet.as_os_str().to_os_string();
+    path.push(".light");
+    PathBuf::from(path)
+}
+
+/// The state's key: of the seed, so only who opens the wallet reads it, and
+/// a new password leaves it as it is.
+fn light_key(seed: &[u8; 32], profile: Profile) -> Zeroizing<[u8; 32]> {
+    let mut material = Zeroizing::new(Vec::with_capacity(32 + profile.chain_id.len()));
+    material.extend_from_slice(seed);
+    material.extend_from_slice(profile.chain_id.as_bytes());
+    Zeroizing::new(blake3::derive_key(LIGHT_KEY_CONTEXT, &material))
+}
+
+fn light_aad(chain_id: &str) -> Vec<u8> {
+    [LIGHT_MAGIC.as_slice(), chain_id.as_bytes()].concat()
+}
+
+/// The state at `path`: `None` if there is none, an error if it cannot be
+/// opened with `key`.
+fn read_light(path: &Path, key: &[u8; 32], profile: Profile) -> Result<Option<LightWallet>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = stark_cli::read_bounded(path, MAX_LIGHT_STATE_BYTES)?;
+    let body = bytes
+        .strip_prefix(LIGHT_MAGIC.as_slice())
+        .filter(|body| body.len() > 12)
+        .ok_or("not a sealed wallet state")?;
+    let (nonce, sealed) = body.split_at(12);
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(error)?;
+    let plain = Zeroizing::new(
+        cipher
+            .decrypt(
+                Nonce::from_slice(nonce),
+                Payload {
+                    msg: sealed,
+                    aad: &light_aad(profile.chain_id),
+                },
+            )
+            .map_err(|_| "the wallet state does not open with this wallet".to_string())?,
+    );
+    LightWallet::decode(&plain).map(Some).map_err(error)
 }
 
 /// One request to the node's API, which listens on loopback only.
@@ -229,6 +405,36 @@ fn api_call(
     path: &str,
     body: Option<(&str, &[u8])>,
     timeout: Duration,
+) -> Result<(u16, Vec<u8>), String> {
+    api_call_limited(base, method, path, body, timeout, MAX_API_REPLY)
+}
+
+/// The body of a `GET` that answers bytes (a scan page), up to `limit`. A
+/// busy node answers 503 while both of its workers verify: a few retries
+/// cover that.
+fn api_bytes(base: &str, path: &str, limit: usize) -> Result<Vec<u8>, String> {
+    for attempt in 0..5 {
+        let (status, bytes) =
+            api_call_limited(base, "GET", path, None, Duration::from_secs(120), limit)?;
+        match status {
+            200 => return Ok(bytes),
+            503 if attempt < 4 => std::thread::sleep(Duration::from_secs(1)),
+            _ => {
+                let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                return api_ok(status, value).map(|_| Vec::new());
+            }
+        }
+    }
+    Err("the node API stayed busy".into())
+}
+
+fn api_call_limited(
+    base: &str,
+    method: &str,
+    path: &str,
+    body: Option<(&str, &[u8])>,
+    timeout: Duration,
+    limit: usize,
 ) -> Result<(u16, Vec<u8>), String> {
     let authority = base
         .strip_prefix("http://")
@@ -255,11 +461,13 @@ fn api_call(
         .and_then(|_| stream.write_all(bytes))
         .map_err(|e| format!("node API {authority}: {e}"))?;
     let mut reply = Vec::new();
+    // The head and the chunk lines on top of the body.
+    let cap = limit.saturating_add(64 * 1024);
     (&mut stream)
-        .take(MAX_API_REPLY as u64 + 1)
+        .take(cap as u64 + 1)
         .read_to_end(&mut reply)
         .map_err(|e| format!("node API {authority}: {e}"))?;
-    if reply.len() > MAX_API_REPLY {
+    if reply.len() > cap {
         return Err("node API reply too large".into());
     }
     let split = reply
@@ -385,53 +593,6 @@ fn resolve(text: &str, profile: Profile, api: &str) -> Result<Address, String> {
     }
     Ok(full)
 }
-
-/// Balance figures of one scan, with a live pending payment's inputs
-/// reserved.
-struct Funds {
-    spendable: u64,
-    immature: u64,
-    reserved: u64,
-    max_sendable: u64,
-    notes: usize,
-    pending: bool,
-}
-
-fn funds(scan: &Scan, wallet: &Path, password: &str, profile: Profile) -> Result<Funds, String> {
-    let reservation = stark_cli::pending(wallet, password, profile)?
-        .filter(|tx| stark_cli::live_pending(tx, &scan.state));
-    let mut figures = Funds {
-        spendable: 0,
-        immature: 0,
-        reserved: 0,
-        max_sendable: 0,
-        notes: scan.notes.len(),
-        pending: reservation.is_some(),
-    };
-    for owned in &scan.notes {
-        let total = if owned.index.is_none() {
-            &mut figures.immature
-        } else if reservation
-            .as_ref()
-            .is_some_and(|tx| tx.statement.nullifiers.contains(&owned.nullifier))
-        {
-            &mut figures.reserved
-        } else {
-            &mut figures.spendable
-        };
-        *total = total
-            .checked_add(owned.note.value)
-            .ok_or("balance overflow")?;
-    }
-    // One pending payment per wallet: nothing more goes out until it does.
-    if reservation.is_none() {
-        figures.max_sendable = stark_cli::max_sendable(&scan.notes);
-    }
-    Ok(figures)
-}
-
-const PENDING_REASON: &str =
-    "a payment of this wallet is still pending: wait until it is mined or expires";
 
 /// Run one action and return its JSON reply.
 async fn act(action: &str, args: &[String]) -> Result<Value, String> {
@@ -663,28 +824,31 @@ async fn act(action: &str, args: &[String]) -> Result<Value, String> {
                 })
                 .transpose()?
                 .unwrap_or(usize::MAX);
-            let (state, lag) = mirror(&store, args).await?;
+            let wallet = fs::canonicalize(&path).map_err(error)?;
             let action = action.to_string();
             blocking(move || {
-                let (accounts, _) = stark_cli::open_wallet_accounts(&path, &password)?;
-                let scan = stark_cli::scan_for(&state.storage, profile, &accounts)?;
-                let figures = funds(&scan, &path, &password, profile)?;
-                let height = u64::from(scan.state.height);
+                let _lock = stark_cli::wallet_lock(&wallet)?;
+                let mut light = Light::open(&wallet, &password, profile)?;
+                let lag = light.sync(&api);
+                light.save()?;
+                let figures = light.wallet.balance();
+                let height = u64::from(light.wallet.height());
                 Ok(match action.as_str() {
                     "balance" => json!({
-                        "name":name,"height":height,"wallet_height":height,
+                        "name":name,"height":height,"wallet_height":height,"tip":figures.tip,
                         "node_behind":lag.is_some(),"sync_error":lag,
-                        "spendable_atoms":figures.spendable,"immature_atoms":figures.immature,
-                        "reserved_atoms":figures.reserved,
-                        "spendable":format_zka_amount(figures.spendable),
-                        "immature":format_zka_amount(figures.immature),
-                        "max_sendable_atoms":figures.max_sendable,"notes":figures.notes,
+                        "spendable_atoms":figures.spendable_atoms,
+                        "immature_atoms":figures.immature_atoms,
+                        "reserved_atoms":figures.reserved_atoms,
+                        "spendable":format_zka_amount(figures.spendable_atoms),
+                        "immature":format_zka_amount(figures.immature_atoms),
+                        "max_sendable_atoms":figures.max_sendable_atoms,"notes":figures.notes,
                         "pending_payment":figures.pending,
                     }),
                     "history" => {
-                        let count = scan.history.len();
-                        let entries: Vec<_> = scan
-                            .history
+                        let history = light.wallet.history();
+                        let count = history.len();
+                        let entries: Vec<_> = history
                             .iter()
                             .rev()
                             .take(limit)
@@ -703,7 +867,7 @@ async fn act(action: &str, args: &[String]) -> Result<Value, String> {
                                     "received_atoms":entry.received,"spent_atoms":entry.spent,
                                     "net_atoms":net.to_string(),"amount_atoms":amount,
                                     "amount":format_zka_amount(amount),"timestamp":entry.timestamp,
-                                    "confirmations":height.saturating_sub(entry.height) + 1,
+                                    "confirmations":height.saturating_sub(u64::from(entry.height)) + 1,
                                 })
                             })
                             .collect();
@@ -713,24 +877,22 @@ async fn act(action: &str, args: &[String]) -> Result<Value, String> {
                         let amount = amount.expect("estimate-fee parsed its amount");
                         let mut reply = json!({
                             "name":name,"height":height,"amount_atoms":amount,
-                            "max_sendable_atoms":figures.max_sendable,"spendable_atoms":figures.spendable,
+                            "max_sendable_atoms":figures.max_sendable_atoms,
+                            "spendable_atoms":figures.spendable_atoms,
                         });
-                        let plan = if figures.pending {
-                            Err(PENDING_REASON.to_string())
-                        } else {
-                            stark_cli::select_inputs(scan.notes, amount)
-                        };
-                        match plan {
-                            Ok((inputs, total, fee)) => {
+                        // One pending payment per wallet: the engine refuses
+                        // a quote until it is mined or expires.
+                        match light.wallet.quote_total(amount) {
+                            Ok((fee, inputs, total)) => {
                                 reply["enough"] = true.into();
                                 reply["fee_atoms"] = fee.into();
                                 reply["fee"] = format_zka_amount(fee).into();
-                                reply["inputs"] = inputs.len().into();
+                                reply["inputs"] = inputs.into();
                                 reply["change_atoms"] = (total - amount - fee).into();
                             }
                             Err(reason) => {
                                 reply["enough"] = false.into();
-                                reply["reason"] = reason.into();
+                                reply["reason"] = reason.to_string().into();
                             }
                         }
                         reply
@@ -755,27 +917,29 @@ async fn act(action: &str, args: &[String]) -> Result<Value, String> {
                     .await
                     .map_err(|e| format!("--to: {e}"))?
             };
-            let (state, lag) = mirror(&store, args).await?;
-            if let Some(lag) = lag {
-                return Err(format!(
-                    "the wallet's node is not in sync ({lag}); send when it is"
-                ));
-            }
             let wallet = fs::canonicalize(&path).map_err(error)?;
             blocking(move || {
                 let _lock = stark_cli::wallet_lock(&wallet)?;
-                let (accounts, _) = stark_cli::open_wallet_accounts(&wallet, &password)?;
-                let (tx, fee, _) = stark_cli::pay(
-                    &state.storage,
-                    profile,
-                    &wallet,
-                    &accounts,
-                    &password,
-                    to,
-                    amount,
-                    memo.as_deref(),
-                )?;
-                let height = stark_cli::tip(&state.storage, profile)?.header.block_height;
+                let mut light = Light::open(&wallet, &password, profile)?;
+                let lag = light.sync(&api);
+                light.save()?;
+                if let Some(lag) = lag {
+                    return Err(format!(
+                        "the wallet's node is not in sync ({lag}); send when it is"
+                    ));
+                }
+                let memo = memo.unwrap_or_default();
+                let plan = light
+                    .wallet
+                    .plan_for(&light.accounts, to, amount, memo.as_bytes())
+                    .map_err(error)?;
+                let fee = plan.fee;
+                let tx = plan.prove_for(&light.accounts).map_err(error)?;
+                // Held before it leaves: a cut leaves its notes reserved, and
+                // the engine frees them when it is mined or expires.
+                light.wallet.reserve(&tx).map_err(error)?;
+                light.save()?;
+                let height = u64::from(light.wallet.height());
                 let bytes = tx.encode().map_err(error)?;
                 let sent = api_json(
                     &api,
@@ -790,7 +954,8 @@ async fn act(action: &str, args: &[String]) -> Result<Value, String> {
                     })),
                     // The node refused it: free the inputs for another try.
                     Ok((status, reply)) => {
-                        let _ = fs::remove_file(stark_cli::pending_path(&wallet));
+                        light.wallet.release();
+                        light.save()?;
                         api_ok(status, reply)
                     }
                     // Unknown outcome: the payment may be in the node's
@@ -921,10 +1086,9 @@ mod tests {
     use super::*;
     use crate::quantic::{
         stark::protocol::ledger::{conventional_fee, ATOMS, PREMINE},
-        stark_api,
-        stark_net::{self, ServerIdentity},
+        stark_api, stark_node,
     };
-    use iroh::endpoint::presets;
+    use std::sync::Arc;
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|s| s.to_string()).collect()
@@ -1110,12 +1274,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn balance_and_history_follow_the_wallet_node() {
+    async fn balance_history_and_a_payment_run_on_the_light_engine() {
         let dir = tempfile::tempdir().unwrap();
         let created = act("new", &with(dir.path(), &["--name", "miner"]))
             .await
             .unwrap();
         let address = Address::decode(created["address"].as_str().unwrap(), 3).unwrap();
+        let friend = act("new", &with(dir.path(), &["--name", "friend"]))
+            .await
+            .unwrap();
 
         // The wallet's node, with one block mined to the wallet.
         let storage =
@@ -1126,42 +1293,30 @@ mod tests {
                 Profile::REGTEST.chain_id.as_bytes().to_vec(),
             )
             .unwrap();
-        let node = NodeState::new(storage).unwrap();
+        let node = stark_api::NodeState::new(storage).unwrap();
         // Block 1 carries the premine, spendable at once; block 2 a coinbase
         // that matures two blocks later.
         let (first, _) = stark_node::mine_once(&node, address.clone()).await.unwrap();
-        let (second, _) = stark_node::mine_once(&node, address).await.unwrap();
-        let server = stark_net::serve(
-            node.clone(),
-            ServerIdentity::from_seed(&[90; 32]).unwrap(),
-            presets::Minimal,
+        let (second, _) = stark_node::mine_once(&node, address.clone()).await.unwrap();
+        // Its loopback API, as ZSilent's node serves it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        let served = node.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, stark_api::router(served)).await
+        });
+
+        // Without the node the wallet answers what it has, and says so.
+        let alone = act(
+            "balance",
+            &with(dir.path(), &["--name", "miner", "--api", "http://127.0.0.1:9"]),
         )
         .await
         .unwrap();
-        let mut descriptor = server.descriptor.clone();
-        let socket = server
-            .endpoint
-            .bound_sockets()
-            .into_iter()
-            .find(|a| a.is_ipv4())
-            .unwrap();
-        descriptor.endpoint_addr = iroh::EndpointAddr::new(server.endpoint.id()).with_ip_addr(
-            std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), socket.port()),
-        );
-        let peer = dir.path().join("node.peer.json");
-        fs::write(&peer, serde_json::to_vec(&descriptor).unwrap()).unwrap();
-
-        // Without the node the mirror answers what it has, and says so.
-        let alone = act("balance", &with(dir.path(), &["--name", "miner"]))
-            .await
-            .unwrap();
         assert_eq!(alone["node_behind"], true);
         assert_eq!(alone["height"], 0);
 
-        let synced = with(
-            dir.path(),
-            &["--name", "miner", "--peer", peer.to_str().unwrap()],
-        );
+        let synced = with(dir.path(), &["--name", "miner", "--api", &api]);
         let balance = act("balance", &synced).await.unwrap();
         assert_eq!(balance["node_behind"], false, "{balance}");
         assert_eq!(balance["height"], 2);
@@ -1208,7 +1363,65 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(too_much["enough"], false, "{too_much}");
-        server.close().await;
+
+        // The state stays beside the wallet, sealed: the next call reads only
+        // the blocks that are new.
+        let sealed = dir.path().join("wallets").join("miner.json.light");
+        assert!(fs::read(&sealed).unwrap().starts_with(LIGHT_MAGIC));
+        stark_node::mine_once(&node, address.clone()).await.unwrap();
+        let later = act("balance", &synced).await.unwrap();
+        assert_eq!(later["height"], 3, "{later}");
+
+        // A payment: proved here, held, taken by the node.
+        let to = friend["address"].as_str().unwrap();
+        let sent = act(
+            "send",
+            &[
+                synced.clone(),
+                args(&["--to", to, "--amount", "5", "--memo", "gracias"]),
+            ]
+            .concat(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sent["fee_atoms"], fee, "{sent}");
+        let held = act("balance", &synced).await.unwrap();
+        assert_eq!(held["pending_payment"], true, "{held}");
+        assert_eq!(held["reserved_atoms"], PREMINE, "{held}");
+        let second_payment = act(
+            "estimate-fee",
+            &[synced.clone(), args(&["--amount", "1"])].concat(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second_payment["enough"], false, "{second_payment}");
+
+        // Mined: the friend has it, and the miner its change.
+        stark_node::mine_once(&node, address.clone()).await.unwrap();
+        let theirs = act(
+            "balance",
+            &with(dir.path(), &["--name", "friend", "--api", &api]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(theirs["spendable_atoms"], 5 * ATOMS, "{theirs}");
+        let mine = act("balance", &synced).await.unwrap();
+        assert_eq!(mine["pending_payment"], false, "{mine}");
+        assert_eq!(mine["reserved_atoms"], 0, "{mine}");
+        assert!(
+            mine["spendable_atoms"].as_u64().unwrap() >= PREMINE - 5 * ATOMS - fee,
+            "{mine}"
+        );
+        let history = act("history", &synced).await.unwrap();
+        assert_eq!(history["transactions"][0]["kind"], "sent", "{history}");
+        assert_eq!(history["transactions"][0]["txid"], sent["txid"]);
+
+        // A state that does not open (another key, damaged) is only a cache:
+        // the wallet reads the chain again and answers the same.
+        fs::write(&sealed, b"ZQLIGHT1 not a state").unwrap();
+        let again = act("balance", &synced).await.unwrap();
+        assert_eq!(again["spendable_atoms"], mine["spendable_atoms"], "{again}");
+        server.abort();
     }
 
     #[test]

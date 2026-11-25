@@ -317,29 +317,20 @@ pub(crate) struct OwnedNote {
     pub(crate) index: Option<u32>,
     pub(crate) nullifier: Digest,
 }
-/// One transaction that touched the wallet: what it paid to the wallet and
-/// what it spent of the wallet's notes.
-pub(crate) struct Movement {
-    pub(crate) txid: [u8; 32],
-    pub(crate) height: u64,
-    pub(crate) timestamp: u64,
-    pub(crate) coinbase: bool,
-    pub(crate) received: u64,
-    pub(crate) spent: u64,
-}
 pub(crate) struct Scan {
     pub(crate) state: Ledger,
     /// Unspent notes.
     pub(crate) notes: Vec<OwnedNote>,
-    /// Oldest first.
-    pub(crate) history: Vec<Movement>,
 }
+#[cfg(test)]
 pub(crate) fn scan(db: &RocksDbStorage, profile: Profile, account: &Account) -> Result<Scan, String> {
     scan_for(db, profile, std::slice::from_ref(account))
 }
 
-/// [`scan`] for every address of a wallet ([`open_wallet_accounts`]): each
-/// output is tried with each one, a decryption per address.
+/// The unspent notes of every address of a wallet
+/// ([`open_wallet_accounts`]), from the whole ledger of `db`: each output is
+/// tried with each address, a decryption per address. The explicit-path
+/// tools use it; `quantic-pq-wallet` keeps a light state instead.
 pub(crate) fn scan_for(
     db: &RocksDbStorage,
     profile: Profile,
@@ -357,17 +348,15 @@ pub(crate) fn scan_for(
         positions.entry(cm).or_insert(index);
     }
     let mut notes = Vec::new();
-    // Every note the wallet ever received, by nullifier: what a later
-    // transaction spends of it.
-    let mut values = BTreeMap::new();
-    let mut history = Vec::new();
+    // Every note the wallet ever received, by nullifier: one that arrives
+    // twice counts once.
+    let mut seen = std::collections::BTreeSet::new();
     for height in 1..=parent.header.block_height {
         let block = db
             .get_canonical_block_by_height(height)
             .map_err(error)?
             .ok_or("scan requires unpruned canonical blocks")?;
         for tx in stark::decode(&block)? {
-            let mut received = 0u64;
             for (cm, envelope) in tx.statement.commitments.iter().zip(&tx.envelopes) {
                 let opened = accounts.iter().find_map(|account| {
                     account
@@ -379,13 +368,9 @@ pub(crate) fn scan_for(
                     let nullifier = note
                         .nullifier(&account.spend, profile.network)
                         .map_err(error)?;
-                    if values.contains_key(&nullifier) {
+                    if !seen.insert(nullifier) {
                         continue;
                     }
-                    values.insert(nullifier, note.value);
-                    received = received
-                        .checked_add(note.value)
-                        .ok_or("balance overflow")?;
                     if !state.spent.contains(&nullifier) {
                         notes.push(OwnedNote {
                             account: account.index,
@@ -396,29 +381,9 @@ pub(crate) fn scan_for(
                     }
                 }
             }
-            let mut spent = 0u64;
-            for nullifier in &tx.statement.nullifiers {
-                if let Some(value) = values.get(nullifier) {
-                    spent = spent.checked_add(*value).ok_or("balance overflow")?;
-                }
-            }
-            if received > 0 || spent > 0 {
-                history.push(Movement {
-                    txid: tx.txid(),
-                    height,
-                    timestamp: block.header.timestamp,
-                    coinbase: tx.statement.nullifiers.is_empty(),
-                    received,
-                    spent,
-                });
-            }
         }
     }
-    Ok(Scan {
-        state,
-        notes,
-        history,
-    })
+    Ok(Scan { state, notes })
 }
 
 /// The largest mature notes first, at most [`MAX_INPUTS`], until they pay
@@ -452,19 +417,6 @@ pub(crate) fn select_inputs(
     Ok((selected, total, fee))
 }
 
-/// The most one payment can send: the eight largest mature notes less the
-/// payment's fee.
-pub(crate) fn max_sendable(notes: &[OwnedNote]) -> u64 {
-    let mut values: Vec<u64> = notes
-        .iter()
-        .filter(|note| note.index.is_some())
-        .map(|note| note.note.value)
-        .collect();
-    values.sort_unstable_by(|a, b| b.cmp(a));
-    values.truncate(MAX_INPUTS);
-    let total = values.iter().fold(0u64, |sum, value| sum.saturating_add(*value));
-    total.saturating_sub(conventional_fee(values.len().max(1), 2))
-}
 
 /// Build a payment of `amount` to `to` and reserve its inputs in the
 /// wallet's pending file before returning it. The caller holds the wallet

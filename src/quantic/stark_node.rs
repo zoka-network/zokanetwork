@@ -1560,49 +1560,6 @@ async fn sync(options: Options) -> Result<(), String> {
     result
 }
 
-/// Bring a wallet mirror up to `peer`, the wallet's own node, over a direct
-/// connection: checkpoint first, then at most `maximum` blocks. Returns the
-/// mirror's head and whether it reached the node's tip. Prints no progress.
-pub(crate) async fn follow(
-    state: &NodeState,
-    peer: &NodeDescriptor,
-    maximum: usize,
-) -> Result<(Head, bool), String> {
-    if peer.chain_id != state.profile.chain_id {
-        return Err("the node descriptor names another chain".into());
-    }
-    let mut client = Client::connect(peer, presets::Minimal).await?;
-    let result = async {
-        exchange_checkpoint(&mut client, state, false, &mut CheckpointRelay::default()).await?;
-        let mut total = 0;
-        while total < maximum {
-            let imported = client
-                .pull_limited(state, PEER_BATCH.min(maximum - total))
-                .await?;
-            if imported == 0 {
-                break;
-            }
-            total += imported;
-        }
-        let local = head(state).await?;
-        let reached = client.head().await?.hash == local.hash;
-        Ok::<_, String>((local, reached))
-    }
-    .await;
-    client.close().await;
-    // Verifications still running hold permits: the caller drops the mirror
-    // only after they end.
-    drop(
-        state
-            .work
-            .clone()
-            .acquire_many_owned(stark_api::MAX_CRYPTO_WORKERS as u32)
-            .await
-            .map_err(err)?,
-    );
-    result
-}
-
 async fn broadcast(options: Options) -> Result<(), String> {
     let profile = match (options.network()?, options.peers()) {
         (Some(profile), _) => profile,

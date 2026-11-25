@@ -555,6 +555,13 @@ impl LightWallet {
         Ok((fee, inputs.len()))
     }
 
+    /// [`Self::quote`] and what the notes it spends add up to, which gives
+    /// the change: `total - amount - fee`.
+    pub fn quote_total(&self, amount: u64) -> Result<(u64, usize, u64), Error> {
+        let (inputs, total, fee) = self.select(amount)?;
+        Ok((fee, inputs.len(), total))
+    }
+
     /// The largest mature notes first, at most [`MAX_INPUTS`], until they pay
     /// `amount` and the fee of a two-output payment.
     fn select(&self, amount: u64) -> Result<(Vec<&OwnedNote>, u64, u64), Error> {
