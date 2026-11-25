@@ -15,6 +15,14 @@ cadena sigue, no se reinicia. Detalle técnico en [PRUEBA-V4.md](PRUEBA-V4.md).
   y 0,80 MB en vez de 7,85 MB (8 notas). En el teléfono de 32 bits, un pago de
   8 notas tarda 27 s en vez de 90 s y usa 100 MB de memoria en vez de 741 MB.
   Mismas notas, mismo árbol, mismas direcciones y la misma seguridad estimada.
+- **El minero CLI baja XMRig solo:** `2-get-xmrig.cmd` / `./zoka-miner.sh
+  get-xmrig` trae XMRig 6.25.0 de sus releases oficiales y controla el
+  SHA-256 de su `SHA256SUMS`; el de minar pasó a `3-start-mining.cmd`. La guía
+  explica cómo permitir XMRig en Defender y cómo deshacerlo. XMRig sigue sin
+  venir adentro: los antivirus marcarían el paquete entero. Se agregó el mismo
+  día, después de publicar, y reemplazó el zip y el tar.gz de la release
+  (antes `a15c25b5…` y `394d6292…`; apartados en
+  `target/cli-miner/5.1.0-sin-get-xmrig`).
 - **Activación en el bloque 10.000 de la testnet.** Desde ahí, los pagos llevan
   la prueba v4; los de la v3 valen hasta el 10.099. Las billeteras eligen la
   versión solas.
@@ -32,7 +40,7 @@ está atrasada, así que los primeros bloques salen más rápido.
 
 | Qué | Versión | Archivo / hash | Commit |
 | --- | --- | --- | --- |
-| Nodo y minero CLI (Latest; 5.0.1 Superseded) | 5.1.0 | zip `a15c25b5…`, tar.gz `394d6292…`, Linux `a18e3dbb…`; `zoka.exe` `27c0abc3…`, `zokahd.exe` `005d0e4c…` | `58feddaa` = etiqueta `v5.1.0` |
+| Nodo y minero CLI (Latest; 5.0.1 Superseded) | 5.1.0 | zip `48a6d404…`, tar.gz `362198cf…`, Linux `a18e3dbb…`; `zoka.exe` `27c0abc3…`, `zokahd.exe` `005d0e4c…` | nodo `58feddaa` = etiqueta `v5.1.0`; scripts del paquete `ec1cd9c8` |
 | ZSilent (Latest; 5.0.1 Superseded) | 5.1.0 | `ZSilent-Core-5.1.0.msi` `81789fb1…` (por dentro: zoka, zokahd y Tor 0.4.9.14) | `5e0ee8b` = etiqueta `v5.1.0` |
 | ZKAPriv (Latest; 4.0.0 Superseded) | 4.0.1 (código 21) | `ZKAPriv-4.0.1.apk` `2020c649…`, firma `061376f8…` | `872f285` = etiqueta `v4.0.1` |
 | Billetera web | WASM `c742cc80…` | wallet.zoka.network (Pages `zokawallet`) | zokawallet `68a5b20` |
