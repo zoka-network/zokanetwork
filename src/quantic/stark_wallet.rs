@@ -1424,6 +1424,77 @@ mod tests {
         server.abort();
     }
 
+    /// The network upgrade of the narrow proof, rehearsed on a node: once the
+    /// chain reaches the activation height, the same wallet proves its next
+    /// payment with version 4 by itself, and the node takes and mines it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn after_the_activation_height_payments_prove_with_version_4() {
+        use crate::quantic::stark::protocol::{
+            ledger::{proof_version_for, REGTEST_PROOF_V4_HEIGHT},
+            PROOF_V4,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let created = act("new", &with(dir.path(), &["--name", "miner"]))
+            .await
+            .unwrap();
+        let address = Address::decode(created["address"].as_str().unwrap(), 3).unwrap();
+        let friend = act("new", &with(dir.path(), &["--name", "friend"]))
+            .await
+            .unwrap();
+        let storage =
+            Arc::new(crate::storage::RocksDbStorage::new(dir.path().join("node")).unwrap());
+        storage
+            .put_raw(
+                stark_api::DB_MARKER,
+                Profile::REGTEST.chain_id.as_bytes().to_vec(),
+            )
+            .unwrap();
+        let node = stark_api::NodeState::new(storage).unwrap();
+        // Up to the block before the switch: the next one proves with v4.
+        for _ in 1..REGTEST_PROOF_V4_HEIGHT {
+            stark_node::mine_once(&node, address.clone()).await.unwrap();
+        }
+        assert_eq!(proof_version_for(3, REGTEST_PROOF_V4_HEIGHT), PROOF_V4);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        let served = node.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, stark_api::router(served)).await
+        });
+        let synced = with(dir.path(), &["--name", "miner", "--api", &api]);
+        let to = friend["address"].as_str().unwrap();
+        let sent = act(
+            "send",
+            &[synced.clone(), args(&["--to", to, "--amount", "7"])].concat(),
+        )
+        .await
+        .unwrap();
+        let txid: [u8; 32] = hex::decode(sent["txid"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let proof = node
+            .mempool
+            .lock()
+            .unwrap()
+            .get(&txid)
+            .expect("the node took the payment")
+            .proof
+            .clone();
+        assert_eq!(proof.version, PROOF_V4);
+        assert!(proof.proof.len() < 1_000_000, "{} bytes", proof.proof.len());
+        stark_node::mine_once(&node, address.clone()).await.unwrap();
+        let theirs = act(
+            "balance",
+            &with(dir.path(), &["--name", "friend", "--api", &api]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(theirs["spendable_atoms"], 7 * ATOMS, "{theirs}");
+        assert_eq!(theirs["height"], REGTEST_PROOF_V4_HEIGHT, "{theirs}");
+        server.abort();
+    }
+
     #[test]
     fn the_api_client_reads_plain_and_chunked_replies() {
         assert_eq!(

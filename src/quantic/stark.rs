@@ -649,6 +649,7 @@ mod tests {
                 Payment::new(alice.address(), PREMINE - ATOMS - 200),
             ],
             200,
+            zoka_pq_pool::ledger::proof_version_for(3, ledger.height + 1),
         )
         .unwrap();
         let mut pool = Mempool::default();
@@ -728,6 +729,7 @@ mod tests {
                 Payment::new(alice.address(), PREMINE - ATOMS - 200),
             ],
             200,
+            zoka_pq_pool::ledger::proof_version_for(3, ledger.height + 1),
         )
         .unwrap();
         let canonical = mine(&db, P, &genesis, &bob.address(), vec![payment.clone()], 1_700_000_120).unwrap();

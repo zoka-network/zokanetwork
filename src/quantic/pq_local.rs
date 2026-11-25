@@ -218,6 +218,7 @@ impl Chain {
             inputs,
             payments,
             fee,
+            zoka_pq_pool::ledger::proof_version_for(account.network, position.ledger.height + 1),
         )
         .map_err(|e| format!("no pude armar el pago: {e}"))?;
         let mut pool = stark::Mempool::default();

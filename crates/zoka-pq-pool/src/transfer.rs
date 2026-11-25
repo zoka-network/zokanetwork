@@ -94,6 +94,7 @@ fn config_with(domain: &[u8]) -> Result<Config, Error> {
     Ok(Config::new(pcs, challenger_with(domain)))
 }
 
+#[cfg(test)]
 fn challenger() -> Challenger {
     challenger_with(TRANSCRIPT_DOMAIN)
 }

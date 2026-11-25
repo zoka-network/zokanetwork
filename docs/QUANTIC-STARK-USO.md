@@ -551,10 +551,13 @@ ramas laterales se validan con esos registros y el índice canónico de
 nullifiers. Detalle en [QUANTIC-V2-FORMATO.md](QUANTIC-V2-FORMATO.md). Las
 bases creadas antes de ese formato no se pueden abrir: hay que usar una nueva.
 
-La wallet reconstruye el árbol completo recorriendo los bloques canónicos (sin
-podar) cada vez que calcula saldo o arma un pago; eso crece con la cadena. Las
-pruebas se transportan por transacción, unos 1,9 MB por pago, sin agregación
-recursiva de todo el bloque.
+Desde la 5.1.0, `quantic-pq-wallet` usa el motor liviano (el de ZKAPriv y la
+billetera web): guarda su estado cifrado al lado de la billetera y lee solo los
+bloques nuevos por `/scan2`, sin pruebas (0,2 s por consulta a la altura
+9.770). Hasta la 5.0.1 reconstruía el árbol completo en cada consulta. Las
+pruebas se transportan por transacción, sin agregación recursiva del bloque:
+2,59 MB por pago de 2 notas con la prueba v3 y 0,74 MB con la v4, que se activa
+en el bloque 20.000 de la testnet ([PRUEBA-V4.md](PRUEBA-V4.md)).
 
 La configuración de STARK y el estimador de Plonky3 se documentan en la
 [revisión del código](REVISION-STARK-CODIGO-2026-10-25.md). Los bits de seguridad

@@ -1,5 +1,29 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
+## 25/11: envíos lentos, prueba v4 y actualizaciones de red (fases A, B y C)
+
+El usuario vio que ZSilent tardaba ~6 min en enviar. Causas medidas: cada
+`balance`/`history` de `quantic-pq-wallet` reconstruía la cadena entera dos
+veces (~30 s y 2,1 GB leídos por llamada a la altura 9.741) y ZSilent los
+lanzaba cada 30 s sin esperar al anterior (cola sin fin, el envío al final).
+Además, la prueba de un pago pesa 2,59 MB (2 notas) a 7,85 MB (8 notas).
+Decisión del usuario: **nunca más empezar la cadena de cero por un cambio;
+la mainnet no se reinicia; los cambios entran como actualizaciones a una
+altura** (memoria «Actualizar, no reiniciar»). Pidió hacer A, B y C de corrido.
+
+| Fase | Qué | Dónde | Estado |
+| --- | --- | --- | --- |
+| A1 | ZSilent: una lectura de saldo a la vez, solo con bloque nuevo, candado justo, el envío primero | zsilent-core `billetera-sin-cola` `6110534` (worktree `C:\tmp\zoka-wt\zsilent-sin-cola`) | hecho, gradle test OK |
+| A2 | `quantic-pq-wallet` sobre el motor liviano (LightWallet): estado cifrado `<billetera>.json.light`, solo bloques nuevos por `/scan2`; `wallet-mirror` ya no se usa | ZOKA `billetera-motor-liviano` `c0c75862` | hecho: 0,2 s el saldo (antes ~30 s), 21,6 s la primera vez |
+| B | Prueba v4 (`transfer::narrow`): el mismo programa en 452 columnas; 0,74 MB (2→2) y 0,79 MB (8→2), 2-3× más rápida; 128 bits en el estimador | ZOKA `prueba-v4` `2270aceb`, [docs/PRUEBA-V4.md](docs/PRUEBA-V4.md) | hecho y medido en la PC; falta el teléfono |
+| C1 | Activación por altura (consenso): v4 desde H, v3 hasta H+100; testnet H = 20.000, regtest 8, red nueva solo v4 | `ledger::proof_version_allowed` | hecho, con prueba |
+| C2 | Billeteras eligen la versión del próximo bloque solas (`proof_version_for`) | `transaction::transfer`, `light::Plan` | hecho |
+| C3 | Ensayo de la activación con un nodo de regtest | `stark_wallet` prueba `after_the_activation_height…` | ver abajo |
+| C4 | Releases: nodo y minero 5.1.0 (Windows y Linux), ZSilent 5.1.0, `.so` y APK de ZKAPriv, billetera web y ZokaScan | — | pendiente |
+| C5 | Publicar y actualizar VPS y faucet **antes del bloque 20.000** (~8/12) | — | lo hace el usuario |
+
+Nada publicado ni instalado. Las ramas no están pusheadas.
+
 Actualizada: **13 de noviembre de 2026**, Argentina. **Testnet v3 en vivo** (génesis `397714b6…`): nodo y minero 5.0.1, ZSilent 5.0.1, ZKAPriv 4.0.0, billetera web, ZokaScan, faucet y zoka.network publicados; autoridad de checkpoints 2 de 3 (PC, VPS 1, VPS 2) firmando. `main` = `protocolo-v3` en ZOKA, ZSilent y ZKAPriv.
 Proyecto: `C:\Users\mderramus\ZOKA`.
 

@@ -2085,6 +2085,7 @@ mod tests {
                     Payment::new(alice.address(), PREMINE - ATOMS - 200),
                 ],
                 200,
+                zoka_pq_pool::ledger::proof_version_for(3, ledger.height + 1),
             )
             .map_err(err)?;
             let id = payment.txid();
@@ -2190,6 +2191,7 @@ mod tests {
                     Payment::new(alice.address(), PREMINE - ATOMS - 200),
                 ],
                 200,
+                zoka_pq_pool::ledger::proof_version_for(3, ledger.height + 1),
             )
             .map_err(err)?;
             let id = payment.txid();

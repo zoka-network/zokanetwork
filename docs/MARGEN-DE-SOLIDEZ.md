@@ -4,6 +4,14 @@
 la configuración actual y la compara con alternativas, para decidir en el
 próximo reinicio de la testnet.
 
+## La prueba v4 (25/11, rama `prueba-v4`)
+
+El circuito angosto ([PRUEBA-V4.md](PRUEBA-V4.md)) usa los mismos parámetros de
+FRI, el mismo hash de compromisos y el mismo campo de desafíos. El estimador da
+**128 bits** clásicos en las tres formas (2→2, 4→2 y 8→2), con el mismo tope
+de la hipótesis de Keccak-256. Lo controla
+`transfer::narrow::tests::soundness_estimates_cover_every_shape`.
+
 ## Lo que quedó en el protocolo v3 (11/11, rama `protocolo-v3`)
 
 - **Opción A:** 160 consultas, blowup 8, sin grinding, trazas de 512 filas.
