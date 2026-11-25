@@ -9,16 +9,17 @@
 # cambia). No tiene sentido minar con los dos a la vez: se reparten la CPU.
 #
 # En la testnet el nodo no mina solo: mina XMRig a través de su Stratum. Si
-# XMRig está al lado de este script, "mine" lo arranca.
+# XMRig está al lado de este script, "mine" lo arranca. "get-xmrig" lo baja de
+# sus releases oficiales y controla el SHA-256 publicado.
 #
 # "mine" queda vigilado: si XMRig se cierra vuelve a los 10 s, y si se cae el
 # nodo se rearman los dos. "autostart" lo hace arrancar al iniciar sesión.
 #
-# Uso: zoka-miner.ps1 <create-wallet | restore-wallet | address | view-key | mine | autostart [-Off] | balance | status | node-id> [-Wallet nombre] [-Threads n] [-StratumPort n] [-Xmrig ruta]
+# Uso: zoka-miner.ps1 <create-wallet | restore-wallet | get-xmrig | address | view-key | mine | autostart [-Off] | balance | status | node-id> [-Wallet nombre] [-Threads n] [-StratumPort n] [-Xmrig ruta]
 
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("create-wallet", "restore-wallet", "address", "view-key", "mine", "autostart", "balance", "status", "node-id", "help")]
+    [ValidateSet("create-wallet", "restore-wallet", "get-xmrig", "address", "view-key", "mine", "autostart", "balance", "status", "node-id", "help")]
     [string]$Command = "help",
     [string]$Wallet = "miner",
     [int]$Threads = 0,
@@ -120,6 +121,73 @@ function Find-Xmrig {
     return $null
 }
 
+# XMRig 6.25.0, la versión con la que se prueba Zoka. El hash es el del
+# SHA256SUMS de github.com/xmrig/xmrig/releases/tag/v6.25.0. Del zip sale solo
+# xmrig.exe: el driver WinRing0x64.sys que trae también lo frena el antivirus,
+# y XMRig mina sin él.
+$XmrigVersion = "6.25.0"
+$XmrigArchive = "xmrig-$XmrigVersion-windows-gcc-x64.zip"
+$XmrigSha256 = "3d4b59dafc50900414aa93cdba7cd7f929137ee58e3e8285f7db1c05d1ac327c"
+$XmrigUrl = "https://github.com/xmrig/xmrig/releases/download/v$XmrigVersion/$XmrigArchive"
+
+function Say-AntivirusHelp {
+    Say "Windows Defender (or another antivirus) removed xmrig.exe: it flags CPU miners as trojans." "Yellow"
+    Say "To allow only XMRig: Windows Security > Virus & threat protection > Protection history," "Yellow"
+    Say "open the XMRig entry, check that its file is in this folder and choose Actions > Allow on device." "Yellow"
+    Say "Then run 2-get-xmrig.cmd again. README.md, step 3, explains it and how to undo it." "Yellow"
+}
+
+function Get-Xmrig {
+    $found = Find-Xmrig
+    if ($found) {
+        Say "XMRig is already here: $found" "Green"
+        return
+    }
+    $archive = Join-Path $Root $XmrigArchive
+    Say "Downloading XMRig $XmrigVersion from its official releases:" "Cyan"
+    Say "  $XmrigUrl"
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $progress = $ProgressPreference
+    $ProgressPreference = "SilentlyContinue"
+    try {
+        Invoke-WebRequest -Uri $XmrigUrl -OutFile $archive -UseBasicParsing
+    } finally {
+        $ProgressPreference = $progress
+    }
+    $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLower()
+    if ($sha -ne $XmrigSha256) {
+        Remove-Item -LiteralPath $archive -Force
+        throw "The download does not match XMRig's official SHA-256 (got $sha, expected $XmrigSha256). It was deleted and nothing was unpacked."
+    }
+    Say "SHA-256 matches the official one: $sha" "Green"
+    $folder = Join-Path $Root "xmrig-$XmrigVersion"
+    $exe = Join-Path $folder "xmrig.exe"
+    New-Item -ItemType Directory -Force -Path $folder | Out-Null
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($archive)
+    try {
+        $entry = $zip.Entries | Where-Object { $_.FullName -match '(^|/)xmrig\.exe$' } | Select-Object -First 1
+        if (-not $entry) { throw "xmrig.exe is not inside $XmrigArchive" }
+        try {
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $exe, $true)
+        } catch {
+            Say-AntivirusHelp
+            return
+        }
+    } finally {
+        $zip.Dispose()
+        Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+    }
+    # El antivirus a veces lo borra un momento después de escribirlo.
+    Start-Sleep -Seconds 3
+    if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+        Say-AntivirusHelp
+        return
+    }
+    Say "XMRig $XmrigVersion is ready in $folder" "Green"
+    Say "Next: 3-start-mining.cmd" "Cyan"
+}
+
 # Start-Process junta los argumentos con espacios: los que tienen espacios van
 # entre comillas (la carpeta del paquete puede tenerlos).
 function Join-Arguments([string[]]$Values) {
@@ -210,7 +278,8 @@ function Start-Mining {
                     }
                 } else {
                     if ($round -eq 1) {
-                        Say "XMRig was not found next to this script, so the node is waiting for miners. Start it with:" "Yellow"
+                        Say "XMRig was not found next to this script, so the node is waiting for miners." "Yellow"
+                        Say "Get it with 2-get-xmrig.cmd and start this again, or start XMRig yourself with:" "Yellow"
                         Say "  xmrig -o $Stratum -u $Wallet -p x -a rx/0 -t $Threads" "Yellow"
                         Say "Ctrl+C stops the node." "Cyan"
                         Say ""
@@ -314,6 +383,7 @@ switch ($Command) {
             ForEach-Object { if ($_ -match '"view_key":"([^"]+)"') { $Matches[1] } else { $_ } }
         if ($LASTEXITCODE -ne 0) { throw "Could not read the view key." }
     }
+    "get-xmrig" { Get-Xmrig }
     "mine" { Start-Mining }
     "autostart" { Set-Autostart (-not $Off) }
     "balance" {
@@ -354,6 +424,7 @@ switch ($Command) {
         Say "Zoka Quantic Testnet v3 CLI miner. Commands:"
         Say "  create-wallet   a new wallet (shows its 24 words once)"
         Say "  restore-wallet  a wallet from its 24 words"
+        Say "  get-xmrig       download XMRig $XmrigVersion from its official releases and check its SHA-256"
         Say "  address         the address you share to get paid"
         Say "  view-key        a key that shows your balance (zokascan.cc/wallet) and cannot spend"
         Say "  mine            run the node, and XMRig if it is next to this script (-Threads n); restarts them if they stop"

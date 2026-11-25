@@ -19,7 +19,7 @@
 # y lo abre en su firewall: así se la alcanza directo, sin el servicio de
 # direcciones ni los relays de n0 (docs/SEMILLAS.md).
 #
-# Uso: ./zoka-miner.sh <create-wallet | restore-wallet | address | view-key | mine | autostart [--off] | balance | status | node-id> [--wallet nombre] [--threads n] [--stratum-port n] [--xmrig ruta] [--tor host:puerto] [--bind ip:puerto]
+# Uso: ./zoka-miner.sh <create-wallet | restore-wallet | get-xmrig | address | view-key | mine | autostart [--off] | balance | status | node-id> [--wallet nombre] [--threads n] [--stratum-port n] [--xmrig ruta] [--tor host:puerto] [--bind ip:puerto]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -130,6 +130,42 @@ find_xmrig() {
     command -v xmrig 2> /dev/null || true
 }
 
+# XMRig 6.25.0, la versión con la que se prueba Zoka. El hash es el del
+# SHA256SUMS de github.com/xmrig/xmrig/releases/tag/v6.25.0.
+XMRIG_VERSION="6.25.0"
+XMRIG_ARCHIVE="xmrig-$XMRIG_VERSION-linux-static-x64.tar.gz"
+XMRIG_SHA256="4732cee4ffad920392fa35e432b77294f2cdf69fbb73491a7dff8b649336f888"
+XMRIG_URL="https://github.com/xmrig/xmrig/releases/download/v$XMRIG_VERSION/$XMRIG_ARCHIVE"
+
+get_xmrig() {
+    local found archive
+    found="$(find_xmrig)"
+    if [ -n "$found" ]; then
+        echo "XMRig is already here: $found"
+        return
+    fi
+    archive="$ROOT/$XMRIG_ARCHIVE"
+    echo "Downloading XMRig $XMRIG_VERSION from its official releases:"
+    echo "  $XMRIG_URL"
+    if command -v curl > /dev/null; then
+        curl -fsSL -o "$archive" "$XMRIG_URL" || die "the download failed"
+    elif command -v wget > /dev/null; then
+        wget -q -O "$archive" "$XMRIG_URL" || die "the download failed"
+    else
+        die "install curl or wget, or download $XMRIG_URL yourself"
+    fi
+    if ! echo "$XMRIG_SHA256  $archive" | sha256sum -c --status -; then
+        rm -f "$archive"
+        die "the download does not match XMRig's official SHA-256 ($XMRIG_SHA256). It was deleted and nothing was unpacked."
+    fi
+    echo "SHA-256 matches the official one: $XMRIG_SHA256"
+    tar -xzf "$archive" -C "$ROOT"
+    rm -f "$archive"
+    [ -x "$ROOT/xmrig-$XMRIG_VERSION/xmrig" ] || die "xmrig is not inside $XMRIG_ARCHIVE"
+    echo "XMRig $XMRIG_VERSION is ready in $ROOT/xmrig-$XMRIG_VERSION"
+    echo "Next: ./zoka-miner.sh mine"
+}
+
 XMRIG_PID=""
 stop_xmrig() {
     if [ -n "$XMRIG_PID" ] && kill -0 "$XMRIG_PID" 2> /dev/null; then
@@ -232,7 +268,8 @@ mine() {
                 done
             else
                 if [ "$round" -eq 1 ]; then
-                    echo "XMRig was not found next to this script, so the node is waiting for miners. Start it with:"
+                    echo "XMRig was not found next to this script, so the node is waiting for miners."
+                    echo "Get it with ./zoka-miner.sh get-xmrig and start this again, or start XMRig yourself with:"
                     echo "  xmrig -o $STRATUM -u $WALLET -p x -a rx/0 -t $THREADS"
                     echo "Ctrl+C stops the node."
                     echo
@@ -336,6 +373,9 @@ case "$COMMAND" in
         ZOKA_CLI_PASSWORD="$p" "$ZOKA" quantic-pq-wallet show-view-key --network "$NETWORK" --dir "$DATA" \
             --name "$WALLET" --password-env ZOKA_CLI_PASSWORD --json | sed -n 's/.*"view_key":"\([^"]*\)".*/\1/p'
         ;;
+    get-xmrig)
+        get_xmrig
+        ;;
     mine)
         mine
         ;;
@@ -379,6 +419,7 @@ case "$COMMAND" in
 Zoka Quantic Testnet v3 CLI miner. Commands:
   create-wallet   a new wallet (shows its 24 words once)
   restore-wallet  a wallet from its 24 words
+  get-xmrig       download XMRig 6.25.0 from its official releases and check its SHA-256
   address         the address you share to get paid
   view-key        a key that shows your balance (zokascan.cc/wallet) and cannot spend
   mine            run the node, and XMRig if it is next to this script (--threads n); restarts them if they stop

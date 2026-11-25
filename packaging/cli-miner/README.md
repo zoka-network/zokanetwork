@@ -1,11 +1,11 @@
 # Zoka Quantic Testnet v3 CLI miner
 
 Mine the **Zoka Quantic Testnet v3** from a terminal, without the desktop
-wallet. This package is the Zoka node (`zoka`, the same one ZSilent 5.0 runs
-inside) plus a few scripts that create a wallet, start the node so XMRig can
-mine through it, and show your balance.
+wallet. This package is the Zoka node (`zoka`, the same one ZSilent 5.1 runs
+inside) plus a few scripts that create a wallet, download XMRig, start the node
+so XMRig can mine through it, and show your balance.
 
-> **Prefer an app?** Use **ZSilent 5.0**, the official desktop wallet for
+> **Prefer an app?** Use **ZSilent 5.1**, the official desktop wallet for
 > Windows: the same node and the same network, with buttons instead of
 > commands.
 
@@ -23,13 +23,15 @@ mine through it, and show your balance.
 
 | File | What for |
 | --- | --- |
-| `zoka` / `zoka.exe` | The Zoka Quantic node and wallet (version 5.0.1) |
+| `zoka` / `zoka.exe` | The Zoka Quantic node and wallet (version 5.1.0) |
 | `zoka-miner.ps1` / `zoka-miner.sh` | One script for every step below |
-| `*.cmd` (Windows) | Double-click shortcuts to that script |
+| `*.cmd` (Windows) | Double-click shortcuts to that script, numbered in order: `1-create-wallet`, `2-get-xmrig`, `3-start-mining` |
 | `SHA256SUMS.txt` | The hashes of every file in the package |
 
-**XMRig is not included** (see step 3). Everything the miner writes (the chain,
-the node's identity, the wallets) stays in a `data` folder next to the scripts.
+**XMRig is not included:** antivirus programs flag CPU miners, so a package
+with it inside would be blocked. Step 3 downloads the official one for you.
+Everything the miner writes (the chain, the node's identity, the wallets, XMRig)
+stays in this folder.
 
 ## Requirements
 
@@ -44,12 +46,12 @@ Compare the file's SHA-256 with the one published next to it in the release:
 
 ```powershell
 # Windows (PowerShell)
-Get-FileHash .\zoka-cli-miner-5.0.1-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\zoka-cli-miner-5.1.0-windows-x64.zip -Algorithm SHA256
 ```
 
 ```bash
 # Linux
-sha256sum zoka-cli-miner-5.0.1-linux-x64.tar.gz
+sha256sum zoka-cli-miner-5.1.0-linux-x64.tar.gz
 ```
 
 If they do not match, do not run it: download it again from the official
@@ -59,7 +61,7 @@ release.
 
 - **Windows:** unzip the package anywhere (for example in Documents) and
   double-click **`1-create-wallet.cmd`**.
-- **Linux:** `tar xzf zoka-cli-miner-5.0.1-linux-x64.tar.gz`, `cd` into the
+- **Linux:** `tar xzf zoka-cli-miner-5.1.0-linux-x64.tar.gz`, `cd` into the
   folder and run `./zoka-miner.sh create-wallet`.
 
 Choose a password (at least 8 characters). Then you will see **24 words**:
@@ -80,20 +82,47 @@ RandomX miner (`rx/0`, Monero's algorithm), mines through the node's Stratum
 server. Every block it finds pays your wallet in full: this is solo mining
 through your own node, not a shared pool.
 
-1. Download XMRig only from its [official releases](https://github.com/xmrig/xmrig/releases)
-   (`xmrig-<version>-windows-x64.zip`, or `linux-static-x64` on Linux) and check
-   its SHA-256 against the `SHA256SUMS` published next to it.
-2. Unpack it **inside this package's folder**. The folder the archive comes
-   with (`xmrig-<version>`) works as it is. You can also say where it is:
-   `zoka-miner.ps1 mine -Xmrig C:\path\xmrig.exe` or
-   `./zoka-miner.sh mine --xmrig /path/xmrig`.
+- **Windows:** double-click **`2-get-xmrig.cmd`**.
+- **Linux:** `./zoka-miner.sh get-xmrig`
 
-Antivirus programs, Windows Defender included, flag CPU miners such as XMRig
-and stop them.
+It downloads **XMRig 6.25.0**, the version Zoka is tested with, from its
+[official releases](https://github.com/xmrig/xmrig/releases/tag/v6.25.0),
+checks it against the official SHA-256 and unpacks it next to the scripts, in
+`xmrig-6.25.0`. If the hash does not match, it deletes the download and unpacks
+nothing.
+
+| File | Official SHA-256 |
+| --- | --- |
+| `xmrig-6.25.0-windows-gcc-x64.zip` | `3d4b59dafc50900414aa93cdba7cd7f929137ee58e3e8285f7db1c05d1ac327c` |
+| `xmrig-6.25.0-linux-static-x64.tar.gz` | `4732cee4ffad920392fa35e432b77294f2cdf69fbb73491a7dff8b649336f888` |
+
+To do it by hand, download that file from the same page, check its hash and
+unpack it inside this package's folder: the `xmrig-6.25.0` folder it comes with
+works as it is. To use an XMRig you already have:
+`zoka-miner.ps1 mine -Xmrig C:\path\xmrig.exe` or
+`./zoka-miner.sh mine --xmrig /path/xmrig`.
+
+### If the antivirus removes it (Windows)
+
+Windows Defender flags CPU miners, XMRig included, as trojans
+(`Trojan:Win64/HashvaultMiner`) and deletes them; `2-get-xmrig.cmd` tells you
+when that happens. To allow XMRig, and only XMRig:
+
+1. Open **Windows Security** → **Virus & threat protection** → **Protection
+   history**.
+2. Open the XMRig entry, check that its file is inside this package's folder,
+   and choose **Actions** → **Allow on device**.
+3. Run **`2-get-xmrig.cmd`** again.
+
+To undo it: **Virus & threat protection** → **Allowed threats** → **Don't
+allow**. Other antivirus programs have the same option: an exception for that
+file. From the Windows zip, `2-get-xmrig.cmd` takes only `xmrig.exe`: the
+`WinRing0x64.sys` driver that comes with it is blocked too, and XMRig mines
+without it.
 
 ## 4. Mine
 
-- **Windows:** double-click **`2-start-mining.cmd`**.
+- **Windows:** double-click **`3-start-mining.cmd`**.
 - **Linux:** `./zoka-miner.sh mine`
 
 The script starts the node, which connects to the network and downloads the
@@ -180,7 +209,7 @@ still matter. Every node that stays online all day makes the network sturdier,
 and an always-on node can become a
 **seed**, one of the nodes compiled into Zoka so new nodes find the network.
 
-- Leave **`2-start-mining.cmd`** / `./zoka-miner.sh mine` running. Without XMRig
+- Leave **`3-start-mining.cmd`** / `./zoka-miner.sh mine` running. Without XMRig
   the node still runs and serves the chain; with it, it also mines.
 - To offer it as a seed, run **`show-node-id.cmd`** / `./zoka-miner.sh node-id`
   and send both ids to the Zoka team on Discord. They are public; they never
@@ -200,7 +229,7 @@ and an always-on node can become a
   identity get in each other's way on the network. Every install creates its
   own.
 - Your **24 words** are the backup. With them you can restore the wallet in this
-  package or in ZSilent 5.0, on any computer.
+  package or in ZSilent 5.1, on any computer.
 - You can also make an encrypted copy in a file:
   `zoka quantic-pq-wallet backup --network testnet --dir data/quantic-testnet-v3 --name miner --out <file>`
 
@@ -214,7 +243,7 @@ and an always-on node can become a
 Both listen on this computer only. Towards the internet the node uses QUIC
 (UDP) and n0's relays, with no open ports.
 
-The API does not clash with ZSilent 5.0's. The Stratum uses the same port as
+The API does not clash with ZSilent 5.1's. The Stratum uses the same port as
 ZSilent's, though: if ZSilent's Stratum is on, pick another one with
 `zoka-miner.ps1 mine -StratumPort 3334` or `./zoka-miner.sh mine --stratum-port 3334`.
 Either way, do not mine with both at once: they share the same CPU.

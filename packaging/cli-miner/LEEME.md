@@ -1,11 +1,11 @@
 # Minero CLI de Zoka Quantic Testnet v3
 
 Miná la **Zoka Quantic Testnet v3** desde una terminal, sin la wallet de
-escritorio. Este paquete es el nodo de Zoka (`zoka`, el mismo que ZSilent 5.0
-usa por dentro) con unos scripts que crean una wallet, arrancan el nodo para
-minar con XMRig y muestran tu saldo.
+escritorio. Este paquete es el nodo de Zoka (`zoka`, el mismo que ZSilent 5.1
+usa por dentro) con unos scripts que crean una wallet, bajan XMRig, arrancan el
+nodo para minar con XMRig y muestran tu saldo.
 
-> **¿Preferís una aplicación?** Usá **ZSilent 5.0**, la wallet oficial de
+> **¿Preferís una aplicación?** Usá **ZSilent 5.1**, la wallet oficial de
 > escritorio para Windows: el mismo nodo y la misma red, con botones en vez de
 > comandos.
 
@@ -23,14 +23,15 @@ minar con XMRig y muestran tu saldo.
 
 | Archivo | Para qué |
 | --- | --- |
-| `zoka` / `zoka.exe` | El nodo y la wallet de Zoka Quantic (versión 5.0.1) |
+| `zoka` / `zoka.exe` | El nodo y la wallet de Zoka Quantic (versión 5.1.0) |
 | `zoka-miner.ps1` / `zoka-miner.sh` | Un script para cada paso de abajo |
-| `*.cmd` (Windows) | Accesos de doble clic a ese script |
+| `*.cmd` (Windows) | Accesos de doble clic a ese script, numerados en orden: `1-create-wallet`, `2-get-xmrig`, `3-start-mining` |
 | `SHA256SUMS.txt` | Los hashes de todos los archivos del paquete |
 
-**XMRig no viene incluido** (ver el paso 3). Todo lo que escribe el minero (la
-cadena, la identidad del nodo, las wallets) queda en una carpeta `data`, al lado
-de los scripts.
+**XMRig no viene incluido:** los antivirus marcan a los mineros de CPU, así que
+un paquete que lo trajera adentro quedaría bloqueado. El paso 3 te baja el
+oficial. Todo lo que escribe el minero (la cadena, la identidad del nodo, las
+wallets, XMRig) queda en esta carpeta.
 
 ## Requisitos
 
@@ -45,12 +46,12 @@ Compará el SHA-256 del archivo con el que está publicado al lado, en el releas
 
 ```powershell
 # Windows (PowerShell)
-Get-FileHash .\zoka-cli-miner-5.0.1-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\zoka-cli-miner-5.1.0-windows-x64.zip -Algorithm SHA256
 ```
 
 ```bash
 # Linux
-sha256sum zoka-cli-miner-5.0.1-linux-x64.tar.gz
+sha256sum zoka-cli-miner-5.1.0-linux-x64.tar.gz
 ```
 
 Si no coinciden, no lo ejecutes: bajalo de nuevo del release oficial.
@@ -59,7 +60,7 @@ Si no coinciden, no lo ejecutes: bajalo de nuevo del release oficial.
 
 - **Windows:** descomprimí el paquete donde quieras (por ejemplo, en Documentos)
   y hacé doble clic en **`1-create-wallet.cmd`**.
-- **Linux:** `tar xzf zoka-cli-miner-5.0.1-linux-x64.tar.gz`, entrá a la carpeta
+- **Linux:** `tar xzf zoka-cli-miner-5.1.0-linux-x64.tar.gz`, entrá a la carpeta
   con `cd` y ejecutá `./zoka-miner.sh create-wallet`.
 
 Elegí una contraseña (8 caracteres como mínimo). Después vas a ver **24
@@ -80,20 +81,46 @@ minero de RandomX (`rx/0`, el algoritmo de Monero), a través del servidor
 Stratum del nodo. Cada bloque que encuentra paga entero a tu wallet: es minería
 individual a través de tu nodo, no un pool compartido.
 
-1. Bajá XMRig solo de sus [releases oficiales](https://github.com/xmrig/xmrig/releases)
-   (`xmrig-<versión>-windows-x64.zip`, o el `linux-static-x64` en Linux) y
-   verificá su SHA-256 con el `SHA256SUMS` que publican al lado.
-2. Descomprimilo **dentro de la carpeta de este paquete**. La carpeta que trae
-   el archivo (`xmrig-<versión>`) sirve tal cual. También podés indicar dónde
-   está: `zoka-miner.ps1 mine -Xmrig C:\ruta\xmrig.exe` o
-   `./zoka-miner.sh mine --xmrig /ruta/xmrig`.
+- **Windows:** doble clic en **`2-get-xmrig.cmd`**.
+- **Linux:** `./zoka-miner.sh get-xmrig`
 
-Los antivirus, Windows Defender incluido, marcan a los mineros de CPU como
-XMRig y los frenan.
+Baja **XMRig 6.25.0**, la versión con la que se prueba Zoka, de sus
+[releases oficiales](https://github.com/xmrig/xmrig/releases/tag/v6.25.0),
+controla el SHA-256 oficial y lo descomprime al lado de los scripts, en
+`xmrig-6.25.0`. Si el hash no coincide, borra la descarga y no descomprime nada.
+
+| Archivo | SHA-256 oficial |
+| --- | --- |
+| `xmrig-6.25.0-windows-gcc-x64.zip` | `3d4b59dafc50900414aa93cdba7cd7f929137ee58e3e8285f7db1c05d1ac327c` |
+| `xmrig-6.25.0-linux-static-x64.tar.gz` | `4732cee4ffad920392fa35e432b77294f2cdf69fbb73491a7dff8b649336f888` |
+
+Para hacerlo a mano, bajá ese archivo de la misma página, controlá su hash y
+descomprimilo dentro de la carpeta de este paquete: la carpeta `xmrig-6.25.0`
+que trae sirve tal cual. Para usar un XMRig que ya tenés:
+`zoka-miner.ps1 mine -Xmrig C:\ruta\xmrig.exe` o
+`./zoka-miner.sh mine --xmrig /ruta/xmrig`.
+
+### Si el antivirus lo borra (Windows)
+
+Windows Defender marca a los mineros de CPU, XMRig incluido, como troyanos
+(`Trojan:Win64/HashvaultMiner`) y los borra; `2-get-xmrig.cmd` te avisa si pasa.
+Para permitir XMRig, y solo XMRig:
+
+1. Abrí **Seguridad de Windows** → **Protección antivirus y contra amenazas** →
+   **Historial de protección**.
+2. Abrí la entrada de XMRig, fijate que el archivo esté en la carpeta de este
+   paquete y elegí **Acciones** → **Permitir en el dispositivo**.
+3. Volvé a ejecutar **`2-get-xmrig.cmd`**.
+
+Para deshacerlo: **Protección antivirus y contra amenazas** → **Amenazas
+permitidas** → **No permitir**. Los otros antivirus tienen la misma opción: una
+excepción para ese archivo. Del zip de Windows, `2-get-xmrig.cmd` saca solo
+`xmrig.exe`: el driver `WinRing0x64.sys` que viene con él también queda
+bloqueado, y XMRig mina sin él.
 
 ## 4. Miná
 
-- **Windows:** doble clic en **`2-start-mining.cmd`**.
+- **Windows:** doble clic en **`3-start-mining.cmd`**.
 - **Linux:** `./zoka-miner.sh mine`
 
 El script arranca el nodo, que se conecta a la red y baja la cadena. Después
@@ -183,7 +210,7 @@ queda prendido todo el día hace más firme la red, y un nodo que nunca se apaga
 puede ser una **semilla**: uno de los nodos que vienen dentro de Zoka para que
 los nodos nuevos encuentren la red.
 
-- Dejá corriendo **`2-start-mining.cmd`** / `./zoka-miner.sh mine`. Sin XMRig
+- Dejá corriendo **`3-start-mining.cmd`** / `./zoka-miner.sh mine`. Sin XMRig
   el nodo igual corre y sirve la cadena; con XMRig, además mina.
 - Para ofrecerlo como semilla, ejecutá **`show-node-id.cmd`** /
   `./zoka-miner.sh node-id` y mandale los dos identificadores al equipo de Zoka
@@ -202,7 +229,7 @@ los nodos nuevos encuentren la red.
 - **No copies la carpeta `node` a otra computadora.** Dos nodos con la misma
   identidad se pisan en la red. Cada instalación crea la suya.
 - Tus **24 palabras** son la copia de seguridad. Con ellas podés restaurar la
-  wallet en este paquete o en ZSilent 5.0, en cualquier computadora.
+  wallet en este paquete o en ZSilent 5.1, en cualquier computadora.
 - También se puede hacer una copia cifrada en un archivo:
   `zoka quantic-pq-wallet backup --network testnet --dir data\quantic-testnet-v3 --name miner --out <archivo>`
 
@@ -216,7 +243,7 @@ los nodos nuevos encuentren la red.
 Los dos escuchan solo en esta computadora. Hacia afuera el nodo usa QUIC (UDP)
 y los relays de n0, sin puertos abiertos.
 
-La API no choca con la de ZSilent 5.0. El Stratum sí usa el mismo puerto que el
+La API no choca con la de ZSilent 5.1. El Stratum sí usa el mismo puerto que el
 de ZSilent: si tenés el de ZSilent encendido, elegí otro con
 `zoka-miner.ps1 mine -StratumPort 3334` o `./zoka-miner.sh mine --stratum-port 3334`.
 De todas formas, no mines con los dos a la vez: se reparten la misma CPU.
