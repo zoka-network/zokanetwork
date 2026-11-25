@@ -16,17 +16,19 @@ altura** (memoria «Actualizar, no reiniciar»). Pidió hacer A, B y C de corrid
 | A1 | ZSilent: una lectura de saldo a la vez, solo con bloque nuevo, candado justo, el envío primero | zsilent-core `billetera-sin-cola` `6110534` (worktree `C:\tmp\zoka-wt\zsilent-sin-cola`) | hecho, gradle test OK |
 | A2 | `quantic-pq-wallet` sobre el motor liviano (LightWallet): estado cifrado `<billetera>.json.light`, solo bloques nuevos por `/scan2`; `wallet-mirror` ya no se usa | ZOKA `billetera-motor-liviano` `c0c75862` | hecho: 0,2 s el saldo (antes ~30 s), 21,6 s la primera vez |
 | B | Prueba v4 (`transfer::narrow`): el mismo programa en 452 columnas; 0,74 MB (2→2) y 0,79 MB (8→2), 2-3× más rápida; 128 bits en el estimador | ZOKA `prueba-v4` `2270aceb`, [docs/PRUEBA-V4.md](docs/PRUEBA-V4.md) | hecho y medido en la PC; falta el teléfono |
-| C1 | Activación por altura (consenso): v4 desde H, v3 hasta H+100; testnet H = 20.000, regtest 8, red nueva solo v4 | `ledger::proof_version_allowed` | hecho, con prueba |
+| C1 | Activación por altura (consenso): v4 desde H, v3 hasta H+100; testnet H = **10.000** (era 20.000; el usuario la adelantó a la altura 9.865), regtest 8, red nueva solo v4 | `ledger::proof_version_allowed` | hecho, con prueba |
 | C2 | Billeteras eligen la versión del próximo bloque solas (`proof_version_for`) | `transaction::transfer`, `light::Plan` | hecho |
 | C3 | Ensayo de la activación con un nodo de regtest | `stark_wallet` prueba `after_the_activation_height…` | hecho: 104 pruebas `quantic::` sin fallas |
 | C4 | Releases: nodo y minero 5.1.0 (Windows y Linux), ZSilent 5.1.0, ZKAPriv 4.0.1 (`.so` + APK firmado), WASM de la billetera web, descargas de zoka.network. ZokaScan no cambia (no verifica pruebas) | `target/release-5.1.0/` | hecho: armado y verificado, sin publicar |
-| C5 | Integrar a `main`, etiquetar, publicar y actualizar VPS y faucet **antes del bloque 20.000** (~9/12; 9.834 el 25/11) | [docs/RELEASE-5.1.0.md](docs/RELEASE-5.1.0.md) | espera el OK del usuario |
+| C5 | Integrar a `main`, etiquetar, publicar y actualizar VPS, faucet, web y PC | [docs/RELEASE-5.1.0.md](docs/RELEASE-5.1.0.md) | **hecho el 25/11** (recompilado con la altura 10.000) |
 
-Nada publicado ni instalado. Ramas subidas a GitHub y GitLab: ZOKA `prueba-v4`,
-zsilent-core `billetera-sin-cola` (`5e0ee8b`), zkapriv `red-v4` (`a3ec58f`),
-zokawallet `red-v4` (`66827f2`) y zokaweb `descargas-5.1.0` (`7bc75bc`). Pasos,
-hashes y las tres notas de GitHub en [docs/RELEASE-5.1.0.md](docs/RELEASE-5.1.0.md).
-Falta medir la v4 en el teléfono de 32 bits.
+**Publicado el 25/11:** nodo y minero 5.1.0, ZSilent 5.1.0 y ZKAPriv 4.0.1
+(Latest, verificadas bajándolas), `main` y etiquetas en GitHub y GitLab, VPS 1
+y 2, billetera web y zoka.network; ZSilent 5.1.0 instalada en la PC y ZKAPriv
+4.0.1 en el teléfono. La v4 medida en el teléfono: 8 notas en 27 s y 100 MB
+(v3: 90 s y 741 MB). La cadena quedó quieta en el 9.866 porque la PC era la
+única que minaba: el 10.000 llega cuando vuelva a minar. Falta el aviso de
+Discord (usuario) y, después del 10.000, un pago de prueba con la v4.
 
 Actualizada: **13 de noviembre de 2026**, Argentina. **Testnet v3 en vivo** (génesis `397714b6…`): nodo y minero 5.0.1, ZSilent 5.0.1, ZKAPriv 4.0.0, billetera web, ZokaScan, faucet y zoka.network publicados; autoridad de checkpoints 2 de 3 (PC, VPS 1, VPS 2) firmando. `main` = `protocolo-v3` en ZOKA, ZSilent y ZKAPriv.
 Proyecto: `C:\Users\mderramus\ZOKA`.

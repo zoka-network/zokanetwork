@@ -44,8 +44,26 @@ en pocas columnas:
 | 4→2 | 4,33 MB | 0,74 MB | 3,72 s | 1,67 s | 226 ms | 143 ms |
 | 8→2 | 7,85 MB | 0,79 MB | 13,95 s | 5,16 s | 343 ms | 199 ms |
 
-Columnas: 452 en las tres formas (v3: 3.086, 5.550 y 10.478). Falta medir en
-el teléfono de 32 bits.
+Columnas: 452 en las tres formas (v3: 3.086, 5.550 y 10.478).
+
+### Medido en el teléfono de 32 bits (25/11)
+
+Samsung A13 (SM-A135M, armeabi-v7a, 3,8 GB). Las pruebas del pool compiladas
+con `cargo ndk -t armeabi-v7a -P 26 test --release --lib --no-run`, copiadas
+a una carpeta temporal de `/data/local/tmp` y borradas al terminar;
+`what_each_version_costs`, con la memoria pico leída de `VmHWM` en `/proc`.
+
+| Forma | Probar v3 | Probar v4 | Verificar v3 | Verificar v4 |
+| --- | ---: | ---: | ---: | ---: |
+| 2→2 | 14,06 s | 5,83 s | 553 ms | 375 ms |
+| 4→2 | 26,51 s | 10,33 s | 787 ms | 437 ms |
+| 8→2 | 90,11 s | 27,01 s | 1.308 ms | 634 ms |
+
+- Tamaños iguales a los de la PC (2.593.885 / 737.480 bytes en 2→2;
+  7.853.113 / 796.449 en 8→2).
+- Memoria pico: 741 MB con la v3 8→2 (lo mismo que el 11/11) y **100 MB con
+  la v4 8→2** (`the_largest_shape_with_carries_in_every_limb_proves_and_verifies`,
+  44 s con la verificación).
 
 De qué está hecha una prueba v4 de 2→2 (739.903 bytes):
 
@@ -110,7 +128,8 @@ La regla (consenso, `ledger::proof_version_allowed`):
 
 - un pago del bloque `h` puede llevar la prueba v4 si `h ≥ H`;
 - la v3 vale hasta `H + 100` (gracia para los pagos armados justo antes);
-- `H` es 20.000 en la testnet, 8 en regtest, y toda red nueva (la mainnet)
+- `H` es 10.000 en la testnet (decidido el 25/11 a la altura 9.865, para verla
+  activarse esa misma tarde), 8 en regtest, y toda red nueva (la mainnet)
   tiene solo v4 desde el génesis.
 
 Las billeteras prueban con `ledger::proof_version_for(red, próximo bloque)`:
@@ -122,11 +141,8 @@ siguen igual después de la activación.
 
 ## Qué falta
 
-- Medir la v4 en el teléfono de 32 bits.
-- Publicar nodo, minero, ZSilent, ZKAPriv y web antes del bloque 20.000
-  (~9/12), y actualizar los VPS y el faucet. Si la fecha no da, se cambia `H`
-  antes de publicar. Todo está armado y verificado (25/11): ver
-  [RELEASE-5.1.0.md](RELEASE-5.1.0.md).
+- Ver la activación en el bloque 10.000 y un pago real con la v4 (todo lo
+  demás se publicó el 25/11: ver [RELEASE-5.1.0.md](RELEASE-5.1.0.md)).
 
 Hechos el 25/11: la `.so` de ZKAPriv (arm64-v8a y armeabi-v7a) y su APK 4.0.1,
 el WASM de la billetera web y el ensayo de la activación en regtest. ZokaScan no
