@@ -18,11 +18,15 @@ altura** (memoria «Actualizar, no reiniciar»). Pidió hacer A, B y C de corrid
 | B | Prueba v4 (`transfer::narrow`): el mismo programa en 452 columnas; 0,74 MB (2→2) y 0,79 MB (8→2), 2-3× más rápida; 128 bits en el estimador | ZOKA `prueba-v4` `2270aceb`, [docs/PRUEBA-V4.md](docs/PRUEBA-V4.md) | hecho y medido en la PC; falta el teléfono |
 | C1 | Activación por altura (consenso): v4 desde H, v3 hasta H+100; testnet H = 20.000, regtest 8, red nueva solo v4 | `ledger::proof_version_allowed` | hecho, con prueba |
 | C2 | Billeteras eligen la versión del próximo bloque solas (`proof_version_for`) | `transaction::transfer`, `light::Plan` | hecho |
-| C3 | Ensayo de la activación con un nodo de regtest | `stark_wallet` prueba `after_the_activation_height…` | ver abajo |
-| C4 | Releases: nodo y minero 5.1.0 (Windows y Linux), ZSilent 5.1.0, `.so` y APK de ZKAPriv, billetera web y ZokaScan | — | pendiente |
-| C5 | Publicar y actualizar VPS y faucet **antes del bloque 20.000** (~8/12) | — | lo hace el usuario |
+| C3 | Ensayo de la activación con un nodo de regtest | `stark_wallet` prueba `after_the_activation_height…` | hecho: 104 pruebas `quantic::` sin fallas |
+| C4 | Releases: nodo y minero 5.1.0 (Windows y Linux), ZSilent 5.1.0, ZKAPriv 4.0.1 (`.so` + APK firmado), WASM de la billetera web, descargas de zoka.network. ZokaScan no cambia (no verifica pruebas) | `target/release-5.1.0/` | hecho: armado y verificado, sin publicar |
+| C5 | Integrar a `main`, etiquetar, publicar y actualizar VPS y faucet **antes del bloque 20.000** (~9/12; 9.834 el 25/11) | [docs/RELEASE-5.1.0.md](docs/RELEASE-5.1.0.md) | espera el OK del usuario |
 
-Nada publicado ni instalado. Las ramas no están pusheadas.
+Nada publicado ni instalado. Ramas subidas a GitHub y GitLab: ZOKA `prueba-v4`,
+zsilent-core `billetera-sin-cola` (`5e0ee8b`), zkapriv `red-v4` (`a3ec58f`),
+zokawallet `red-v4` (`66827f2`) y zokaweb `descargas-5.1.0` (`7bc75bc`). Pasos,
+hashes y las tres notas de GitHub en [docs/RELEASE-5.1.0.md](docs/RELEASE-5.1.0.md).
+Falta medir la v4 en el teléfono de 32 bits.
 
 Actualizada: **13 de noviembre de 2026**, Argentina. **Testnet v3 en vivo** (génesis `397714b6…`): nodo y minero 5.0.1, ZSilent 5.0.1, ZKAPriv 4.0.0, billetera web, ZokaScan, faucet y zoka.network publicados; autoridad de checkpoints 2 de 3 (PC, VPS 1, VPS 2) firmando. `main` = `protocolo-v3` en ZOKA, ZSilent y ZKAPriv.
 Proyecto: `C:\Users\mderramus\ZOKA`.

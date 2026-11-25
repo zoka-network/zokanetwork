@@ -123,9 +123,11 @@ siguen igual después de la activación.
 ## Qué falta
 
 - Medir la v4 en el teléfono de 32 bits.
-- Compilar la `.so` de ZKAPriv (armeabi-v7a y arm64), la billetera web y
-  ZokaScan con el pool nuevo.
-- Ensayar la activación con nodos de regtest.
-- Publicar nodo, minero, ZSilent, ZKAPriv y web antes del bloque 20.000, y
-  actualizar los VPS y el faucet. Si la fecha no da, se cambia `H` antes de
-  publicar.
+- Publicar nodo, minero, ZSilent, ZKAPriv y web antes del bloque 20.000
+  (~9/12), y actualizar los VPS y el faucet. Si la fecha no da, se cambia `H`
+  antes de publicar. Todo está armado y verificado (25/11): ver
+  [RELEASE-5.1.0.md](RELEASE-5.1.0.md).
+
+Hechos el 25/11: la `.so` de ZKAPriv (arm64-v8a y armeabi-v7a) y su APK 4.0.1,
+el WASM de la billetera web y el ensayo de la activación en regtest. ZokaScan no
+se recompila: solo escanea, no verifica pruebas.
