@@ -23,7 +23,7 @@ nodo para minar con XMRig y muestran tu saldo.
 
 | Archivo | Para qué |
 | --- | --- |
-| `zoka` / `zoka.exe` | El nodo y la wallet de Zoka Quantic (versión 5.1.0) |
+| `zoka` / `zoka.exe` | El nodo y la wallet de Zoka Quantic (versión 5.1.1) |
 | `zoka-miner.ps1` / `zoka-miner.sh` | Un script para cada paso de abajo |
 | `*.cmd` (Windows) | Accesos de doble clic a ese script, numerados en orden: `1-create-wallet`, `2-get-xmrig`, `3-start-mining` |
 | `SHA256SUMS.txt` | Los hashes de todos los archivos del paquete |
@@ -46,12 +46,12 @@ Compará el SHA-256 del archivo con el que está publicado al lado, en el releas
 
 ```powershell
 # Windows (PowerShell)
-Get-FileHash .\zoka-cli-miner-5.1.0-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\zoka-cli-miner-5.1.1-windows-x64.zip -Algorithm SHA256
 ```
 
 ```bash
 # Linux
-sha256sum zoka-cli-miner-5.1.0-linux-x64.tar.gz
+sha256sum zoka-cli-miner-5.1.1-linux-x64.tar.gz
 ```
 
 Si no coinciden, no lo ejecutes: bajalo de nuevo del release oficial.
@@ -60,7 +60,7 @@ Si no coinciden, no lo ejecutes: bajalo de nuevo del release oficial.
 
 - **Windows:** descomprimí el paquete donde quieras (por ejemplo, en Documentos)
   y hacé doble clic en **`1-create-wallet.cmd`**.
-- **Linux:** `tar xzf zoka-cli-miner-5.1.0-linux-x64.tar.gz`, entrá a la carpeta
+- **Linux:** `tar xzf zoka-cli-miner-5.1.1-linux-x64.tar.gz`, entrá a la carpeta
   con `cd` y ejecutá `./zoka-miner.sh create-wallet`.
 
 Elegí una contraseña (8 caracteres como mínimo). Después vas a ver **24
