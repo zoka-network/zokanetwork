@@ -11,6 +11,8 @@ pub mod genesis;
 pub mod health;
 #[cfg(feature = "pq-experimental")]
 pub mod hybrid_signature;
+#[cfg(feature = "pq-experimental")]
+pub mod release_signing;
 pub mod identity;
 pub mod mempool;
 pub mod metrics;

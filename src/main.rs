@@ -91,6 +91,7 @@ fn print_quantic_usage() {
     println!("  zoka checkpoint-keygen --network quantic-testnet     the authority key (both halves, stays on this PC)");
     println!("  zoka quantic-genesis --network quantic-testnet --premine-to <address> --out <file>");
     println!("  zoka checkpoint-status | checkpoint-sign | snapshot-info | snapshot-export | iroh-id");
+    println!("  zoka release keygen | sign <SHA256SUMS.txt> | verify <SHA256SUMS.txt> | export-pem   release signatures");
     println!("  zoka version");
     println!();
 }
@@ -18945,6 +18946,8 @@ async fn run() -> Result<(), String> {
         "private-tx-audit" => cmd_private_tx_audit(tail),
         "checkpoint-keygen" => cmd_checkpoint_keygen(tail),
         "checkpoint-sign" => cmd_checkpoint_sign(tail),
+        #[cfg(feature = "pq-experimental")]
+        "release" => zoka::release_signing::run(tail),
         #[cfg(feature = "quantic")]
         "quantic-wallet" => cmd_quantic_wallet(tail),
         #[cfg(feature = "quantic")]

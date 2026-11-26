@@ -69,6 +69,13 @@ pub(super) fn open_user_key(text: &str, kind: &str) -> Result<Zeroizing<[u8; 32]
         .map_err(|_| "invalid authority seed length".into())
 }
 
+/// The text of a key file holding `seed` protected for the current Windows
+/// user, with `kind` bound into the ciphertext. `read_key_seed` opens it. The
+/// release signing key (`release_signing`) uses it with its own kinds.
+pub fn protect_seed_for_user(seed: &[u8; 32], kind: &str) -> Result<Vec<u8>, String> {
+    encode_user_key(seed, kind)
+}
+
 fn encode_user_key(seed: &[u8; 32], kind: &str) -> Result<Vec<u8>, String> {
     let protected = dpapi(seed, kind, true)?;
     serde_json::to_vec_pretty(&UserKey {
