@@ -72,10 +72,20 @@ está atrasada, así que los primeros bloques salen más rápido.
 crearon como borrador, se completaron los adjuntos y se publicaron aparte. Ojo:
 `gh release view <etiqueta>` también encuentra borradores.
 
+## La activación (26/11)
+
+- El bloque 10.000 pasó sin cortes. El 26/11 a la altura 10.638, la PC, el
+  VPS 1 y el VPS 2 estaban en la misma punta, firmando checkpoints, sin
+  bloques rechazados en las semillas. El faucet ya funciona con el motor
+  liviano (`faucet.json.light`) y dio por cerrado solo su pago pendiente viejo.
+- **Primer pago con la prueba v4:** tx `0f8a8e7c…` (ZSilent 5.1.0, 1 ZKA),
+  minada en el bloque **10.642** con una prueba de **745.595 bytes** (el
+  último pago v3, en el 9.867, llevaba 2.593.198). Comisión 0,0002 ZKA (2→2).
+  Los tres nodos tienen el mismo 10.642 (`644f6a99…`) y siguen juntos.
+
 ## Lo que queda
 
-1. **Volver a minar** (XMRig contra ZSilent): reanuda la cadena y trae el
-   bloque 10.000.
+1. ~~Volver a minar y pasar el 10.000~~: hecho.
 2. **Discord (usuario):** `discord-bot/notice.upgrade-5.1.0.json` (id
    `upgrade-5-1-0`). Vista previa con
    `node scripts/send-notice.js notice.upgrade-5.1.0.json`; para mandarlo,
