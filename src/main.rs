@@ -18845,7 +18845,7 @@ async fn run() -> Result<(), String> {
     // The STARK v2 commands only verify RandomX hashes: on the testnet XMRig
     // mines through the node's Stratum, and regtest uses the CPU test PoW.
     #[cfg(feature = "quantic-pq")]
-    if matches!(command.as_str(), "quantic-pq" | "quantic-pq-node" | "quantic-pq-wallet") {
+    if matches!(command.as_str(), "quantic-pq" | "quantic-pq-node" | "quantic-pq-wallet" | "quantic-pq-wallet-rpc") {
         zoka::mining::pow::prefer_light_mode();
     }
     match command.as_str() {
@@ -18855,6 +18855,8 @@ async fn run() -> Result<(), String> {
         "quantic-pq-node" => zoka::quantic::stark_node::run(tail).await,
         #[cfg(feature = "quantic-pq")]
         "quantic-pq-wallet" => zoka::quantic::stark_wallet::run(tail).await,
+        #[cfg(feature = "quantic-pq")]
+        "quantic-pq-wallet-rpc" => zoka::quantic::stark_wallet::rpc::run(tail).await,
         "version" | "--version" | "-V" => {
             println!("zoka {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -20197,7 +20199,7 @@ fn command_uses_invocation_directory(command: Option<&str>) -> bool {
     cfg!(feature = "quantic-pq")
         && matches!(
             command,
-            Some("quantic-pq" | "quantic-pq-node" | "quantic-pq-wallet" | "pq-regtest")
+            Some("quantic-pq" | "quantic-pq-node" | "quantic-pq-wallet" | "quantic-pq-wallet-rpc" | "pq-regtest")
         )
 }
 

@@ -1154,6 +1154,9 @@ pub async fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// El servidor JSON-RPC 2.0 para exchanges (`zoka quantic-pq-wallet-rpc`).
+pub mod rpc;
+
 #[cfg(test)]
 mod tests {
     use super::*;

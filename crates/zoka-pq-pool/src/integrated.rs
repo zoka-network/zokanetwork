@@ -185,3 +185,21 @@ mod tests {
         assert!(tag_memo(1, "a\0b").is_err());
     }
 }
+
+#[cfg(test)]
+mod vector {
+    use super::*;
+
+    /// The fixed vector every app checks against: the testnet short address
+    /// of test seed 2 (the one ZSilent's tests use) with tag 42.
+    pub const SHORT: &str = "zqtest22m1iDEYKpaemBFZMVj2k1SAzEV9BGL1uFXRZVABUrvAYuHQRbj";
+    pub const TAG_42: &str = "zqtesti23jYjdoHfKWvz5DDUPwYYXACN7eAWX8qdEVQRw5uAGAeCskj7rGtZtrKFb16E2";
+
+    #[test]
+    fn the_shared_vector_stays_the_same() {
+        let short = ShortAddress::decode(SHORT, 2).unwrap();
+        assert_eq!(IntegratedAddress::new(short, 42).encode(), TAG_42);
+        let back = IntegratedAddress::decode(TAG_42, 2).unwrap();
+        assert_eq!((back.short, back.tag), (short, 42));
+    }
+}
