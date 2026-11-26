@@ -82,6 +82,11 @@ crearon como borrador, se completaron los adjuntos y se publicaron aparte. Ojo:
   minada en el bloque **10.642** con una prueba de **745.595 bytes** (el
   último pago v3, en el 9.867, llevaba 2.593.198). Comisión 0,0002 ZKA (2→2).
   Los tres nodos tienen el mismo 10.642 (`644f6a99…`) y siguen juntos.
+- **Primer pago v4 armado en el teléfono** (ZKAPriv 4.0.1, Samsung de 32 bits,
+  de vuelta a ZSilent): tx `d78a64d3…`, bloque **10.645** (`42f7e270…`), prueba
+  de **737.051 bytes**, comisión 0,0002 ZKA. El registro del teléfono muestra el
+  QR leído a las 13:58:40 y el cálculo de la prueba a las 13:58:51; el bloque
+  salió a las 13:59:19. Los tres nodos en el mismo 10.645, sin rechazos.
 
 ## Lo que queda
 
