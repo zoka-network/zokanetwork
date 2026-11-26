@@ -15,6 +15,7 @@ use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 use zoka_light::{checkpoint::SignedCheckpoint, directory::AddressRecord};
 use zoka_pq_pool::{
+    integrated::{tag_memo, IntegratedAddress},
     light::{LightWallet, Movement},
     scan::ScanPage2,
     transaction::Transaction,
@@ -73,7 +74,8 @@ pub fn valid_phrase(phrase: &str) -> bool {
     seed_of(phrase).is_ok()
 }
 
-/// `"full"`, `"short"` o `""` si no es una dirección de `network`.
+/// `"full"`, `"short"`, `"integrated"` o `""` si no es una dirección de
+/// `network`.
 #[wasm_bindgen(js_name = addressKind)]
 pub fn address_kind(text: &str, network: u8) -> String {
     let text = text.trim();
@@ -81,9 +83,39 @@ pub fn address_kind(text: &str, network: u8) -> String {
         "full".into()
     } else if ShortAddress::decode(text, network).is_ok() {
         "short".into()
+    } else if IntegratedAddress::decode(text, network).is_ok() {
+        "integrated".into()
     } else {
         String::new()
     }
+}
+
+/// La corta que lleva una dirección integrada (la de un exchange), para
+/// resolverla como cualquier corta; `""` si no lo es.
+#[wasm_bindgen(js_name = integratedShort)]
+pub fn integrated_short(text: &str, network: u8) -> String {
+    IntegratedAddress::decode(text.trim(), network)
+        .map(|integrated| integrated.short.encode())
+        .unwrap_or_default()
+}
+
+/// El código de cliente de una dirección integrada, en decimal (un `u64` no
+/// entra en un número de JavaScript); `""` si no lo es.
+#[wasm_bindgen(js_name = integratedTag)]
+pub fn integrated_tag(text: &str, network: u8) -> String {
+    IntegratedAddress::decode(text.trim(), network)
+        .map(|integrated| integrated.tag.to_string())
+        .unwrap_or_default()
+}
+
+/// El memo de un pago a una dirección integrada: `zoka-tag:<código>` y la
+/// nota de quien paga en la línea siguiente. Falla si no entra en 512 bytes.
+#[wasm_bindgen(js_name = tagMemo)]
+pub fn tag_memo_of(tag: &str, note: &str) -> Result<String, JsError> {
+    let tag: u64 = tag
+        .parse()
+        .map_err(|_| JsError::new("that is not a customer code"))?;
+    tag_memo(tag, note).map_err(js)
 }
 
 /// Si la dirección completa `full` (la que devuelve `/address/<corta>`) es la
@@ -487,6 +519,23 @@ mod tests {
         assert!(matches_short(&full, &short, 2));
         assert_eq!(short_of(&full, 2), short);
         assert_eq!(short_of(&short, 2), "");
+    }
+
+    /// El vector fijo del nodo (`zoka-pq-pool`, integrated.rs): la corta de la
+    /// semilla de prueba 2 de testnet con el código de cliente 42.
+    #[test]
+    fn an_integrated_address_gives_its_short_address_and_tag() {
+        let short = "zqtest22m1iDEYKpaemBFZMVj2k1SAzEV9BGL1uFXRZVABUrvAYuHQRbj";
+        let integrated = "zqtesti23jYjdoHfKWvz5DDUPwYYXACN7eAWX8qdEVQRw5uAGAeCskj7rGtZtrKFb16E2";
+        assert_eq!(address_kind(integrated, 2), "integrated");
+        assert_eq!(integrated_short(integrated, 2), short);
+        assert_eq!(integrated_tag(integrated, 2), "42");
+        assert_eq!(address_kind(integrated, 1), "");
+        assert_eq!(integrated_short(short, 2), "");
+        assert_eq!(integrated_tag(short, 2), "");
+        assert_eq!(tag_memo_of("42", "").unwrap(), "zoka-tag:42");
+        assert_eq!(tag_memo_of("42", "order 7").unwrap(), "zoka-tag:42\norder 7");
+        assert_eq!(tag_memo_of("18446744073709551615", "").unwrap(), "zoka-tag:18446744073709551615");
     }
 
     #[test]
