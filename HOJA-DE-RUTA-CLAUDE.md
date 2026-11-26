@@ -1,5 +1,24 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
+## 26/11: activación v4 verificada, releases firmadas, relays propios, kit para exchanges y 5.1.1 armada
+
+- **Activación v4:** pasó el bloque 10.000; primeros pagos v4 en el 10.642
+  (ZSilent) y el 10.645 (teléfono). Ver [docs/RELEASE-5.1.0.md](docs/RELEASE-5.1.0.md).
+- **Releases firmadas:** publicadas (clave `61c2afa5…`, guía
+  [docs/release-verification.md](docs/release-verification.md)).
+- **Relays propios:** relay1/relay2.zoka.network en vivo en los VPS (443, SSH
+  en el 2222); el nodo que los usa sale en la 5.1.1.
+- **Kit para exchanges** (pedido del usuario: «hacerlo completo así luego
+  solo cambiamos de testnet a mainnet»): direcciones integradas, servidor
+  `quantic-pq-wallet-rpc` y [docs/EXCHANGE-INTEGRATION.md](docs/EXCHANGE-INTEGRATION.md);
+  pagan integradas la CLI, ZSilent, ZKAPriv y la web.
+- **5.1.1 armada, sin publicar:** [docs/RELEASE-5.1.1.md](docs/RELEASE-5.1.1.md)
+  tiene ramas, archivos, pasos y notas. Falta la prueba en el teléfono y el OK.
+- **Para que decida el usuario:** el bounty y la revisión externa (rama
+  `revision-externa`: `SECURITY.md` y `docs/EXTERNAL-REVIEW.md`, con montos,
+  plazos y contacto a confirmar) y los pools (rama `diseno-pools`,
+  `docs/QUANTIC-POOL-DE-MINERIA.md`, con cuatro opciones).
+
 ## 25/11: envíos lentos, prueba v4 y actualizaciones de red (fases A, B y C)
 
 El usuario vio que ZSilent tardaba ~6 min en enviar. Causas medidas: cada
