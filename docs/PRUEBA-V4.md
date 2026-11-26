@@ -1,5 +1,8 @@
 # Prueba v4 y actualizaciones de red (25/11/2026)
 
+> **English:** [PROOF-V4.md](PROOF-V4.md) es la versión pública en inglés.
+> Esta es la nota interna, con el detalle de cómo se decidió.
+
 Rama `prueba-v4` (sobre `billetera-motor-liviano`, sobre `protocolo-v3`).
 Código: [transfer/narrow.rs](../crates/zoka-pq-pool/src/transfer/narrow.rs),
 reglas de activación en [ledger.rs](../crates/zoka-pq-pool/src/ledger.rs).
@@ -139,10 +142,12 @@ un pago v3 que quedó afuera de la gracia sale solo.
 Notas, árbol, nullifiers y direcciones no cambian: los saldos y las billeteras
 siguen igual después de la activación.
 
-## Qué falta
+## La activación (26/11)
 
-- Ver la activación en el bloque 10.000 y un pago real con la v4 (todo lo
-  demás se publicó el 25/11: ver [RELEASE-5.1.0.md](RELEASE-5.1.0.md)).
+Pasó el 10.000 sin cortes. Primer pago v4 desde ZSilent en el bloque 10.642
+(prueba de 745.595 bytes) y el primero armado en el teléfono en el 10.645
+(737.051 bytes); los tres nodos siguieron juntos. Detalle en
+[RELEASE-5.1.0.md](RELEASE-5.1.0.md).
 
 Hechos el 25/11: la `.so` de ZKAPriv (arm64-v8a y armeabi-v7a) y su APK 4.0.1,
 el WASM de la billetera web y el ensayo de la activación en regtest. ZokaScan no
