@@ -38,6 +38,7 @@ use zeroize::Zeroizing;
 use super::{
     stark::{
         protocol::{
+            integrated::{tag_memo, IntegratedAddress},
             light::LightWallet,
             scan::{ScanPage2, MAX_SCAN_BLOCKS, MAX_SCAN_PAGE_BYTES},
             transaction::Transaction,
@@ -50,7 +51,7 @@ use super::{
 };
 use crate::economics::{format_zka_amount, parse_zka_amount};
 
-const USAGE: &str = "usage: zoka quantic-pq-wallet <new|generate-phrase|restore|address|addresses|new-address|publish-address|list|balance|history|estimate-fee|send|show-phrase|show-view-key|change-password|backup|import-backup> --network testnet|regtest --dir DIR [--name WALLET | --address ITS_ADDRESS] [--password-env VAR | --password-stdin] [--api http://127.0.0.1:9140] [history: --limit N] [show-view-key: --incoming] [restore: --phrase-env VAR or the phrase on stdin] [estimate-fee and send: --amount ZKA] [send: --to FULL_OR_SHORT [--memo TEXT]] [change-password: --new-password-env VAR] [backup: --out FILE] [import-backup: --file FILE] [--json]";
+const USAGE: &str = "usage: zoka quantic-pq-wallet <new|generate-phrase|restore|address|addresses|new-address|publish-address|integrated-address|parse-address|list|balance|history|estimate-fee|send|show-phrase|show-view-key|change-password|backup|import-backup> --network testnet|regtest --dir DIR [--name WALLET | --address ITS_ADDRESS] [--password-env VAR | --password-stdin] [--api http://127.0.0.1:9140] [history: --limit N] [show-view-key: --incoming] [restore: --phrase-env VAR or the phrase on stdin] [estimate-fee and send: --amount ZKA] [send: --to FULL_SHORT_OR_INTEGRATED [--memo TEXT]] [integrated-address: --tag N] [parse-address: --address TEXT] [change-password: --new-password-env VAR] [backup: --out FILE] [import-backup: --file FILE] [--json]";
 const DEFAULT_API: &str = "http://127.0.0.1:9140";
 const MAX_API_REPLY: usize = 1024 * 1024;
 const MAX_NAME: usize = 64;
@@ -567,14 +568,26 @@ fn publish(api: &str, full: Address) -> Result<Value, String> {
 }
 
 /// A full address, or the full address the node finds for a short one. The
-/// node cannot answer another address: the short one is its digest.
-fn resolve(text: &str, profile: Profile, api: &str) -> Result<Address, String> {
+/// node cannot answer another address: the short one is its digest. An
+/// integrated address is a short one with a customer tag, which comes back
+/// too: the payment carries it in its memo.
+fn resolve(text: &str, profile: Profile, api: &str) -> Result<(Address, Option<u64>), String> {
     let text = text.trim();
     if let Ok(full) = Address::decode(text, profile.network) {
-        return Ok(full);
+        return Ok((full, None));
     }
-    let short = ShortAddress::decode(text, profile.network)
-        .map_err(|_| format!("--to is not a {} v2 address, full or short", profile.name))?;
+    let (short, tag) = match IntegratedAddress::decode(text, profile.network) {
+        Ok(integrated) => (integrated.short, Some(integrated.tag)),
+        Err(_) => (
+            ShortAddress::decode(text, profile.network).map_err(|_| {
+                format!(
+                    "--to is not a {} v2 address: full, short or integrated",
+                    profile.name
+                )
+            })?,
+            None,
+        ),
+    };
     let (status, reply) = api_json(
         api,
         "GET",
@@ -591,12 +604,35 @@ fn resolve(text: &str, profile: Profile, api: &str) -> Result<Address, String> {
     if !short.matches(&full) {
         return Err("the node answered another address for that short address".into());
     }
-    Ok(full)
+    Ok((full, tag))
+}
+
+/// What kind of address `text` is, without a node: full, short or
+/// integrated (with its tag). `None` if it is none of them on `profile`.
+fn parse_address(text: &str, profile: Profile) -> Option<Value> {
+    let text = text.trim();
+    if let Ok(full) = Address::decode(text, profile.network) {
+        return Some(json!({"valid":true,"kind":"full","short_address":full.short().ok(),"tag":null}));
+    }
+    if let Ok(short) = ShortAddress::decode(text, profile.network) {
+        return Some(json!({"valid":true,"kind":"short","short_address":short.encode(),"tag":null}));
+    }
+    IntegratedAddress::decode(text, profile.network).ok().map(|integrated| {
+        json!({"valid":true,"kind":"integrated","short_address":integrated.short.encode(),
+            "tag":integrated.tag.to_string()})
+    })
 }
 
 /// Run one action and return its JSON reply.
 async fn act(action: &str, args: &[String]) -> Result<Value, String> {
     let profile = Profile::named(required(args, "--network")?)?;
+    // Needs no wallet: checks an address someone typed.
+    if action == "parse-address" {
+        let text = required(args, "--address")?;
+        return Ok(parse_address(text, profile).unwrap_or_else(|| {
+            json!({"valid":false,"network":profile.chain_id})
+        }));
+    }
     let store = Store {
         dir: PathBuf::from(required(args, "--dir")?),
         profile,
@@ -668,6 +704,24 @@ async fn act(action: &str, args: &[String]) -> Result<Value, String> {
             Ok(
                 json!({"name":name,"short_address":short_of(&file.address, profile),"address":file.address}),
             )
+        }
+        // A deposit address for one customer: the wallet's main address and
+        // the customer's tag (`--tag N`, or a random one). Payers resolve its
+        // short part from a node, so the wallet's address must be published.
+        "integrated-address" => {
+            let (name, path) = store.select(args)?;
+            let (file, _) = stark_cli::read_wallet(&path)?;
+            let full = Address::decode(&file.address, profile.network).map_err(error)?;
+            let tag = match option(args, "--tag") {
+                Some(text) => text
+                    .parse::<u64>()
+                    .map_err(|_| "--tag must be a whole number from 0 to 18446744073709551615")?,
+                None => rand::rngs::OsRng.next_u64(),
+            };
+            let short = full.short_address().map_err(error)?;
+            Ok(json!({"name":name,"integrated_address":IntegratedAddress::new(short, tag).encode(),
+                "tag":tag.to_string(),"short_address":short.encode(),
+                "note":"payers find this wallet's address from its short form: publish it once with publish-address"}))
         }
         // Point 4 of the 10/11 review: more receive addresses of the same
         // seed. Whoever pays two of them cannot tell they paid one wallet.
@@ -868,6 +922,7 @@ async fn act(action: &str, args: &[String]) -> Result<Value, String> {
                                     "net_atoms":net.to_string(),"amount_atoms":amount,
                                     "amount":format_zka_amount(amount),"timestamp":entry.timestamp,
                                     "confirmations":height.saturating_sub(u64::from(entry.height)) + 1,
+                                    "memo":entry.memo,"tag":entry.tag().map(|tag| tag.to_string()),
                                 })
                             })
                             .collect();
@@ -880,8 +935,7 @@ async fn act(action: &str, args: &[String]) -> Result<Value, String> {
                             "max_sendable_atoms":figures.max_sendable_atoms,
                             "spendable_atoms":figures.spendable_atoms,
                         });
-                        // One pending payment per wallet: the engine refuses
-                        // a quote until it is mined or expires.
+                        // From the notes no pending payment holds.
                         match light.wallet.quote_total(amount) {
                             Ok((fee, inputs, total)) => {
                                 reply["enough"] = true.into();
@@ -911,11 +965,17 @@ async fn act(action: &str, args: &[String]) -> Result<Value, String> {
             let memo = option(args, "--memo")
                 .filter(|memo| !memo.is_empty())
                 .map(str::to_owned);
-            let to = {
+            let (to, tag) = {
                 let (text, api) = (required(args, "--to")?.to_string(), api.clone());
                 blocking(move || resolve(&text, profile, &api))
                     .await
                     .map_err(|e| format!("--to: {e}"))?
+            };
+            // An integrated address: its tag goes first in the memo, and the
+            // payer's own memo, if any, on the next line.
+            let memo = match tag {
+                Some(tag) => Some(tag_memo(tag, memo.as_deref().unwrap_or_default()).map_err(error)?),
+                None => memo,
             };
             let wallet = fs::canonicalize(&path).map_err(error)?;
             blocking(move || {
@@ -951,6 +1011,7 @@ async fn act(action: &str, args: &[String]) -> Result<Value, String> {
                 match sent {
                     Ok((status, reply)) if (200..300).contains(&status) => Ok(json!({
                         "name":name,"txid":hex::encode(tx.txid()),"fee_atoms":fee,"height":height,"node":reply,
+                        "tag":tag.map(|tag| tag.to_string()),
                     })),
                     // The node refused it: free the inputs for another try.
                     Ok((status, reply)) => {
@@ -1023,6 +1084,18 @@ fn human(action: &str, reply: &Value) -> String {
         ),
         "generate-phrase" => field("recovery_phrase"),
         "restore" | "address" | "publish-address" | "new-address" => field("short_address"),
+        "integrated-address" => format!(
+            "{}\nCustomer tag: {}",
+            field("integrated_address"),
+            field("tag")
+        ),
+        "parse-address" => match (reply["valid"].as_bool(), reply["kind"].as_str()) {
+            (Some(true), Some(kind)) => match reply["tag"].as_str() {
+                Some(tag) => format!("Valid {kind} address, customer tag {tag}"),
+                None => format!("Valid {kind} address"),
+            },
+            _ => "Not an address of this network".to_string(),
+        },
         "addresses" => reply["addresses"]
             .as_array()
             .map(|list| {
@@ -1518,5 +1591,23 @@ mod tests {
             Duration::from_secs(1)
         )
         .is_err());
+    }
+
+    #[test]
+    fn parse_address_tells_full_short_and_integrated_apart() {
+        let account = Account::from_seed(&[41; 32], Profile::REGTEST.network, 0).unwrap();
+        let full = account.address();
+        let short = full.short_address().unwrap();
+        let integrated = IntegratedAddress::new(short, 9_007_199_254_740_993).encode();
+        let check = |text: &str| parse_address(text, Profile::REGTEST);
+        assert_eq!(check(&full.encode().unwrap()).unwrap()["kind"], "full");
+        assert_eq!(check(&short.encode()).unwrap()["kind"], "short");
+        let parsed = check(&integrated).unwrap();
+        assert_eq!(parsed["kind"], "integrated");
+        // Above 2^53: a string, so JavaScript does not round it.
+        assert_eq!(parsed["tag"], "9007199254740993");
+        assert_eq!(parsed["short_address"], short.encode().as_str());
+        assert!(check("zqregtest2notanaddress").is_none());
+        assert!(check(&integrated.replacen("zqregtesti2", "zqtesti2", 1)).is_none());
     }
 }
