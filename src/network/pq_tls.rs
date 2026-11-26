@@ -269,16 +269,18 @@ impl<P: Preset> Preset for PostQuantumTls<P> {
     }
 }
 
-/// El preset de producción del nodo: el de n0 (relays para atravesar NAT) y, en
-/// un proceso que sigue una red de Zoka Quantic, el TLS híbrido. Zenith queda
-/// como estaba.
+pub use crate::network::relays::ZokaN0;
+
+/// El preset de producción del nodo: el de n0 con los relays de Zoka (para
+/// atravesar NAT) y, en un proceso que sigue una red de Zoka Quantic, el TLS
+/// híbrido. Zenith queda como estaba.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NodePreset;
 
 impl Preset for NodePreset {
     fn apply(self, builder: Builder) -> Builder {
         if crate::network::p2p::network_protocol_is_set() {
-            RequiredPostQuantumTls(presets::N0).apply(builder)
+            RequiredPostQuantumTls(ZokaN0).apply(builder)
         } else {
             presets::N0.apply(builder)
         }

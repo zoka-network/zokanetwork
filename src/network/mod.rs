@@ -22,6 +22,7 @@ pub mod pq_tls;
 pub mod stream_transport;
 pub mod private_tx_request_response;
 pub mod quantic_light_request_response;
+pub mod relays;
 pub mod snapshot_request_response;
 
 #[allow(unused_imports)]

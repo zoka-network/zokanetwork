@@ -16,7 +16,7 @@
 //! it and the seeds being down does not cut it off.
 use std::{net::SocketAddr, sync::Arc};
 
-use iroh::{endpoint::presets, EndpointAddr, EndpointId, TransportAddr};
+use iroh::{EndpointAddr, EndpointId, TransportAddr};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 
@@ -55,7 +55,7 @@ pub fn builtin_seeds(profile: Profile) -> Result<Vec<NodeDescriptor>, String> {
 /// One peer on `route`, authenticated by its pinned ML-DSA key.
 async fn dial(peer: &NodeDescriptor, route: Route) -> Result<Client, String> {
     match route {
-        Route::Direct => Client::connect(peer, presets::N0).await,
+        Route::Direct => Client::connect(peer, crate::network::relays::ZokaN0).await,
         Route::Tor(proxy) => {
             let dialer = StreamTransport::new(None, Arc::new(SocksDialer { proxy }))
                 .map_err(|e| e.to_string())?;

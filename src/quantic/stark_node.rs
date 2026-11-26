@@ -340,7 +340,7 @@ pub(crate) async fn mine_once(state: &NodeState, to: Address) -> Result<(Block, 
 
 async fn connect(peer: &NodeDescriptor, relay: bool) -> Result<Client, String> {
     if relay {
-        Client::connect(peer, presets::N0).await
+        Client::connect(peer, crate::network::relays::ZokaN0).await
     } else {
         Client::connect(peer, presets::Minimal).await
     }
@@ -1329,13 +1329,13 @@ async fn serve(options: Options) -> Result<(), String> {
         let transport = StreamTransport::new(Some(address), Arc::new(TcpDialer)).map_err(err)?;
         stream_transport = Some(transport.clone());
         if relay {
-            stark_net::serve_bound(state.clone(), identity, AlsoStream(presets::N0, transport), p2p_bind).await?
+            stark_net::serve_bound(state.clone(), identity, AlsoStream(crate::network::relays::ZokaN0, transport), p2p_bind).await?
         } else {
             stark_net::serve_bound(state.clone(), identity, AlsoStream(presets::Minimal, transport), p2p_bind)
                 .await?
         }
     } else if relay {
-        stark_net::serve_bound(state.clone(), identity, presets::N0, p2p_bind).await?
+        stark_net::serve_bound(state.clone(), identity, crate::network::relays::ZokaN0, p2p_bind).await?
     } else {
         stark_net::serve_bound(state.clone(), identity, presets::Minimal, p2p_bind).await?
     };

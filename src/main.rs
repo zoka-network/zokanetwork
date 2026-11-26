@@ -20066,7 +20066,7 @@ fn cmd_snapshot_fetch_iroh(args: &[String]) -> Result<(), String> {
             if network.is_quantic() {
                 return zoka::network::iroh_snapshot_transfer::fetch_snapshot(
                     endpoint_id.into(),
-                    zoka::network::pq_tls::RequiredPostQuantumTls(iroh::endpoint::presets::N0),
+                    zoka::network::pq_tls::RequiredPostQuantumTls(zoka::network::relays::ZokaN0),
                 ).await.map_err(|e| format!("iroh snapshot fetch failed: {e}"));
             }
             zoka::network::iroh_snapshot_transfer::fetch_snapshot(

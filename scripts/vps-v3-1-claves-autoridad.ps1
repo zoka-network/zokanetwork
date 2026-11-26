@@ -55,7 +55,7 @@ $out = Join-Path $PSScriptRoot 'autoridad-v3-publicas.txt'
 $lines = @("# Claves publicas de autoridad de la testnet v3, creadas el $(Get-Date -Format s)")
 foreach ($ip in $Hosts) {
     Write-Output "== $ip"
-    $reply = $remote | & ssh -p 443 -i $Key -o "UserKnownHostsFile=$KnownHosts" "root@$ip" 'sed 1s/^$(printf ''\357\273\277'')// | bash -s'
+    $reply = $remote | & ssh -p 2222 -i $Key -o "UserKnownHostsFile=$KnownHosts" "root@$ip" 'sed 1s/^$(printf ''\357\273\277'')// | bash -s'
     if ($LASTEXITCODE -ne 0) { throw "fallo en $ip (codigo $LASTEXITCODE)" }
     $ed = ($reply | Where-Object { $_ -like 'Public key: *' }) -replace '^Public key: ', ''
     $ml = $reply | Where-Object { $_ -match '^[0-9a-f]{3904}$' }

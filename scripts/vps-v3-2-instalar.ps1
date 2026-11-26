@@ -30,8 +30,8 @@ $Binary = (Resolve-Path $Binary).Path
 $sha = (Get-FileHash -Algorithm SHA256 $Binary).Hash.ToLower()
 Write-Output "Binario: $Binary"
 Write-Output "SHA-256: $sha"
-$ssh = @('-p', '443', '-i', $Key, '-o', "UserKnownHostsFile=$KnownHosts")
-$scp = @('-P', '443', '-i', $Key, '-o', "UserKnownHostsFile=$KnownHosts")
+$ssh = @('-p', '2222', '-i', $Key, '-o', "UserKnownHostsFile=$KnownHosts")
+$scp = @('-P', '2222', '-i', $Key, '-o', "UserKnownHostsFile=$KnownHosts")
 
 # Solo ASCII; __SHA__ y __ROLE__ se reemplazan antes de mandarlo.
 $remote = @'
