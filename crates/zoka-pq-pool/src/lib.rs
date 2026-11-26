@@ -5,6 +5,7 @@ pub mod commitment;
 pub mod crypto;
 #[cfg(any(test, feature = "fuzzing"))]
 pub mod fuzzing;
+pub mod integrated;
 pub mod ledger;
 pub mod light;
 pub mod model;

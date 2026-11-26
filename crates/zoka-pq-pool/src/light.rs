@@ -38,8 +38,10 @@ const RECENT_HASHES: usize = 1024;
 pub const MAX_ADDRESSES: u32 = 8;
 /// The first byte of [`LightWallet::encode`]: a state saved by another
 /// version (the v2 testnet's, say) is refused, not misread, and the wallet
-/// reads the chain again.
-pub(crate) const STATE_FORMAT: u8 = 3;
+/// reads the chain again. 4 (5.1.1): each note keeps its transaction, its
+/// integrated-address tag and whether it is change, and several payments can
+/// be pending at once.
+pub(crate) const STATE_FORMAT: u8 = 4;
 
 /// A note the wallet received, spent or not.
 #[derive(Clone, Serialize, Deserialize)]
@@ -53,6 +55,13 @@ pub struct OwnedNote {
     pub index: Option<u32>,
     pub height: u32,
     pub coinbase: bool,
+    /// The transaction that created it.
+    pub txid: [u8; 32],
+    /// The customer tag of a payment to an integrated address
+    /// ([`crate::integrated`]), read from its memo.
+    pub tag: Option<u64>,
+    /// The change of a payment the wallet made: not a deposit.
+    pub change: bool,
 }
 
 /// One transaction that touched the wallet.
@@ -72,6 +81,11 @@ pub struct Movement {
     pub memo: String,
 }
 impl Movement {
+    /// The customer tag its memo carries, if it was paid to an integrated
+    /// address. Per note, [`OwnedNote::tag`] is the one to credit.
+    pub fn tag(&self) -> Option<u64> {
+        crate::integrated::memo_tag(&self.memo)
+    }
     /// What it paid to others: zero unless the wallet sent it.
     pub fn paid(&self) -> u64 {
         self.spent
@@ -148,7 +162,9 @@ pub struct LightWallet {
     settled: Option<State>,
     /// A copy taken near the tip, waiting to become the settled one.
     recent: Option<State>,
-    pending: Option<Pending>,
+    /// Payments handed to the network and not mined yet, oldest first. Each
+    /// holds its own notes, so several can be on their way at once.
+    pending: Vec<Pending>,
     /// See [`LightBalance::verified`].
     verified: u32,
     /// How many addresses it reads for: the accounts `0..addresses`.
@@ -164,7 +180,7 @@ impl LightWallet {
             current: State::new(network)?,
             settled: None,
             recent: None,
-            pending: None,
+            pending: Vec::new(),
             verified: 0,
             addresses: 1,
         })
@@ -244,8 +260,22 @@ impl LightWallet {
     pub fn history(&self) -> &[Movement] {
         &self.current.history
     }
+    /// The oldest payment still pending, if any.
     pub fn pending(&self) -> Option<&Pending> {
-        self.pending.as_ref()
+        self.pending.first()
+    }
+    /// Every payment still pending, oldest first.
+    pub fn pendings(&self) -> &[Pending] {
+        &self.pending
+    }
+    /// Every note the wallet received, spent or not, oldest first: with
+    /// [`OwnedNote::change`] and [`OwnedNote::tag`], the deposits.
+    pub fn notes(&self) -> &[OwnedNote] {
+        &self.current.notes
+    }
+    /// Whether a note was spent in a block the wallet read.
+    pub fn is_spent(&self, owned: &OwnedNote) -> bool {
+        self.current.ledger.spent.contains(&owned.nullifier)
     }
 
     /// Read a page that starts at [`Self::next`]. If the chain moved to
@@ -362,6 +392,7 @@ impl LightWallet {
                 let mut received = 0u64;
                 let mut memo = None;
                 let mut theirs = Vec::new();
+                let first_new = state.notes.len();
                 for output in &tx.outputs {
                     // Each address in turn: one decryption per address.
                     let opened = accounts.iter().find_map(|account| {
@@ -378,6 +409,7 @@ impl LightWallet {
                             }
                             known.insert(nullifier, note.value);
                             received = received.checked_add(note.value).ok_or(Error::Shape)?;
+                            let tag = crate::integrated::memo_tag(&memo_text(&text));
                             if memo.is_none() && text.iter().any(|&b| b != 0) {
                                 memo = Some(text);
                             }
@@ -389,6 +421,9 @@ impl LightWallet {
                                 index: None,
                                 height,
                                 coinbase: tx.coinbase(),
+                                txid: tx.txid,
+                                tag,
+                                change: false,
                             });
                         }
                         None => theirs.push(output),
@@ -401,6 +436,11 @@ impl LightWallet {
                     .try_fold(0u64, |sum, value| sum.checked_add(*value))
                     .ok_or(Error::Shape)?;
                 if spent > 0 {
+                    // What comes back from the wallet's own payment is its
+                    // change, never a deposit.
+                    for owned in &mut state.notes[first_new..] {
+                        owned.change = true;
+                    }
                     // What the wallet paid: the memo it wrote.
                     memo = theirs
                         .iter()
@@ -494,11 +534,10 @@ impl LightWallet {
         }
         state.hash = block.hash.clone();
         let ledger = &state.ledger;
-        if self.pending.as_ref().is_some_and(|p| {
-            p.expiry <= ledger.height || p.nullifiers.iter().any(|nf| ledger.spent.contains(nf))
-        }) {
-            self.pending = None;
-        }
+        // A payment leaves the list once it is mined or expires.
+        self.pending.retain(|p| {
+            p.expiry > ledger.height && !p.nullifiers.iter().any(|nf| ledger.spent.contains(nf))
+        });
         Ok(())
     }
 
@@ -523,7 +562,7 @@ impl LightWallet {
         let mut balance = LightBalance {
             height: self.height(),
             tip: self.tip,
-            pending: self.pending.is_some(),
+            pending: !self.pending.is_empty(),
             verified: self.verified,
             ..LightBalance::default()
         };
@@ -538,11 +577,12 @@ impl LightWallet {
             };
             *total = total.saturating_add(owned.note.value);
         }
-        if self.pending.is_none() {
-            let mut values: Vec<u64> = self.spendable().iter().map(|o| o.note.value).collect();
-            values.sort_unstable_by(|a, b| b.cmp(a));
-            values.truncate(MAX_INPUTS);
-            let total = values.iter().fold(0u64, |sum, v| sum.saturating_add(*v));
+        // From the notes no pending payment holds.
+        let mut values: Vec<u64> = self.spendable().iter().map(|o| o.note.value).collect();
+        values.sort_unstable_by(|a, b| b.cmp(a));
+        values.truncate(MAX_INPUTS);
+        let total = values.iter().fold(0u64, |sum, v| sum.saturating_add(*v));
+        if total > 0 {
             balance.max_sendable_atoms =
                 total.saturating_sub(conventional_fee(values.len().max(1), 2));
         }
@@ -568,11 +608,8 @@ impl LightWallet {
         if amount == 0 {
             return Err(Error::Ledger("the amount must be positive"));
         }
-        if self.pending.is_some() {
-            return Err(Error::Ledger(
-                "a payment is still pending: wait until it is mined or expires",
-            ));
-        }
+        // Notes a pending payment holds are left out: several payments can
+        // be on their way at once, each with its own notes.
         let mut notes = self.spendable();
         notes.sort_by_key(|owned| std::cmp::Reverse(owned.note.value));
         let mut selected = Vec::new();
@@ -661,7 +698,13 @@ impl LightWallet {
     /// proof included) and hold its inputs until it is mined or expires.
     pub fn reserve(&mut self, tx: &Transaction) -> Result<(), Error> {
         self.current.ledger.check_transfer(tx)?;
-        self.pending = Some(Pending {
+        let reserved = self.reserved();
+        if tx.statement.nullifiers.iter().any(|nf| reserved.contains(nf)) {
+            return Err(Error::Ledger(
+                "another pending payment already holds one of its notes",
+            ));
+        }
+        self.pending.push(Pending {
             txid: tx.txid(),
             nullifiers: tx.statement.nullifiers.clone(),
             expiry: self
@@ -672,9 +715,18 @@ impl LightWallet {
         Ok(())
     }
 
-    /// Free the inputs of a payment the network refused.
+    /// Free the inputs of the payment reserved last, which the network
+    /// refused.
     pub fn release(&mut self) {
-        self.pending = None;
+        self.pending.pop();
+    }
+
+    /// Free the inputs of the pending payment `txid`, which the network
+    /// refused. `false` if it was not pending.
+    pub fn release_txid(&mut self, txid: &[u8; 32]) -> bool {
+        let before = self.pending.len();
+        self.pending.retain(|p| &p.txid != txid);
+        self.pending.len() != before
     }
 }
 
@@ -1184,5 +1236,107 @@ mod tests {
         let saved = both.encode().unwrap();
         assert_eq!(LightWallet::decode(&saved).unwrap().addresses(), 2);
         assert!(LightWallet::decode(&saved[1..]).is_err());
+    }
+
+    #[test]
+    fn a_deposit_to_an_integrated_address_keeps_its_tag_and_change_is_not_a_deposit() {
+        use crate::integrated::{tag_memo, IntegratedAddress};
+        let alice = Account::from_seed(&[31; 32], NET, 0).unwrap();
+        let exchange = Account::from_seed(&[32; 32], NET, 0).unwrap();
+        let mut chain = Chain::new();
+        // Regtest coinbases wait two blocks: the premine is spendable at 3.
+        for _ in 0..3 {
+            chain.mine(&alice, vec![], 0);
+        }
+
+        // Alice pays the integrated address of customer 77.
+        let deposit_to =
+            IntegratedAddress::new(exchange.address().short_address().unwrap(), 77);
+        let decoded = IntegratedAddress::decode(&deposit_to.encode(), NET).unwrap();
+        assert!(decoded.short.matches(&exchange.address()));
+        let mut payer = LightWallet::new(NET, 1).unwrap();
+        chain.sync(&mut payer, &alice);
+        let memo = tag_memo(decoded.tag, "first deposit").unwrap();
+        let tx = payer
+            .plan(&alice, exchange.address(), 5 * ATOMS, memo.as_bytes())
+            .unwrap()
+            .prove(&alice)
+            .unwrap();
+        payer.reserve(&tx).unwrap();
+        chain.ledger.check_transfer(&tx).unwrap();
+        chain.mine(&alice, vec![tx.clone()], 0);
+
+        let mut books = LightWallet::new(NET, 1).unwrap();
+        chain.sync(&mut books, &exchange);
+        let deposits: Vec<&OwnedNote> = books.notes().iter().filter(|n| !n.change).collect();
+        assert_eq!(deposits.len(), 1);
+        assert_eq!(
+            (deposits[0].tag, deposits[0].txid, deposits[0].note.value, deposits[0].height),
+            (Some(77), tx.txid(), 5 * ATOMS, 4)
+        );
+        assert!(!books.is_spent(deposits[0]));
+        assert_eq!(books.history().last().unwrap().tag(), Some(77));
+
+        // The payer's change came back in the same transaction: not a deposit.
+        chain.sync(&mut payer, &alice);
+        let change: Vec<&OwnedNote> = payer.notes().iter().filter(|n| n.txid == tx.txid()).collect();
+        assert_eq!(change.len(), 1);
+        assert!(change[0].change && change[0].tag.is_none());
+        assert!(payer.pendings().is_empty(), "the mined payment left the list");
+
+        // The tags survive the saved state.
+        let books = LightWallet::decode(&books.encode().unwrap()).unwrap();
+        assert_eq!(books.notes()[0].tag, Some(77));
+    }
+
+    #[test]
+    fn several_payments_can_be_pending_at_once_each_with_its_own_notes() {
+        let alice = Account::from_seed(&[33; 32], NET, 0).unwrap();
+        let exchange = Account::from_seed(&[34; 32], NET, 0).unwrap();
+        let mut chain = Chain::new();
+        chain.mine(&alice, vec![], 0);
+        for _ in 0..5 {
+            chain.mine(&exchange, vec![], 0);
+        }
+        let mut hot = LightWallet::new(NET, 1).unwrap();
+        chain.sync(&mut hot, &exchange);
+        let mature = hot.balance().spendable_atoms;
+        assert!(mature >= 2 * 12 * ATOMS, "two mature coinbases at least");
+
+        let first = hot
+            .plan(&exchange, alice.address(), 5 * ATOMS, b"withdrawal 1")
+            .unwrap()
+            .prove(&exchange)
+            .unwrap();
+        hot.reserve(&first).unwrap();
+        let second = hot
+            .plan(&exchange, alice.address(), 6 * ATOMS, b"withdrawal 2")
+            .unwrap()
+            .prove(&exchange)
+            .unwrap();
+        hot.reserve(&second).unwrap();
+        assert_eq!(hot.pendings().len(), 2);
+        assert_eq!(hot.pending().unwrap().txid, first.txid(), "oldest first");
+        let used: BTreeSet<Digest> = first.statement.nullifiers.iter().copied().collect();
+        assert!(second.statement.nullifiers.iter().all(|nf| !used.contains(nf)));
+        let held = hot.balance();
+        assert!(held.pending);
+        assert_eq!(held.reserved_atoms + held.spendable_atoms, mature);
+
+        // The same payment cannot hold its notes twice.
+        assert!(hot.reserve(&first).is_err());
+        // One the network refused frees only its own notes.
+        assert!(hot.release_txid(&second.txid()));
+        assert!(!hot.release_txid(&second.txid()));
+        assert_eq!(hot.pendings().len(), 1);
+        hot.reserve(&second).unwrap();
+
+        // Both are mined in the same block, and both leave the list.
+        chain.ledger.check_transfer(&first).unwrap();
+        chain.ledger.check_transfer(&second).unwrap();
+        chain.mine(&alice, vec![first, second], 0);
+        chain.sync(&mut hot, &exchange);
+        assert!(hot.pendings().is_empty());
+        assert!(!hot.balance().pending);
     }
 }
