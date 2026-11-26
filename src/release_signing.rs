@@ -45,9 +45,55 @@ const SIGNATURE_HEADER: &str = "ZOKA release signature v1";
 const BACKUP_SCHEMA: &str = "zoka-release-key-backup-v1";
 const MIN_BACKUP_PASSWORD_CHARS: usize = 12;
 
-/// La clave pública de releases del equipo (`HybridVerifyingKey` en hex).
-/// Vacía hasta que se genere: entonces `verify` pide `--pubkey`.
-pub const RELEASE_PUBKEY_HEX: &str = "";
+/// La clave pública de releases del equipo (`HybridVerifyingKey` en hex),
+/// generada el 26/11/2026. La privada vive en la PC del equipo, protegida con
+/// DPAPI, con una copia cifrada aparte (`backup`).
+pub const RELEASE_PUBKEY_HEX: &str = concat!(
+    "01612c6c9bb57d74ccd9bc759c478cc96e4c77d5ee715330f59aeee83fcaba613cbb7abbf792a175232b59ca4a65b648",
+    "a714b3625a9a52f9ad3e9640088134adcbc0695d52a9e29f2042c703f3d13c0c4f6266a1ca99db7e79c9be1c01621264",
+    "aff37b26fd4089bc84754c5930d6896e1477e7842caf510f9e4ef198e649693f0d1b50efdf526058643b7e3f03359fc3",
+    "50b19b1907e68bb76b8441bf7aa7b371f43e44a2fe13022e76c6c01f5ee67ae6b360165177513d0f562aad96105db45f",
+    "6a56b0699d002e29e9e5967463069e55a420fa03a6fadfbc010c285a9437ddc0f39cb66deaa31008cae1d96e9999f195",
+    "e4fdc6ffedcc8844a5f06e1a84b996da5422f7104e25eb5c085506ee4e07f1d96a5e94b094b7ae8561782c3833d22ae8",
+    "aaa338fd84ddf25fa8a19148aa8ba78a09937b7c6bc7d497c919d005574cbb69a736add5f832ff61a9293a708872563b",
+    "44bc46aafdd4a65a48d06fff79b5cd474646576b3638c672f70c7e3c8f8cdaeec5da1bc1259d9f0ef04c71f8554457e0",
+    "9ee5b046fa9084e9672e3cca367ff671a9c7cd8b476c03e9682ad32b657367f8abb8dc1a8f4be6fa9da27227b13b1e51",
+    "bbe245c666610d7ec5244b56a3e159280008b79839a30282e4539a4b8cec4e665a22ea2929ad9fd9d119efcf93f75874",
+    "a96c7b512a94cfbe802508ea826327015e8b8096bd70a5495c0944abdd4cf46564a3cff57a449bfc998e56212b8674a6",
+    "490977922146b50173114c6c6e0ed52064c66f77aa2772a387ae537868896107cc69f8c92331479e304a3f495b2f6c5c",
+    "b7a461a947dd7b5d88533b8b3275f1597ff49001c398b1025dbdfa282baa2a49d69728a17eeaed23c2d37138643e4104",
+    "88dfb33e8f73f3d6dd262cbb6f6938bb1fe51bb433419432e472ff30d84c9ace51ce3f503494f0d6e939a5b388e58c6a",
+    "7e2ffadce879f864b71b4b620700f1cf6e85ac2f7ab2ee23ed9816ca91988913be79bc49f57146f873aace0f71665e44",
+    "d2dd3287eb6922b277f15b3e0df7242a869eff760db6ba63dacd9e6e9066fd318a0fc03e235ad4fc4b37dd8c864684c0",
+    "39145a1f04539c1b4d9101a3a1cac2da4eb93f0e904f4c23375958a6ed8e0a8496eb061ff3aab10f44eb67d0204d84d4",
+    "dca2539fafbd9a8c3f9885abb112d37e7c11b231638d47c5b4f2bb245350b4ecd4d085d44ef27538938ada893c61b78d",
+    "596b72f93cee44b36d525ceb8135f5513fabfd163a3ce31c43614a1009ca538c516c6ac81da95f3ea7c3bf4ea279a039",
+    "29d890265cdc6257514d24789815d3c0a6d246339e71bd79f96dc400a150a9fed1317c7ee259de70db32063f05344ed7",
+    "90893cd5039a98a1a47214d146e7e5560298b380f8af09951afcd5af990d45cbe3c74635467adbd4a638d681643fb91c",
+    "ae7e3a94cb52b020bb1c13f67fd56b882b3b983ebb077d50df3bad6b5a5a49a6338771f96dfa9bf29a182f0248594a15",
+    "13ded04a4643d3252e88189430afc18ee52d53b26618749584744bbf2335cc80d981fd0ca4287367c80cf6eb2ce6bc2d",
+    "7542c443cbb76a4816baae50b8e34d2e57c6651b81cfca53ebeb780f3bdda65253cb49a2ffc294ac1c8c264c0cc0d62c",
+    "f98fd1524917957a4bab69b2ed6eb578ad4b40e55c228d7258f496f907e135c685b8915e2c7f485dcf3edc8ce4665e95",
+    "536511eb7287dd2bc3447f8bd9c83d30084e19bd621aaf9615b81ca9baaeccd2cf7a072e688fa352fea11c1800812593",
+    "3c2107675552378521a7329266ad9ee29668205f525e95a64f7b06cf191b9ab47f6d5e83a175052c03bb026fdf640d65",
+    "80e1414572b4a13180f301e11ad031afbe73978a448df7bfd0fe913adf9f1f20b6e4b8cd07f7fa9adc552bf26f866e8c",
+    "3224a72c29c3cc0c1667c5b1ada0532ddce3f4eda98cec8bd2db5f7199a6d7b6fc6164da92233c989906bb4f15457459",
+    "f96befb5e4f261d13b99b61b9982ea7974c10283f4a6b3ad97011c2c43c517855e57b13b7c873a048b3b44b0ded216e5",
+    "c6a5970b5fea5089c597bdd4f8a200daa31dd0d41df40f59898b671d2c6ffa037059d4a4542121a366798d0a4e3919aa",
+    "ebf0c38c5bf1d47b0927287711304ada5b4fe1538a53bcab1df6142125a232ccd9eea6648dfaa11797868dc0a015bc39",
+    "e1e5dc72217f3d4148840d6620c1485688c13bc48b3d1fca1183cec635ecaad2021a005522701d0c0ded5f3639126a3a",
+    "57f9c8be601b94d3795457eb71108f0fa515dd03a1fa005474ef72776bfc93dcbb43426280b7b4bf7b2ef661d60d7100",
+    "317fd13bd00a27ee8fa9a042f2b24014af4708d80304414b9bc7cbd2c635e09b55d3ec02507c714e827c415ace361709",
+    "15a70d04b76a72b67a7135aa6292a2c25d4bcbbbb192199d320f71c56a3f7e69d0b7164002eb601c679a9a45d44814b3",
+    "7384d8b7c0c82467eac7b4ac810ed7ce6f7445c18a815a1934a06db82aa277fc0265c3a920d76ea997f07e7bb3d9fdf3",
+    "6a1cc31bb6cfe162e3a9237b6511fbce4566d59228204380794c3f386305970affbbce05b3078f87b7149e73e6c60f4b",
+    "9dc842662cb495389bc9bc30a093afa453c8411eee2bff59c8cdc299274147175f434e7bef51567be3655bc3e2522753",
+    "6160572bf166057978149a29f6bb8618f912ff1cfd0a6d5e5325a1ec0e013931dc4674441cc85af6efce83a9c9369893",
+    "965ba44faaad2dc72ee545e743933b8ddbf745236658caeaeff46bffeef851b0c385c4f854d8507b8d192bbc6df5b706",
+    "e872f8fbda356689da83ded2446701ab07",
+);
+/// SHA-256 de esa clave: lo que se publica (docs/release-verification.md).
+pub const RELEASE_KEY_FINGERPRINT: &str = "61c2afa567d79ad5c43a89c582656f55ffc888a54ac06ddc8445dece63ed5c99";
 
 // SubjectPublicKeyInfo (RFC 8410 y RFC 9881) sin la clave: lo que antecede a
 // los 32 bytes de Ed25519 y a los 1.952 de ML-DSA-65 en un PEM de OpenSSL.
@@ -691,6 +737,13 @@ mod tests {
         assert!(!signature_path(&sums).exists());
         sign_file(&sums, &keys, None).unwrap();
         assert!(sign_file(&sums, &keys, None).unwrap_err().contains("cannot create"));
+    }
+
+    #[test]
+    fn the_compiled_release_key_is_the_published_one() {
+        let key = embedded_key().unwrap();
+        assert_eq!(fingerprint(&key), RELEASE_KEY_FINGERPRINT);
+        assert_eq!(key.to_hex(), RELEASE_PUBKEY_HEX);
     }
 
     #[test]
