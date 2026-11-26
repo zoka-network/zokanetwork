@@ -2,7 +2,10 @@
 # Instala el relay de iroh de Zoka en un VPS (relay1 en el VPS 1, relay2 en el
 # VPS 2). Se corre como root en el VPS, con el binario ya subido:
 #
-#   bash vps-relay-instalar.sh <relayN.zoka.network> <ruta del binario> <sha256>
+#   bash vps-relay-instalar.sh <relayN.zoka.network> <ruta del binario> <sha256> <correo>
+#
+# Let's Encrypt exige un correo de contacto en este modo; va como argumento
+# para que no quede escrito en el repositorio.
 #
 # El relay usa el 443/TCP (HTTPS, con certificado de Let's Encrypt que saca
 # solo), el 80/TCP (HTTP y la prueba de portal cautivo) y el 7842/UDP (QUIC,
@@ -14,6 +17,11 @@ set -euo pipefail
 host="$1"
 binary="$2"
 sha="$3"
+contact="$4"
+case "$contact" in
+    *@*.*) ;;
+    *) echo "falta el correo de contacto para Let's Encrypt" >&2; exit 1 ;;
+esac
 case "$host" in
     relay1.zoka.network|relay2.zoka.network) ;;
     *) echo "nombre inesperado: $host" >&2; exit 1 ;;
@@ -45,6 +53,7 @@ cert_mode = "LetsEncrypt"
 hostname = "$host"
 cert_dir = "/var/lib/iroh-relay/certs"
 prod_tls = true
+contact = "$contact"
 
 [limits]
 accept_conn_limit = 50.0
@@ -97,8 +106,18 @@ fi
 if ss -tlnpH | grep -q 'sshd.*:443 '; then echo "SSH sigue en el 443" >&2; exit 1; fi
 
 systemctl daemon-reload
-systemctl enable --now iroh-relay
-sleep 5
-systemctl is-active iroh-relay
+systemctl enable iroh-relay
+systemctl restart iroh-relay
+# Arrancar lleva unos segundos; el certificado, algo más la primera vez.
+for _ in $(seq 1 12); do
+    sleep 5
+    if systemctl is-active --quiet iroh-relay && ss -tlnH | awk '{print $4}' | grep -qE ':443$'; then
+        break
+    fi
+done
 journalctl -u iroh-relay --no-pager -o cat -n 15
+if ! systemctl is-active --quiet iroh-relay; then
+    echo "el relay no quedó andando" >&2
+    exit 1
+fi
 echo LISTO="$host"
