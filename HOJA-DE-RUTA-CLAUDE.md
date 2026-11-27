@@ -1,5 +1,28 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
+## 27/11: auditoría de lo desactualizado y ZSilent 5.1.2, publicadas
+
+El usuario vio «Testnet v3» en la sección Network de ZokaScan y pidió revisar
+ZokaScan, zoka.network, la billetera web, ZSilent y ZKAPriv. La cadena sigue
+siendo la v3 (se actualiza, no se reinicia); lo viejo eran los textos.
+Detalle, hashes y notas en [docs/RELEASE-5.1.2.md](docs/RELEASE-5.1.2.md).
+
+- **Publicado y verificado en vivo:**
+  - **ZokaScan:** Network con la prueba v4, la comisión, los relays y la autoridad 2 de 3.
+  - **zoka.network:** Tech, Docs, carta 06 y repos; papers 2.7 regenerados.
+  - **Billetera web:** pasa a la 0.4.0.
+  - **ZSilent 5.1.2:** con el nodo 5.1.1. Es la Latest; la 5.1.1 quedó marcada «Superseded».
+  - **README nuevos:** el del nodo y el de ZKAPriv.
+  - **Política de ZKAPriv:** también en la rama `zkapriv-v2`, que es la que abre la 4.0.2.
+  - **Ramas:** todo en `main`, en GitHub y en GitLab.
+- **Del usuario:**
+  - Instalar ZSilent 5.1.2 en la PC, con ZSilent cerrada. Reemplaza a la 5.1.1.
+  - Mandar el aviso de Discord, que ya apunta a ZSilent 5.1.2. Sigue en borrador.
+- **Para otro día:**
+  - `zoka help` de la 5.1.1 muestra comandos de la v1, y la ayuda de `quantic-pq-node` dice «STARK v2 node»: hace falta una versión nueva del nodo.
+  - En ZKAPriv, el enlace de Privacy a `main` sale con la próxima APK.
+  - El «Technology Brief» del repo `Docs`, que es de la v2.
+
 ## 26/11: activación v4 verificada, releases firmadas, relays propios, kit para exchanges y 5.1.1 armada
 
 - **Activación v4:** pasó el bloque 10.000; primeros pagos v4 en el 10.642

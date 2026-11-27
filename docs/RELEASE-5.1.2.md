@@ -9,6 +9,14 @@ quedaban textos de la v2, de la v1 y de Zenith. Plan aprobado:
 
 ZSilent 5.1.2 lleva el **mismo nodo 5.1.1**. No es actualización de red.
 
+**Publicado el 27/11 con el OK del usuario:**
+- Release `v5.1.2` de zsilent-core como Latest. La bajé de vuelta y el hash y la firma dan OK. La 5.1.1 quedó marcada «Superseded».
+- Etiqueta `v5.1.2` = `be923da`.
+- `main` en GitHub y GitLab en los seis repos.
+- Desplegados zoka.network (`9d32e4c`, con ZSilent 5.1.2 y los papers 2.7), ZokaScan (`5c5bd01`) y la billetera web (`19e1a46`). Los bundles publicados son iguales a los `dist`.
+- La política que abre ZKAPriv 4.0.2 ya es la del 27/11.
+- El aviso de Discord (`discord-bot/notice.release-5.1.1.json`, todavía borrador) apunta a ZSilent 5.1.2.
+
 ## Ramas `auditoria-27-11`
 
 | Repo | Commits | Qué |
