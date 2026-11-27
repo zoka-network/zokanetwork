@@ -1,5 +1,38 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
+## 27/11 (tarde): los pendientes sin decisiones, publicados
+
+El usuario pidió avanzar con todo lo que no dependía de él («si avanza con
+todo») y dio el OK de publicar.
+
+- **Publicado y comprobado en vivo:**
+  - **ZokaScan** (`e9fe7e2`): el pie con la billetera web y el faucet. La
+    página API decía «GET only»: ahora tiene los dos POST, `/scan2`, los
+    límites de escritura del nodo y ejemplos reales (primer pago v4, bloque
+    10.642).
+  - **Repo `Docs`** (`f2ea33c`): el Technology Brief EN/ES rehecho para la
+    testnet v3 con el mismo diseño, generado por `source/build-brief.py`
+    (HTML a PDF con Chrome). También las descripciones «About» de `audit`,
+    `media` y `Docs`.
+  - **Contacto de seguridad y para exchanges: `zokanetwork@proton.me`**
+    (decisión del usuario), en el README y en la guía para exchanges
+    (`d93d4cfe`). El `SECURITY.md` de `revision-externa` ya lo tenía.
+- **En ramas:**
+  - `ayuda-quantic-v3` (`dca26718`, subida): `zoka help` y la ayuda del nodo
+    con los comandos de hoy; la v1 queda al final como retirada. Sale con la
+    próxima versión del nodo.
+  - `tope-de-pagos` (local, `3e5d688f`): `docs/TOPE-DE-PAGOS.md`, pedido del
+    usuario. Propuesta: mantener 16. Antes de subir a 32, descartar
+    las pruebas validadas debajo de un checkpoint y una comisión exacta que
+    suba con la ocupación.
+- **Fuzzing en el VPS 2:** unidad `zoka-fuzz`, seis objetivos de una hora
+  desde las 16:30 CET; resultados en `/root/zoka-fuzz-results-20261127`
+  (`runs.tsv`, `exit-code`).
+- **SafeTrade:** borrador en `safetrade-mensaje.md`, sin commitear: la
+  integración en la testnet ahora y el listado con la mainnet.
+- **Del usuario:** el bounty y la revisión externa, los pools, la propuesta
+  del tope, `zokawallet` público en GitLab y ZKAPriv 4.1 con el teléfono.
+
 ## 27/11: auditoría de lo desactualizado y ZSilent 5.1.2, publicadas
 
 El usuario vio «Testnet v3» en la sección Network de ZokaScan y pidió revisar
