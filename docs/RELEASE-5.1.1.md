@@ -75,12 +75,25 @@ carpeta por defecto todavía tiene la 0.4.9.13 y el script la rechaza.
 - El MSI abierto por extracción administrativa: `zoka.exe`, `zokahd.exe` y
   `tor.exe` son los de la tabla y el manifiesto.
 
+## Prueba en vivo (26/11, noche)
+
+- ZKAPriv 4.0.2 instalada por adb encima de la 4.0.1 en el Samsung A13
+  (código 22); abrió, releyó la cadena y sincronizó.
+- **Teléfono → exchange:** el usuario escaneó el QR de la integrada (código
+  4242) y pagó 10 ZKA; la prueba tardó unos 40 s. El servidor del VPS 2 vio el
+  depósito con `tag: "4242"` en el bloque **10.740** (tx `40edcc6a…`), y más
+  tarde con `finalized: true`.
+- **Exchange → ZSilent:** `transfer` de 1 ZKA a la corta de la billetera
+  `zsilent` (tx `2b7e89fa…`, comisión 0,0002, armado en 2 s), minado en el
+  **10.762**. Repetir el pedido devolvió el mismo retiro; el mismo
+  `request_id` con otro monto dio `-32004`. Saldo final 8,9998 ZKA: el vuelto
+  volvió y no figura como depósito.
+- El servidor de prueba quedó apagado (`systemctl stop zoka-exchange-test`);
+  los archivos siguen en `/root/zoka-exchange-test`.
+
 ## Lo que falta antes de publicar
 
-1. **Prueba en el teléfono (usuario):** instalar la 4.0.2 encima de la 4.0.1 y
-   pagar desde ZKAPriv a una dirección integrada del exchange de prueba del
-   VPS 2. Yo controlo por el servidor RPC que el depósito llegue con su código
-   y devuelvo un retiro a ZKAPriv.
+1. ~~Prueba en el teléfono~~: hecha, arriba.
 2. **OK del usuario** para integrar, etiquetar y publicar.
 
 ## Pasos para publicar (con el OK)
