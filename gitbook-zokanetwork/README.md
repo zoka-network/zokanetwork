@@ -1,5 +1,9 @@
 # Zoka Documentation
 
+> **Historical.** This GitBook describes Zenith, the network Zoka retired on
+> 21 October 2026, and its wallets. For Zoka Quantic, the current network, see
+> [zoka.network](https://zoka.network/#docs) and the [README](../README.md).
+
 Welcome to the ZOKA Network documentation.
 
 ZOKA is a privacy-first blockchain designed for self-custodial private

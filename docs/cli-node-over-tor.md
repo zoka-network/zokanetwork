@@ -1,5 +1,10 @@
 # Running a Zoka Quantic node from the command line (Linux and Windows)
 
+> **Historical: testnet v1, October 2026.** These commands belong to a retired
+> testnet. Today's node is `zoka quantic-pq-node`, and Tor mode is its `--tor`
+> flag; the CLI miner runs it for you with `mine -Tor` (Windows) or
+> `mine --tor` (Linux): see [the CLI miner guide](../packaging/cli-miner/README.md#tor-mode-optional).
+
 The commands below are for **Zoka Quantic Testnet**. For the mainnet, once it
 launches, use `--network quantic-mainnet`, its manifest, P2P port 28380 and API
 port 3300. (Zenith, the previous network, was retired on 21 October 2026.)
