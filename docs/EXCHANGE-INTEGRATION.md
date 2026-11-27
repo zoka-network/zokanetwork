@@ -185,5 +185,6 @@ method, `-32602` params, `-32603` internal) and these:
 - Payments are private: the chain shows no amounts or addresses. What a payment
   publishes is described in the whitepaper.
 
-Questions: open an issue at
-<https://github.com/zoka-network/zokanetwork/issues>.
+Questions: write to **zokanetwork@proton.me**, or open an issue at
+<https://github.com/zoka-network/zokanetwork/issues>. Report a vulnerability
+only by mail, never in a public issue.

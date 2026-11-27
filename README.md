@@ -125,3 +125,6 @@ Design notes in Spanish, with the reasoning behind each decision, are in
 
 Never publish recovery phrases, passwords or server secrets. Verify a release's
 checksums and signature before running it.
+
+Found a vulnerability? Write to **zokanetwork@proton.me** instead of opening a
+public issue.
