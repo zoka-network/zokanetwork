@@ -32,7 +32,7 @@ funciona con los nodos 5.1.0, y la cadena y el consenso no cambian.
 | --- | --- | --- | --- |
 | ZOKA | `kit-exchanges` (incluye `relays-propios`) | `6ef0da2d` | nodo 5.1.1, kit, relays, guía del minero |
 | zsilent-core | `kit-exchanges` (worktree `C:\tmp\zoka-wt\zsilent-sin-cola`) | `d863f8b` | ZSilent 5.1.1, paga integradas |
-| zkapriv | `kit-exchanges` | `5310f51` + las `.so` | ZKAPriv 4.0.2, paga integradas |
+| zkapriv | `kit-exchanges` | `b30366f` | ZKAPriv 4.0.2, paga integradas; `.so` desde ZOKA `5013a998` |
 | zokawallet | `integradas` | `32f4771` | paga integradas; WASM de ZOKA `e2cc03a1` |
 | zokaweb | `descargas-5.1.1` | `eed594e` | descargas, relays, roadmap y «For exchanges» |
 | ZOKA | `revision-externa` | `8c253ee2` | `SECURITY.md` y `docs/EXTERNAL-REVIEW.md` (no sale con la release) |
@@ -45,10 +45,10 @@ Todas salen de su `main` actual y se integran por avance rápido.
 | Archivo | SHA-256 |
 | --- | --- |
 | `node/zoka-cli-miner-5.1.1-windows-x64.zip` | `e7e5d5537f57083b1b4a18cf2c13a3aa78bfbf7dc003fa10c8127feb897a0a05` |
-| `node/zoka-cli-miner-5.1.1-linux-x64.tar.gz` | pendiente |
-| `node/zoka-5.1.1-linux-x64` (glibc 2.30+) | pendiente |
+| `node/zoka-cli-miner-5.1.1-linux-x64.tar.gz` | `bdac1e9a0b0730cd3a958739bfa5394122b4ba10b7111c6d2258a8fe4b8f519e` |
+| `node/zoka-5.1.1-linux-x64` (glibc 2.30+) | `b0d0b3ce8a848514e56019661187ae60c1b490552d0132af3ce123107ef61d2b` |
 | `zsilent/ZSilent-Core-5.1.1.msi` (Tor 0.4.9.14) | `6b8bbe74de9a99c1009e3995e7bb90a67fc97d1e8a9ea1ce9f5bf3a26aa9180c` |
-| `zkapriv/ZKAPriv-4.0.2.apk` | pendiente |
+| `zkapriv/ZKAPriv-4.0.2.apk` (código 22, certificado `061376f8…`) | `2da7d09bbe1c34fc90598beba4fe1ff5a6328e0f144b6db7c33787065cb7ff86` |
 | `zoka.exe` (dentro del MSI y del ZIP) | `4e16ab553d3be64b04edb844aa5576d864b738c60ce6406bfb1ff85fe2bebced` |
 | `zokahd.exe` | `af7fb383ed39d926397b6cac26386c916e4a402990db29a5f1e229ac9ac7e80a` |
 
@@ -63,7 +63,14 @@ carpeta por defecto todavía tiene la 0.4.9.13 y el script la rechaza.
   (depósito con código, retiro pagado una sola vez aunque se repita el pedido).
 - Billetera web: 40 pruebas (1 saltada como antes) y `npm run build`.
 - ZSilent: `IntegratedAddressRecognitionTest`.
-- Motor de ZKAPriv: 5 pruebas en la PC; Kotlin compila.
+- Motor de ZKAPriv: 5 pruebas en la PC; las dos `.so` llevan los relays y
+  el código de cliente, y son las mismas dentro del APK.
+- Firmas: las tres carpetas con `zoka release verify`; la del nodo, también
+  con OpenSSL 3.5.6.
+- Exchange de prueba en el VPS 2 (`/root/zoka-exchange-test`, unidad
+  transitoria `zoka-exchange-test`, solo en 127.0.0.1:18090): sincronizado
+  con la testnet, integrada de prueba con el código 4242:
+  `zqtesti23FCAV63JTd7cKmhkGHgYrncDyq6pyRZitKJiRnNJYR38PVVL8K1uZ6zVxHtcW`.
 - zoka.network: 17 pruebas y `npm run build`.
 - El MSI abierto por extracción administrativa: `zoka.exe`, `zokahd.exe` y
   `tor.exe` son los de la tabla y el manifiesto.
@@ -112,8 +119,8 @@ Descargá el ZIP de Windows o el tar.gz de Linux y comprobá el archivo con `SHA
 
 ```
 e7e5d5537f57083b1b4a18cf2c13a3aa78bfbf7dc003fa10c8127feb897a0a05  zoka-cli-miner-5.1.1-windows-x64.zip
-(pendiente)  zoka-cli-miner-5.1.1-linux-x64.tar.gz
-(pendiente)  zoka-5.1.1-linux-x64
+bdac1e9a0b0730cd3a958739bfa5394122b4ba10b7111c6d2258a8fe4b8f519e  zoka-cli-miner-5.1.1-linux-x64.tar.gz
+b0d0b3ce8a848514e56019661187ae60c1b490552d0132af3ce123107ef61d2b  zoka-5.1.1-linux-x64
 ```
 
 Compilado de `6ef0da2d`.
@@ -160,8 +167,8 @@ After updating, ZKAPriv reads the chain once more.
 **SHA-256**
 
 ```
-(pendiente)  ZKAPriv-4.0.2.apk
+2da7d09bbe1c34fc90598beba4fe1ff5a6328e0f144b6db7c33787065cb7ff86  ZKAPriv-4.0.2.apk
 ```
 
-Built from `5310f51` and the engines from ZOKA `6ef0da2d`.
+Built from `b30366f`, with engines from Zoka node 5.1.1.
 ````
