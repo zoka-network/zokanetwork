@@ -1,7 +1,21 @@
 # Nodo, minero y ZSilent 5.1.1, ZKAPriv 4.0.2: relays propios y kit para exchanges
 
-**Armada el 26/11/2026, sin publicar.** No es una actualización de red: la 5.1.1
+**Publicada el 26/11/2026 (noche).** No es una actualización de red: la 5.1.1
 funciona con los nodos 5.1.0, y la cadena y el consenso no cambian.
+
+## Publicado
+
+| Qué | Estado |
+| --- | --- |
+| Releases en GitHub | zokanetwork `v5.1.1`, zsilent-core `v5.1.1` y zkapriv `v4.0.2`, Latest, con `SHA256SUMS.txt` y `.sig`; bajadas de vuelta, hashes y firmas OK. 5.1.0, ZSilent 5.1.0 y ZKAPriv 4.0.1 marcadas «Superseded» |
+| `main` y etiquetas | GitHub y GitLab (443) en ZOKA, zsilent-core, zkapriv, zokawallet, zokaweb y zokaexplorer; `v5.1.1` = `6ef0da2d` (nodo), `d863f8b` (ZSilent); `v4.0.2` = `b30366f` |
+| VPS 1 y 2 | semillas en 5.1.1 como autoridad (la 5.1.0 en `/usr/local/bin/zoka-5.1.0`); faucet y API pública OK |
+| Billetera web | wallet.zoka.network con el WASM `0894e4da…`, controlado en vivo |
+| zoka.network | descargas 5.1.1 / 4.0.2, relays, roadmap y «For exchanges» (`eed594e`), en vivo |
+| ZokaScan | el buscador explica las direcciones de exchange (`bdeb5a1`), en vivo |
+| Teléfono de prueba | ZKAPriv 4.0.2 instalada |
+
+Pendiente del usuario: ZSilent 5.1.1 en la PC y el aviso de Discord.
 
 ## Qué trae
 
