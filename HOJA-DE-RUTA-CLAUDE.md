@@ -15,9 +15,16 @@ Detalle, hashes y notas en [docs/RELEASE-5.1.2.md](docs/RELEASE-5.1.2.md).
   - **README nuevos:** el del nodo y el de ZKAPriv.
   - **Política de ZKAPriv:** también en la rama `zkapriv-v2`, que es la que abre la 4.0.2.
   - **Ramas:** todo en `main`, en GitHub y en GitLab.
-- **Del usuario:**
-  - Instalar ZSilent 5.1.2 en la PC, con ZSilent cerrada. Reemplaza a la 5.1.1.
-  - Mandar el aviso de Discord, que ya apunta a ZSilent 5.1.2. Sigue en borrador.
+- **Hecho después, el 27/11, a pedido del usuario («hazlo tu»):**
+  - **ZSilent 5.1.2 instalada en la PC.** Cerré ZSilent parando sus procesos (la
+    salida normal de la app también mata al nodo con `destroy()`), corrí
+    `msiexec /i … /passive /norestart`, que salió con 0, y la volví a abrir con
+    `explorer.exe`. Versión 5.1.2, `zoka.exe` y `zokahd.exe` iguales a la release,
+    Tor 0.4.9.14. El nodo volvió en modo completo y XMRig se reconectó.
+  - **Aviso de Discord enviado:** tres mensajes por canal, comprobados con
+    `check-notice.js`. El de la 5.1.0 no había salido nunca, así que el enviado
+    cuenta las dos: la 5.1.0 es obligatoria para quien sigue en la 5.0.x, y la
+    5.1.1 es recomendable. `notice.upgrade-5.1.0.json` quedó marcado para no mandarlo.
 - **Para otro día:**
   - `zoka help` de la 5.1.1 muestra comandos de la v1, y la ayuda de `quantic-pq-node` dice «STARK v2 node»: hace falta una versión nueva del nodo.
   - En ZKAPriv, el enlace de Privacy a `main` sale con la próxima APK.

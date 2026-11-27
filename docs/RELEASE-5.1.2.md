@@ -10,12 +10,14 @@ quedaban textos de la v2, de la v1 y de Zenith. Plan aprobado:
 ZSilent 5.1.2 lleva el **mismo nodo 5.1.1**. No es actualización de red.
 
 **Publicado el 27/11 con el OK del usuario:**
+
 - Release `v5.1.2` de zsilent-core como Latest. La bajé de vuelta y el hash y la firma dan OK. La 5.1.1 quedó marcada «Superseded».
 - Etiqueta `v5.1.2` = `be923da`.
 - `main` en GitHub y GitLab en los seis repos.
 - Desplegados zoka.network (`9d32e4c`, con ZSilent 5.1.2 y los papers 2.7), ZokaScan (`5c5bd01`) y la billetera web (`19e1a46`). Los bundles publicados son iguales a los `dist`.
 - La política que abre ZKAPriv 4.0.2 ya es la del 27/11.
-- El aviso de Discord (`discord-bot/notice.release-5.1.1.json`, todavía borrador) apunta a ZSilent 5.1.2.
+- Aviso de Discord enviado el 27/11 (`discord-bot/notice.release-5.1.1.json`): cuenta la 5.1.0, cuyo aviso nunca había salido, y la 5.1.1, con ZSilent 5.1.2 en las descargas. Comprobado con `check-notice.js`.
+- ZSilent 5.1.2 instalada en la PC el 27/11 (`msiexec /passive`, salida 0, binarios iguales a la release).
 
 ## Ramas `auditoria-27-11`
 
@@ -63,8 +65,8 @@ su versión de `-Dzsilent.version=5.1.2`.
    zokaexplorer y zokaweb, en GitHub y GitLab.
 4. Comprobar: descargas con hash y firma, bundles publicados iguales a los
    `dist`, la política que abre ZKAPriv 4.0.2.
-5. Del usuario: instalar ZSilent 5.1.2 en la PC (con ZSilent cerrada) en
-   lugar de la 5.1.1.
+5. Instalar ZSilent 5.1.2 en la PC (con ZSilent cerrada) en lugar de la 5.1.1.
+   Hecho el 27/11.
 
 ## Notas para GitHub
 
@@ -78,7 +80,7 @@ ZSilent 5.1.2 para **Zoka Quantic Testnet v3**, con el mismo nodo Zoka 5.1.1. No
 
 Cerrá ZSilent antes de instalar `ZSilent-Core-5.1.2.msi`. Se instala encima de la 5.1.1 o la 5.1.0. Verificá su SHA-256 con `SHA256SUMS.txt` y su firma `SHA256SUMS.txt.sig` (docs/release-verification.md del repo del nodo; huella de la clave `61c2afa5 67d79ad5 c43a89c5 82656f55 ffc888a5 4ac06ddc 8445dece 63ed5c99`); `release-manifest.json` identifica los binarios y el manifiesto de red incluidos.
 
-```
+```text
 2ef0cc01b619b17186122414108f61babcb38e431c0e16699ee911455d51d8c5  ZSilent-Core-5.1.2.msi
 ```
 
