@@ -105,5 +105,4 @@ def mosaic(short):
 - **ZKAPriv:** the wallet card, Receive (the ID of the address shown) and Send
   (the recipient's ID, before you confirm).
 - **ZSilent** and the **web wallet:** Receive and the payment review.
-- **ZokaScan:** the page of a short address and the explanation of an exchange
-  deposit address.
+- **ZokaScan:** the page of a short address.
