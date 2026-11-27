@@ -2,7 +2,92 @@
 
 Primera versión: 22/10/2026, un borrador de diseño de un pool. Actualizado el
 23/10/2026, después de que el usuario pidiera apuntar a los pools grandes y a
-P2Pool, con opciones Stratum.
+P2Pool, con opciones Stratum. **Rehecho el 26/11/2026 para la testnet v3
+(STARK):** la sección que sigue manda; lo de abajo de «Historia (octubre,
+Quantic v1)» describe la red de Orchard y queda como antecedente.
+
+## 26/11/2026: diseño para la testnet v3 (para aprobar)
+
+### Qué hay hoy
+
+| | Estado |
+| --- | --- |
+| PoW RandomX `rx/0` con el blob de 76 bytes que entiende XMRig | Hecho (v3) |
+| Stratum en el nodo (`--stratum`, `src/quantic/stark_stratum.rs`) | Hecho y probado con XMRig: cada login cobra el bloque entero a su dirección. Minería solo, sin custodia, aunque el nodo atienda a muchos mineros |
+| Plantilla y envío de bloques por la API local (`GET /mining/template?address=`, `POST /blocks`) | Hecho |
+| Pagos desde una billetera de servidor | Hecho con el kit de exchanges (`quantic-pq-wallet-rpc`, `transfer` idempotente) |
+| RPC con los nombres de `monerod` para el software de pools | Falta |
+| Coinbase que le paga a varios | **No existe:** el consenso v3 exige una sola salida en el coinbase (`Statement::validate`, `crates/zoka-pq-pool/src/model.rs`) |
+
+### Qué cambió desde octubre
+
+- **El coinbase ya no lleva prueba.** Publica cada salida con su apertura
+  (`Opening`), así que sumar salidas cuesta un sobre X-Wing cada una (menos de
+  4 KB), no una prueba. Un pool sin custodia que paga en el coinbase dejó de
+  ser caro en cómputo.
+- **Pero el coinbase tiene exactamente una salida.** Pagarle a varios en el
+  bloque es una actualización de red por altura, como la de la prueba v4.
+- **Entran 16 pagos por bloque.** Un pool con custodia que le paga a 200
+  mineros ocupa 12 bloques y medio enteros, compitiendo con los pagos de todos.
+  Por bytes entrarían unos 40: un bloque admite 32 MiB y un pago v4 pesa
+  0,74 a 0,80 MB. Verificar 32 pagos lleva unos 4 a 6 s en la PC (126 a
+  199 ms cada uno).
+
+### Opciones
+
+**A. Pools con custodia de terceros** (nodejs-pool, cryptonote-nodejs-pool).
+No cambia el consenso.
+
+- En el nodo, un JSON-RPC con los nombres de `monerod` en `/json_rpc`:
+  `get_block_template` (con espacio para el extranonce del pool),
+  `submit_block`, `get_last_block_header`, `get_block_header_by_height` y
+  `get_info`. El nodo guarda cada plantilla, como hace hoy el Stratum: el pool
+  devuelve la plantilla con su extranonce y el nonce.
+- El pool arma el blob con un SHA-256 (los bytes 43 a 75 incluyen el
+  extranonce), no con un módulo nativo propio de Zoka. Hay que documentarlo con
+  un vector.
+- Paga con `quantic-pq-wallet-rpc`. Como los pools esperan `monero-wallet-rpc`,
+  hace falta un adaptador o un pago por minero. Choca con los 16 pagos por
+  bloque.
+- Esfuerzo: uno o dos días, más una prueba con nodejs-pool real en una red
+  local.
+
+**B. xmrig-proxy contra el Stratum del nodo.** Junta muchos XMRig en una
+conexión. Sin código: solo probarlo y escribir la guía. Sirve a granjas que
+minan para una sola dirección.
+
+**C. Pool propio sin custodia, estilo P2Pool.** Los mineros arman una cadena
+de aciertos y cada bloque les paga en el coinbase a los de la última ventana.
+
+- Consenso: coinbase de hasta N salidas (por ejemplo 16), por altura.
+- Cadena de aciertos por iroh, ventana PPLNS, aciertos verificados con
+  RandomX y una regla para los bloques que caen en un cambio de ventana.
+- Esfuerzo: semanas. El roadmap lo pone en 2028.
+
+**D. Más capacidad (consenso).** Subir `MAX_BLOCK_TRANSACTIONS` (por ejemplo
+de 16 a 32) y, si hace falta, pagos de varios destinatarios. Lo segundo cambia
+la forma única de los pagos (hoy siempre 2 salidas): un pago de 8 salidas se
+reconocería como un pago en lote. Ayuda también a los exchanges.
+
+### Recomendación
+
+1. **B ahora:** probar xmrig-proxy y escribir la guía.
+2. **A en la 5.2.0:** el RPC de `monerod` en el nodo, sin tocar el consenso,
+   con la prueba contra nodejs-pool.
+3. **Una sola actualización de red** que junte el coinbase de N salidas y el
+   tope de pagos por bloque, para no hacer dos.
+4. **C cuando haya mineros suficientes** y la actualización del punto 3 esté
+   activa.
+
+### Lo que decide el usuario
+
+- Si se hacen A y B (pools de terceros con custodia: la custodia es decisión de
+  cada operador, Zoka no los opera).
+- Si se arma la actualización de red del punto 3, y con qué números: salidas
+  del coinbase (16) y pagos por bloque (32).
+- Si C sigue en 2028 o se adelanta.
+
+## Historia (octubre, Quantic v1)
 
 ## Estado
 
