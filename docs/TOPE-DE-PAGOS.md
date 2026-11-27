@@ -4,6 +4,9 @@
 (`crates/zoka-pq-pool/src/ledger.rs`) y proponer un número. Cambiarlo es
 consenso: entra como una actualización de red a una altura, como la prueba v4.
 
+**Decisión (27/11/2026): mantener 16.** El usuario delegó la decisión en la
+propuesta de abajo.
+
 ## Los límites de hoy
 
 | Límite | Valor | De dónde |

@@ -87,6 +87,21 @@ reconocería como un pago en lote. Ayuda también a los exchanges.
   del coinbase (16) y pagos por bloque (32).
 - Si C sigue en 2028 o se adelanta.
 
+### Decisión (27/11/2026)
+
+El usuario delegó la decisión. Queda así:
+
+1. **B:** probar xmrig-proxy contra el Stratum del nodo y escribir la guía. Es
+   lo próximo de minería.
+2. **A:** el RPC con los nombres de `monerod` entra en la próxima versión del
+   nodo que toque la minería (5.2.0), con la prueba contra nodejs-pool. Los
+   pools con custodia los opera cada uno; Zoka no opera ninguno.
+3. **La actualización de red** (coinbase de N salidas y más pagos por bloque)
+   espera a que los nodos descarten las pruebas validadas y a una comisión que
+   suba con la ocupación: ver [TOPE-DE-PAGOS.md](TOPE-DE-PAGOS.md). Hasta
+   entonces, 16 pagos por bloque.
+4. **C** queda para después de la mainnet, si hay mineros suficientes.
+
 ## Historia (octubre, Quantic v1)
 
 ## Estado

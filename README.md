@@ -127,4 +127,6 @@ Never publish recovery phrases, passwords or server secrets. Verify a release's
 checksums and signature before running it.
 
 Found a vulnerability? Write to **zokanetwork@proton.me** instead of opening a
-public issue.
+public issue. The security policy, with what is in scope and the rules for
+testing, is in [SECURITY.md](SECURITY.md); the scope for an external review is
+in [docs/EXTERNAL-REVIEW.md](docs/EXTERNAL-REVIEW.md).
