@@ -1887,12 +1887,12 @@ pub async fn run(args: &[String]) -> Result<(), String> {
         }
         "identity" => identity(Options::parse(rest, &["--identity", "--network"])?).await,
         "help" | "--help" | "-h" => {
-            println!("STARK v2 node. --network regtest (default for a new --db: CPU test PoW)\n\
+            println!("Zoka Quantic node (STARK). --network regtest (default for a new --db: CPU test PoW)\n\
 or testnet (zoka-quantic-testnet-v3: RandomX, ASERT). An existing --db keeps its chain.\n\
   serve --db DIR --identity FILE [--network NAME] [--api 127.0.0.1:9140] [--descriptor-out FILE]\n\
         [--peer DESCRIPTOR ...] [--seeds builtin|none|MANIFEST] [--relay N0|none]\n\
         [--announce yes|no] [--authority DIR] [--mine-to ADDRESS] [--interval 120]\n\
-        [--stratum 127.0.0.1:3333]   (testnet: XMRig logs in with its v2 address, full or a\n\
+        [--stratum 127.0.0.1:3333]   (testnet: XMRig logs in with its wallet's address, full or a\n\
         short one the node knows; --mine-to pays logins that are not addresses. Regtest:\n\
         built-in miner.)\n\
         [--tor 127.0.0.1:9050]   (Tor mode: only through a local tor.exe's SOCKS port, to\n\
@@ -1901,9 +1901,9 @@ or testnet (zoka-quantic-testnet-v3: RandomX, ASERT). An existing --db keeps its
         onion service: also listen there for Tor-mode nodes)\n\
         [--bind 0.0.0.0:PORT]   (a fixed UDP port, for a seed with a public IP whose\n\
         manifest entry lists it in direct_addresses: reached without lookup or relays)\n\
-        [--public-api 127.0.0.1:9181]   (an explorer's read-only API on its own loopback\n\
-        port, for a tunnel to publish: GET only, any origin, its own rate; also\n\
-        ZOKA_PQ_PUBLIC_API)\n\
+        [--public-api 127.0.0.1:9181]   (an explorer's public API on its own loopback port,\n\
+        for a tunnel to publish: reads, plus POST /transactions and /address for wallets;\n\
+        any origin, its own rates; also ZOKA_PQ_PUBLIC_API)\n\
   sync --db MIRROR_DIR [--peer DESCRIPTOR] [--network NAME] [--max-blocks 8192] [--relay N0|none]\n\
   broadcast --tx FILE [--peer DESCRIPTOR | --network NAME] [--relay N0|none]\n\
   identity --identity FILE [--network NAME]   (prints the endpoint id and ML-DSA key id a\n\
@@ -1927,8 +1927,9 @@ Set ZOKA_PQ_PASSWORD to create/open the encrypted node identity. Files are never
 Use a separate mirror database for wallet commands while the node database is open.\n\
 Seeds come from the manifest compiled in for the chain (none on regtest); without --peer,\n\
 sync and broadcast use them. The node learns more peers from its peers, dials each one and\n\
-shares only those that authenticated. Testnet uses n0 relays and address lookup by default\n\
-(no open port needed); regtest is direct. Ctrl+C stops the node.");
+shares only those that authenticated. Testnet uses relays by default (Zoka's relay1 and\n\
+relay2.zoka.network, and n0's; the node takes the fastest) and n0's address lookup: no open\n\
+port needed. --relay none keeps it direct; regtest is direct. Ctrl+C stops the node.");
             Ok(())
         }
         _ => Err(format!("unknown STARK node command {command}; use help")),

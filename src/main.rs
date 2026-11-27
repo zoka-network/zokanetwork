@@ -43,7 +43,9 @@ const QUANTIC_FULLNODE_USAGE: [&str; 4] = [
     "               [--stratum host:port]   (XMRig and other rx/0 miners mine against this node)",
 ];
 
-/// La ayuda de una build de Quantic: solo lo que sirve en sus dos redes.
+/// La ayuda de una build de Quantic: primero lo que sirve en la testnet de hoy
+/// (los comandos STARK) y al final lo de la testnet v1 de octubre, que ya no
+/// corre. Sus líneas de `fullnode` siguen ahí por la prueba de ZSilent 3.0.
 #[cfg(feature = "quantic")]
 fn print_quantic_usage() {
     println!();
@@ -52,47 +54,52 @@ fn print_quantic_usage() {
     println!(
         "  {}",
         paint(
-            "Two networks: quantic-testnet (default, test coins) and quantic-mainnet. Zenith was retired on 2026-10-21.",
+            "Zoka Quantic Testnet (zoka-quantic-testnet-v3): test coins, no value. The mainnet is not live yet.",
             ANSI_DIM
         )
     );
     println!("{}", dashboard_divider());
-    println!("{}", dashboard_section("Wallet (zoka quantic-wallet <action> --network quantic-testnet)", ANSI_GREEN));
-    println!("  new --name <wallet> --password-stdin            a new wallet (24-word phrase, shown once)");
-    println!("  generate-phrase | restore --name <w> --phrase-env <VAR> --password-stdin");
-    println!("  list [--password-stdin] | address --name <w> [--full]   (the short address unless --full)");
-    println!("  balance | history [--limit n] --name <w> --password-stdin");
-    println!("  estimate-fee --amount <ZKA> | send --to <address> --amount <ZKA> [--memo <text>] --name <w> --password-stdin");
-    println!("  show-phrase | change-password --new-password-env <VAR> | backup --out <file> | import-backup --file <file>");
-    println!("  (pick the wallet with --name or --address; add --json for machine output; --rpc <url> for another node)");
     #[cfg(feature = "quantic-pq")]
     {
-        println!(
-            "{}",
-            dashboard_section(
-                "Red local postcuántica (zoka-quantic-regtest-v2, no es la testnet)",
-                ANSI_GREEN
-            )
-        );
-        println!("  zoka pq-regtest new --dir <carpeta> --name <wallet> --password-env <VAR>");
-        println!("  zoka pq-regtest address --dir <carpeta> --name <wallet>");
-        println!("  zoka pq-regtest balance|mine --dir <carpeta> --name <wallet> --password-env <VAR>");
-        println!("  zoka pq-regtest send --dir <carpeta> --name <wallet> --password-env <VAR> --to <zqregtest2...> --amount <átomos>");
-        println!("  zoka quantic-pq help     wallet, send and block import/export with explicit file paths");
-        println!("  zoka quantic-pq-node help     authenticated v2 regtest node, sync and broadcast");
+        println!("{}", dashboard_section("Node (zoka quantic-pq-node help: every option)", ANSI_GREEN));
+        println!("  zoka quantic-pq-node serve --network testnet --db <dir> --identity <file> [--api 127.0.0.1:9140]");
+        println!("        [--stratum 127.0.0.1:3333 --mine-to <address>]   (XMRig and other rx/0 miners mine against this node)");
+        println!("        [--tor 127.0.0.1:9050]   (Tor mode: only through a local Tor, no UDP and no relays)");
+        println!("  The identity password comes from ZOKA_PQ_PASSWORD. Relays are on by default (relay1 and");
+        println!("  relay2.zoka.network, and n0's): no open port needed.");
+        println!("{}", dashboard_section("Wallet (zoka quantic-pq-wallet help: every action)", ANSI_GREEN));
+        println!("  zoka quantic-pq-wallet <action> --network testnet --dir <dir> --name <wallet> --password-env <VAR>");
+        println!("  new | restore | list | address | addresses | new-address | publish-address | balance | history");
+        println!("  estimate-fee --amount <ZKA> | send --to <full, short or integrated address> --amount <ZKA> [--memo <text>]");
+        println!("  integrated-address --tag <n> | show-view-key [--incoming] | show-phrase | backup | import-backup");
+        println!("  (24-word recovery phrase; the wallet reads the chain from a node's API, 127.0.0.1:9140 by default)");
+        println!("{}", dashboard_section("Exchanges", ANSI_GREEN));
+        println!("  zoka quantic-pq-wallet-rpc --network testnet --dir <dir> --name <wallet> --password-env <VAR>");
+        println!("        --rpc-token-env <VAR> [--rpc-bind 127.0.0.1:18090]   (JSON-RPC 2.0 wallet server)");
+        println!("  Guide: docs/EXCHANGE-INTEGRATION.md at github.com/zoka-network/zokanetwork");
+        println!("{}", dashboard_section("Local test chain (regtest, not the testnet)", ANSI_GREEN));
+        println!("  zoka pq-regtest new|address|balance|mine|send --dir <dir> --name <wallet> --password-env <VAR>");
+        println!("  zoka quantic-pq help   (wallet, send and block import/export with explicit file paths)");
     }
-    println!("{}", dashboard_section("Node", ANSI_GREEN));
+    println!("{}", dashboard_section("Releases", ANSI_GREEN));
+    println!("  zoka release verify <SHA256SUMS.txt>   checks a release's hybrid Ed25519 + ML-DSA-65 signature");
+    println!("  zoka version");
+    println!("{}", dashboard_section("Network team", ANSI_GREEN));
+    println!("  zoka checkpoint-keygen --network quantic-testnet     the authority key (both halves, stays on this PC)");
+    #[cfg(feature = "quantic-pq")]
+    println!("  zoka quantic-pq-node checkpoint-sign | authority-encrypt | authority-backup | authority-restore");
+    println!("  zoka quantic-genesis --network quantic-testnet --premine-to <address> --out <file>");
+    println!("  zoka checkpoint-status | checkpoint-sign | snapshot-info | snapshot-export | iroh-id");
+    println!("  zoka release keygen | sign <SHA256SUMS.txt> | export-pem   release signatures");
+    println!(
+        "{}",
+        dashboard_section("Retired: Zoka Quantic v1, the October 2026 testnet (it no longer runs)", ANSI_YELLOW)
+    );
+    println!("  zoka quantic-wallet <action> --network quantic-testnet   (new, restore, list, balance, send, ...)");
     for line in QUANTIC_FULLNODE_USAGE {
         println!("{line}");
     }
-    println!("  zoka mine-status --network quantic-testnet [--json]");
-    println!("  zoka node-status | height | block-info | chain-stats   [--network quantic-testnet]");
-    println!("{}", dashboard_section("Network team", ANSI_GREEN));
-    println!("  zoka checkpoint-keygen --network quantic-testnet     the authority key (both halves, stays on this PC)");
-    println!("  zoka quantic-genesis --network quantic-testnet --premine-to <address> --out <file>");
-    println!("  zoka checkpoint-status | checkpoint-sign | snapshot-info | snapshot-export | iroh-id");
-    println!("  zoka release keygen | sign <SHA256SUMS.txt> | verify <SHA256SUMS.txt> | export-pem   release signatures");
-    println!("  zoka version");
+    println!("  zoka mine-status | node-status | height | block-info | chain-stats   [--network quantic-testnet]");
     println!();
 }
 
@@ -18766,15 +18773,26 @@ const ZENITH_ONLY_COMMANDS: &[&str] = &[
     "genesis-verify", "mainnet-network-lint", "chain-republish-private-txs", "trusted-setup-init",
 ];
 
-#[cfg(feature = "quantic")]
+#[cfg(feature = "quantic-pq")]
+const QUANTIC_INSTEAD: &str = "Use `zoka quantic-pq-wallet` for wallets and `zoka quantic-pq-node serve --network testnet` for the node (XMRig mines against its --stratum), or ZSilent.";
+#[cfg(all(feature = "quantic", not(feature = "quantic-pq")))]
 const QUANTIC_INSTEAD: &str = "Use `zoka quantic-wallet` for wallets, `zoka fullnode --network quantic-testnet` for the node (add --quantic-mine-to <address> to mine), or ZSilent 3.0.";
 
 #[cfg(feature = "quantic")]
 fn print_quantic_start() {
     println!("zoka {} — Zoka Quantic", env!("CARGO_PKG_VERSION"));
-    println!("Networks: quantic-testnet (default) and quantic-mainnet. Zenith was retired on 2026-10-21.");
-    println!("  zoka quantic-wallet new --network quantic-testnet --name <wallet> --password-stdin");
-    println!("  zoka fullnode --network quantic-testnet [--quantic-mine-to <address>]");
+    #[cfg(feature = "quantic-pq")]
+    {
+        println!("Network: Zoka Quantic Testnet (zoka-quantic-testnet-v3), test coins. The mainnet is not live yet.");
+        println!("  zoka quantic-pq-node serve --network testnet --db <dir> --identity <file>   the node");
+        println!("  zoka quantic-pq-wallet new --network testnet --dir <dir> --name <wallet> --password-env <VAR>");
+    }
+    #[cfg(not(feature = "quantic-pq"))]
+    {
+        println!("Networks: quantic-testnet (default) and quantic-mainnet. Zenith was retired on 2026-10-21.");
+        println!("  zoka quantic-wallet new --network quantic-testnet --name <wallet> --password-stdin");
+        println!("  zoka fullnode --network quantic-testnet [--quantic-mine-to <address>]");
+    }
     println!("  zoka help   (every command)");
 }
 

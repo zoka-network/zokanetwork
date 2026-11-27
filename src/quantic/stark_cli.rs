@@ -604,7 +604,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     match command {
         "help" | "--help" => {
             println!(
-                "ZOKA QUANTIC STARK v2 (regtest by default; --network testnet for the RandomX chain)\n\
+                "ZOKA QUANTIC STARK tools (regtest by default; --network testnet for the RandomX chain)\n\
 wallet-create --wallet FILE [--network NAME] [--password-stdin]\n\
 wallet-restore --wallet FILE --phrase-stdin [--network NAME] [--password-stdin]\n\
 address --wallet FILE [--short]\n\
@@ -638,7 +638,7 @@ One atom = 0.000001 ZKA. No public chain or wallet path is selected automaticall
                     .map_err(|_| "invalid recovery phrase".to_string())?;
                 let entropy = Zeroizing::new(mnemonic.to_entropy());
                 if entropy.len() != 32 {
-                    return Err("STARK v2 requires a 24-word / 256-bit recovery phrase".into());
+                    return Err("Zoka Quantic requires a 24-word / 256-bit recovery phrase".into());
                 }
                 seed.copy_from_slice(&entropy);
             } else {

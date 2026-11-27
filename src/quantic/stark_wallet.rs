@@ -179,7 +179,7 @@ fn seed_of(phrase: &str) -> Result<Zeroizing<[u8; 32]>, String> {
     let seed: [u8; 32] = entropy
         .as_slice()
         .try_into()
-        .map_err(|_| "Zoka Quantic v2 needs a 24-word / 256-bit recovery phrase".to_string())?;
+        .map_err(|_| "Zoka Quantic needs a 24-word / 256-bit recovery phrase".to_string())?;
     Ok(Zeroizing::new(seed))
 }
 
