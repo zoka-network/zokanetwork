@@ -1,5 +1,29 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
+## 27/11 (noche): ZKAPriv 4.1.0 publicada y las decisiones delegadas
+
+El usuario conectó el teléfono y delegó lo demás («ZKAPRIV YA CONECTADO LO
+DEMAS ARREGLALO TU»).
+
+- **Decidido y publicado** (`main` `63234f11`): `SECURITY.md` y
+  `docs/EXTERNAL-REVIEW.md` (el bounty abre antes de la mainnet, sin montos
+  comprometidos); pools: xmrig-proxy y su guía primero, el RPC de `monerod` en
+  la 5.2.0, la actualización de red (coinbase de N salidas y más pagos) después
+  de descartar pruebas validadas y de una comisión por ocupación, y el pool sin
+  custodia tras la mainnet; tope de 16 pagos por bloque. `zokawallet` ya era
+  público en GitLab.
+- **ZKAPriv 4.1.0 publicada** (release Latest, etiqueta `v4.1.0` = `c288ea9`):
+  el rediseño negro y vidrio (`panel-limpio-y-hojas`) junto con la 4.0.2. Envíos
+  del rediseño suma las direcciones de exchange; código 23; APK `ada40031…`
+  con el certificado de siempre. 16 pruebas instrumentadas sin fallas en el
+  teléfono, incluida la de la cadena real por HTTPS, P2P y Tor. Bajada y
+  verificada, instalada sobre la app real (conserva la billetera), zoka.network
+  en la 4.1.0 (`64b2694`) y aviso en Discord. Detalle en
+  `zkapriv/docs/VALIDACION-4.1.0.md`.
+- **Trampa:** `gradlew connectedDebugAndroidTest` desinstaló «ZKAPriv Testnet»
+  y borró sus datos de prueba. Las pruebas se corren con `am instrument`.
+- **Lo próximo de minería:** xmrig-proxy y su guía (opción B).
+
 ## 27/11 (tarde): los pendientes sin decisiones, publicados
 
 El usuario pidió avanzar con todo lo que no dependía de él («si avanza con
