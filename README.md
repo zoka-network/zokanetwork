@@ -113,6 +113,7 @@ bundles this node.
 | --- | --- |
 | Proof v4 and network upgrades | [docs/PROOF-V4.md](docs/PROOF-V4.md) |
 | Integrating an exchange | [docs/EXCHANGE-INTEGRATION.md](docs/EXCHANGE-INTEGRATION.md) |
+| Zoka ID, the fingerprint of an address | [docs/ZOKA-ID.md](docs/ZOKA-ID.md) |
 | Verifying releases | [docs/release-verification.md](docs/release-verification.md) |
 | The CLI miner | [packaging/cli-miner/README.md](packaging/cli-miner/README.md) |
 | Whitepaper and litepaper | [zoka.network](https://zoka.network/#docs/papers) |
