@@ -1,5 +1,29 @@
 # Zoka Quantic: hoja de ruta para continuar con Claude
 
+## 28/11: Zoka ID publicado en las cuatro apps
+
+El usuario quería darle un sentido en la cadena al «ID único» de la
+credencial de ZKAPriv 4.1. Eligió la huella visual de cada dirección en toda la
+red, con un código largo. Especificación con vectores:
+[docs/ZOKA-ID.md](docs/ZOKA-ID.md). El mosaico v1 no cambia; el código v2 son 10
+bytes de la misma semilla (80 bits, cinco grupos) y empieza con el v1.
+
+- **Publicado y verificado:** ZKAPriv 4.1.1 (release Latest; el motor ahora da
+  la corta de cualquier dirección) y ZSilent 5.1.3 (Latest; nodo 5.1.1 oficial,
+  la corta del destinatario sale de `quantic-pq-wallet parse-address`).
+  También la billetera web 0.5.0 y ZokaScan (tarjeta en la página de una
+  dirección corta), zoka.network con las versiones y un aviso en Discord.
+- **Dónde se ve:** en Recibir, en la revisión de un pago (el del destinatario,
+  con el aviso de comparar el código) y en ZokaScan.
+- **Instalado:** ZSilent 5.1.3 en la PC. Arrancó en solo-sincronizar hasta que
+  el usuario la desbloquee. ZKAPriv 4.1.1 en el teléfono queda pendiente: el
+  teléfono se desconectó.
+- **Trampa:** `target/release/zoka.exe` es la compilación con la ayuda nueva
+  (rama `ayuda-quantic-v3`). Para empaquetar ZSilent hubo que poner los binarios
+  oficiales de la 5.1.1 (copiados de ZSilent instalado) y después restaurarla.
+- **Fuzzing del 27/11 (VPS 2), terminado:** seis objetivos de una hora, salida
+  0, sin artefactos de falla.
+
 ## 27/11 (noche): ZKAPriv 4.1.0 publicada y las decisiones delegadas
 
 El usuario conectó el teléfono y delegó lo demás («ZKAPRIV YA CONECTADO LO
