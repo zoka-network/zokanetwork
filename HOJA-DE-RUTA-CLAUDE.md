@@ -15,9 +15,11 @@ bytes de la misma semilla (80 bits, cinco grupos) y empieza con el v1.
   dirección corta), zoka.network con las versiones y un aviso en Discord.
 - **Dónde se ve:** en Recibir, en la revisión de un pago (el del destinatario,
   con el aviso de comparar el código) y en ZokaScan.
-- **Instalado:** ZSilent 5.1.3 en la PC. Arrancó en solo-sincronizar hasta que
-  el usuario la desbloquee. ZKAPriv 4.1.1 en el teléfono queda pendiente: el
-  teléfono se desconectó.
+- **Instalado:** ZSilent 5.1.3 en la PC. Arrancó en solo-sincronizar y sin
+  Stratum, y la cadena quedó parada en el 11.922 (08:13) hasta que el usuario la
+  desbloqueó; el 11.923 (08:29) lo minó la PC con 33 shares y ningún rechazo.
+  ZKAPriv 4.1.1 en el teléfono, encima de la app real (`adb install -r`, código
+  24, abre sin errores). «ZKAPriv Testnet» queda en la 4.1.0.
 - **Trampa:** `target/release/zoka.exe` es la compilación con la ayuda nueva
   (rama `ayuda-quantic-v3`). Para empaquetar ZSilent hubo que poner los binarios
   oficiales de la 5.1.1 (copiados de ZSilent instalado) y después restaurarla.
